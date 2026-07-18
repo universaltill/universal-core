@@ -7,10 +7,11 @@ Universal Till: Till is the retail/POS edge, Core is the enterprise
 backbone it and other systems connect into.
 
 **Status: early kernel spike, not yet public.** This repo exists only
-locally so far — not pushed to GitHub, pending review (see the `docs`
-repo's `code-reviews/2026-07-18-universal-core-kernel-spike.md` for why).
-Full architecture decision: `docs` repo,
-`adr/0017-universal-erp-metadata-kernel.md`.
+locally so far — not pushed to GitHub, pending review (see
+`docs/code-reviews/2026-07-18-universal-core-kernel-spike.md` for why).
+Full architecture decision: `docs/adr/0001-universal-erp-metadata-kernel.md`
+(this repo's own ADR-0001; was unitill `docs` repo ADR-0017 before this
+became a separate product tree).
 
 ## What exists today
 
@@ -56,4 +57,4 @@ TEST_DATABASE_URL=... go test ./...  # includes Postgres integration tests
 
 ## License
 
-AGPLv3 (see `LICENSE`) — see ADR-0017 §13 for the reasoning.
+AGPLv3 (see `LICENSE`) — see ADR-0001 §13 for the reasoning.
