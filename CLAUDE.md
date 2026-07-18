@@ -1,16 +1,18 @@
 # universal-core — rules for working in this repo
 
 The metadata-driven ERP kernel (Go, Postgres, server-rendered HTMX). Governing
-decision: `docs` repo → `adr/0017-universal-erp-metadata-kernel.md`. Full
-standards: `docs` repo → `reference/coding-standards.md` (shared with
-universal-till). The non-negotiables:
+decision: this repo's own `docs/adr/0001-universal-erp-metadata-kernel.md`
+(self-hosted here since 2026-07-18; was unitill `docs` repo ADR-0017 before
+Universal Core became a separate product tree — see the ADR's provenance
+note). Full standards: `../unitill/docs/reference/coding-standards.md`
+(still shared with universal-till). The non-negotiables:
 
 ## Data access — repository pattern (same discipline as universal-till)
 - **Raw SQL lives only in `internal/data` (repositories) and
   `internal/db/migrations`.** No SQL query text anywhere else.
 - Migrations are **append-only** after the first release.
 
-## The kernel/deterministic-core boundary (ADR-0017 §1, §16) — the most
+## The kernel/deterministic-core boundary (ADR-0001 §1, §16) — the most
 important rule in this repo
 - **Everything under `internal/kernel/entity`, `internal/kernel/form`, and
   `internal/kernel/workflow` is generic and metadata-driven.** It must never
@@ -25,7 +27,7 @@ important rule in this repo
   screen or API response goes into the Entity/Form Definition or the
   generator, never a one-off patch to generated output.
 
-## Audit — AI-actor identity is first-class (ADR-0017 §14)
+## Audit — AI-actor identity is first-class (ADR-0001 §14)
 Every mutation writes an audit row carrying `actor_type` (`human` |
 `ai_agent`), `actor_id`, and — when `ai_agent` — `model_version` and an
 `input_hash`. This is not optional metadata; write it from the same
@@ -36,7 +38,7 @@ after the fact.
 Every table that isn't global configuration carries `tenant_id`. Every
 repository method takes a tenant scope explicitly — no query may rely on
 an implicit/ambient tenant context. This is the single most consequential
-line of defence against a cross-tenant data leak (see ADR-0017 §3).
+line of defence against a cross-tenant data leak (see ADR-0001 §3).
 
 ## API, formats, i18n
 Same conventions as universal-till: responses `{ "data": …, "error": null }`,
@@ -44,6 +46,6 @@ JSON **snake_case**, dates ISO-8601, money via a `money.Money`-equivalent
 integer-minor-units type. No hardcoded user-facing strings.
 
 ## Process
-Document-first (ADR-0007): architectural changes get an ADR in `docs`
+Document-first (ADR-0007): architectural changes get an ADR in `docs/adr/`
 before the code lands. Every substantive change gets a review doc in
 `docs/code-reviews/<date>-<topic>.md`.
