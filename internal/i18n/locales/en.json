@@ -1,0 +1,6 @@
+{
+  "form.field.required_suffix": " *",
+  "form.related_list.empty": "No related records.",
+  "form.master_detail.empty": "No lines yet.",
+  "form.master_detail.add": "+ Add"
+}
