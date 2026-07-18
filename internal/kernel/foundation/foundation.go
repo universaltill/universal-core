@@ -1,9 +1,11 @@
 // Package foundation seeds the always-on base entities every module
-// depends on (ADR-0017 §8): the Party–Role–Relationship pattern plus the
-// small set of cross-cutting entities (unit of measure, currency) that
-// Sales, Procurement, Inventory, and Manufacturing all reference. These
-// ship with the kernel, not as an optional module — a tenant licensing
-// only one operational module still needs a Party to exist.
+// depends on (ADR-0001 §8, reference-data-model.md §0): the
+// Party–Role–Relationship pattern, the generic Attachment entity any
+// record can carry files against, and the cross-cutting entities (unit of
+// measure, currency) that Sales, Procurement, Inventory, and Manufacturing
+// all reference. These ship with the kernel, not as an optional module —
+// a tenant licensing only one operational module still needs a Party to
+// exist.
 package foundation
 
 import "github.com/universaltill/universal-core/internal/kernel/entity"
@@ -61,6 +63,40 @@ func PartyRelationship() *entity.Definition {
 	}
 }
 
+// Attachment is a generic file reference usable from any entity type —
+// reference-data-model.md §0 calls this out as "usable from any entity",
+// which is why entity_type/record_id are plain string fields rather than
+// a FieldReference with a fixed Target: a FieldReference can only ever
+// point at one target entity type (see entity.Field.Target), but an
+// Attachment on a PurchaseOrder today and a Vendor tomorrow needs to name
+// a different target each time. This mirrors how the generic `records`
+// table and `audit_log` already store entity_type+record_id (CLAUDE.md's
+// generic-storage pattern), not a new mechanism. Who uploaded it isn't a
+// field here — crud.Engine writes an audit_log row (with actor identity)
+// for every record's creation, Attachment included, so duplicating actor
+// identity onto Attachment itself would be redundant *as long as
+// Attachment records only ever get created through crud.Engine*. If a
+// future bulk-import or direct-upload path ever writes Attachment records
+// through internal/data directly, bypassing crud.Engine, that assumption
+// breaks silently — revisit then, don't assume this holds forever.
+func Attachment() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "Attachment",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "entity_type", Type: entity.FieldString, Required: true},
+			{Name: "record_id", Type: entity.FieldString, Required: true},
+			{Name: "file_name", Type: entity.FieldString, Required: true},
+			{Name: "mime_type", Type: entity.FieldString, Required: true},
+			{Name: "size_bytes", Type: entity.FieldNumber, Required: true},
+			// storage_path is where the actual bytes live (e.g. an object
+			// store key) — this kernel spike models the metadata record
+			// only, not a storage backend.
+			{Name: "storage_path", Type: entity.FieldString, Required: true},
+		},
+	}
+}
+
 // UnitOfMeasure is a base unit (each, box, kg, litre) referenced by
 // Inventory, Procurement, Sales, and Manufacturing alike.
 func UnitOfMeasure() *entity.Definition {
@@ -95,6 +131,7 @@ func All() []*entity.Definition {
 		Party(),
 		PartyRole(),
 		PartyRelationship(),
+		Attachment(),
 		UnitOfMeasure(),
 		Currency(),
 	}
