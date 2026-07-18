@@ -2,9 +2,9 @@ package workflow
 
 import "testing"
 
-// poApprovalWorkflow is the worked example from ADR-0017's Ansar-derived
-// purchasing scenario, generalised: a PO over a threshold requires
-// approval, then finance is notified.
+// poApprovalWorkflow is the worked example from ADR-0017's purchasing
+// scenario: a PO over a threshold requires approval, then finance is
+// notified.
 func poApprovalWorkflow() *Definition {
 	return &Definition{
 		Name:    "po_approval",
