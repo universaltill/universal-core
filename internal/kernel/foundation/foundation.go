@@ -1,9 +1,11 @@
 // Package foundation seeds the always-on base entities every module
-// depends on (ADR-0017 §8): the Party–Role–Relationship pattern plus the
-// small set of cross-cutting entities (unit of measure, currency) that
-// Sales, Procurement, Inventory, and Manufacturing all reference. These
-// ship with the kernel, not as an optional module — a tenant licensing
-// only one operational module still needs a Party to exist.
+// depends on (ADR-0001 §8, reference-data-model.md §0): the
+// Party–Role–Relationship pattern with its typed, multiple-per-party
+// Address/ContactMechanism, plus the cross-cutting entities (unit of
+// measure + conversions, currency + exchange rates) that Sales,
+// Procurement, Inventory, and Manufacturing all reference. These ship
+// with the kernel, not as an optional module — a tenant licensing only
+// one operational module still needs a Party to exist.
 package foundation
 
 import "github.com/universaltill/universal-core/internal/kernel/entity"
@@ -61,6 +63,47 @@ func PartyRelationship() *entity.Definition {
 	}
 }
 
+// Address is a postal address attachable to a Party — typed and multiple
+// per Party (reference-data-model.md §0), not a single hardcoded address
+// field set on Party itself. A Party with billing and shipping addresses
+// in different countries is the common case, not an edge case.
+func Address() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "Address",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "party_id", Type: entity.FieldReference, Required: true, Target: "Party"},
+			{Name: "address_type", Type: entity.FieldEnum, Required: true,
+				EnumValues: []string{"billing", "shipping", "registered", "other"}},
+			{Name: "line1", Type: entity.FieldString, Required: true},
+			{Name: "line2", Type: entity.FieldString},
+			{Name: "city", Type: entity.FieldString, Required: true},
+			{Name: "region", Type: entity.FieldString},
+			{Name: "postal_code", Type: entity.FieldString},
+			{Name: "country_code", Type: entity.FieldString, Required: true}, // ISO 3166-1 alpha-2
+			{Name: "is_primary", Type: entity.FieldBool, Default: false},
+		},
+	}
+}
+
+// ContactMechanism is a typed contact channel (phone/email/fax/mobile),
+// multiple per Party — same "typed and multiple" pattern as Address
+// (reference-data-model.md §0), rather than fixed phone/email columns on
+// Party that can't represent a second phone number or a fax-only contact.
+func ContactMechanism() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "ContactMechanism",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "party_id", Type: entity.FieldReference, Required: true, Target: "Party"},
+			{Name: "mechanism_type", Type: entity.FieldEnum, Required: true,
+				EnumValues: []string{"phone", "mobile", "email", "fax"}},
+			{Name: "value", Type: entity.FieldString, Required: true},
+			{Name: "is_primary", Type: entity.FieldBool, Default: false},
+		},
+	}
+}
+
 // UnitOfMeasure is a base unit (each, box, kg, litre) referenced by
 // Inventory, Procurement, Sales, and Manufacturing alike.
 func UnitOfMeasure() *entity.Definition {
@@ -74,8 +117,25 @@ func UnitOfMeasure() *entity.Definition {
 	}
 }
 
+// UomConversion is a conversion factor between two UnitOfMeasure entries
+// (e.g. 1 box = 12 each: from_uom_id=box, to_uom_id=each, factor=12) —
+// reference-data-model.md §0 calls this out alongside UnitOfMeasure
+// itself, since Inventory/Procurement/Sales/Manufacturing all need to
+// convert between a stocking unit and an ordering/selling unit.
+func UomConversion() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "UomConversion",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "from_uom_id", Type: entity.FieldReference, Required: true, Target: "UnitOfMeasure"},
+			{Name: "to_uom_id", Type: entity.FieldReference, Required: true, Target: "UnitOfMeasure"},
+			{Name: "factor", Type: entity.FieldNumber, Required: true},
+		},
+	}
+}
+
 // Currency is a base currency; ExchangeRate (date-effective rates) is a
-// separate entity referencing it, not modeled in this first increment.
+// separate entity referencing it.
 func Currency() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "Currency",
@@ -88,6 +148,23 @@ func Currency() *entity.Definition {
 	}
 }
 
+// ExchangeRate is a date-effective rate between two currencies, kept as
+// its own entity (not a field on Currency) since rates change daily while
+// a Currency's own code/name/minor_unit don't — Finance, Sales, and
+// Procurement all consume this for multi-currency documents.
+func ExchangeRate() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "ExchangeRate",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "from_currency_id", Type: entity.FieldReference, Required: true, Target: "Currency"},
+			{Name: "to_currency_id", Type: entity.FieldReference, Required: true, Target: "Currency"},
+			{Name: "effective_date", Type: entity.FieldDate, Required: true},
+			{Name: "rate", Type: entity.FieldNumber, Required: true},
+		},
+	}
+}
+
 // All returns every foundation Definition — the set that must exist
 // before any operational module is enabled for a tenant.
 func All() []*entity.Definition {
@@ -95,7 +172,11 @@ func All() []*entity.Definition {
 		Party(),
 		PartyRole(),
 		PartyRelationship(),
+		Address(),
+		ContactMechanism(),
 		UnitOfMeasure(),
+		UomConversion(),
 		Currency(),
+		ExchangeRate(),
 	}
 }
