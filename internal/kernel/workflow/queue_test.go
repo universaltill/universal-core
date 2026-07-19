@@ -587,6 +587,112 @@ func TestQueue_ReclaimStale_LeavesFreshRunningJobAlone(t *testing.T) {
 	}
 }
 
+// TestWorkflowJobRepo_MarkFailedCannotResurrectAnAlreadyDoneJob is the
+// regression test for the code-review finding that MarkDone/MarkFailed/
+// MarkWaitingApproval matched only on id+tenant_id, with no status guard
+// — so a stale-but-alive worker (one whose step ran past leaseTimeout
+// but hadn't actually crashed) could call Mark* on a job another process
+// had already moved on from, silently clobbering its state. This
+// reproduces the reviewer's exact demonstrated case: enqueue -> claim ->
+// MarkDone (job legitimately completes) -> a later MarkFailed call on
+// the SAME id, simulating the original worker's zombie retry, must NOT
+// flip a 'done' job back to 'queued'.
+func TestWorkflowJobRepo_MarkFailedCannotResurrectAnAlreadyDoneJob(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	tenantID := seedTenant(t, db)
+	repo := data.NewWorkflowJobRepo(db)
+
+	job, err := repo.Enqueue(ctx, data.WorkflowJob{
+		TenantID: tenantID, WorkflowName: "resurrection_check", WorkflowVersion: 1,
+		EntityType: "PurchaseOrder", RecordID: "11111111-1111-1111-1111-111111111111",
+		Actor: humanActor(),
+	})
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := db.ExecContext(ctx,
+		`UPDATE workflow_jobs SET status = 'running', updated_at = now() WHERE id = $1`, job.ID,
+	); err != nil {
+		t.Fatalf("simulate claim: %v", err)
+	}
+	if err := repo.MarkDone(ctx, tenantID, job.ID, 1); err != nil {
+		t.Fatalf("MarkDone: %v", err)
+	}
+
+	// The zombie retry: a worker that (unbeknownst to it) already had
+	// this job's result recorded calls MarkFailed anyway.
+	if _, err := repo.MarkFailed(ctx, tenantID, job.ID, errors.New("zombie worker's late failure"), time.Now()); !errors.Is(err, data.ErrNotFound) {
+		t.Fatalf("expected MarkFailed on an already-done job to return ErrNotFound, got %v", err)
+	}
+
+	got, err := repo.Get(ctx, tenantID, job.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status != "done" {
+		t.Fatalf("expected the completed job to stay 'done', got %q — MarkFailed resurrected it", got.Status)
+	}
+	if got.Attempts != 0 {
+		t.Fatalf("expected the rejected MarkFailed to leave attempts untouched, got %d", got.Attempts)
+	}
+}
+
+// TestQueue_ReclaimStale_OriginalStaleWorkerCannotUndoTheReclaim is the
+// companion regression test at the ReclaimStale/Queue level: a job whose
+// lease expired and was reclaimed (moved back to 'queued', counted as an
+// attempt) must not have that bookkeeping undone by the original worker
+// finally calling MarkDone after the fact — it was slow, not
+// necessarily dead, and ReclaimStale already made the authoritative call
+// that its lease expired.
+func TestQueue_ReclaimStale_OriginalStaleWorkerCannotUndoTheReclaim(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	tenantID := seedTenant(t, db)
+	def := &Definition{
+		Name: "slow_not_dead", Version: 1,
+		Trigger: Trigger{Type: TriggerManual},
+		Steps:   []Step{{Kind: StepNotify}},
+	}
+	q, err := NewQueue(db, nil)
+	if err != nil {
+		t.Fatalf("NewQueue: %v", err)
+	}
+	job, err := q.Enqueue(ctx, def, tenantID, "PurchaseOrder", "22222222-2222-2222-2222-222222222222", humanActor())
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := db.ExecContext(ctx,
+		`UPDATE workflow_jobs SET status = 'running', updated_at = now() - interval '1 hour' WHERE id = $1`,
+		job.ID,
+	); err != nil {
+		t.Fatalf("simulate long-running claim: %v", err)
+	}
+
+	if _, err := q.ReclaimStale(ctx, 5*time.Minute); err != nil {
+		t.Fatalf("ReclaimStale: %v", err)
+	}
+
+	// The original worker wasn't actually dead — it was just slow — and
+	// now finishes its step and reports success, unaware it's been
+	// reclaimed out from under it.
+	repo := data.NewWorkflowJobRepo(db)
+	if err := repo.MarkDone(ctx, tenantID, job.ID, 1); !errors.Is(err, data.ErrNotFound) {
+		t.Fatalf("expected the original worker's late MarkDone to be rejected, got %v", err)
+	}
+
+	got, err := repo.Get(ctx, tenantID, job.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status != "queued" {
+		t.Fatalf("expected the job to stay in ReclaimStale's 'queued' state, got %q — the stale worker undid the reclaim", got.Status)
+	}
+	if got.Attempts != 1 {
+		t.Fatalf("expected ReclaimStale's attempt count to survive the rejected MarkDone, got %d", got.Attempts)
+	}
+}
+
 func TestQueue_ProcessOne_PanicInHandlerIsRecoveredAndRetried(t *testing.T) {
 	db := testDB(t)
 	ctx := context.Background()

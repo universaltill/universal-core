@@ -257,7 +257,12 @@ func TestRender_EscapesFieldValues(t *testing.T) {
 // JSON literal, both of which the browser would HTML-decode back to the
 // raw character before htmx parsed it as a URL/JSON — letting a crafted
 // record ID smuggle an extra query parameter or JSON key. Both are now
-// built with net/url and encoding/json server-side instead.
+// built with net/url and encoding/json server-side instead. A follow-up
+// independent review found the form's own hx-post (the one sink this
+// test didn't originally cover) still interpolated EntityType/RecordID
+// raw — the identical bug class, just missed in the first hardening
+// pass — now closed via the same url.PathEscape-built PostHref the other
+// hrefs already use.
 func TestRender_RecordIDCannotBreakHxAttributes(t *testing.T) {
 	r := testRenderer(t)
 	data := Data{
@@ -272,6 +277,27 @@ func TestRender_RecordIDCannotBreakHxAttributes(t *testing.T) {
 		t.Fatalf("render: %v", err)
 	}
 	out := buf.String()
+
+	// The form's own hx-post must be built via url.PathEscape, same as the
+	// other hrefs, so the RecordID round-trips through the path segment
+	// exactly. Two escaping layers stack here: url.PathEscape leaves
+	// "&"/"=" literal (legal, unescaped pchar per RFC 3986 — harmless
+	// since there's no "?" to make them look like query syntax; see the
+	// "?" case below for the character that actually matters), and then
+	// html/template's HTML-attribute-context escaping entity-encodes
+	// that literal "&" into "&amp;" on top, the same double layer the
+	// hx-vals assertion above already unwinds with html.UnescapeString
+	// before json.Unmarshal — so this must unwind both layers in the
+	// same order (HTML-unescape, then PathUnescape) to get back the
+	// original RecordID.
+	gotPostRaw := attrValueDQ(t, out, `hx-post="/api/records/PurchaseOrder/`)
+	gotPostRecordID, err := url.PathUnescape(html.UnescapeString(gotPostRaw))
+	if err != nil {
+		t.Fatalf("hx-post record ID segment doesn't PathUnescape: %v", err)
+	}
+	if gotPostRecordID != data.RecordID {
+		t.Fatalf("expected hx-post record ID to round-trip exactly, got %q want %q", gotPostRecordID, data.RecordID)
+	}
 
 	// The related_list hx-get URL must percent-encode the record ID, not
 	// emit a literal unescaped "&" that would parse as an extra query param.
@@ -294,16 +320,70 @@ func TestRender_RecordIDCannotBreakHxAttributes(t *testing.T) {
 	}
 }
 
+// TestRender_RecordIDQuestionMarkCannotBreakHxPostIntoQueryString is the
+// regression test for the actual exploitable character in the hx-post
+// path-segment injection: unlike "&"/"=" (legal, inert pchar per RFC
+// 3986 — see TestRender_RecordIDCannotBreakHxAttributes), an unescaped
+// "?" would end the path and start a query string, letting a crafted
+// record ID append real query parameters to the form's own submit
+// target. url.PathEscape must turn it into %3F.
+func TestRender_RecordIDQuestionMarkCannotBreakHxPostIntoQueryString(t *testing.T) {
+	r := testRenderer(t)
+	data := Data{
+		RecordID: `1?admin=true`,
+		Record:   map[string]any{"payment_method": "Wire"},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if strings.Contains(out, `hx-post="/api/records/PurchaseOrder/1?admin=true"`) {
+		t.Fatalf("record ID's '?' leaked into hx-post unescaped, turning the record-ID path segment into a query string: got:\n%s", out)
+	}
+	if !strings.Contains(out, `hx-post="/api/records/PurchaseOrder/1%3Fadmin=true"`) {
+		t.Fatalf("expected hx-post's '?' to be percent-encoded to %%3F, got:\n%s", out)
+	}
+}
+
+// TestRender_PostHrefOmitsRecordIDForNewRecord confirms the hx-post
+// refactor preserved the existing new-vs-existing-record URL shape
+// (/api/records/{EntityType} vs /api/records/{EntityType}/{RecordID}),
+// not just that it's now escaped.
+func TestRender_PostHrefOmitsRecordIDForNewRecord(t *testing.T) {
+	r := testRenderer(t)
+	data := Data{Record: map[string]any{"payment_method": "Wire"}}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, `hx-post="/api/records/PurchaseOrder"`) {
+		t.Fatalf("expected a new (unsaved) record's hx-post to omit the record ID segment, got:\n%s", out)
+	}
+}
+
 // attrValue extracts the text between the first occurrence of prefix and
 // the next single quote — good enough for a test fixture's known markup.
 func attrValue(t *testing.T, page, prefix string) string {
+	t.Helper()
+	return attrValueUntil(t, page, prefix, `'`)
+}
+
+// attrValueDQ is attrValue for a double-quoted attribute (e.g. hx-post="...").
+func attrValueDQ(t *testing.T, page, prefix string) string {
+	t.Helper()
+	return attrValueUntil(t, page, prefix, `"`)
+}
+
+func attrValueUntil(t *testing.T, page, prefix, closing string) string {
 	t.Helper()
 	i := strings.Index(page, prefix)
 	if i < 0 {
 		t.Fatalf("prefix %q not found in:\n%s", prefix, page)
 	}
 	rest := page[i+len(prefix):]
-	j := strings.Index(rest, `'`)
+	j := strings.Index(rest, closing)
 	if j < 0 {
 		t.Fatalf("unterminated attribute after prefix %q in:\n%s", prefix, page)
 	}
