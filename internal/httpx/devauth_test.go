@@ -70,10 +70,12 @@ func TestDevAuth_RejectsMissingHeaders(t *testing.T) {
 	}
 }
 
+const testTenantID = "11111111-1111-1111-1111-111111111111"
+
 func TestDevAuth_PopulatesRequestContextWhenEnabled(t *testing.T) {
 	withDevAuthEnabled(t, true)
 	req := httptest.NewRequest("GET", "/", nil)
-	req.Header.Set("X-Tenant-ID", "tenant-1")
+	req.Header.Set("X-Tenant-ID", testTenantID)
 	req.Header.Set("X-Actor-ID", "actor-1")
 	rec := httptest.NewRecorder()
 
@@ -82,7 +84,43 @@ func TestDevAuth_PopulatesRequestContextWhenEnabled(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), `"tenant_id":"tenant-1"`) || !strings.Contains(rec.Body.String(), `"actor_id":"actor-1"`) {
+	if !strings.Contains(rec.Body.String(), `"tenant_id":"`+testTenantID+`"`) || !strings.Contains(rec.Body.String(), `"actor_id":"actor-1"`) {
 		t.Fatalf("expected the handler to see the headers via RequestContext, got %s", rec.Body.String())
+	}
+}
+
+// TestDevAuth_RejectsMalformedTenantID is the regression test for the
+// code-review finding that a non-UUID X-Tenant-ID reached a query as a
+// malformed parameter, surfacing as a 500 with a raw Postgres driver
+// error in the response. It's now rejected here, as a 401, before ever
+// reaching a handler or a query.
+func TestDevAuth_RejectsMalformedTenantID(t *testing.T) {
+	withDevAuthEnabled(t, true)
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Header.Set("X-Tenant-ID", "not-a-uuid")
+	req.Header.Set("X-Actor-ID", "actor-1")
+	rec := httptest.NewRecorder()
+
+	DevAuth(okHandler()).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for a malformed X-Tenant-ID, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestDevAuth_TrimsWhitespaceOnlyHeaders confirms a whitespace-only
+// header is treated the same as a missing one, not as a non-empty
+// (garbage) tenant/actor id.
+func TestDevAuth_TrimsWhitespaceOnlyHeaders(t *testing.T) {
+	withDevAuthEnabled(t, true)
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Header.Set("X-Tenant-ID", "   ")
+	req.Header.Set("X-Actor-ID", "actor-1")
+	rec := httptest.NewRecorder()
+
+	DevAuth(okHandler()).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for a whitespace-only X-Tenant-ID, got %d: %s", rec.Code, rec.Body.String())
 	}
 }

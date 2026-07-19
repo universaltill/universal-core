@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"os"
+	"sync"
 	"testing"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -103,5 +104,43 @@ func TestApply_FormDefinitionsHasActorTrackingColumns(t *testing.T) {
 		if !exists {
 			t.Fatalf("expected form_definitions.%s to exist after Apply", col)
 		}
+	}
+}
+
+// TestApply_ConcurrentCallersDoNotFail is the regression test for the
+// code-review finding that Apply's "CREATE TABLE IF NOT EXISTS
+// schema_migrations" plus per-migration "SELECT EXISTS ... INSERT" isn't
+// itself a safe compare-and-set under concurrent execution: several
+// replicas booting simultaneously against a fresh (unmigrated) database
+// used to crash-loop every replica but one on a duplicate-key error.
+// pg_advisory_lock (migrationLockKey) now serializes concurrent callers.
+func TestApply_ConcurrentCallersDoNotFail(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+
+	const callers = 5
+	var wg sync.WaitGroup
+	errs := make([]error, callers)
+	for i := range callers {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = Apply(ctx, db)
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent Apply caller %d failed: %v", i, err)
+		}
+	}
+
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations`).Scan(&count); err != nil {
+		t.Fatalf("count schema_migrations: %v", err)
+	}
+	if count != 3 {
+		t.Fatalf("expected exactly 3 recorded migrations after %d concurrent Apply calls, got %d", callers, count)
 	}
 }
