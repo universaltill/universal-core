@@ -59,14 +59,12 @@ func PurchaseOrder() *entity.Definition {
 			{Name: "total", Type: entity.FieldNumber, Default: float64(0)},
 		},
 		Relationships: []entity.Relationship{
-			// Declared for the real target shape (reference-data-model.md:
-			// "has many POLines") even though formrender's master-detail
-			// section (purchasing/forms.go's PurchaseOrderForm) doesn't
-			// need this to render the section itself — see this
-			// package's own doc comment on formrender's Data.Children
-			// not being populated by the HTTP layer yet, a separate,
-			// already-tracked limitation (QUEUE.md), not something this
-			// Definition needs to work around.
+			// ParentField ("purchase_order_id") is what
+			// internal/api/handlers.go's loadMasterDetailChildren looks up
+			// to find this PurchaseOrder's POLine rows for
+			// PurchaseOrderForm's master-detail section — not just
+			// documentation of the real target shape
+			// (reference-data-model.md: "has many POLines").
 			{Name: "lines", Kind: entity.RelationComposition, Target: "POLine", ParentField: "purchase_order_id"},
 		},
 	}
