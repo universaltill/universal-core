@@ -32,16 +32,18 @@ type Handler struct {
 	formDefs   *data.FormDefinitionRepo
 	crud       *crud.Engine
 	renderer   *formrender.Renderer
+	catalog    *i18n.Catalog
 }
 
-// New builds a Handler. catalog is the i18n.Catalog forms render against
-// (internal/i18n.Load).
+// New builds a Handler. catalog is the i18n.Catalog forms (and the
+// import wizard, import.go) render against (internal/i18n.Load).
 func New(db *sql.DB, catalog *i18n.Catalog) *Handler {
 	return &Handler{
 		entityDefs: data.NewEntityDefinitionRepo(db),
 		formDefs:   data.NewFormDefinitionRepo(db),
 		crud:       crud.NewEngine(db),
 		renderer:   formrender.New(catalog),
+		catalog:    catalog,
 	}
 }
 
@@ -54,6 +56,9 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	mux.Handle("GET /api/records/{entityType}/{id}", httpx.DevAuth(http.HandlerFunc(h.getRecord)))
 	mux.Handle("GET /forms/{entityType}/new", httpx.DevAuth(http.HandlerFunc(h.renderNewForm)))
 	mux.Handle("GET /forms/{entityType}/{id}", httpx.DevAuth(http.HandlerFunc(h.renderRecordForm)))
+	mux.Handle("GET /import/{entityType}", httpx.DevAuth(http.HandlerFunc(h.importUploadPage)))
+	mux.Handle("POST /import/{entityType}/preview", httpx.DevAuth(http.HandlerFunc(h.importPreview)))
+	mux.Handle("POST /import/{entityType}/commit", httpx.DevAuth(http.HandlerFunc(h.importCommit)))
 }
 
 // requestContext fetches the httpx.RequestContext a preceding DevAuth (or

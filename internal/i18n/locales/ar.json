@@ -2,5 +2,16 @@
   "form.field.required_suffix": " *",
   "form.related_list.empty": "لا توجد سجلات مرتبطة.",
   "form.master_detail.empty": "لا توجد بنود بعد.",
-  "form.master_detail.add": "+ إضافة"
+  "form.master_detail.add": "+ إضافة",
+  "import.choose_file": "اختر ملف CSV أو XLSX",
+  "import.preview_button": "معاينة",
+  "import.commit_button": "تنفيذ",
+  "import.mapping_heading": "تعيين الأعمدة",
+  "import.rows_heading": "معاينة الصفوف",
+  "import.unmapped_option": "— تخطي —",
+  "import.row_status_ok": "صحيح",
+  "import.row_status_error": "خطأ",
+  "import.result_heading": "نتيجة الاستيراد",
+  "import.result_succeeded": "نجح",
+  "import.result_failed": "فشل"
 }
