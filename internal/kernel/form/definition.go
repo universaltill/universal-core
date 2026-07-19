@@ -5,7 +5,10 @@
 // in a named workflow, referenced by an action, not written here.
 package form
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+)
 
 // ActionOp is the closed set of verbs a button may invoke (ADR-0017 §6's
 // guardrail). Adding a new op is a deliberate decision, not something a
@@ -113,4 +116,19 @@ func (d *Definition) Validate() error {
 		}
 	}
 	return nil
+}
+
+// Unmarshal decodes raw (the form_definitions.definition JSONB column,
+// read as plain []byte by internal/data — that package stays generic and
+// never imports this one) into a Definition and validates it before
+// returning, same discipline as entity.Unmarshal.
+func Unmarshal(raw []byte) (*Definition, error) {
+	var d Definition
+	if err := json.Unmarshal(raw, &d); err != nil {
+		return nil, fmt.Errorf("unmarshal form definition: %w", err)
+	}
+	if err := d.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid form definition: %w", err)
+	}
+	return &d, nil
 }

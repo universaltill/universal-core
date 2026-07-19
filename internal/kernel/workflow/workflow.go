@@ -6,7 +6,10 @@
 // doc comment for how the two executors relate.
 package workflow
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+)
 
 // TriggerType is when a workflow fires.
 type TriggerType string
@@ -74,6 +77,23 @@ func (d *Definition) Validate() error {
 		}
 	}
 	return nil
+}
+
+// Unmarshal decodes raw (the workflow_definitions.definition JSONB
+// column, read as plain []byte by internal/data — that package stays
+// generic and never imports this one; also, this package's own queue.go
+// already imports internal/data, so the reverse import would cycle) into
+// a Definition and validates it before returning, same discipline as
+// entity.Unmarshal/form.Unmarshal.
+func Unmarshal(raw []byte) (*Definition, error) {
+	var d Definition
+	if err := json.Unmarshal(raw, &d); err != nil {
+		return nil, fmt.Errorf("unmarshal workflow definition: %w", err)
+	}
+	if err := d.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid workflow definition: %w", err)
+	}
+	return &d, nil
 }
 
 // StepResult records the outcome of one executed step.
