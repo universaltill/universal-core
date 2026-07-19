@@ -64,8 +64,16 @@ func (r *Renderer) Render(w io.Writer, def *form.Definition, ent *entity.Definit
 }
 
 type viewModel struct {
-	EntityType        string
-	RecordID          string
+	EntityType string
+	RecordID   string
+	// PostHref is the form's own hx-post target, pre-built via
+	// url.PathEscape the same way AddHref/RelatedListHref/WorkflowHref/
+	// ReportHref are — EntityType/RecordID must not be interpolated
+	// directly into the template's hx-post, since hx-post isn't a
+	// URL-context attribute html/template auto-escapes for that purpose
+	// (only attribute-context escaping applies), so a raw RecordID could
+	// otherwise inject query structure into the form's own submit target.
+	PostHref          string
 	Sections          []sectionView
 	Actions           []actionView
 	RequiredSuffix    string
@@ -140,9 +148,15 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 		return viewModel{}, fmt.Errorf("build workflow.start hx-vals: %w", err)
 	}
 
+	postHref := "/api/records/" + url.PathEscape(def.EntityType)
+	if data.RecordID != "" {
+		postHref += "/" + url.PathEscape(data.RecordID)
+	}
+
 	vm := viewModel{
 		EntityType:        def.EntityType,
 		RecordID:          data.RecordID,
+		PostHref:          postHref,
 		RequiredSuffix:    r.i18n.T(locale, "form.field.required_suffix"),
 		RelatedListEmpty:  r.i18n.T(locale, "form.related_list.empty"),
 		MasterDetailEmpty: r.i18n.T(locale, "form.master_detail.empty"),
@@ -290,7 +304,7 @@ func buildChildRows(children []map[string]any) []childRowView {
 	return rows
 }
 
-const tmplSrc = `<form class="uc-form" data-entity-type="{{.EntityType}}" hx-post="/api/records/{{.EntityType}}{{if .RecordID}}/{{.RecordID}}{{end}}" hx-target="this" hx-swap="outerHTML">
+const tmplSrc = `<form class="uc-form" data-entity-type="{{.EntityType}}" hx-post="{{.PostHref}}" hx-target="this" hx-swap="outerHTML">
 {{range .Sections}}
 <section class="uc-section" data-component="{{.Component}}">
 <h2>{{.Title}}</h2>

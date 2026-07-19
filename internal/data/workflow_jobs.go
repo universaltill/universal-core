@@ -117,11 +117,13 @@ func (r *WorkflowJobRepo) ClaimNext(ctx context.Context) (WorkflowJob, error) {
 // step ran). Scoped by tenantID (CLAUDE.md's multi-tenancy rule) even
 // though today's only caller (Queue.ProcessOne) already has the job's own
 // tenant_id from ClaimNext — cheap defense in depth, and consistent with
-// every other by-ID method below.
+// every other by-ID method below. Guarded by status = 'running': see the
+// package-level note above ReclaimStale on why every Mark* method needs
+// this guard, not just a tenant/id match.
 func (r *WorkflowJobRepo) MarkDone(ctx context.Context, tenantID, id string, stepIndex int) error {
 	n, err := execRows(ctx, r.db,
 		`UPDATE workflow_jobs SET status = 'done', step_index = $3, updated_at = now()
-		 WHERE id = $1 AND tenant_id = $2`,
+		 WHERE id = $1 AND tenant_id = $2 AND status = 'running'`,
 		id, tenantID, stepIndex)
 	if err != nil {
 		return fmt.Errorf("mark workflow job done: %w", err)
@@ -134,11 +136,12 @@ func (r *WorkflowJobRepo) MarkDone(ctx context.Context, tenantID, id string, ste
 
 // MarkWaitingApproval halts a job at a require_approval step. stepIndex
 // is the approval step's own index, so ResumeAfterApproval's step_index+1
-// resumes at the step after it.
+// resumes at the step after it. Guarded by status = 'running' — see the
+// package-level note above ReclaimStale.
 func (r *WorkflowJobRepo) MarkWaitingApproval(ctx context.Context, tenantID, id string, stepIndex int) error {
 	n, err := execRows(ctx, r.db,
 		`UPDATE workflow_jobs SET status = 'waiting_approval', step_index = $3, updated_at = now()
-		 WHERE id = $1 AND tenant_id = $2`,
+		 WHERE id = $1 AND tenant_id = $2 AND status = 'running'`,
 		id, tenantID, stepIndex)
 	if err != nil {
 		return fmt.Errorf("mark workflow job waiting_approval: %w", err)
@@ -154,7 +157,8 @@ func (r *WorkflowJobRepo) MarkWaitingApproval(ctx context.Context, tenantID, id 
 // reached it moves to 'dead_letter' and stops being retried — a human has
 // to look at it, it never disappears silently. Computed in one atomic
 // UPDATE (not read-attempts-then-write) so two workers can't race past
-// max_attempts.
+// max_attempts. Guarded by status = 'running' — see the package-level
+// note above ReclaimStale.
 func (r *WorkflowJobRepo) MarkFailed(ctx context.Context, tenantID, id string, stepErr error, runAfter time.Time) (status string, err error) {
 	row := r.db.QueryRowContext(ctx,
 		`UPDATE workflow_jobs
@@ -163,7 +167,7 @@ func (r *WorkflowJobRepo) MarkFailed(ctx context.Context, tenantID, id string, s
 		     status = CASE WHEN attempts + 1 >= max_attempts THEN 'dead_letter' ELSE 'queued' END,
 		     run_after = CASE WHEN attempts + 1 >= max_attempts THEN run_after ELSE $4 END,
 		     updated_at = now()
-		 WHERE id = $1 AND tenant_id = $2
+		 WHERE id = $1 AND tenant_id = $2 AND status = 'running'
 		 RETURNING status`,
 		id, tenantID, stepErr.Error(), runAfter,
 	)
@@ -239,6 +243,27 @@ func (r *WorkflowJobRepo) Get(ctx context.Context, tenantID, id string) (Workflo
 // maintenance sweep, not a tenant-scoped request. Returns the reclaimed
 // job IDs so a caller can log/alert; call this periodically (e.g. once
 // per poll loop) from whatever process runs ProcessOne.
+//
+// Reclaiming isn't the only case this table's writes need to guard
+// against: a worker isn't always dead just because it's stale — it can
+// simply be slow (a step handler running longer than leaseTimeout while
+// still perfectly alive). If ReclaimStale requeues that job out from
+// under it, and the original worker later finishes and calls MarkDone/
+// MarkFailed/MarkWaitingApproval anyway, an UPDATE keyed only on id+
+// tenant_id would happily resurrect a job ReclaimStale had already
+// requeued or dead-lettered — completed work un-completing itself, or a
+// dead-lettered job silently un-dead-lettering. That's why every Mark*
+// method above adds `AND status = 'running'`: once ReclaimStale (or
+// another worker, in principle) has moved a job off 'running', the
+// original worker's own Mark* call now affects zero rows and returns
+// ErrNotFound instead of clobbering whatever state the job moved to —
+// the stale worker's result is simply discarded, which is correct,
+// since ReclaimStale already counted that lease timeout as a failed
+// attempt. This doesn't close the race entirely (a fence token tied to
+// the specific claim would be needed for that — see QUEUE.md), but it
+// closes the resurrection/clobbering failure mode, which is the
+// dangerous part: silent data corruption rather than a merely-redundant
+// retry.
 func (r *WorkflowJobRepo) ReclaimStale(ctx context.Context, leaseTimeout time.Duration) ([]string, error) {
 	rows, err := r.db.QueryContext(ctx,
 		`UPDATE workflow_jobs
