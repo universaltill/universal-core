@@ -121,7 +121,12 @@ func UnitOfMeasure() *entity.Definition {
 // (e.g. 1 box = 12 each: from_uom_id=box, to_uom_id=each, factor=12) —
 // reference-data-model.md §0 calls this out alongside UnitOfMeasure
 // itself, since Inventory/Procurement/Sales/Manufacturing all need to
-// convert between a stocking unit and an ordering/selling unit.
+// convert between a stocking unit and an ordering/selling unit. The
+// "from multiplies into to" direction is a documented convention only,
+// not schema-enforced (entity.Field has no way to express it) — build a
+// conversion helper that bakes the direction in once a caller actually
+// needs to convert a quantity, rather than each caller re-deriving which
+// way to multiply.
 func UomConversion() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "UomConversion",
@@ -129,7 +134,7 @@ func UomConversion() *entity.Definition {
 		Fields: []entity.Field{
 			{Name: "from_uom_id", Type: entity.FieldReference, Required: true, Target: "UnitOfMeasure"},
 			{Name: "to_uom_id", Type: entity.FieldReference, Required: true, Target: "UnitOfMeasure"},
-			{Name: "factor", Type: entity.FieldNumber, Required: true},
+			{Name: "factor", Type: entity.FieldNumber, Required: true}, // to_qty = from_qty × factor
 		},
 	}
 }
@@ -151,7 +156,13 @@ func Currency() *entity.Definition {
 // ExchangeRate is a date-effective rate between two currencies, kept as
 // its own entity (not a field on Currency) since rates change daily while
 // a Currency's own code/name/minor_unit don't — Finance, Sales, and
-// Procurement all consume this for multi-currency documents.
+// Procurement all consume this for multi-currency documents. rate follows
+// the same "from multiplies into to" convention as UomConversion.factor
+// above (e.g. 1 USD = 3.64 QAR: from_currency_id=USD, to_currency_id=QAR,
+// rate=3.64) — like factor, this is a documented convention only, not
+// schema-enforced; a conversion helper should bake the direction in
+// before any caller consumes this field, rather than each caller
+// re-deriving which way to multiply.
 func ExchangeRate() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "ExchangeRate",
@@ -160,7 +171,7 @@ func ExchangeRate() *entity.Definition {
 			{Name: "from_currency_id", Type: entity.FieldReference, Required: true, Target: "Currency"},
 			{Name: "to_currency_id", Type: entity.FieldReference, Required: true, Target: "Currency"},
 			{Name: "effective_date", Type: entity.FieldDate, Required: true},
-			{Name: "rate", Type: entity.FieldNumber, Required: true},
+			{Name: "rate", Type: entity.FieldNumber, Required: true}, // to_amount = from_amount × rate
 		},
 	}
 }
