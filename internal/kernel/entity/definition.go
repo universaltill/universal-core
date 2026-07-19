@@ -6,6 +6,7 @@
 package entity
 
 import (
+	"encoding/json"
 	"fmt"
 )
 
@@ -116,4 +117,26 @@ func (d *Definition) Validate() error {
 		}
 	}
 	return nil
+}
+
+// Unmarshal decodes raw (the entity_definitions.definition JSONB column,
+// read as plain []byte by internal/data — that package stays generic and
+// never imports this one, matching how it already stores plain records'
+// data as map[string]any rather than a typed per-entity struct) into a
+// Definition and validates it before returning. A definition that made
+// it into the registry is
+// assumed already-validated at write time, but decoding here re-validates
+// anyway: JSONB in Postgres isn't itself schema-checked against this
+// Go type, so a row written by a future non-Go writer, or hand-edited in
+// the database, must still fail loud rather than hand back a
+// Definition this package's own Validate would reject.
+func Unmarshal(raw []byte) (*Definition, error) {
+	var d Definition
+	if err := json.Unmarshal(raw, &d); err != nil {
+		return nil, fmt.Errorf("unmarshal entity definition: %w", err)
+	}
+	if err := d.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid entity definition: %w", err)
+	}
+	return &d, nil
 }

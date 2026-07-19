@@ -23,13 +23,16 @@ var ErrNoJobAvailable = data.ErrNoJobAvailable
 type StepHandler func(ctx context.Context, job data.WorkflowJob, step Step) error
 
 // DefinitionLookup resolves the workflow.Definition a queued job was
-// enqueued against. There is no workflow_definitions table yet (unlike
-// entity_definitions/form_definitions, which already have a versioned
-// draft/approve/publish lifecycle per ADR-0001 §14) — that's a separate,
-// not-yet-built increment (see QUEUE.md). Until it exists, the caller
-// supplies the lookup, keeping this package free of an assumption about
-// how/where Definitions end up persisted.
-type DefinitionLookup func(name string, version int) (*Definition, error)
+// enqueued against, scoped to tenantID — required, not optional: workflow
+// definitions are per-tenant (a tenant can customize/version its own
+// workflows), and ClaimNext is deliberately tenant-global (a background
+// dispatcher polls every tenant's due jobs), so a lookup keyed only on
+// name+version with no tenant scope would resolve one tenant's workflow
+// definition against another tenant's job — exactly the kind of ambient,
+// implicit-tenant-context bug CLAUDE.md's multi-tenancy rule exists to
+// rule out. RegistryDefinitionLookup (registry.go) is the real,
+// registry-backed implementation; tests build their own stub closures.
+type DefinitionLookup func(ctx context.Context, tenantID, name string, version int) (*Definition, error)
 
 // Queue is the durable, Postgres-backed counterpart to the in-memory
 // Execute — the "durable, transactional Postgres job queue (retries,
@@ -127,7 +130,7 @@ func (q *Queue) ProcessOne(ctx context.Context, lookup DefinitionLookup) (job da
 		return data.WorkflowJob{}, err
 	}
 
-	def, err := lookup(job.WorkflowName, job.WorkflowVersion)
+	def, err := lookup(ctx, job.TenantID, job.WorkflowName, job.WorkflowVersion)
 	if err != nil {
 		return job, q.fail(ctx, job, fmt.Errorf("look up workflow definition: %w", err))
 	}

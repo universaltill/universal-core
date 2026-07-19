@@ -62,7 +62,7 @@ func seedTenant(t *testing.T, db *sql.DB) string {
 }
 
 func lookupFor(def *Definition) DefinitionLookup {
-	return func(name string, version int) (*Definition, error) {
+	return func(ctx context.Context, tenantID, name string, version int) (*Definition, error) {
 		if name == def.Name && version == def.Version {
 			return def, nil
 		}
@@ -432,7 +432,7 @@ func TestQueue_ProcessOne_DefinitionLookupError(t *testing.T) {
 		t.Fatalf("Enqueue: %v", err)
 	}
 
-	failingLookup := func(name string, version int) (*Definition, error) {
+	failingLookup := func(ctx context.Context, tenantID, name string, version int) (*Definition, error) {
 		return nil, errors.New("definition store unavailable")
 	}
 	if _, err := q.ProcessOne(ctx, failingLookup); err != nil {
@@ -474,7 +474,7 @@ func TestQueue_ProcessOne_InvalidDefinitionFromLookup(t *testing.T) {
 	// can't happen via Enqueue (which validates first) but could if a
 	// workflow_definitions-backed lookup returns a corrupted/rolled-back
 	// version.
-	invalidLookup := func(name string, version int) (*Definition, error) {
+	invalidLookup := func(ctx context.Context, tenantID, name string, version int) (*Definition, error) {
 		return &Definition{Name: name, Version: version, Trigger: Trigger{Type: TriggerManual}}, nil
 	}
 	if _, err := q.ProcessOne(ctx, invalidLookup); err != nil {
