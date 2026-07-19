@@ -102,6 +102,17 @@ func TestDefinitionValidate_WorkflowActionWithoutWorkflowName(t *testing.T) {
 	}
 }
 
+func TestDefinitionValidate_NavigateActionWithoutRoute(t *testing.T) {
+	d := &Definition{
+		EntityType: "PurchaseOrder",
+		Sections:   []Section{{Title: "H", Component: ComponentFields, Fields: []FormField{{Name: "x"}}}},
+		Actions:    []Action{{Label: "Back", Op: OpNavigate}},
+	}
+	if err := d.Validate(); err == nil {
+		t.Fatal("expected error for navigate action with no route")
+	}
+}
+
 func TestDefinitionValidate_ReportActionWithoutReportName(t *testing.T) {
 	d := &Definition{
 		EntityType: "PurchaseOrder",

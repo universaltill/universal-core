@@ -1,9 +1,9 @@
 // Package workflow implements the declarative workflow definitions from
-// ADR-0017 §9: trigger + steps, executed in order. This first increment
-// covers definitions and a synchronous executor only — the durable,
-// transactional Postgres job queue (retries, dead-letter, resumable) is a
-// larger piece of its own and is deliberately not built yet (see the
-// review doc for what's still open).
+// ADR-0001 §9: trigger + steps, executed in order. Definitions and the
+// synchronous in-memory Execute were the first increment; Queue (queue.go)
+// is the durable, transactional Postgres job queue (retries, dead-letter,
+// resumable) built on top of the same Definition/Step types — see queue.go's
+// doc comment for how the two executors relate.
 package workflow
 
 import "fmt"

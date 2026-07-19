@@ -61,6 +61,7 @@ type Action struct {
 	Op       ActionOp `json:"op"`
 	Workflow string   `json:"workflow,omitempty"` // required when Op == OpWorkflowStart
 	Report   string   `json:"report,omitempty"`   // required when Op == OpReportRender
+	Route    string   `json:"route,omitempty"`    // required when Op == OpNavigate
 }
 
 // Definition is one version of a form's layout for an entity type.
@@ -93,8 +94,12 @@ func (d *Definition) Validate() error {
 	}
 	for i, a := range d.Actions {
 		switch a.Op {
-		case OpSave, OpNavigate:
+		case OpSave:
 			// no extra requirement
+		case OpNavigate:
+			if a.Route == "" {
+				return fmt.Errorf("action %d (%q): navigate requires a route", i, a.Label)
+			}
 		case OpWorkflowStart:
 			if a.Workflow == "" {
 				return fmt.Errorf("action %d (%q): workflow.start requires a workflow name", i, a.Label)
