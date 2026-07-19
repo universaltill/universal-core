@@ -1,0 +1,78 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    services:
+      # Runs the DB-backed suite for real (workflow queue, csvimport
+      # Commit, foundation/definition registries) instead of letting
+      # TEST_DATABASE_URL-unset skip them silently, the way a local run
+      # without a database does.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: universal_core_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/universal_core_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Prep Go cache dirs
+        run: |
+          mkdir -p "${RUNNER_TEMP}/gobuildcache"
+          mkdir -p "${RUNNER_TEMP}/gomodcache"
+      - name: Restore Go cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}/gobuildcache
+            ${{ runner.temp }}/gomodcache
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+      - name: gofmt check
+        run: |
+          FMT_OUT="$(gofmt -l .)"
+          if [ -n "$FMT_OUT" ]; then
+            echo "The following files need gofmt:" >&2
+            echo "$FMT_OUT" >&2
+            exit 1
+          fi
+      - name: Apply migrations
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client
+          for f in internal/db/migrations/*.sql; do
+            echo "applying $f"
+            psql "$TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"
+          done
+      - name: Build
+        env:
+          GOMODCACHE: ${{ runner.temp }}/gomodcache
+          GOCACHE: ${{ runner.temp }}/gobuildcache
+        run: go build ./...
+      - name: Vet
+        env:
+          GOMODCACHE: ${{ runner.temp }}/gomodcache
+          GOCACHE: ${{ runner.temp }}/gobuildcache
+        run: go vet ./...
+      - name: Test
+        env:
+          GOMODCACHE: ${{ runner.temp }}/gomodcache
+          GOCACHE: ${{ runner.temp }}/gobuildcache
+        run: go test ./... -race -count=1
