@@ -1,3 +1,9 @@
 /bin/
 *.log
 .DS_Store
+
+# This repo is public. docs/ (ADRs, code-review records) and infra/
+# (Terraform) live in the private universaltill/uc-infra repo instead —
+# ignored here so an accidental `git add -A` can never re-introduce them.
+/docs/
+/infra/

@@ -1,11 +1,16 @@
 # universal-core — rules for working in this repo
 
-The metadata-driven ERP kernel (Go, Postgres, server-rendered HTMX). Governing
-decision: this repo's own `docs/adr/0001-universal-erp-metadata-kernel.md`
-(self-hosted here since 2026-07-18; was unitill `docs` repo ADR-0017 before
-Universal Core became a separate product tree — see the ADR's provenance
-note). Full standards: `../unitill/docs/reference/coding-standards.md`
-(still shared with universal-till). The non-negotiables:
+The metadata-driven ERP kernel (Go, Postgres, server-rendered HTMX). This
+repo is **public** — governing decision doc and every review record live
+in the **private** sibling repo `../uc-infra` instead (moved there
+2026-07-19, see `../uc-infra/README.md`): `../uc-infra/docs/adr/0001-
+universal-erp-metadata-kernel.md` (self-hosted since 2026-07-18; was
+unitill `docs` repo ADR-0017 before Universal Core became a separate
+product tree — see the ADR's provenance note) and `../uc-infra/docs/
+code-reviews/`. `docs/` and `infra/` are gitignored *in this repo*
+specifically so an accidental `git add -A` can never leak either into the
+public history. Full standards: `../unitill/docs/reference/coding-
+standards.md` (still shared with universal-till). The non-negotiables:
 
 ## Data access — repository pattern (same discipline as universal-till)
 - **Raw SQL lives only in `internal/data` (repositories) and
@@ -46,6 +51,8 @@ JSON **snake_case**, dates ISO-8601, money via a `money.Money`-equivalent
 integer-minor-units type. No hardcoded user-facing strings.
 
 ## Process
-Document-first (ADR-0007): architectural changes get an ADR in `docs/adr/`
-before the code lands. Every substantive change gets a review doc in
-`docs/code-reviews/<date>-<topic>.md`.
+Document-first (ADR-0007): architectural changes get an ADR in
+`../uc-infra/docs/adr/` before the code lands. Every substantive change
+gets a review doc in `../uc-infra/docs/code-reviews/<date>-<topic>.md` —
+**not** in this repo (see the top of this file: this repo is public,
+`../uc-infra` is private).
