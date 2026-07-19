@@ -56,10 +56,28 @@ func (h *Handler) importUploadPage(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// importPreview parses the uploaded file, suggests a column mapping
-// (csvimport.SuggestMapping), and renders a fragment showing that
-// mapping (editable) alongside a validation preview of every row —
-// nothing is written yet.
+// importPreview parses the uploaded file and renders a fragment showing
+// an editable column mapping alongside a validation preview of every
+// row — nothing is written yet.
+//
+// The mapping comes from mappingFromForm(r) when the request already
+// carries mapping.* fields (the user is re-submitting after adjusting
+// the <select> dropdowns this same handler rendered), falling back to
+// csvimport.SuggestMapping's name-match guess on the very first call for
+// a given file. A real-world CSV's headers routinely don't exactly
+// name-match the entity's field names for every required field (e.g.
+// "Item Name" vs. the "name" field) — SuggestMapping's guess is only a
+// starting point, not a guarantee. When the resulting mapping still
+// doesn't satisfy csvimport.ValidateMapping, this used to fail the whole
+// request with a raw JSON 400 and never show the mapping table at all,
+// making the wizard unusable for any file the auto-guess couldn't fully
+// resolve (found by actually driving the wizard against a real CSV, not
+// by the unit tests, which always passed a pre-completed mapping in
+// directly). Now an incomplete mapping still renders the mapping table
+// (whatever was resolved, plus the unresolved fields blank) with the
+// validation error surfaced inline and no rows/Commit button — only a
+// "re-preview" button that resubmits the same file together with
+// whatever the user just picked in the dropdowns.
 func (h *Handler) importPreview(w http.ResponseWriter, r *http.Request) {
 	rc, ok := requestContext(w, r)
 	if !ok {
@@ -79,26 +97,34 @@ func (h *Handler) importPreview(w http.ResponseWriter, r *http.Request) {
 		return // readUploadedFile already wrote the response
 	}
 
-	headers, mapping, results, err := previewUpload(data, xlsx, def)
+	submitted := mappingFromForm(r)
+
+	headers, mapping, results, mappingErr, err := previewUpload(data, xlsx, def, submitted)
 	if err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	rowOK := h.catalog.T(locale, "import.row_status_ok")
-	rowError := h.catalog.T(locale, "import.row_status_error")
-
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	err = importTmpl.ExecuteTemplate(w, "preview", importPreviewView{
+	view := importPreviewView{
 		EntityType:     entityType,
+		PreviewHref:    "/import/" + entityType + "/preview",
 		CommitHref:     "/import/" + entityType + "/commit",
 		MappingHeading: h.catalog.T(locale, "import.mapping_heading"),
 		RowsHeading:    h.catalog.T(locale, "import.rows_heading"),
 		CommitLabel:    h.catalog.T(locale, "import.commit_button"),
+		RepreviewLabel: h.catalog.T(locale, "import.repreview_button"),
 		Mappings:       buildMappingRows(headers, mapping, def, h.catalog.T(locale, "import.unmapped_option")),
-		Rows:           buildResultRows(results, rowOK, rowError),
-	})
-	if err != nil {
+	}
+	if mappingErr != nil {
+		view.MappingError = mappingErr.Error()
+	} else {
+		rowOK := h.catalog.T(locale, "import.row_status_ok")
+		rowError := h.catalog.T(locale, "import.row_status_error")
+		view.Rows = buildResultRows(results, rowOK, rowError)
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := importTmpl.ExecuteTemplate(w, "preview", view); err != nil {
 		writeInternalError(w, "render import preview", err)
 	}
 }
@@ -189,17 +215,32 @@ func readUploadedFile(w http.ResponseWriter, r *http.Request) (data []byte, xlsx
 	return data, xlsx, true
 }
 
-func previewUpload(data []byte, xlsx bool, def *entity.Definition) (headers []string, mapping csvimport.ColumnMapping, results []csvimport.RowResult, err error) {
+// previewUpload reads data's headers, resolves a mapping (submitted if
+// non-empty, otherwise csvimport.SuggestMapping's guess), and — only if
+// that mapping passes csvimport.ValidateMapping — runs the row-level
+// preview. A failing mapping is reported via mappingErr, not err: err is
+// reserved for the file itself being unreadable (a real 400, nothing
+// left to show the user); mappingErr is recoverable, the caller still
+// has headers+mapping to render the editable mapping table with.
+func previewUpload(data []byte, xlsx bool, def *entity.Definition, submitted csvimport.ColumnMapping) (headers []string, mapping csvimport.ColumnMapping, results []csvimport.RowResult, mappingErr error, err error) {
 	if xlsx {
 		headers, err = csvimport.HeadersXLSX(bytes.NewReader(data))
 	} else {
 		headers, err = csvimport.Headers(bytes.NewReader(data))
 	}
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("read uploaded file: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("read uploaded file: %w", err)
 	}
 
-	mapping = csvimport.SuggestMapping(headers, def)
+	if len(submitted) > 0 {
+		mapping = submitted
+	} else {
+		mapping = csvimport.SuggestMapping(headers, def)
+	}
+
+	if mappingErr = csvimport.ValidateMapping(def, headers, mapping); mappingErr != nil {
+		return headers, mapping, nil, mappingErr, nil
+	}
 
 	if xlsx {
 		results, err = csvimport.PreviewXLSX(bytes.NewReader(data), def, mapping)
@@ -207,9 +248,9 @@ func previewUpload(data []byte, xlsx bool, def *entity.Definition) (headers []st
 		results, err = csvimport.Preview(bytes.NewReader(data), def, mapping)
 	}
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
-	return headers, mapping, results, nil
+	return headers, mapping, results, nil, nil
 }
 
 // mappingFromForm reconstructs a csvimport.ColumnMapping from the
@@ -252,12 +293,19 @@ type importPageView struct {
 
 type importPreviewView struct {
 	EntityType     string
+	PreviewHref    string
 	CommitHref     string
 	MappingHeading string
 	RowsHeading    string
 	CommitLabel    string
+	RepreviewLabel string
 	Mappings       []mappingRowView
-	Rows           []previewRowView
+	// MappingError is set instead of Rows when the current mapping fails
+	// csvimport.ValidateMapping (e.g. a required field still unmapped) —
+	// the template shows the mapping table plus this message and a
+	// re-preview button, never a Commit button, until it's empty.
+	MappingError string
+	Rows         []previewRowView
 }
 
 type mappingRowView struct {
@@ -349,6 +397,10 @@ var importTmpl = template.Must(template.New("import").Parse(`
 </tbody>
 </table>
 
+{{if .MappingError}}
+<p class="uc-import-mapping-error">{{.MappingError}}</p>
+<button type="button" hx-post="{{.PreviewHref}}" hx-include="#uc-import-form, #uc-import-preview" hx-target="#uc-import-result" hx-encoding="multipart/form-data">{{.RepreviewLabel}}</button>
+{{else}}
 <h2>{{.RowsHeading}}</h2>
 <table class="uc-import-rows">
 <tbody>
@@ -364,6 +416,7 @@ var importTmpl = template.Must(template.New("import").Parse(`
 </table>
 
 <button type="button" hx-post="{{.CommitHref}}" hx-include="#uc-import-form, #uc-import-preview" hx-target="#uc-import-result" hx-encoding="multipart/form-data">{{.CommitLabel}}</button>
+{{end}}
 </div>
 {{end}}
 

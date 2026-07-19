@@ -399,6 +399,105 @@ func TestAPI_RenderRecordForm_ShowsRecordData(t *testing.T) {
 	}
 }
 
+func purchaseOrderEntityDef() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "PurchaseOrder",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "vendor_id", Type: entity.FieldString, Required: true},
+		},
+		Relationships: []entity.Relationship{
+			{Name: "lines", Kind: entity.RelationComposition, Target: "POLine", ParentField: "purchase_order_id"},
+		},
+	}
+}
+
+func purchaseOrderFormDef() *form.Definition {
+	return &form.Definition{
+		EntityType: "PurchaseOrder",
+		Version:    1,
+		Sections: []form.Section{
+			{Title: "Header", Component: form.ComponentFields, Fields: []form.FormField{{Name: "vendor_id", Label: "Vendor"}}},
+			{Title: "Lines", Component: form.ComponentMasterDetail, Target: "POLine", RollUp: "line_total", RollUpTarget: "total"},
+		},
+	}
+}
+
+func poLineEntityDef() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "POLine",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "purchase_order_id", Type: entity.FieldString, Required: true},
+			{Name: "line_total", Type: entity.FieldNumber, Required: true},
+		},
+	}
+}
+
+func poLineFormDef() *form.Definition {
+	return &form.Definition{
+		EntityType: "POLine",
+		Version:    1,
+		Sections: []form.Section{
+			{Title: "Details", Component: form.ComponentFields, Fields: []form.FormField{{Name: "line_total", Label: "Line Total"}}},
+		},
+	}
+}
+
+// TestAPI_RenderRecordForm_ShowsMasterDetailChildren is the regression
+// test for a real gap found while dogfooding the purchasing module: a
+// PurchaseOrder form's Lines section rendered as permanently empty even
+// when POLine records referencing it actually existed, because
+// renderForm never populated formrender.Data.Children (RecordRepo had no
+// "list where field X == this id" query — see loadMasterDetailChildren's
+// doc comment). This confirms a real child row now shows up, and that
+// its line_total actually rolls up into the header.
+func TestAPI_RenderRecordForm_ShowsMasterDetailChildren(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, purchaseOrderEntityDef(), purchaseOrderFormDef())
+	publishEntityAndForm(t, db, tenantID, poLineEntityDef(), poLineFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	poReq := newRequest("POST", "/api/records/PurchaseOrder", tenantID, "farshid", []byte(`{"vendor_id":"v1"}`))
+	poRec := httptest.NewRecorder()
+	mux.ServeHTTP(poRec, poReq)
+	var po struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(poRec.Body.Bytes(), &po); err != nil {
+		t.Fatalf("unmarshal PO: %v", err)
+	}
+
+	lineBody := []byte(`{"purchase_order_id":"` + po.Data.ID + `","line_total":150.5}`)
+	lineReq := newRequest("POST", "/api/records/POLine", tenantID, "farshid", lineBody)
+	lineRecRec := httptest.NewRecorder()
+	mux.ServeHTTP(lineRecRec, lineReq)
+	if lineRecRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 creating POLine, got %d: %s", lineRecRec.Code, lineRecRec.Body.String())
+	}
+
+	formReq := newRequest("GET", "/forms/PurchaseOrder/"+po.Data.ID, tenantID, "farshid", nil)
+	formRec := httptest.NewRecorder()
+	mux.ServeHTTP(formRec, formReq)
+
+	if formRec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", formRec.Code, formRec.Body.String())
+	}
+	body := formRec.Body.String()
+	if strings.Contains(body, "No lines yet") {
+		t.Fatalf("expected the existing POLine to render as a child row, got:\n%s", body)
+	}
+	if !strings.Contains(body, "total: 150.5") {
+		t.Fatalf("expected the roll-up to sum the child's line_total into the header total, got:\n%s", body)
+	}
+}
+
 func TestAPI_RenderForm_UnknownRecordIs404(t *testing.T) {
 	db := testDB(t)
 	withDevAuthEnabled(t)

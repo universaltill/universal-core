@@ -6,6 +6,7 @@
   "import.choose_file": "Choose a CSV or XLSX file",
   "import.preview_button": "Preview",
   "import.commit_button": "Commit",
+  "import.repreview_button": "Preview again",
   "import.mapping_heading": "Column Mapping",
   "import.rows_heading": "Preview Rows",
   "import.unmapped_option": "— skip —",
