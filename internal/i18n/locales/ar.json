@@ -6,6 +6,7 @@
   "import.choose_file": "اختر ملف CSV أو XLSX",
   "import.preview_button": "معاينة",
   "import.commit_button": "تنفيذ",
+  "import.repreview_button": "معاينة مرة أخرى",
   "import.mapping_heading": "تعيين الأعمدة",
   "import.rows_heading": "معاينة الصفوف",
   "import.unmapped_option": "— تخطي —",

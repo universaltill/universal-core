@@ -118,6 +118,40 @@ func (r *RecordRepo) List(ctx context.Context, tenantID, entityType string) ([]R
 	return out, rows.Err()
 }
 
+// ListByField returns every non-deleted record of entityType whose data
+// has fieldName == value — the query a master-detail section needs to
+// find its child rows (e.g. every POLine whose purchase_order_id matches
+// the parent PurchaseOrder's id). fieldName is passed as a bind
+// parameter to the ->> operator, never concatenated into the query text,
+// so a caller-controlled field name can't alter the query's structure.
+func (r *RecordRepo) ListByField(ctx context.Context, tenantID, entityType, fieldName, value string) ([]Record, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT id, data FROM records
+		 WHERE tenant_id = $1 AND entity_type = $2 AND data->>$3 = $4 AND deleted_at IS NULL
+		 ORDER BY created_at`,
+		tenantID, entityType, fieldName, value,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list records by field: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Record
+	for rows.Next() {
+		var id string
+		var raw []byte
+		if err := rows.Scan(&id, &raw); err != nil {
+			return nil, fmt.Errorf("scan record: %w", err)
+		}
+		var data map[string]any
+		if err := json.Unmarshal(raw, &data); err != nil {
+			return nil, fmt.Errorf("unmarshal record data: %w", err)
+		}
+		out = append(out, Record{ID: id, TenantID: tenantID, EntityType: entityType, Data: data})
+	}
+	return out, rows.Err()
+}
+
 // Update replaces a record's data using the repo's own connection pool.
 // Use UpdateTx when the write must be atomic with another operation.
 func (r *RecordRepo) Update(ctx context.Context, tenantID, entityType, id string, data map[string]any) error {

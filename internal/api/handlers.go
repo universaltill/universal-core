@@ -242,13 +242,19 @@ func (h *Handler) renderRecordForm(w http.ResponseWriter, r *http.Request) {
 
 // renderForm is shared by the "new" and "existing record" routes; id =="" means new.
 //
-// Known scope limitation for this first HTTP increment: master_detail/
-// related_list sections render empty (formrender.Data.Children is never
-// populated here) — RecordRepo has no "list records where field X ==
-// this id" query yet, only List-by-entity-type. Revisit once a real
-// caller needs master-detail forms to actually show their child rows
-// over HTTP (formrender itself already supports it; this handler
-// doesn't wire it yet).
+// master_detail sections are populated below via loadMasterDetailChildren
+// (RecordRepo.ListByField, added once a real caller — PurchaseOrder's
+// Lines section — needed it; formrender itself already supported
+// Data.Children, this handler just didn't fetch anything to put there
+// before). related_list sections still render empty: unlike
+// master_detail, the template already lazy-loads a related_list's rows
+// itself via a separate hx-trigger="load" request to
+// /api/records/{Target}?ref=..., but nothing serves that ref-filtered
+// query yet (no form.Section field says which field on Target points
+// back to this record for an arbitrary related-list, the way
+// entity.Relationship.ParentField does for a composition/master-detail
+// child) — still a real gap, just not one any Definition in this kernel
+// exercises yet (QUEUE.md).
 func (h *Handler) renderForm(w http.ResponseWriter, r *http.Request, id string) {
 	rc, ok := requestContext(w, r)
 	if !ok {
@@ -288,6 +294,13 @@ func (h *Handler) renderForm(w http.ResponseWriter, r *http.Request, id string) 
 		}
 		renderData.RecordID = rec.ID
 		renderData.Record = rec.Data
+
+		children, err := h.loadMasterDetailChildren(r.Context(), rc.TenantID, entDef, formDef, id)
+		if err != nil {
+			writeInternalError(w, fmt.Sprintf("load %s master-detail children", entityType), err)
+			return
+		}
+		renderData.Children = children
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -302,6 +315,50 @@ func (h *Handler) renderForm(w http.ResponseWriter, r *http.Request, id string) 
 		log.Printf("api: render %s form (id=%q): %v", entityType, id, err)
 		httpx.WriteError(w, http.StatusInternalServerError, "internal error")
 	}
+}
+
+// loadMasterDetailChildren fetches the child rows for every
+// ComponentMasterDetail section in formDef, keyed by section.Target — the
+// shape formrender.Data.Children expects. For each such section it finds
+// entDef's own entity.Relationship naming that Target (ParentField is
+// declared on the parent, not the child — see entity.Relationship's doc
+// comment) and lists every child record whose ParentField equals the
+// current record's id. A section with no matching Relationship is
+// skipped (formrender.buildChildRows treats a missing key as "no
+// children", the same as an explicitly empty slice) rather than erroring
+// — a Definition mismatch here is a data-modeling bug to fix in the
+// Definition, not something that should 500 every form render for it.
+func (h *Handler) loadMasterDetailChildren(ctx context.Context, tenantID string, entDef *entity.Definition, formDef *form.Definition, recordID string) (map[string][]map[string]any, error) {
+	children := make(map[string][]map[string]any)
+	for _, section := range formDef.Sections {
+		if section.Component != form.ComponentMasterDetail {
+			continue
+		}
+		var rel *entity.Relationship
+		for i := range entDef.Relationships {
+			if entDef.Relationships[i].Target == section.Target {
+				rel = &entDef.Relationships[i]
+				break
+			}
+		}
+		if rel == nil || rel.ParentField == "" {
+			continue
+		}
+		childDef, err := h.entityDef(ctx, tenantID, section.Target)
+		if err != nil {
+			return nil, fmt.Errorf("look up %s definition for master-detail section: %w", section.Target, err)
+		}
+		records, err := h.crud.ListByField(ctx, childDef, tenantID, rel.ParentField, recordID)
+		if err != nil {
+			return nil, fmt.Errorf("list %s children: %w", section.Target, err)
+		}
+		rows := make([]map[string]any, len(records))
+		for i, rec := range records {
+			rows[i] = rec.Data
+		}
+		children[section.Target] = rows
+	}
+	return children, nil
 }
 
 func writeDefinitionLookupError(w http.ResponseWriter, entityType string, err error) {
