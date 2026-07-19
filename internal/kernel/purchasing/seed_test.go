@@ -194,3 +194,50 @@ func TestPublish_LeavesRolledBackVersionAlone(t *testing.T) {
 		t.Fatalf("expected Item to stay rolled back (no published version), got: %v", err)
 	}
 }
+
+// TestPublishForms_PublishesEveryPurchasingForm mirrors
+// foundation/seed_test.go's TestPublishForms_PublishesEveryFoundationForm
+// — confirms all four purchasing forms actually land in the
+// form_definitions registry.
+func TestPublishForms_PublishesEveryPurchasingForm(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	tenantID := seedTenant(t, db)
+	formRepo := data.NewFormDefinitionRepo(db)
+
+	if err := PublishForms(ctx, db, tenantID, humanActor()); err != nil {
+		t.Fatalf("PublishForms: %v", err)
+	}
+
+	forms := []struct {
+		entityType string
+		version    int
+	}{
+		{"Item", ItemForm().Version},
+		{"PurchaseOrder", PurchaseOrderForm().Version},
+		{"POLine", POLineForm().Version},
+		{"InventoryItem", InventoryItemForm().Version},
+	}
+	for _, f := range forms {
+		v, err := formRepo.GetPublished(ctx, tenantID, f.entityType)
+		if err != nil {
+			t.Fatalf("GetPublished(%s form): %v", f.entityType, err)
+		}
+		if v.Version != f.version {
+			t.Fatalf("%s form: expected published version %d, got %d", f.entityType, f.version, v.Version)
+		}
+	}
+}
+
+func TestPublishForms_IsIdempotent(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	tenantID := seedTenant(t, db)
+
+	if err := PublishForms(ctx, db, tenantID, humanActor()); err != nil {
+		t.Fatalf("first PublishForms: %v", err)
+	}
+	if err := PublishForms(ctx, db, tenantID, humanActor()); err != nil {
+		t.Fatalf("second PublishForms should be a no-op, got: %v", err)
+	}
+}
