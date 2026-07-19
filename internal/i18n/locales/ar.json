@@ -1,0 +1,6 @@
+{
+  "form.field.required_suffix": " *",
+  "form.related_list.empty": "لا توجد سجلات مرتبطة.",
+  "form.master_detail.empty": "لا توجد بنود بعد.",
+  "form.master_detail.add": "+ إضافة"
+}
