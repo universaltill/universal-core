@@ -11,6 +11,17 @@ import (
 	"strings"
 )
 
+// maxXLSXFileSize bounds the compressed upload itself, and
+// maxXLSXEntrySize bounds how many decompressed bytes any single zip
+// entry (sharedStrings.xml, the worksheet) may expand to, independent of
+// maxXLSXFileSize — see the decompression-bomb note on readXLSX. package
+// vars rather than consts purely so tests can shrink them instead of
+// materializing 100+ MiB fixtures.
+var (
+	maxXLSXFileSize  int64 = 100 << 20 // 100 MiB
+	maxXLSXEntrySize int64 = 500 << 20 // 500 MiB
+)
+
 // readXLSX reads an .xlsx file's first worksheet into the same
 // (headers, rows) shape readCSV produces, so ValidateMapping,
 // buildRowData and coerce work unchanged on either format.
@@ -42,10 +53,20 @@ import (
 // blank lines. RowResult.RowNumber is therefore positional (which
 // non-blank row this is), not the worksheet's own row number —
 // consistent with how Preview/Commit already number CSV rows.
+//
+// Both the compressed upload (maxXLSXFileSize) and each zip entry's
+// decompressed size (maxXLSXEntrySize, enforced in openZipEntry) are
+// capped: deflate can expand a small compressed payload by orders of
+// magnitude, so bounding only the upload size wouldn't stop a
+// decompression-bomb .xlsx from exhausting memory while sharedStrings.xml
+// or the worksheet is decoded.
 func readXLSX(r io.Reader) (headers []string, rows [][]string, err error) {
-	data, err := io.ReadAll(r)
+	data, err := io.ReadAll(io.LimitReader(r, maxXLSXFileSize+1))
 	if err != nil {
 		return nil, nil, fmt.Errorf("read xlsx: %w", err)
+	}
+	if int64(len(data)) > maxXLSXFileSize {
+		return nil, nil, fmt.Errorf("xlsx file exceeds the %d MiB size limit", maxXLSXFileSize>>20)
 	}
 	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
@@ -143,9 +164,19 @@ type xlsxSST struct {
 }
 
 func readSharedStrings(zr *zip.Reader) ([]string, error) {
-	f, err := zr.Open("xl/sharedStrings.xml")
-	if err != nil {
+	idx := -1
+	for i, f := range zr.File {
+		if f.Name == "xl/sharedStrings.xml" {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
 		return nil, nil // no shared strings table: workbook uses only inline strings/numbers
+	}
+	f, err := openZipEntry(zr.File[idx])
+	if err != nil {
+		return nil, fmt.Errorf("open xl/sharedStrings.xml: %w", err)
 	}
 	defer f.Close()
 
@@ -160,7 +191,8 @@ func readSharedStrings(zr *zip.Reader) ([]string, error) {
 	return out, nil
 }
 
-// firstSheetFile opens the lowest-numbered xl/worksheets/sheetN.xml entry.
+// firstSheetFile opens the lowest-numbered xl/worksheets/sheetN.xml entry,
+// bounded to maxXLSXEntrySize decompressed bytes.
 func firstSheetFile(zr *zip.Reader) (io.ReadCloser, error) {
 	type candidate struct {
 		n    int
@@ -183,7 +215,7 @@ func firstSheetFile(zr *zip.Reader) (io.ReadCloser, error) {
 		return nil, fmt.Errorf("xlsx has no xl/worksheets/sheetN.xml entry")
 	}
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].n < candidates[j].n })
-	return candidates[0].file.Open()
+	return openZipEntry(candidates[0].file)
 }
 
 func readWorksheet(f io.ReadCloser) (*xlsxWorksheet, error) {
@@ -194,6 +226,56 @@ func readWorksheet(f io.ReadCloser) (*xlsxWorksheet, error) {
 	}
 	return &ws, nil
 }
+
+// openZipEntry opens f bounded to maxXLSXEntrySize decompressed bytes. A
+// zip's central directory declares an entry's uncompressed size, but that
+// declared value isn't trustworthy on its own (a crafted entry can lie
+// about it while its deflate stream actually produces far more) — the
+// real enforcement is boundedReader erroring the moment a Read would
+// cross the cap, not the upfront size check, which only exists to reject
+// an honestly-huge entry without decompressing anything.
+func openZipEntry(f *zip.File) (io.ReadCloser, error) {
+	if f.UncompressedSize64 > uint64(maxXLSXEntrySize) {
+		return nil, fmt.Errorf("%s declares %d bytes uncompressed, over the %d MiB limit", f.Name, f.UncompressedSize64, maxXLSXEntrySize>>20)
+	}
+	rc, err := f.Open()
+	if err != nil {
+		return nil, err
+	}
+	return &boundedReadCloser{
+		r:      &boundedReader{r: rc, remaining: maxXLSXEntrySize, name: f.Name},
+		closer: rc,
+	}, nil
+}
+
+// boundedReader errors clearly the instant a Read would exceed its cap,
+// rather than silently truncating and leaving the caller (an XML decoder)
+// to fail with a confusing "unexpected EOF" partway through a tag.
+type boundedReader struct {
+	r         io.Reader
+	remaining int64
+	name      string
+}
+
+func (b *boundedReader) Read(p []byte) (int, error) {
+	if b.remaining <= 0 {
+		return 0, fmt.Errorf("%s exceeds the %d MiB uncompressed size limit", b.name, maxXLSXEntrySize>>20)
+	}
+	if int64(len(p)) > b.remaining {
+		p = p[:b.remaining]
+	}
+	n, err := b.r.Read(p)
+	b.remaining -= int64(n)
+	return n, err
+}
+
+type boundedReadCloser struct {
+	r      io.Reader
+	closer io.Closer
+}
+
+func (b *boundedReadCloser) Read(p []byte) (int, error) { return b.r.Read(p) }
+func (b *boundedReadCloser) Close() error               { return b.closer.Close() }
 
 // cellValues turns one <row>'s cells into a positional []string sized to
 // the highest column index present, with gaps (columns Excel omits from
