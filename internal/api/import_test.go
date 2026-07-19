@@ -123,6 +123,63 @@ func TestImport_Preview_SuggestsMappingAndShowsRows(t *testing.T) {
 	}
 }
 
+// TestImport_Preview_IncompleteMappingShowsEditorNotHardError is the
+// regression test for a real bug found by manually driving the wizard
+// against a synthetic CSV (see import.go's importPreview doc comment):
+// a header that doesn't exactly name-match a required field ("Vendor
+// Name" vs. the "name" field) used to make the whole preview request
+// fail with a raw JSON 400 and never show the mapping table at all —
+// there was no way to fix the mapping through the wizard itself. It must
+// instead render the mapping table (so the column can be mapped
+// manually) with the validation error surfaced inline, and no rows or
+// Commit button until the mapping is actually complete.
+func TestImport_Preview_IncompleteMappingShowsEditorNotHardError(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	csvContent := []byte("Vendor Name\nAcme Textiles\n")
+	req := newMultipartRequest(t, "/import/Vendor/preview", tenantID, "farshid", "vendors.csv", csvContent, nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 (mapping editor, not a hard error), got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `name="mapping.Vendor Name"`) {
+		t.Fatalf("expected a mapping select for the 'Vendor Name' header so it can be fixed, got:\n%s", body)
+	}
+	if !strings.Contains(body, `required field &#34;name&#34; has no column mapped to it`) {
+		t.Fatalf("expected the mapping validation error surfaced inline, got:\n%s", body)
+	}
+	if strings.Contains(body, `hx-post="/import/Vendor/commit"`) {
+		t.Fatalf("expected no Commit button while the mapping is incomplete, got:\n%s", body)
+	}
+
+	// Re-submit with the column manually mapped, same as a user picking
+	// it from the <select> and clicking "Preview again".
+	req2 := newMultipartRequest(t, "/import/Vendor/preview", tenantID, "farshid", "vendors.csv", csvContent,
+		map[string]string{"mapping.Vendor Name": "name"})
+	rec2 := httptest.NewRecorder()
+	mux.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec2.Code, rec2.Body.String())
+	}
+	body2 := rec2.Body.String()
+	if !strings.Contains(body2, "Acme Textiles") {
+		t.Fatalf("expected the completed mapping to show the row's data, got:\n%s", body2)
+	}
+	if !strings.Contains(body2, `hx-post="/import/Vendor/commit"`) {
+		t.Fatalf("expected a Commit button once the mapping is complete, got:\n%s", body2)
+	}
+}
+
 func TestImport_Preview_InvalidRowShowsError(t *testing.T) {
 	db := testDB(t)
 	withDevAuthEnabled(t)
