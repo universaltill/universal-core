@@ -15,6 +15,16 @@
 // NAV 2009 has no OData) is a separate, larger piece: it needs a real
 // NAV 2009 schema to map against, which this kernel spike doesn't have
 // access to yet. CSV is the connector spike's first, self-contained slice.
+//
+// XLSX (xlsx.go) is the second format on the same slice — BACKLOG.md R1
+// says "CSV/XLSX everywhere". It reuses this file's ValidateMapping,
+// buildRowData and coerce unchanged: an XLSX reader's only job is to
+// produce the same (headers []string, rows [][]string) shape readCSV
+// does, via PreviewXLSX/CommitXLSX. No third-party dependency — the xlsx
+// reader is hand-rolled against encoding/xml + archive/zip (both
+// stdlib), matching this kernel's preference for a minimal dependency
+// footprint over pulling in a general-purpose spreadsheet library for a
+// read-only, header+cells subset of the format.
 package csvimport
 
 import (
@@ -85,13 +95,28 @@ func ValidateMapping(def *entity.Definition, headers []string, mapping ColumnMap
 	return nil
 }
 
+// reader parses a file into a header row plus data rows — the shape both
+// readCSV and readXLSX produce, and the only thing preview/commit below
+// need to know about the source format.
+type reader func(io.Reader) (headers []string, rows [][]string, err error)
+
 // Preview parses r as CSV (first row is headers) and validates every data
 // row against def via mapping, without writing anything — the
 // "validation preview" step BACKLOG.md's import-wizard requirement calls
 // for. Every row is reported, valid or not, so a human reviews the whole
 // batch before anything commits.
 func Preview(r io.Reader, def *entity.Definition, mapping ColumnMapping) ([]RowResult, error) {
-	headers, rows, err := readCSV(r)
+	return preview(r, readCSV, def, mapping)
+}
+
+// PreviewXLSX is Preview for an .xlsx file's first worksheet instead of a
+// CSV file — same validation contract, same RowResult shape.
+func PreviewXLSX(r io.Reader, def *entity.Definition, mapping ColumnMapping) ([]RowResult, error) {
+	return preview(r, readXLSX, def, mapping)
+}
+
+func preview(r io.Reader, read reader, def *entity.Definition, mapping ColumnMapping) ([]RowResult, error) {
+	headers, rows, err := read(r)
 	if err != nil {
 		return nil, err
 	}
@@ -118,7 +143,17 @@ func Preview(r io.Reader, def *entity.Definition, mapping ColumnMapping) ([]RowR
 // doesn't block the rows around it, so a batch of 500 rows with 3 bad
 // ones still imports the other 497.
 func Commit(ctx context.Context, r io.Reader, def *entity.Definition, mapping ColumnMapping, engine *crud.Engine, tenantID string, actor audit.Actor) ([]RowResult, error) {
-	results, err := Preview(r, def, mapping)
+	return commit(ctx, r, readCSV, def, mapping, engine, tenantID, actor)
+}
+
+// CommitXLSX is Commit for an .xlsx file's first worksheet instead of a
+// CSV file.
+func CommitXLSX(ctx context.Context, r io.Reader, def *entity.Definition, mapping ColumnMapping, engine *crud.Engine, tenantID string, actor audit.Actor) ([]RowResult, error) {
+	return commit(ctx, r, readXLSX, def, mapping, engine, tenantID, actor)
+}
+
+func commit(ctx context.Context, r io.Reader, read reader, def *entity.Definition, mapping ColumnMapping, engine *crud.Engine, tenantID string, actor audit.Actor) ([]RowResult, error) {
+	results, err := preview(r, read, def, mapping)
 	if err != nil {
 		return nil, err
 	}
