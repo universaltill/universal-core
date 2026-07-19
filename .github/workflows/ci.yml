@@ -28,6 +28,7 @@ jobs:
           --health-retries 10
     env:
       TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/universal_core_test?sslmode=disable
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/universal_core_test?sslmode=disable
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -54,13 +55,6 @@ jobs:
             echo "$FMT_OUT" >&2
             exit 1
           fi
-      - name: Apply migrations
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client
-          for f in internal/db/migrations/*.sql; do
-            echo "applying $f"
-            psql "$TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"
-          done
       - name: Build
         env:
           GOMODCACHE: ${{ runner.temp }}/gomodcache
@@ -71,6 +65,18 @@ jobs:
           GOMODCACHE: ${{ runner.temp }}/gomodcache
           GOCACHE: ${{ runner.temp }}/gobuildcache
         run: go vet ./...
+      # Through cmd/migrate (internal/db.Apply, schema_migrations-tracked)
+      # rather than applying internal/db/migrations/*.sql directly with
+      # psql — a second, untracked path here would drift from what
+      # cmd/universal-core itself does on boot (it did: internal/db's own
+      # tests call Apply() too, and previously found the schema already
+      # present with nothing recorded, then tried to re-run 001_init.sql
+      # into it).
+      - name: Apply migrations
+        env:
+          GOMODCACHE: ${{ runner.temp }}/gomodcache
+          GOCACHE: ${{ runner.temp }}/gobuildcache
+        run: go run ./cmd/migrate
       - name: Test
         env:
           GOMODCACHE: ${{ runner.temp }}/gomodcache
