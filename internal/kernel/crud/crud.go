@@ -100,3 +100,10 @@ func (e *Engine) Get(ctx context.Context, def *entity.Definition, tenantID, id s
 func (e *Engine) List(ctx context.Context, def *entity.Definition, tenantID string) ([]data.Record, error) {
 	return e.records.List(ctx, tenantID, def.EntityType)
 }
+
+// ListByField returns every def record whose fieldName == value — used
+// to fetch a master-detail section's child rows (see
+// data.RecordRepo.ListByField).
+func (e *Engine) ListByField(ctx context.Context, def *entity.Definition, tenantID, fieldName, value string) ([]data.Record, error) {
+	return e.records.ListByField(ctx, tenantID, def.EntityType, fieldName, value)
+}
