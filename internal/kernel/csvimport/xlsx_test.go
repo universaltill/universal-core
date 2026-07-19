@@ -3,6 +3,8 @@ package csvimport
 import (
 	"archive/zip"
 	"bytes"
+	"compress/flate"
+	"hash/crc32"
 	"strings"
 	"testing"
 )
@@ -425,5 +427,116 @@ func TestValidateMapping_ReusedUnchangedForXLSX(t *testing.T) {
 	_, err := PreviewXLSX(bytes.NewReader(data), vendorDef(), ColumnMapping{"Vendor Name": "not_a_real_field"})
 	if err == nil {
 		t.Fatal("expected PreviewXLSX to fail fast on a broken mapping, same as Preview does for CSV")
+	}
+}
+
+// withXLSXLimits temporarily shrinks the package-level size caps so tests
+// can exercise them without materializing 100+ MiB fixtures.
+func withXLSXLimits(t *testing.T, fileLimit, entryLimit int64) {
+	t.Helper()
+	prevFile, prevEntry := maxXLSXFileSize, maxXLSXEntrySize
+	maxXLSXFileSize, maxXLSXEntrySize = fileLimit, entryLimit
+	t.Cleanup(func() { maxXLSXFileSize, maxXLSXEntrySize = prevFile, prevEntry })
+}
+
+// TestPreviewXLSX_UploadOverFileSizeLimitIsRejected is the regression test
+// for the code-review finding that io.ReadAll(r) buffered an .xlsx upload
+// with no cap at all — a large file would be read fully into memory
+// before this package ever got a chance to reject it.
+func TestPreviewXLSX_UploadOverFileSizeLimitIsRejected(t *testing.T) {
+	withXLSXLimits(t, 100, 500<<20)
+
+	sheet := `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet ` + xlsxNS + `><sheetData>
+<row r="1"><c r="A1" t="inlineStr"><is><t>Vendor Name</t></is></c></row>
+</sheetData></worksheet>`
+	data := buildXLSX(t, map[string]string{"xl/worksheets/sheet1.xml": sheet})
+	if int64(len(data)) <= 100 {
+		t.Fatalf("test fixture (%d bytes) must exceed the 100-byte limit under test", len(data))
+	}
+
+	_, err := PreviewXLSX(bytes.NewReader(data), vendorDef(), vendorMapping())
+	if err == nil {
+		t.Fatal("expected an upload over maxXLSXFileSize to be rejected")
+	}
+}
+
+// TestPreviewXLSX_EntryDeclaringHugeUncompressedSizeIsRejected is the
+// regression test for openZipEntry's upfront UncompressedSize64 check: a
+// zip entry that honestly declares a decompressed size over the cap is
+// rejected without decompressing anything.
+func TestPreviewXLSX_EntryDeclaringHugeUncompressedSizeIsRejected(t *testing.T) {
+	withXLSXLimits(t, 100<<20, 1<<20) // 1 MiB entry cap
+
+	// A real (non-bomb) 2 MiB payload: highly compressible content still
+	// declares its true uncompressed size in the zip central directory,
+	// which is what openZipEntry checks before ever calling Open.
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	w, err := zw.Create("xl/worksheets/sheet1.xml")
+	if err != nil {
+		t.Fatalf("create entry: %v", err)
+	}
+	if _, err := w.Write(bytes.Repeat([]byte("a"), 2<<20)); err != nil {
+		t.Fatalf("write entry: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close zip: %v", err)
+	}
+
+	_, err = PreviewXLSX(bytes.NewReader(buf.Bytes()), vendorDef(), vendorMapping())
+	if err == nil {
+		t.Fatal("expected a zip entry declaring an uncompressed size over the cap to be rejected")
+	}
+}
+
+// TestPreviewXLSX_DecompressionBombIsBoundedDuringRead is the regression
+// test for boundedReader's Read-time enforcement specifically — not just
+// openZipEntry's upfront UncompressedSize64 check. A crafted zip entry's
+// header can LIE about its uncompressed size (declaring something small,
+// within the cap) while its actual deflate stream expands far past it;
+// the upfront check trusts the header and would wave this through, so
+// the real defense against a decompression bomb is bounding the Read
+// itself, which is what this test isolates by building a raw entry whose
+// declared size and actual decompressed size disagree.
+func TestPreviewXLSX_DecompressionBombIsBoundedDuringRead(t *testing.T) {
+	withXLSXLimits(t, 100<<20, 1<<20) // 1 MiB entry cap
+
+	var compressed bytes.Buffer
+	fw, err := flate.NewWriter(&compressed, flate.BestCompression)
+	if err != nil {
+		t.Fatalf("new flate writer: %v", err)
+	}
+	bomb := bytes.Repeat([]byte("a"), 10<<20) // 10 MiB decompressed, over the 1 MiB cap
+	if _, err := fw.Write(bomb); err != nil {
+		t.Fatalf("compress bomb payload: %v", err)
+	}
+	if err := fw.Close(); err != nil {
+		t.Fatalf("close flate writer: %v", err)
+	}
+
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	fh := &zip.FileHeader{
+		Name:               "xl/worksheets/sheet1.xml",
+		Method:             zip.Deflate,
+		CompressedSize64:   uint64(compressed.Len()),
+		UncompressedSize64: 4, // lie: declares 4 bytes, well within the cap
+		CRC32:              crc32.ChecksumIEEE([]byte("fake")),
+	}
+	w, err := zw.CreateRaw(fh)
+	if err != nil {
+		t.Fatalf("create raw entry: %v", err)
+	}
+	if _, err := w.Write(compressed.Bytes()); err != nil {
+		t.Fatalf("write raw entry: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close zip: %v", err)
+	}
+
+	_, err = PreviewXLSX(bytes.NewReader(buf.Bytes()), vendorDef(), vendorMapping())
+	if err == nil {
+		t.Fatal("expected decompression to be bounded during Read even when the zip header lies about uncompressed size")
 	}
 }
