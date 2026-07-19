@@ -2,5 +2,16 @@
   "form.field.required_suffix": " *",
   "form.related_list.empty": "No related records.",
   "form.master_detail.empty": "No lines yet.",
-  "form.master_detail.add": "+ Add"
+  "form.master_detail.add": "+ Add",
+  "import.choose_file": "Choose a CSV or XLSX file",
+  "import.preview_button": "Preview",
+  "import.commit_button": "Commit",
+  "import.mapping_heading": "Column Mapping",
+  "import.rows_heading": "Preview Rows",
+  "import.unmapped_option": "— skip —",
+  "import.row_status_ok": "OK",
+  "import.row_status_error": "Error",
+  "import.result_heading": "Import Result",
+  "import.result_succeeded": "succeeded",
+  "import.result_failed": "failed"
 }

@@ -8,10 +8,12 @@
 // engine in this kernel, behaviour comes only from the Definition and
 // mapping passed in, never a per-entity-type branch (CLAUDE.md).
 //
-// Column-mapping UI/suggestion (an HTMX form, or an AI-assisted "guess
-// the mapping from header names" step per BACKLOG.md's R4 sync-engine
-// vision) is out of scope here — this package's contract is an explicit
-// mapping in, a per-row result out. NAV 2009 connectivity (SQL views —
+// Column-mapping suggestion (headers.go's SuggestMapping — a plain
+// case-insensitive name match, not an AI-assisted guess per BACKLOG.md's
+// R4 sync-engine vision, which is still out of scope) gives a starting
+// point a caller can override; this package's core contract stays an
+// explicit mapping in, a per-row result out — suggestion never bypasses
+// ValidateMapping. NAV 2009 connectivity (SQL views —
 // NAV 2009 has no OData) is a separate, larger piece: it needs a real
 // NAV 2009 schema to map against, which this kernel spike doesn't have
 // access to yet. CSV is the connector spike's first, self-contained slice.
