@@ -29,6 +29,18 @@ import (
 // naive "does a row already exist" check would find one and skip it
 // without ever finishing the job. A row already published, or
 // deliberately rolled_back, is left alone either way.
+//
+// Not safe to call concurrently for the SAME tenant: publishOne is
+// check-then-act (GetVersion, then conditionally write), not a single
+// atomic operation. Two racing calls can collide — a duplicate
+// CreateDraft hits entity_definitions' UNIQUE (tenant_id, entity_type,
+// version) constraint, a duplicate Approve/Publish hits
+// definitionRepo.transition's atomic status-guarded UPDATE — but every
+// collision is a clean error on the losing call, never a wrong
+// ordering or a corrupted row, and Publish is idempotent, so simply
+// retrying a call that errored this way converges to the same
+// fully-published end state. Expected call pattern is once per tenant
+// onboarding (a cold path), where this doesn't come up in practice.
 func Publish(ctx context.Context, db *sql.DB, tenantID string, actor audit.Actor) error {
 	repo := data.NewEntityDefinitionRepo(db)
 	for _, def := range All() {

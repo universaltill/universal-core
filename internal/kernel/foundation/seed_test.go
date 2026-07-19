@@ -128,6 +128,44 @@ func TestPublish_ResumesFromPartiallyDraftedState(t *testing.T) {
 	}
 }
 
+// TestPublish_ResumesFromApprovedState is TestPublish_ResumesFromPartiallyDraftedState's
+// counterpart for the other partial-failure point: a crash after Approve
+// but before Publish. publishOne must not re-approve an already-approved
+// row (that would hit definitionRepo.transition's atomic status guard
+// and error) — it must go straight to Publish.
+func TestPublish_ResumesFromApprovedState(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	tenantID := seedTenant(t, db)
+	repo := data.NewEntityDefinitionRepo(db)
+	actor := humanActor()
+
+	partyDef := Party()
+	raw, err := json.Marshal(partyDef)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if _, err := repo.CreateDraft(ctx, tenantID, partyDef.EntityType, partyDef.Version, raw, actor); err != nil {
+		t.Fatalf("CreateDraft: %v", err)
+	}
+	if err := repo.Approve(ctx, tenantID, partyDef.EntityType, partyDef.Version, actor); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	// Deliberately do NOT publish — simulating a crash right here.
+
+	if err := Publish(ctx, db, tenantID, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	v, err := repo.GetPublished(ctx, tenantID, "Party")
+	if err != nil {
+		t.Fatalf("expected Party to be published after resuming from an approved-only state, got: %v", err)
+	}
+	if v.Version != partyDef.Version {
+		t.Fatalf("expected published version %d, got %d", partyDef.Version, v.Version)
+	}
+}
+
 // TestPublish_LeavesRolledBackVersionAlone confirms a deliberately
 // rolled-back version is never silently re-published by a later
 // Publish call.
