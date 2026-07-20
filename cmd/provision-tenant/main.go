@@ -31,6 +31,7 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
 	"github.com/universaltill/universal-core/internal/kernel/purchasing"
@@ -67,12 +68,20 @@ func main() {
 		log.Fatal("-name is required when not reusing an existing tenant via -tenant-id")
 	}
 
+	// De-duplicated via a set: PublishAll is idempotent regardless (a
+	// repeat would just be redundant work, not incorrect), but there's
+	// no reason to actually do that work or log a module twice for
+	// something as easy to catch as "-modules purchasing,purchasing".
 	var modules []string
 	if *modulesFlag != "" {
-		modules = strings.Split(*modulesFlag, ",")
-		for _, m := range modules {
+		seen := make(map[string]bool)
+		for m := range strings.SplitSeq(*modulesFlag, ",") {
 			if _, ok := modulePublishers[m]; !ok {
 				log.Fatalf("unknown module %q (available: purchasing)", m)
+			}
+			if !seen[m] {
+				seen[m] = true
+				modules = append(modules, m)
 			}
 		}
 	}
@@ -91,12 +100,11 @@ func main() {
 
 	id := *tenantID
 	if id == "" {
-		if err := sqlDB.QueryRowContext(ctx,
-			`INSERT INTO tenants (name, region) VALUES ($1, $2) RETURNING id`,
-			*name, *region,
-		).Scan(&id); err != nil {
+		created, err := data.NewTenantRepo(sqlDB).Create(ctx, *name, *region)
+		if err != nil {
 			log.Fatalf("create tenant: %v", err)
 		}
+		id = created
 		log.Printf("created tenant %s", id)
 	}
 
