@@ -203,13 +203,29 @@ func clickAndSettle(selector string) chromedp.Action {
 	if err != nil {
 		panic(err) // selector is always a Go string literal from this file
 	}
+	// Also listens for htmx:afterRequest with detail.successful === false
+	// (a non-2xx response, or the request never completing) and rejects
+	// immediately with the real status — without this, a server-side
+	// regression would otherwise hang this promise for the full 30s
+	// context timeout instead of failing fast with a useful message,
+	// since htmx's default responseHandling skips the swap (and so never
+	// fires htmx:afterSettle) on a failed request.
 	expr := fmt.Sprintf(`new Promise((resolve, reject) => {
   const el = document.querySelector(%s);
   if (!el) { reject(new Error("clickAndSettle: no element matching " + %s)); return; }
-  document.body.addEventListener('htmx:afterSettle', function handler() {
-    document.body.removeEventListener('htmx:afterSettle', handler);
-    resolve(true);
-  });
+  function onSettle() { cleanup(); resolve(true); }
+  function onAfterRequest(e) {
+    if (e.detail.successful === false) {
+      cleanup();
+      reject(new Error("clickAndSettle: request failed, status " + (e.detail.xhr && e.detail.xhr.status)));
+    }
+  }
+  function cleanup() {
+    document.body.removeEventListener('htmx:afterSettle', onSettle);
+    document.body.removeEventListener('htmx:afterRequest', onAfterRequest);
+  }
+  document.body.addEventListener('htmx:afterSettle', onSettle);
+  document.body.addEventListener('htmx:afterRequest', onAfterRequest);
   el.click();
 })`, sel, sel)
 	return chromedp.Evaluate(expr, nil, func(p *cdpruntime.EvaluateParams) *cdpruntime.EvaluateParams {
