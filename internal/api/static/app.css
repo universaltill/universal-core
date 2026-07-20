@@ -156,19 +156,26 @@ a:hover {
   height: 140px;
   border-radius: 50%;
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
+  gap: 0.25rem;
   text-align: center;
   padding: 0.6rem;
   color: #fff;
   font-weight: 600;
-  font-size: 0.95rem;
+  font-size: 0.85rem;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
   z-index: 1;
   transition: transform 0.12s ease;
 }
 
-.uc-hub-node:hover {
+.uc-hub-node-icon {
+  font-size: 1.9rem;
+  line-height: 1;
+}
+
+a.uc-hub-node:hover {
   transform: translate(-50%, -50%) scale(1.06);
   text-decoration: none;
 }
@@ -183,6 +190,29 @@ a:hover {
 .uc-hub-node-7 { background: #66a80f; }
 .uc-hub-node-8 { background: #f08c00; }
 .uc-hub-node-9 { background: #e8590c; }
+
+/* Non-clickable "coming soon" placeholder nodes (see dashboard.go's
+   plannedModuleKeys) — deliberately muted/dashed, distinct from the
+   vivid real-module colors above, so it reads as "not available yet"
+   at a glance, not as a broken/uncolored real module. */
+.uc-hub-node-placeholder {
+  background: #fff;
+  color: var(--uc-muted);
+  border: 2px dashed var(--uc-border);
+  box-shadow: none;
+  cursor: default;
+}
+
+.uc-hub-node-badge {
+  font-size: 0.62rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--uc-muted);
+  background: var(--uc-bg);
+  border-radius: 999px;
+  padding: 0.1rem 0.5rem;
+}
 
 /* A module's own searchable menu (internal/api/modulemenu.go) */
 .uc-menu-search {

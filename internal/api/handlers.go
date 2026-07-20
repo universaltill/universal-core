@@ -73,7 +73,11 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	// (a 401/redirect for the very script tag meant to make that page
 	// itself interactive) before auth can even run.
 	mux.HandleFunc("GET /static/htmx.min.js", serveHTMX)
-	mux.HandleFunc("GET /static/app.css", serveCSS)
+	// Content-hashed path (see layout.go's appCSSPath) — not the plain
+	// "/static/app.css" a stale bookmark/cache might still request, since
+	// serving *this app's* CSS at that fixed URL is exactly the bug this
+	// fixed. shellTmpl only ever links to the hashed path.
+	mux.HandleFunc("GET "+appCSSPath, serveCSS)
 	// webauth's own /ui/login, /ui/auth/callback, /ui/logout — never
 	// wrapped in Guard themselves; that's how a request gets a session
 	// in the first place. No-op registration when webauth is disabled.

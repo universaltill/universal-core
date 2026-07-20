@@ -5,24 +5,25 @@ import "net/http"
 const localeCookie = "uc_locale"
 
 // supportedLocales matches internal/i18n's actual locale files
-// (en.json, ar.json) — the only two the catalog can serve. An
-// unrecognized ?lang= value is ignored rather than persisted, so a typo
-// or a stale bookmark doesn't silently pin a visitor to English forever
-// via the cookie below. Kept in sync with internal/i18n/locales/*.json
-// by hand — see that package's own Catalog.Available() if this needs to
-// become dynamic later.
-var supportedLocales = map[string]bool{"en": true, "ar": true}
+// (en.json, ar.json, tr.json, fa.json) — the only ones the catalog can
+// serve. An unrecognized ?lang= value is ignored rather than persisted,
+// so a typo or a stale bookmark doesn't silently pin a visitor to
+// English forever via the cookie below. Kept in sync with
+// internal/i18n/locales/*.json by hand — see that package's own
+// Catalog.Available() if this needs to become dynamic later.
+var supportedLocales = map[string]bool{"en": true, "ar": true, "tr": true, "fa": true}
 
 // supportedLocaleList is supportedLocales in a fixed, deterministic
 // order — used by nav.go's language switcher; a Go map has no order of
 // its own, and a switcher whose link order shuffled between requests
 // would be a strange, distracting kind of bug.
-var supportedLocaleList = []string{"en", "ar"}
+var supportedLocaleList = []string{"en", "ar", "tr", "fa"}
 
-// rtlLocales names this kernel's right-to-left locales — Arabic is the
-// only one today, kept as a lookup (not a single hardcoded check) so a
-// second RTL locale (Hebrew, Urdu, …) is one line to add, not a rewrite.
-var rtlLocales = map[string]bool{"ar": true}
+// rtlLocales names this kernel's right-to-left locales — Arabic and
+// Farsi today, kept as a lookup (not a single hardcoded check) so a
+// further RTL locale (Hebrew, Urdu, …) is one line to add, not a
+// rewrite.
+var rtlLocales = map[string]bool{"ar": true, "fa": true}
 
 // localeFromRequest resolves the request's locale and, when ?lang=
 // explicitly names a supported one, persists it in a cookie so it

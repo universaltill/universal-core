@@ -771,6 +771,103 @@ func TestAPI_Dashboard_ShowsHubNodePerModule(t *testing.T) {
 	}
 }
 
+// TestAPI_Dashboard_ShowsPlaceholderModulesWithIcons is the regression
+// test for "add all ERP modules, coming soon, colorful with icons":
+// every standard ERP domain this kernel doesn't have a real module for
+// yet still gets a hub node — muted, non-clickable, badged "Coming
+// soon" — rather than being left off the hub entirely just because
+// there's no real module behind it.
+func TestAPI_Dashboard_ShowsPlaceholderModulesWithIcons(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := newRequest("GET", "/", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `uc-hub-node-placeholder`) {
+		t.Fatalf("expected at least one placeholder module node, got:\n%s", body)
+	}
+	if !strings.Contains(body, "Coming soon") {
+		t.Fatalf("expected the coming-soon badge text, got:\n%s", body)
+	}
+	if !strings.Contains(body, `<span class="uc-hub-node-icon">💰</span>Finance`) {
+		t.Fatalf("expected a Finance placeholder node with its icon, got:\n%s", body)
+	}
+	if strings.Contains(body, `href="/modules/finance"`) {
+		t.Fatalf("expected the Finance placeholder to be non-clickable (no real module yet), got:\n%s", body)
+	}
+}
+
+// TestAPI_Dashboard_RealModuleTakesOverPlaceholderSlot confirms a real
+// module never shows up twice — once as itself, once as its own
+// "coming soon" placeholder — when its key happens to match one of
+// plannedModuleKeys.
+func TestAPI_Dashboard_RealModuleTakesOverPlaceholderSlot(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	ctx := context.Background()
+	actor := humanActor()
+
+	entDef := vendorEntityDef()
+	entDef.Module = "finance"
+	entRaw, err := json.Marshal(entDef)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	entRepo := data.NewEntityDefinitionRepo(db)
+	if _, err := entRepo.CreateDraft(ctx, tenantID, entDef.EntityType, entDef.Version, entRaw, actor); err != nil {
+		t.Fatalf("CreateDraft: %v", err)
+	}
+	if err := entRepo.Approve(ctx, tenantID, entDef.EntityType, entDef.Version, actor); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	if err := entRepo.Publish(ctx, tenantID, entDef.EntityType, entDef.Version, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	formDef := vendorFormDef()
+	formRaw, err := json.Marshal(formDef)
+	if err != nil {
+		t.Fatalf("marshal form: %v", err)
+	}
+	formRepo := data.NewFormDefinitionRepo(db)
+	if _, err := formRepo.CreateDraft(ctx, tenantID, formDef.EntityType, formDef.Version, formRaw, actor); err != nil {
+		t.Fatalf("CreateDraft form: %v", err)
+	}
+	if err := formRepo.Approve(ctx, tenantID, formDef.EntityType, formDef.Version, actor); err != nil {
+		t.Fatalf("Approve form: %v", err)
+	}
+	if err := formRepo.Publish(ctx, tenantID, formDef.EntityType, formDef.Version, actor); err != nil {
+		t.Fatalf("Publish form: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := newRequest("GET", "/", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `href="/modules/finance"`) {
+		t.Fatalf("expected Finance to be a real, clickable module, got:\n%s", body)
+	}
+	// Finance's icon (💰) should render exactly once on the hub — twice
+	// would mean it's showing up both as the real module AND as its own
+	// "coming soon" placeholder.
+	if n := strings.Count(body, "💰"); n != 1 {
+		t.Fatalf("expected Finance's icon exactly once (real module, not also a placeholder), got %d occurrences in:\n%s", n, body)
+	}
+}
+
 // TestAPI_ModuleMenu_ShowsEntitiesWithSearchAndActions is the regression
 // test for the page a hub node/nav link actually lands on: a searchable
 // menu of the module's own entity types, each with New/Import links —
@@ -1157,12 +1254,17 @@ func TestAPI_ServesHTMXScript_Unauthenticated(t *testing.T) {
 	}
 }
 
+// TestAPI_ServesCSS_Unauthenticated confirms app.css serves at its
+// actual content-hashed path (see layout.go's appCSSPath) — not a
+// fixed "/static/app.css", which is exactly the stale-cache bug this
+// hashing fixed (a browser that had ever loaded the app before kept
+// serving a year-old immutable-cached stylesheet).
 func TestAPI_ServesCSS_Unauthenticated(t *testing.T) {
 	db := testDB(t)
 	mux := http.NewServeMux()
 	testHandler(t, db).Routes(mux)
 
-	req := httptest.NewRequest("GET", "/static/app.css", nil)
+	req := httptest.NewRequest("GET", appCSSPath, nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -1171,6 +1273,23 @@ func TestAPI_ServesCSS_Unauthenticated(t *testing.T) {
 	}
 	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "css") {
 		t.Fatalf("expected a css content type, got %q", ct)
+	}
+}
+
+// TestAPI_Shell_LinksToHashedCSSPath confirms every rendered page
+// actually links to the same hashed path serveCSS answers at — the
+// two must never drift, or every page silently 404s its own stylesheet.
+func TestAPI_Shell_LinksToHashedCSSPath(t *testing.T) {
+	db := testDB(t)
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := httptest.NewRequest("GET", "/", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if !strings.Contains(rec.Body.String(), `href="`+appCSSPath+`"`) {
+		t.Fatalf("expected the page to link to %s, got:\n%s", appCSSPath, rec.Body.String())
 	}
 }
 
