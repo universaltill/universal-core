@@ -253,6 +253,213 @@ func TestAPI_CreateRecord_MalformedJSONIs400(t *testing.T) {
 	}
 }
 
+// TestAPI_CreateRecord_FormURLEncodedBody is the regression test for the
+// bug found by internal/e2e's real-browser testing: formrender's own
+// <form> submits as application/x-www-form-urlencoded (htmx's default —
+// no hx-encoding override on the form tag), which the old JSON-only
+// decoder rejected outright with "invalid JSON body" before the request
+// ever reached validation. Every real "Save" click was silently broken.
+func TestAPI_CreateRecord_FormURLEncodedBody(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := httptest.NewRequest("POST", "/api/records/Vendor", strings.NewReader("name=Acme+Textiles"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-Tenant-ID", tenantID)
+	req.Header.Set("X-Actor-ID", "farshid")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "Acme Textiles") {
+		t.Fatalf("expected the form-encoded name to round-trip, got %s", rec.Body.String())
+	}
+}
+
+// TestAPI_CreateRecord_HTMXRequest_ReturnsHTMLFragment confirms an
+// htmx-issued create (HX-Request: true, set automatically by htmx on
+// every request — see isHTMXRequest) gets back the re-rendered form as
+// a bare HTML fragment, matching formrender's own
+// hx-target="this" hx-swap="outerHTML" contract — not the JSON envelope
+// a browser has nothing to do with once swapped into a <form> element's
+// place. The returned form points at the new record's own id (a
+// "create" form becomes an "edit" form for what it just created, the
+// standard htmx pattern), and is NOT wrapped in the page shell (layout.go)
+// — this is a swap response, not a page navigation.
+func TestAPI_CreateRecord_HTMXRequest_ReturnsHTMLFragment(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := httptest.NewRequest("POST", "/api/records/Vendor", strings.NewReader("name=Acme+Textiles"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("HX-Request", "true")
+	req.Header.Set("X-Tenant-ID", tenantID)
+	req.Header.Set("X-Actor-ID", "farshid")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Fatalf("expected text/html, got %q", ct)
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "<html") {
+		t.Fatalf("expected a bare fragment (no page shell) for an htmx-swap response, got:\n%s", body)
+	}
+	if !strings.Contains(body, `value="Acme Textiles"`) {
+		t.Fatalf("expected the saved value pre-filled in the returned form, got:\n%s", body)
+	}
+	if !strings.Contains(body, `hx-post="/api/records/Vendor/`) {
+		t.Fatalf("expected the form to now target its own record id, got:\n%s", body)
+	}
+}
+
+// TestAPI_UpdateRecord_FullLoop is the regression test for the second,
+// more severe half of the same bug: POST /api/records/{entityType}/{id}
+// had no route registered at all before this fix — saving an *existing*
+// record's form 404'd outright, unconditionally, regardless of body
+// format.
+func TestAPI_UpdateRecord_FullLoop(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	createReq := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{"name":"Acme Textiles"}`))
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	var created struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal create response: %v", err)
+	}
+
+	updateReq := newRequest("POST", "/api/records/Vendor/"+created.Data.ID, tenantID, "farshid", []byte(`{"name":"Acme Textiles Ltd"}`))
+	updateRec := httptest.NewRecorder()
+	mux.ServeHTTP(updateRec, updateReq)
+	if updateRec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", updateRec.Code, updateRec.Body.String())
+	}
+	if !strings.Contains(updateRec.Body.String(), "Acme Textiles Ltd") {
+		t.Fatalf("expected the updated name in the response, got %s", updateRec.Body.String())
+	}
+
+	getReq := newRequest("GET", "/api/records/Vendor/"+created.Data.ID, tenantID, "farshid", nil)
+	getRec := httptest.NewRecorder()
+	mux.ServeHTTP(getRec, getReq)
+	if !strings.Contains(getRec.Body.String(), "Acme Textiles Ltd") {
+		t.Fatalf("expected the update to persist, got %s", getRec.Body.String())
+	}
+}
+
+func TestAPI_UpdateRecord_HTMXRequest_ReturnsHTMLFragment(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	createReq := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{"name":"Acme Textiles"}`))
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	var created struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal create response: %v", err)
+	}
+
+	req := httptest.NewRequest("POST", "/api/records/Vendor/"+created.Data.ID, strings.NewReader("name=Acme+Textiles+Ltd"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("HX-Request", "true")
+	req.Header.Set("X-Tenant-ID", tenantID)
+	req.Header.Set("X-Actor-ID", "farshid")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Fatalf("expected text/html, got %q", ct)
+	}
+	if !strings.Contains(rec.Body.String(), `value="Acme Textiles Ltd"`) {
+		t.Fatalf("expected the updated value in the returned form, got:\n%s", rec.Body.String())
+	}
+}
+
+func TestAPI_UpdateRecord_UnknownRecordIs404(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := newRequest("POST", "/api/records/Vendor/99999999-9999-9999-9999-999999999999", tenantID, "farshid", []byte(`{"name":"X"}`))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for an unknown record id, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAPI_UpdateRecord_ValidationFailureIs400(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	createReq := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{"name":"Acme Textiles"}`))
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	var created struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal create response: %v", err)
+	}
+
+	// "name" is required; omit it.
+	updateReq := newRequest("POST", "/api/records/Vendor/"+created.Data.ID, tenantID, "farshid", []byte(`{}`))
+	updateRec := httptest.NewRecorder()
+	mux.ServeHTTP(updateRec, updateReq)
+	if updateRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a validation failure, got %d: %s", updateRec.Code, updateRec.Body.String())
+	}
+}
+
 func TestAPI_UnknownEntityType_Is404NotInternalError(t *testing.T) {
 	db := testDB(t)
 	withDevAuthEnabled(t)
