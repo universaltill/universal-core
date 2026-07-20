@@ -50,9 +50,19 @@ func Item() *entity.Definition {
 func PurchaseOrder() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "PurchaseOrder",
-		Version:    2,
+		Version:    3,
 		Module:     "purchasing",
 		Fields: []entity.Field{
+			// po_number is the natural key reference-data-model.md's own
+			// PurchaseOrder row was missing (every real PO has one — a
+			// buyer references it talking to the vendor) and the thing
+			// cmd/seed-demo-data's seedPurchaseOrders was working around
+			// with a coarse "skip if any exist" guard for lack of one
+			// (QUEUE.md, 2026-07-20). Not schema-enforced unique (no
+			// such constraint concept exists yet in entity.Field — same
+			// as Currency.code/Item.sku, which rely on the same
+			// application-level convention, not a DB constraint).
+			{Name: "po_number", Type: entity.FieldString, Required: true},
 			{Name: "vendor_id", Type: entity.FieldReference, Required: true, Target: "Party"},
 			{Name: "order_date", Type: entity.FieldDate, Required: true},
 			{Name: "currency_id", Type: entity.FieldReference, Target: "Currency"},
