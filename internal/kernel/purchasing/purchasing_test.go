@@ -88,9 +88,27 @@ func TestPurchaseOrder_RejectsUnknownStatus(t *testing.T) {
 
 func TestPurchaseOrder_MissingRequiredOrderDate(t *testing.T) {
 	def := PurchaseOrder()
-	data := map[string]any{"vendor_id": "party-1"}
+	// po_number included so this isolates order_date specifically —
+	// without it, this would "pass" even if order_date's Required flag
+	// were removed, since po_number is required too.
+	data := map[string]any{"po_number": "PO-TEST-1", "vendor_id": "party-1"}
 	if err := entity.ValidateRecord(def, data); err == nil {
 		t.Fatal("expected error for missing required order_date")
+	}
+}
+
+func TestPurchaseOrder_RequiresPONumber(t *testing.T) {
+	def := PurchaseOrder()
+	f, ok := def.FieldByName("po_number")
+	if !ok {
+		t.Fatal("expected a po_number field")
+	}
+	if f.Type != entity.FieldString || !f.Required {
+		t.Fatalf("expected po_number to be a required FieldString, got type=%s required=%v", f.Type, f.Required)
+	}
+	data := map[string]any{"vendor_id": "party-1", "order_date": "2026-07-20"}
+	if err := entity.ValidateRecord(def, data); err == nil {
+		t.Fatal("expected error for missing required po_number")
 	}
 }
 
