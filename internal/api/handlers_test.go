@@ -362,6 +362,12 @@ func TestAPI_RenderNewForm_ProducesHTML(t *testing.T) {
 	if !strings.Contains(body, `name="name"`) {
 		t.Fatalf("expected the rendered form to contain the name field, got:\n%s", body)
 	}
+	// Regression coverage for the gap internal/e2e's first real-browser
+	// test caught: without this script tag, every hx-* attribute on the
+	// page is inert markup — a browser has nothing to execute them with.
+	if !strings.Contains(body, `<script src="/static/htmx.min.js"></script>`) {
+		t.Fatalf("expected the page to load htmx.js, got:\n%s", body)
+	}
 }
 
 // TestAPI_RenderRecordForm_ShowsRecordData confirms an existing record's
@@ -495,6 +501,31 @@ func TestAPI_RenderRecordForm_ShowsMasterDetailChildren(t *testing.T) {
 	}
 	if !strings.Contains(body, "total: 150.5") {
 		t.Fatalf("expected the roll-up to sum the child's line_total into the header total, got:\n%s", body)
+	}
+}
+
+// TestAPI_ServesHTMXScript_Unauthenticated confirms /static/htmx.min.js
+// is reachable without dev-auth headers — it has to be, since the page
+// requesting it (a real browser navigating to a route DevAuth would
+// otherwise gate) hasn't authenticated at the point it fetches its own
+// <script> tag.
+func TestAPI_ServesHTMXScript_Unauthenticated(t *testing.T) {
+	db := testDB(t)
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := httptest.NewRequest("GET", "/static/htmx.min.js", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 with no auth headers, got %d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "javascript") {
+		t.Fatalf("expected a javascript content type, got %q", ct)
+	}
+	if !strings.Contains(rec.Body.String(), "htmx") {
+		t.Fatalf("expected real htmx.js content, got %d bytes starting with: %.60s", rec.Body.Len(), rec.Body.String())
 	}
 }
 
