@@ -230,22 +230,18 @@ func (s *seeder) seedInventory(items map[string]string) {
 	}
 }
 
-// seedPurchaseOrders has no natural key to dedup on (PurchaseOrder
-// declares no PO-number field yet), so it uses a coarser guard instead:
-// skip entirely if this tenant already has any PurchaseOrder at all.
-// Good enough for sample data (never doubles up on re-run) without
-// inventing a fake natural key just to satisfy getOrCreate's shape.
+// seedPurchaseOrders dedups on po_number, the same getOrCreate-style
+// natural-key pattern used everywhere else in this seeder — now that
+// PurchaseOrder actually has one (BACKLOG.md/QUEUE.md, 2026-07-21; it
+// didn't when this function was first written, hence the coarser
+// "skip entirely if this tenant already has any PurchaseOrder" guard
+// this replaces). Unlike getOrCreate itself, this can't just call it
+// directly: creating POLines needs the parent's id first, and total is
+// only known after the lines exist, so each order still needs its own
+// create-then-update sequence — only the dedup check is shared.
 func (s *seeder) seedPurchaseOrders(vendors, currencies, items map[string]string) {
 	poDef := s.def("PurchaseOrder")
 	lineDef := s.def("POLine")
-
-	existing, err := s.crud.List(s.ctx, poDef, s.tenantID)
-	if err != nil {
-		log.Fatalf("list PurchaseOrder: %v", err)
-	}
-	if len(existing) > 0 {
-		return
-	}
 
 	type line struct {
 		sku      string
@@ -253,18 +249,28 @@ func (s *seeder) seedPurchaseOrders(vendors, currencies, items map[string]string
 		unitCost float64
 	}
 	orders := []struct {
+		poNumber string
 		vendor   string
 		currency string
 		date     string
 		status   string
 		lines    []line
 	}{
-		{"Acme Textiles", "USD", "2026-07-01", "approved", []line{{"SKU-1002", 40, 18.5}}},
-		{"Gulf Steel Supply", "QAR", "2026-07-10", "submitted", []line{{"SKU-1001", 2000, 0.35}}},
-		{"Anatolia Parts Co.", "TRY", "2026-07-15", "draft", []line{{"SKU-1003", 150, 4.2}, {"SKU-2001", 8, 120}}},
+		{"PO-2026-0001", "Acme Textiles", "USD", "2026-07-01", "approved", []line{{"SKU-1002", 40, 18.5}}},
+		{"PO-2026-0002", "Gulf Steel Supply", "QAR", "2026-07-10", "submitted", []line{{"SKU-1001", 2000, 0.35}}},
+		{"PO-2026-0003", "Anatolia Parts Co.", "TRY", "2026-07-15", "draft", []line{{"SKU-1003", 150, 4.2}, {"SKU-2001", 8, 120}}},
 	}
 	for _, o := range orders {
+		existing, err := s.crud.ListByField(s.ctx, poDef, s.tenantID, "po_number", o.poNumber)
+		if err != nil {
+			log.Fatalf("list PurchaseOrder by po_number: %v", err)
+		}
+		if len(existing) > 0 {
+			continue
+		}
+
 		poID, err := s.crud.Create(s.ctx, poDef, s.tenantID, map[string]any{
+			"po_number":   o.poNumber,
 			"vendor_id":   vendors[o.vendor],
 			"currency_id": currencies[o.currency],
 			"order_date":  o.date,
@@ -287,8 +293,12 @@ func (s *seeder) seedPurchaseOrders(vendors, currencies, items map[string]string
 				log.Fatalf("create POLine: %v", err)
 			}
 		}
+		// Update takes a full replacement set of fields, not a partial
+		// patch (entity.ValidateRecord runs against exactly what's
+		// passed here) — po_number has to be repeated even though it's
+		// unchanged, same as every other field already was.
 		if err := s.crud.Update(s.ctx, poDef, s.tenantID, poID.ID, map[string]any{
-			"vendor_id": vendors[o.vendor], "currency_id": currencies[o.currency],
+			"po_number": o.poNumber, "vendor_id": vendors[o.vendor], "currency_id": currencies[o.currency],
 			"order_date": o.date, "status": o.status, "total": total,
 		}, s.actor); err != nil {
 			log.Fatalf("update PurchaseOrder total: %v", err)
