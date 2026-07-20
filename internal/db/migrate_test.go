@@ -3,12 +3,26 @@ package db
 import (
 	"context"
 	"database/sql"
+	"io/fs"
 	"os"
 	"sync"
 	"testing"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
+
+// embeddedMigrationCount reads the count directly off migrationsFS rather
+// than hardcoding a number here — a hardcoded count goes stale the
+// moment a new migration file lands (it already did once, silently,
+// until 004_tenant_zitadel_org.sql's own test run caught it).
+func embeddedMigrationCount(t *testing.T) int {
+	t.Helper()
+	entries, err := fs.ReadDir(migrationsFS, "migrations")
+	if err != nil {
+		t.Fatalf("read embedded migrations: %v", err)
+	}
+	return len(entries)
+}
 
 func testDB(t *testing.T) *sql.DB {
 	t.Helper()
@@ -75,8 +89,8 @@ func TestApply_IsIdempotent(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations`).Scan(&count); err != nil {
 		t.Fatalf("count schema_migrations: %v", err)
 	}
-	if count != 3 {
-		t.Fatalf("expected exactly 3 recorded migrations, got %d", count)
+	if want := embeddedMigrationCount(t); count != want {
+		t.Fatalf("expected exactly %d recorded migrations, got %d", want, count)
 	}
 }
 
@@ -140,7 +154,7 @@ func TestApply_ConcurrentCallersDoNotFail(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations`).Scan(&count); err != nil {
 		t.Fatalf("count schema_migrations: %v", err)
 	}
-	if count != 3 {
-		t.Fatalf("expected exactly 3 recorded migrations after %d concurrent Apply calls, got %d", callers, count)
+	if want := embeddedMigrationCount(t); count != want {
+		t.Fatalf("expected exactly %d recorded migrations after %d concurrent Apply calls, got %d", want, callers, count)
 	}
 }
