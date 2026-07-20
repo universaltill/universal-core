@@ -59,7 +59,13 @@ func TestAvailable_ListsBothLocales(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 	locales := c.Available()
-	if len(locales) != 2 || locales[0] != "ar" || locales[1] != "en" {
-		t.Fatalf("expected [ar en], got %v", locales)
+	want := []string{"ar", "en", "fa", "tr"}
+	if len(locales) != len(want) {
+		t.Fatalf("expected %v, got %v", want, locales)
+	}
+	for i, l := range want {
+		if locales[i] != l {
+			t.Fatalf("expected %v, got %v", want, locales)
+		}
 	}
 }
