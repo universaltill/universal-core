@@ -230,8 +230,43 @@ func TestRender_HidesFieldWhenVisibleIfFalse(t *testing.T) {
 	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
 		t.Fatalf("render: %v", err)
 	}
-	if strings.Contains(buf.String(), `name="lc_reference"`) {
-		t.Fatalf("expected lc_reference to be hidden when payment_method != LC, got:\n%s", buf.String())
+	if strings.Contains(buf.String(), `<label for="lc_reference"`) {
+		t.Fatalf("expected lc_reference to have no visible input when payment_method != LC, got:\n%s", buf.String())
+	}
+}
+
+// TestRender_VisibleIfHiddenFieldStillPreservesItsValue is the
+// regression test for a real bug independent review found re-verifying
+// the off-form-field data-loss fix: a field the form DOES list, but
+// whose VisibleIf currently evaluates false for this record, was
+// neither rendered as a visible input NOR preserved as a hidden
+// fallback — buildHiddenFields' first version only checked whether a
+// field was *listed* in the Definition, not whether it actually
+// rendered, so a conditionally-hidden field's stored value fell through
+// both paths and was silently wiped on the next save (proved by the
+// reviewer using this exact fixture: an LC purchase order's
+// lc_reference, saved while temporarily displaying as a Wire order).
+func TestRender_VisibleIfHiddenFieldStillPreservesItsValue(t *testing.T) {
+	r := testRenderer(t)
+	data := Data{
+		RecordID: "po-1",
+		// payment_method is "Wire", so lc_reference's VisibleIf
+		// ("payment_method == 'LC'") is currently false — but the order
+		// still carries a real lc_reference value from when it was
+		// previously an LC order.
+		Record:   map[string]any{"vendor_id": "v1", "payment_method": "Wire", "lc_reference": "LC-OLD-VALUE"},
+		Children: map[string][]map[string]any{},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	body := buf.String()
+	if strings.Contains(body, `<label for="lc_reference"`) {
+		t.Fatalf("expected no visible lc_reference input when payment_method != LC, got:\n%s", body)
+	}
+	if !strings.Contains(body, `<input type="hidden" name="lc_reference" value="LC-OLD-VALUE">`) {
+		t.Fatalf("expected lc_reference's value preserved as a hidden field despite being VisibleIf-hidden, got:\n%s", body)
 	}
 }
 

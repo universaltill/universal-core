@@ -200,7 +200,20 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 		rollUpTotals[s.RollUpTarget] = total
 		effective[s.RollUpTarget] = total
 	}
-	vm.HiddenFields = buildHiddenFields(def, ent, effective)
+
+	// rendered tracks every field name that actually produced a visible
+	// input, across every ComponentFields section — not every field name
+	// merely *listed* in the Definition. A field the Definition lists but
+	// whose VisibleIf currently evaluates false (buildFields skips it,
+	// below) is NOT in this set, and correctly falls through to
+	// buildHiddenFields as if it were never on the form at all: a
+	// conditionally-hidden field's value needs the exact same
+	// preservation an always-off-form field does, or it's silently wiped
+	// on save the moment its condition happens to be false (caught by
+	// independent review re-verifying the off-form-field fix: the same
+	// failure mode survives via visible_if if this set is built from the
+	// Definition's listed fields instead of what actually rendered).
+	rendered := make(map[string]bool, len(ent.Fields))
 
 	for _, s := range def.Sections {
 		sv := sectionView{Title: s.Title, Component: s.Component, Target: s.Target}
@@ -212,6 +225,9 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 				return viewModel{}, fmt.Errorf("section %q: %w", s.Title, err)
 			}
 			sv.Fields = fields
+			for _, fv := range fields {
+				rendered[fv.Name] = true
+			}
 
 		case form.ComponentMasterDetail:
 			sv.Children = buildChildRows(data.Children[s.Target])
@@ -230,6 +246,7 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 
 		vm.Sections = append(vm.Sections, sv)
 	}
+	vm.HiddenFields = buildHiddenFields(ent, effective, rendered)
 
 	for _, a := range def.Actions {
 		av := actionView{Label: a.Label, Op: a.Op, Route: a.Route}
@@ -255,23 +272,38 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 // real screen", not the whole entity up front), so without carrying
 // every other entDef field through as a hidden input at its current
 // value, saving a genuinely partial form would silently drop every field
-// it doesn't display — found the hard way (independent review, opus,
-// on internal/api's form-submit-htmx branch): an entity with a field not
-// on its form lost that field's data on the very first real save.
-func buildHiddenFields(def *form.Definition, ent *entity.Definition, record map[string]any) []hiddenFieldView {
-	shown := make(map[string]bool, len(ent.Fields))
-	for _, s := range def.Sections {
-		if s.Component != form.ComponentFields {
-			continue
-		}
-		for _, ff := range s.Fields {
-			shown[ff.Name] = true
-		}
-	}
-
+// it doesn't display — found the hard way (independent review, opus, on
+// internal/api's form-submit-htmx branch): an entity with a field not on
+// its form lost that field's data on the very first real save.
+//
+// Trade-off worth knowing (flagged by that same review, not fixed here:
+// no optimistic-locking/versioning exists anywhere in this kernel yet to
+// fix it properly): this makes every save submit a full point-in-time
+// snapshot of the whole record, not just the fields a given partial form
+// actually edits. Two users with different partial forms open on the
+// same record, saving around the same time, now race for the *entire*
+// record (last write wins, including fields the loser's form never
+// showed) rather than just the fields both happened to edit. Acceptable
+// for now — no version/lock field exists to detect the conflict even if
+// this function didn't do it this way — but a real gap if concurrent
+// editing of the same record ever becomes a real scenario.
+//
+// rendered is the set of field names that actually produced a visible
+// input this render — not every name merely listed in the Definition.
+// The two differ exactly when a listed field's VisibleIf currently
+// evaluates false: buildFields skips rendering it, so it's absent from
+// rendered too, and correctly still gets a hidden fallback here. Building
+// this set from the Definition's listed names instead (an earlier,
+// incomplete version of this fix did) would leave a conditionally-hidden
+// field neither visible nor preserved — caught by independent review
+// re-verifying the off-form-field fix: the identical silent-data-loss
+// failure mode survives via visible_if unless "shown" means "actually
+// rendered for this record's current data", not "named somewhere in the
+// form".
+func buildHiddenFields(ent *entity.Definition, record map[string]any, rendered map[string]bool) []hiddenFieldView {
 	var out []hiddenFieldView
 	for _, ef := range ent.Fields {
-		if shown[ef.Name] {
+		if rendered[ef.Name] {
 			continue
 		}
 		out = append(out, hiddenFieldView{Name: ef.Name, Value: formatFieldValue(record[ef.Name])})
