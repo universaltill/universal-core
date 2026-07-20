@@ -25,15 +25,34 @@ func (a *Authenticator) Guard(next http.Handler) http.Handler {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sess := a.sessionFromCookie(r)
-		if sess == nil {
+		rc, ok := a.TryContext(r)
+		if !ok {
 			a.redirectToLogin(w, r)
 			return
 		}
-		ctx := httpx.WithRequestContext(r.Context(), httpx.RequestContext{
-			TenantID: sess.TenantID,
-			Actor:    audit.Actor{Type: audit.ActorHuman, ID: sess.Subject},
-		})
-		next.ServeHTTP(w, r.WithContext(ctx))
+		next.ServeHTTP(w, r.WithContext(httpx.WithRequestContext(r.Context(), rc)))
 	})
+}
+
+// TryContext is Guard's own session check exposed as a non-enforcing
+// peek: ok=false (never a redirect, never a response write) whenever
+// login is disabled or no valid session cookie is present, instead of
+// sending the browser to /ui/login. It exists for the public "/" landing
+// page (internal/api/dashboard.go), which wants to show the authenticated
+// dashboard *if* a session already exists but must render something for
+// every visitor, logged in or not — a redirect-happy Guard would bounce
+// an anonymous visitor away from the one page that's supposed to work
+// without a session.
+func (a *Authenticator) TryContext(r *http.Request) (httpx.RequestContext, bool) {
+	if !a.Enabled() {
+		return httpx.RequestContext{}, false
+	}
+	sess := a.sessionFromCookie(r)
+	if sess == nil {
+		return httpx.RequestContext{}, false
+	}
+	return httpx.RequestContext{
+		TenantID: sess.TenantID,
+		Actor:    audit.Actor{Type: audit.ActorHuman, ID: sess.Subject},
+	}, true
 }

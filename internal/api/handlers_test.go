@@ -803,9 +803,12 @@ func TestAPI_Dashboard_OmitsEntityWithoutPublishedForm(t *testing.T) {
 	}
 }
 
-// TestAPI_Dashboard_RequiresAuth confirms the root page is behind the
-// same auth as every other route — not accidentally left open.
-func TestAPI_Dashboard_RequiresAuth(t *testing.T) {
+// TestAPI_Dashboard_AnonymousShowsWelcomePage confirms "/" never returns
+// the raw {"data":null,"error":...} JSON blob every other route does on
+// a 401 — a browser landing on the site with no session gets a real HTML
+// welcome page instead, even on a deployment where dev-auth is enabled
+// but this particular request just didn't carry the headers.
+func TestAPI_Dashboard_AnonymousShowsWelcomePage(t *testing.T) {
 	db := testDB(t)
 	withDevAuthEnabled(t)
 
@@ -816,8 +819,42 @@ func TestAPI_Dashboard_RequiresAuth(t *testing.T) {
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 with no auth headers, got %d", rec.Code)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 with a welcome page, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), `"error"`) {
+		t.Fatalf("expected HTML, not a JSON error body, got:\n%s", rec.Body.String())
+	}
+}
+
+// TestAPI_Dashboard_NoAuthBackendConfigured_ShowsWelcomeNotJSON is the
+// regression test for the exact bug report that motivated renderRoot:
+// on a deployment with neither webauth nor dev-auth configured (the
+// public erp.universaltill.com state before webauth's Terraform is
+// applied), "/" used to hard-401 with a raw JSON error body — a browser
+// visitor should see an explanatory HTML page instead.
+func TestAPI_Dashboard_NoAuthBackendConfigured_ShowsWelcomeNotJSON(t *testing.T) {
+	db := testDB(t)
+	// Deliberately not calling withDevAuthEnabled(t): neither auth
+	// backend is configured, matching the public deployment's actual
+	// state until webauth's Zitadel Terraform is applied.
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := httptest.NewRequest("GET", "/", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 with a welcome page, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, `"error"`) {
+		t.Fatalf("expected HTML, not a JSON error body, got:\n%s", body)
+	}
+	if !strings.Contains(body, "does not have sign-in configured") {
+		t.Fatalf("expected the no-auth-backend explanation, got:\n%s", body)
 	}
 }
 
