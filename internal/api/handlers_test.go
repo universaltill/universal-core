@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -1595,6 +1596,103 @@ func TestAPI_RecordList_ColumnHeaderIsTranslated(t *testing.T) {
 	}
 	if strings.Contains(body, "<th>po_number</th>") {
 		t.Fatalf("expected no raw untranslated \"po_number\" column header, got:\n%s", body)
+	}
+}
+
+// TestAPI_RecordList_PaginatesBeyondPageSize confirms the list page
+// actually bounds its query (listPageSize rows per page, not "every
+// record, unpaginated" — QUEUE.md's flagged gap) and that Prev/Next
+// correctly appear/disappear at the boundaries: page 1 of a two-page set
+// has a Next but no Previous, page 2 has a Previous but no Next, and the
+// records shown are the right slice, not duplicated or dropped.
+func TestAPI_RecordList_PaginatesBeyondPageSize(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	total := listPageSize + 5
+	for i := range total {
+		body := fmt.Appendf(nil, `{"name":"Vendor-%02d"}`, i)
+		createReq := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", body)
+		createRec := httptest.NewRecorder()
+		mux.ServeHTTP(createRec, createReq)
+		if createRec.Code != http.StatusCreated {
+			t.Fatalf("create Vendor-%02d: expected 201, got %d: %s", i, createRec.Code, createRec.Body.String())
+		}
+	}
+
+	page1Req := newRequest("GET", "/records/Vendor", tenantID, "farshid", nil)
+	page1Rec := httptest.NewRecorder()
+	mux.ServeHTTP(page1Rec, page1Req)
+	page1Body := page1Rec.Body.String()
+
+	if got := strings.Count(page1Body, "<tr onclick"); got != listPageSize {
+		t.Fatalf("expected %d rows on page 1, got %d:\n%s", listPageSize, got, page1Body)
+	}
+	if !strings.Contains(page1Body, `href="/records/Vendor?page=2"`) {
+		t.Fatalf("expected a link to page 2 on page 1, got:\n%s", page1Body)
+	}
+	if strings.Contains(page1Body, "Previous") {
+		t.Fatalf("expected no Previous link on page 1, got:\n%s", page1Body)
+	}
+	if !strings.Contains(page1Body, "Page 1 of 2") {
+		t.Fatalf("expected the page label \"Page 1 of 2\", got:\n%s", page1Body)
+	}
+
+	page2Req := newRequest("GET", "/records/Vendor?page=2", tenantID, "farshid", nil)
+	page2Rec := httptest.NewRecorder()
+	mux.ServeHTTP(page2Rec, page2Req)
+	page2Body := page2Rec.Body.String()
+
+	if got := strings.Count(page2Body, "<tr onclick"); got != total-listPageSize {
+		t.Fatalf("expected %d rows on page 2, got %d:\n%s", total-listPageSize, got, page2Body)
+	}
+	if !strings.Contains(page2Body, `href="/records/Vendor?page=1"`) {
+		t.Fatalf("expected a link back to page 1 on page 2, got:\n%s", page2Body)
+	}
+	if strings.Contains(page2Body, ">Next<") {
+		t.Fatalf("expected no Next link on the last page, got:\n%s", page2Body)
+	}
+
+	// A page number past the end clamps to the last page rather than
+	// showing an empty table a user could reach by editing the URL.
+	pastEndReq := newRequest("GET", "/records/Vendor?page=99", tenantID, "farshid", nil)
+	pastEndRec := httptest.NewRecorder()
+	mux.ServeHTTP(pastEndRec, pastEndReq)
+	if got := strings.Count(pastEndRec.Body.String(), "<tr onclick"); got != total-listPageSize {
+		t.Fatalf("expected page=99 to clamp to the last page (%d rows), got %d", total-listPageSize, got)
+	}
+}
+
+// TestAPI_RecordList_NoPagerWhenSinglePage confirms the pager itself is
+// absent (not just disabled) when everything fits on one page — no
+// "Page 1 of 1" noise for the common case.
+func TestAPI_RecordList_NoPagerWhenSinglePage(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	createReq := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{"name":"Only Vendor"}`))
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", createRec.Code, createRec.Body.String())
+	}
+
+	req := newRequest("GET", "/records/Vendor", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if strings.Contains(rec.Body.String(), "uc-list-pager") {
+		t.Fatalf("expected no pager for a single page of results, got:\n%s", rec.Body.String())
 	}
 }
 

@@ -118,6 +118,61 @@ func (r *RecordRepo) List(ctx context.Context, tenantID, entityType string) ([]R
 	return out, rows.Err()
 }
 
+// CountByEntityType returns how many non-deleted records of entityType
+// tenantID has — the total a pager needs to compute page count, kept as
+// its own query rather than folded into ListPage via a window function
+// (count(*) OVER()) so the common "page beyond the last one" case (an
+// empty LIMIT/OFFSET result set) doesn't lose the total along with the
+// rows; two simple queries over one query with an edge case.
+func (r *RecordRepo) CountByEntityType(ctx context.Context, tenantID, entityType string) (int, error) {
+	var n int
+	err := r.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM records WHERE tenant_id = $1 AND entity_type = $2 AND deleted_at IS NULL`,
+		tenantID, entityType,
+	).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count records: %w", err)
+	}
+	return n, nil
+}
+
+// ListPage returns one page of tenantID's entityType records — the same
+// ordering as List (created_at, with id as a tiebreaker so pagination
+// stays deterministic even when two records share a created_at). Kept
+// distinct from List rather than adding limit/offset params there: every
+// existing List caller (the JSON API, reference-option dropdowns,
+// master-detail child loading) genuinely wants every matching row, not
+// a page of them — this is additive for the one caller that doesn't
+// (the HTML list page).
+func (r *RecordRepo) ListPage(ctx context.Context, tenantID, entityType string, limit, offset int) ([]Record, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT id, data FROM records
+		 WHERE tenant_id = $1 AND entity_type = $2 AND deleted_at IS NULL
+		 ORDER BY created_at, id
+		 LIMIT $3 OFFSET $4`,
+		tenantID, entityType, limit, offset,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list records page: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Record
+	for rows.Next() {
+		var id string
+		var raw []byte
+		if err := rows.Scan(&id, &raw); err != nil {
+			return nil, fmt.Errorf("scan record: %w", err)
+		}
+		var data map[string]any
+		if err := json.Unmarshal(raw, &data); err != nil {
+			return nil, fmt.Errorf("unmarshal record data: %w", err)
+		}
+		out = append(out, Record{ID: id, TenantID: tenantID, EntityType: entityType, Data: data})
+	}
+	return out, rows.Err()
+}
+
 // ListByField returns every non-deleted record of entityType whose data
 // has fieldName == value — the query a master-detail section needs to
 // find its child rows (e.g. every POLine whose purchase_order_id matches
