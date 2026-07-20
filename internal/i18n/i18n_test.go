@@ -53,6 +53,37 @@ func TestT_ReturnsKeyWhenNothingMatches(t *testing.T) {
 	}
 }
 
+// TestLocales_HaveIdenticalKeySets guards against exactly the kind of
+// drift these hand-maintained JSON files are prone to: a key added to
+// en.json (or fixed/renamed) while updating the other three locales gets
+// forgotten. A missing key doesn't break anything visibly — T just falls
+// back through the chain to en, or to the literal key string — which is
+// precisely why it needs an explicit test rather than relying on someone
+// noticing a stray English string in an Arabic screenshot.
+func TestLocales_HaveIdenticalKeySets(t *testing.T) {
+	c, err := Load("en")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	reference := "en"
+	want := c.messages[reference]
+	for locale, got := range c.messages {
+		if locale == reference {
+			continue
+		}
+		for key := range want {
+			if _, ok := got[key]; !ok {
+				t.Errorf("%s.json is missing key %q (present in %s.json)", locale, key, reference)
+			}
+		}
+		for key := range got {
+			if _, ok := want[key]; !ok {
+				t.Errorf("%s.json has key %q not present in %s.json", locale, key, reference)
+			}
+		}
+	}
+}
+
 func TestAvailable_ListsBothLocales(t *testing.T) {
 	c, err := Load("en")
 	if err != nil {
