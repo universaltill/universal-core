@@ -55,7 +55,7 @@ a:hover {
   color: var(--uc-nav-text);
   font-weight: 700;
   font-size: 1.05rem;
-  margin-right: 0.5rem;
+  margin-inline-end: 0.5rem;
 }
 
 .uc-nav-brand:hover {
@@ -74,36 +74,161 @@ a:hover {
   text-decoration: none;
 }
 
+/* Pushes the language switcher to the far end of the nav — the far
+   *end*, not "right": in an RTL document (dir="rtl", see layout.go's
+   shellTmpl) flex's main-axis direction itself flips, so this lands at
+   the visual left with no extra rule needed. */
+.uc-nav-spacer {
+  flex: 1;
+}
+
+.uc-nav-lang {
+  color: var(--uc-nav-text);
+  opacity: 0.6;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.uc-nav-lang:hover {
+  opacity: 0.9;
+  text-decoration: none;
+}
+
+.uc-nav-lang-active {
+  opacity: 1;
+  font-weight: 700;
+  text-decoration: underline;
+}
+
 .uc-container {
   max-width: 72rem;
   margin: 0 auto;
   padding: 2rem 1.5rem;
 }
 
-/* Dashboard / welcome module tiles */
-.uc-modules {
-  list-style: none;
-  margin: 1.5rem 0 0;
-  padding: 0;
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr));
-  gap: 0.75rem;
+/* Dashboard hub-and-spoke module switcher (internal/api/dashboard.go's
+   hubLayout computes node positions server-side; sizes here must match
+   hubNodeSizePx/hubCenterSizePx in that file). */
+.uc-hub-wrap {
+  overflow-x: auto;
+  margin-top: 1.5rem;
 }
 
-.uc-module-card {
+.uc-hub {
+  position: relative;
+  margin: 0 auto;
+}
+
+.uc-hub-lines {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 0;
+}
+
+.uc-hub-lines line {
+  stroke: var(--uc-border);
+  stroke-width: 2;
+}
+
+.uc-hub-center {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 0.5rem;
+  background: var(--uc-nav-bg);
+  color: #fff;
+  font-weight: 700;
+  font-size: 1.15rem;
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.18);
+  z-index: 2;
+}
+
+.uc-hub-node {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  width: 140px;
+  height: 140px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 0.6rem;
+  color: #fff;
+  font-weight: 600;
+  font-size: 0.95rem;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
+  z-index: 1;
+  transition: transform 0.12s ease;
+}
+
+.uc-hub-node:hover {
+  transform: translate(-50%, -50%) scale(1.06);
+  text-decoration: none;
+}
+
+.uc-hub-node-0 { background: #e8590c; }
+.uc-hub-node-1 { background: #d6336c; }
+.uc-hub-node-2 { background: #ae3ec9; }
+.uc-hub-node-3 { background: #7048e8; }
+.uc-hub-node-4 { background: #3b5bdb; }
+.uc-hub-node-5 { background: #1098ad; }
+.uc-hub-node-6 { background: #0ca678; }
+.uc-hub-node-7 { background: #66a80f; }
+.uc-hub-node-8 { background: #f08c00; }
+.uc-hub-node-9 { background: #e8590c; }
+
+/* A module's own searchable menu (internal/api/modulemenu.go) */
+.uc-menu-search {
+  width: 100%;
+  max-width: 24rem;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--uc-border);
+  border-radius: 4px;
+  font-size: 0.95rem;
+  margin: 0.75rem 0 1.25rem;
+}
+
+.uc-menu-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.uc-menu-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.75rem 1rem;
   border: 1px solid var(--uc-border);
   border-radius: 6px;
-  padding: 1rem;
   background: #fff;
 }
 
-.uc-module-card strong {
-  display: block;
-  font-size: 1rem;
-  margin-bottom: 0.4rem;
+.uc-menu-item-link {
+  font-weight: 600;
 }
 
-.uc-module-card .uc-module-actions {
+.uc-menu-item-code {
+  color: var(--uc-muted);
+  font-weight: 400;
+  font-size: 0.8rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* Legacy dashboard module tiles — still used by the module menu's
+   New/Import action row. */
+.uc-module-actions {
   color: var(--uc-muted);
   font-size: 0.85rem;
 }
@@ -129,7 +254,7 @@ table.uc-table {
 
 table.uc-table th,
 table.uc-table td {
-  text-align: left;
+  text-align: start;
   padding: 0.55rem 0.85rem;
   border-bottom: 1px solid var(--uc-border);
   font-size: 0.92rem;

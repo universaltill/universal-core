@@ -21,6 +21,7 @@ func Party() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "Party",
 		Version:    1,
+		Module:     "foundation",
 		Fields: []entity.Field{
 			{Name: "party_type", Type: entity.FieldEnum, Required: true,
 				EnumValues: []string{"person", "organization"}},
@@ -40,6 +41,7 @@ func PartyRole() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "PartyRole",
 		Version:    1,
+		Module:     "foundation",
 		Fields: []entity.Field{
 			{Name: "party_id", Type: entity.FieldReference, Required: true, Target: "Party"},
 			{Name: "role_type", Type: entity.FieldEnum, Required: true,
@@ -55,6 +57,7 @@ func PartyRelationship() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "PartyRelationship",
 		Version:    1,
+		Module:     "foundation",
 		Fields: []entity.Field{
 			{Name: "party_id_from", Type: entity.FieldReference, Required: true, Target: "Party"},
 			{Name: "party_id_to", Type: entity.FieldReference, Required: true, Target: "Party"},
@@ -72,6 +75,7 @@ func Address() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "Address",
 		Version:    1,
+		Module:     "foundation",
 		Fields: []entity.Field{
 			{Name: "party_id", Type: entity.FieldReference, Required: true, Target: "Party"},
 			{Name: "address_type", Type: entity.FieldEnum, Required: true,
@@ -95,6 +99,7 @@ func ContactMechanism() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "ContactMechanism",
 		Version:    1,
+		Module:     "foundation",
 		Fields: []entity.Field{
 			{Name: "party_id", Type: entity.FieldReference, Required: true, Target: "Party"},
 			{Name: "mechanism_type", Type: entity.FieldEnum, Required: true,
@@ -125,6 +130,7 @@ func Attachment() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "Attachment",
 		Version:    1,
+		Module:     "foundation",
 		Fields: []entity.Field{
 			{Name: "entity_type", Type: entity.FieldString, Required: true},
 			{Name: "record_id", Type: entity.FieldString, Required: true},
@@ -145,6 +151,7 @@ func UnitOfMeasure() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "UnitOfMeasure",
 		Version:    1,
+		Module:     "foundation",
 		Fields: []entity.Field{
 			{Name: "code", Type: entity.FieldString, Required: true},
 			{Name: "name", Type: entity.FieldString, Required: true},
@@ -166,6 +173,7 @@ func UomConversion() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "UomConversion",
 		Version:    1,
+		Module:     "foundation",
 		Fields: []entity.Field{
 			{Name: "from_uom_id", Type: entity.FieldReference, Required: true, Target: "UnitOfMeasure"},
 			{Name: "to_uom_id", Type: entity.FieldReference, Required: true, Target: "UnitOfMeasure"},
@@ -180,6 +188,7 @@ func Currency() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "Currency",
 		Version:    1,
+		Module:     "foundation",
 		Fields: []entity.Field{
 			{Name: "code", Type: entity.FieldString, Required: true}, // ISO 4217, e.g. "QAR", "USD"
 			{Name: "name", Type: entity.FieldString, Required: true},
@@ -202,6 +211,7 @@ func ExchangeRate() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "ExchangeRate",
 		Version:    1,
+		Module:     "foundation",
 		Fields: []entity.Field{
 			{Name: "from_currency_id", Type: entity.FieldReference, Required: true, Target: "Currency"},
 			{Name: "to_currency_id", Type: entity.FieldReference, Required: true, Target: "Currency"},
