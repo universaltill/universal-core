@@ -7,6 +7,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -51,6 +52,11 @@ func New(db *sql.DB, catalog *i18n.Catalog) *Handler {
 // insecure stopgap — see that package's doc comment; main.go always
 // registers Routes, relying on DevAuth itself to fail closed).
 func (h *Handler) Routes(mux *http.ServeMux) {
+	// Unauthenticated: a static asset with no tenant-specific content —
+	// gating it behind DevAuth would only break the page that needs it
+	// (a 401 for the very script tag meant to make the 401 page itself
+	// interactive) before auth can even run.
+	mux.HandleFunc("GET /static/htmx.min.js", serveHTMX)
 	mux.Handle("GET /api/records/{entityType}", httpx.DevAuth(http.HandlerFunc(h.listRecords)))
 	mux.Handle("POST /api/records/{entityType}", httpx.DevAuth(http.HandlerFunc(h.createRecord)))
 	mux.Handle("GET /api/records/{entityType}/{id}", httpx.DevAuth(http.HandlerFunc(h.getRecord)))
@@ -303,17 +309,24 @@ func (h *Handler) renderForm(w http.ResponseWriter, r *http.Request, id string) 
 		renderData.Children = children
 	}
 
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := h.renderer.Render(w, formDef, entDef, renderData, locale); err != nil {
+	// Rendered into a buffer first, not straight to w: this is a
+	// top-level page navigation (GET /forms/{entityType}/new|{id}), not
+	// an htmx-swap response, so it needs the real <html><head> shell
+	// that actually loads htmx.js (see layout.go's doc comment) — a
+	// browser navigating here directly gets nothing but inert markup
+	// otherwise, exactly the gap internal/e2e's first real-browser test
+	// exists to catch.
+	var buf bytes.Buffer
+	if err := h.renderer.Render(&buf, formDef, entDef, renderData, locale); err != nil {
 		// Rendering only fails on a schema-drift/malformed-expression bug
 		// in the Definitions themselves (formrender's own "fail loud"
-		// contract), never on attacker-controlled record data — but by
-		// the time headers are already written for a streaming response
-		// this can't cleanly become a different status code either way,
-		// so it's logged server-side with the real detail and the client
-		// just sees a generic failure, same as every other 500 here.
+		// contract), never on attacker-controlled record data.
 		log.Printf("api: render %s form (id=%q): %v", entityType, id, err)
 		httpx.WriteError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if err := renderShell(w, buf.String()); err != nil {
+		log.Printf("api: render %s form shell (id=%q): %v", entityType, id, err)
 	}
 }
 
