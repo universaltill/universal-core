@@ -83,10 +83,13 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	// "/{$}" — the Go 1.22+ ServeMux exact-match wildcard — not plain
 	// "/", which would act as a catch-all subtree match and silently
 	// swallow every unmatched path into the dashboard instead of a real
-	// 404. Until this route existed at all, "/" 404'd outright: a real
-	// user with a real, working login had nowhere to land without
-	// already knowing a specific /forms/{entityType}/... URL by heart.
-	mux.Handle("GET /{$}", auth(h.renderDashboard))
+	// 404. Deliberately NOT wrapped in auth(): a hard 401 here (the JSON
+	// error body auth() produces) is right for an API route but wrong for
+	// the page a browser actually lands on — renderRoot does its own
+	// optional session check and renders a real welcome page for a
+	// visitor with no session at all, including on a deployment where no
+	// auth backend is configured yet.
+	mux.HandleFunc("GET /{$}", h.renderRoot)
 	mux.Handle("GET /api/records/{entityType}", auth(h.listRecords))
 	mux.Handle("POST /api/records/{entityType}", auth(h.createRecord))
 	mux.Handle("GET /api/records/{entityType}/{id}", auth(h.getRecord))
