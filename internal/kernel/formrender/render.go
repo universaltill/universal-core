@@ -47,6 +47,16 @@ type Data struct {
 	RecordID string // empty for a new/unsaved record
 	Record   map[string]any
 	Children map[string][]map[string]any
+	// ReferenceOptions holds every FieldReference field's picker options,
+	// keyed by field name (not target entity type — two fields could
+	// reference the same target with different filtering someday, the
+	// same forward-looking reasoning Children's own doc comment gives
+	// for keying by Target today). A field with no entry here (e.g. the
+	// target entity has no records yet, or its lookup failed and was
+	// skipped rather than failing the whole render — see
+	// internal/api's loadReferenceOptions) simply renders an empty
+	// dropdown, not an error.
+	ReferenceOptions map[string][]ReferenceOption
 }
 
 // Render writes the HTML/HTMX form for def against ent's field shapes and
@@ -130,12 +140,30 @@ type fieldView struct {
 	Required bool
 	Value    any
 	Checked  bool         // FieldBool only
-	Options  []optionView // FieldEnum only
+	Options  []optionView // FieldEnum and FieldReference only
 }
 
+// optionView is one <option> — Label and Value differ for
+// FieldReference (Value is the referenced record's id, Label is its
+// display text, built by ReferenceOption below); for FieldEnum they're
+// always the same (the enum value has no separate display text).
 type optionView struct {
 	Value    string
+	Label    string
 	Selected bool
+}
+
+// ReferenceOption is one selectable target record for a FieldReference
+// field — ID is what's actually stored (the referenced record's id),
+// Label is what the picker shows a human. Built by the caller (see
+// internal/api's loadReferenceOptions) since fetching the target
+// entity's records needs the registry/crud engine, which this package
+// deliberately has no access to (Render only ever works with data
+// already handed to it — same separation Data.Children already keeps
+// for master-detail rows).
+type ReferenceOption struct {
+	ID    string
+	Label string
 }
 
 type childRowView struct {
@@ -220,7 +248,7 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 
 		switch s.Component {
 		case form.ComponentFields:
-			fields, err := buildFields(s, ent, effective)
+			fields, err := buildFields(s, ent, effective, data.ReferenceOptions)
 			if err != nil {
 				return viewModel{}, fmt.Errorf("section %q: %w", s.Title, err)
 			}
@@ -339,7 +367,7 @@ func FormatFieldValue(v any) string {
 	}
 }
 
-func buildFields(s form.Section, ent *entity.Definition, record map[string]any) ([]fieldView, error) {
+func buildFields(s form.Section, ent *entity.Definition, record map[string]any, referenceOptions map[string][]ReferenceOption) ([]fieldView, error) {
 	var out []fieldView
 	for _, ff := range s.Fields {
 		visible, err := evalVisibleIf(ff.VisibleIf, record)
@@ -374,7 +402,21 @@ func buildFields(s form.Section, ent *entity.Definition, record map[string]any) 
 		case entity.FieldEnum:
 			current, _ := record[ff.Name].(string)
 			for _, ev := range ef.EnumValues {
-				fv.Options = append(fv.Options, optionView{Value: ev, Selected: ev == current})
+				fv.Options = append(fv.Options, optionView{Value: ev, Label: ev, Selected: ev == current})
+			}
+		case entity.FieldReference:
+			current, _ := record[ff.Name].(string)
+			if !ef.Required {
+				// An unset reference must stay a real, selectable choice
+				// — without this, the browser's own <select> default
+				// (whatever option happens to render first) would look
+				// selected on an untouched new-record form even though
+				// no value was actually chosen, and submitting it would
+				// silently write that first option's id.
+				fv.Options = append(fv.Options, optionView{Value: "", Label: "", Selected: current == ""})
+			}
+			for _, opt := range referenceOptions[ff.Name] {
+				fv.Options = append(fv.Options, optionView{Value: opt.ID, Label: opt.Label, Selected: opt.ID == current})
 			}
 		}
 
@@ -416,8 +458,8 @@ const tmplSrc = `<form class="uc-form" data-entity-type="{{.EntityType}}" hx-pos
 <div class="uc-field">
 <label for="{{.Name}}">{{.Label}}{{if .Required}}{{$.RequiredSuffix}}{{end}}</label>
 {{if eq .Type "bool"}}<input type="hidden" name="{{.Name}}" value="false"><input type="checkbox" id="{{.Name}}" name="{{.Name}}" value="true" {{if .Checked}}checked{{end}}{{if .Required}} required{{end}}>
-{{else if eq .Type "enum"}}<select id="{{.Name}}" name="{{.Name}}"{{if .Required}} required{{end}}>
-{{range .Options}}<option value="{{.Value}}" {{if .Selected}}selected{{end}}>{{.Value}}</option>{{end}}
+{{else if or (eq .Type "enum") (eq .Type "reference")}}<select id="{{.Name}}" name="{{.Name}}"{{if .Required}} required{{end}}>
+{{range .Options}}<option value="{{.Value}}" {{if .Selected}}selected{{end}}>{{.Label}}</option>{{end}}
 </select>
 {{else if eq .Type "date"}}<input type="date" id="{{.Name}}" name="{{.Name}}" value="{{.Value}}"{{if .Required}} required{{end}}>
 {{else if eq .Type "number"}}<input type="number" id="{{.Name}}" name="{{.Name}}" value="{{.Value}}"{{if .Required}} required{{end}}>
