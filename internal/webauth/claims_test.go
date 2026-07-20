@@ -17,6 +17,51 @@ func TestOrgIDFromClaims(t *testing.T) {
 	}
 }
 
+// TestOrgIDFromClaims_MultipleDistinctOrgsFailsClosed is the regression
+// test for a real bug independent review found: the original version
+// returned whichever org id happened to come out of Go's randomized map
+// iteration first, so a user granted tenant_member in two different
+// customer orgs (a shared accountant, say) could silently land in a
+// different tenant on every other sign-in. Run several times — a flaky
+// pass here would mean it's still picking one at random rather than
+// genuinely refusing to.
+func TestOrgIDFromClaims_MultipleDistinctOrgsFailsClosed(t *testing.T) {
+	claims := map[string]any{
+		zitadelProjectRolesClaim: map[string]any{
+			"tenant_member": map[string]any{
+				"org-a": "acme.id.universaltill.com",
+				"org-b": "beta.id.universaltill.com",
+			},
+		},
+	}
+	for range 20 {
+		if _, ok := orgIDFromClaims(claims); ok {
+			t.Fatal("expected ok=false when more than one distinct org is asserted, got ok=true")
+		}
+	}
+}
+
+// TestOrgIDFromClaims_SameOrgUnderTwoRolesStillResolves confirms the
+// fix above doesn't over-correct: a user with two DIFFERENT roles that
+// both happen to name the SAME org (not a real scenario yet — this
+// package has only one role — but the claim shape allows it) must
+// still resolve, since there's only one distinct org, not an ambiguity.
+func TestOrgIDFromClaims_SameOrgUnderTwoRolesStillResolves(t *testing.T) {
+	claims := map[string]any{
+		zitadelProjectRolesClaim: map[string]any{
+			"tenant_member": map[string]any{"org-a": "acme.id.universaltill.com"},
+			"tenant_admin":  map[string]any{"org-a": "acme.id.universaltill.com"},
+		},
+	}
+	orgID, ok := orgIDFromClaims(claims)
+	if !ok {
+		t.Fatal("expected ok=true when every asserted role points at the same single org")
+	}
+	if orgID != "org-a" {
+		t.Fatalf("got %q, want org-a", orgID)
+	}
+}
+
 func TestOrgIDFromClaims_MissingClaim(t *testing.T) {
 	if _, ok := orgIDFromClaims(map[string]any{}); ok {
 		t.Fatal("expected ok=false when the project-roles claim is absent (no role grants)")
