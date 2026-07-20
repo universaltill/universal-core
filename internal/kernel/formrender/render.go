@@ -73,7 +73,16 @@ type viewModel struct {
 	// URL-context attribute html/template auto-escapes for that purpose
 	// (only attribute-context escaping applies), so a raw RecordID could
 	// otherwise inject query structure into the form's own submit target.
-	PostHref          string
+	PostHref string
+	// HiddenFields carries every entDef field the form doesn't show in
+	// any fields section, at its current stored value — see this file's
+	// package-level note above buildHiddenFields for why this exists:
+	// without it, a deliberately partial form (foundation.go explicitly
+	// encourages building one as each field is actually needed, not the
+	// whole entity at once) would silently wipe every field it doesn't
+	// show on every save, since the record-write path is a full
+	// replacement, not a merge.
+	HiddenFields      []hiddenFieldView
 	Sections          []sectionView
 	Actions           []actionView
 	RequiredSuffix    string
@@ -105,6 +114,13 @@ type sectionView struct {
 	// attributes the way it does href/src).
 	AddHref         string
 	RelatedListHref string
+}
+
+// hiddenFieldView is one entDef field the form doesn't visibly show —
+// see viewModel.HiddenFields.
+type hiddenFieldView struct {
+	Name  string
+	Value string
 }
 
 type fieldView struct {
@@ -185,6 +201,20 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 		effective[s.RollUpTarget] = total
 	}
 
+	// rendered tracks every field name that actually produced a visible
+	// input, across every ComponentFields section — not every field name
+	// merely *listed* in the Definition. A field the Definition lists but
+	// whose VisibleIf currently evaluates false (buildFields skips it,
+	// below) is NOT in this set, and correctly falls through to
+	// buildHiddenFields as if it were never on the form at all: a
+	// conditionally-hidden field's value needs the exact same
+	// preservation an always-off-form field does, or it's silently wiped
+	// on save the moment its condition happens to be false (caught by
+	// independent review re-verifying the off-form-field fix: the same
+	// failure mode survives via visible_if if this set is built from the
+	// Definition's listed fields instead of what actually rendered).
+	rendered := make(map[string]bool, len(ent.Fields))
+
 	for _, s := range def.Sections {
 		sv := sectionView{Title: s.Title, Component: s.Component, Target: s.Target}
 
@@ -195,6 +225,9 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 				return viewModel{}, fmt.Errorf("section %q: %w", s.Title, err)
 			}
 			sv.Fields = fields
+			for _, fv := range fields {
+				rendered[fv.Name] = true
+			}
 
 		case form.ComponentMasterDetail:
 			sv.Children = buildChildRows(data.Children[s.Target])
@@ -213,6 +246,7 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 
 		vm.Sections = append(vm.Sections, sv)
 	}
+	vm.HiddenFields = buildHiddenFields(ent, effective, rendered)
 
 	for _, a := range def.Actions {
 		av := actionView{Label: a.Label, Op: a.Op, Route: a.Route}
@@ -228,6 +262,81 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 	}
 
 	return vm, nil
+}
+
+// buildHiddenFields is the fix for a real data-loss bug: the record-write
+// path (internal/data.RecordRepo.UpdateTx) is a full replacement, not a
+// merge — SET data = $1, not a per-field patch. A form only shows the
+// fields it was built to show (foundation.go explicitly encourages
+// building a form field-by-field, only "as each is actually needed by a
+// real screen", not the whole entity up front), so without carrying
+// every other entDef field through as a hidden input at its current
+// value, saving a genuinely partial form would silently drop every field
+// it doesn't display — found the hard way (independent review, opus, on
+// internal/api's form-submit-htmx branch): an entity with a field not on
+// its form lost that field's data on the very first real save.
+//
+// Trade-off worth knowing (flagged by that same review, not fixed here:
+// no optimistic-locking/versioning exists anywhere in this kernel yet to
+// fix it properly): this makes every save submit a full point-in-time
+// snapshot of the whole record, not just the fields a given partial form
+// actually edits. Two users with different partial forms open on the
+// same record, saving around the same time, now race for the *entire*
+// record (last write wins, including fields the loser's form never
+// showed) rather than just the fields both happened to edit. Acceptable
+// for now — no version/lock field exists to detect the conflict even if
+// this function didn't do it this way — but a real gap if concurrent
+// editing of the same record ever becomes a real scenario.
+//
+// rendered is the set of field names that actually produced a visible
+// input this render — not every name merely listed in the Definition.
+// The two differ exactly when a listed field's VisibleIf currently
+// evaluates false: buildFields skips rendering it, so it's absent from
+// rendered too, and correctly still gets a hidden fallback here. Building
+// this set from the Definition's listed names instead (an earlier,
+// incomplete version of this fix did) would leave a conditionally-hidden
+// field neither visible nor preserved — caught by independent review
+// re-verifying the off-form-field fix: the identical silent-data-loss
+// failure mode survives via visible_if unless "shown" means "actually
+// rendered for this record's current data", not "named somewhere in the
+// form".
+func buildHiddenFields(ent *entity.Definition, record map[string]any, rendered map[string]bool) []hiddenFieldView {
+	var out []hiddenFieldView
+	for _, ef := range ent.Fields {
+		if rendered[ef.Name] {
+			continue
+		}
+		out = append(out, hiddenFieldView{Name: ef.Name, Value: formatFieldValue(record[ef.Name])})
+	}
+	return out
+}
+
+// formatFieldValue renders a record field's stored Go value (whatever
+// entity.ValidateRecord accepted — string, float64, bool, or nil for
+// "not set") as the plain text an HTML attribute/hidden input carries,
+// and internal/api.parseRecordFields's csvimport.Coerce round-trips back
+// into the same Go type on the next submit. A nil/absent value becomes
+// "" (matching csvimport's own "empty means absent" convention on the
+// way back in), not the string "<nil>" text/template's default
+// stringification would otherwise produce.
+func formatFieldValue(v any) string {
+	switch val := v.(type) {
+	case nil:
+		return ""
+	case float64:
+		// Matches rollup.go's own float formatting — avoids
+		// strconv/fmt's default switch to scientific notation for large
+		// or precise values, which csvimport.Coerce's strconv.ParseFloat
+		// would round-trip correctly but is worth staying consistent
+		// with anyway.
+		return strconv.FormatFloat(val, 'f', -1, 64)
+	case bool:
+		return strconv.FormatBool(val)
+	case string:
+		return val
+	default:
+		return fmt.Sprint(val)
+	}
 }
 
 func buildFields(s form.Section, ent *entity.Definition, record map[string]any) ([]fieldView, error) {
@@ -251,20 +360,12 @@ func buildFields(s form.Section, ent *entity.Definition, record map[string]any) 
 			label = ff.Name
 		}
 
-		value := record[ff.Name]
-		if n, ok := value.(float64); ok {
-			// Format explicitly (matching rollup.go's display format)
-			// rather than relying on text/template's default float
-			// printing, which can switch to scientific notation.
-			value = strconv.FormatFloat(n, 'f', -1, 64)
-		}
-
 		fv := fieldView{
 			Name:     ff.Name,
 			Label:    label,
 			Type:     ef.Type,
 			Required: ef.Required,
-			Value:    value,
+			Value:    formatFieldValue(record[ff.Name]),
 		}
 
 		switch ef.Type {
@@ -305,6 +406,8 @@ func buildChildRows(children []map[string]any) []childRowView {
 }
 
 const tmplSrc = `<form class="uc-form" data-entity-type="{{.EntityType}}" hx-post="{{.PostHref}}" hx-target="this" hx-swap="outerHTML">
+{{range .HiddenFields}}<input type="hidden" name="{{.Name}}" value="{{.Value}}">
+{{end}}
 {{range .Sections}}
 <section class="uc-section" data-component="{{.Component}}">
 <h2>{{.Title}}</h2>
@@ -312,7 +415,7 @@ const tmplSrc = `<form class="uc-form" data-entity-type="{{.EntityType}}" hx-pos
 {{range .Fields}}
 <div class="uc-field">
 <label for="{{.Name}}">{{.Label}}{{if .Required}}{{$.RequiredSuffix}}{{end}}</label>
-{{if eq .Type "bool"}}<input type="checkbox" id="{{.Name}}" name="{{.Name}}" {{if .Checked}}checked{{end}}{{if .Required}} required{{end}}>
+{{if eq .Type "bool"}}<input type="hidden" name="{{.Name}}" value="false"><input type="checkbox" id="{{.Name}}" name="{{.Name}}" value="true" {{if .Checked}}checked{{end}}{{if .Required}} required{{end}}>
 {{else if eq .Type "enum"}}<select id="{{.Name}}" name="{{.Name}}"{{if .Required}} required{{end}}>
 {{range .Options}}<option value="{{.Value}}" {{if .Selected}}selected{{end}}>{{.Value}}</option>{{end}}
 </select>

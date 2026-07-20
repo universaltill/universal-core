@@ -207,7 +207,7 @@ func buildRowData(headers, row []string, def *entity.Definition, mapping ColumnM
 			continue // empty cell means absent, not a zero value
 		}
 		ef, _ := def.FieldByName(fieldName) // present: guaranteed by ValidateMapping
-		v, err := coerce(ef.Type, raw)
+		v, err := Coerce(ef.Type, raw)
 		if err != nil {
 			return nil, fmt.Errorf("field %q: %w", fieldName, err)
 		}
@@ -225,13 +225,17 @@ func columnIndex(headers []string, name string) int {
 	return -1
 }
 
-// coerce converts a raw CSV cell — always a string — into the Go type
-// entity.ValidateRecord expects for t (see entity/validate.go:
+// Coerce converts a raw string value — a CSV cell, or a
+// application/x-www-form-urlencoded form field (internal/api's
+// createRecord/updateRecord reuse this directly for that, rather than a
+// second hand-copy — both are "a raw string that arrived over HTTP, needs
+// entity.ValidateRecord's expected Go type" with identical rules) — into
+// the Go type entity.ValidateRecord expects for t (see entity/validate.go:
 // FieldNumber needs float64/int/int64, FieldBool needs an actual bool;
 // everything else is validated as a plain string already). Without this,
-// every non-string field would fail validation on any CSV import, since a
-// CSV cell is never anything but text.
-func coerce(t entity.FieldType, raw string) (any, error) {
+// every non-string field would fail validation on any CSV import or HTML
+// form submission, since neither ever carries anything but text.
+func Coerce(t entity.FieldType, raw string) (any, error) {
 	switch t {
 	case entity.FieldNumber:
 		n, err := strconv.ParseFloat(raw, 64)
