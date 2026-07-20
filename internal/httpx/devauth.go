@@ -83,24 +83,44 @@ func DevAuth(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if !DevAuthEnabled() {
-			WriteError(w, http.StatusUnauthorized, "no auth backend configured")
-			return
-		}
-		tenantID := strings.TrimSpace(r.Header.Get("X-Tenant-ID"))
-		actorID := strings.TrimSpace(r.Header.Get("X-Actor-ID"))
-		if tenantID == "" || actorID == "" {
+		rc, ok := TryDevAuth(r)
+		if !ok {
+			if !DevAuthEnabled() {
+				WriteError(w, http.StatusUnauthorized, "no auth backend configured")
+				return
+			}
+			tenantID := strings.TrimSpace(r.Header.Get("X-Tenant-ID"))
+			if tenantID != "" && !tenantIDPattern.MatchString(tenantID) {
+				WriteError(w, http.StatusUnauthorized, "X-Tenant-ID is not a valid tenant id")
+				return
+			}
 			WriteError(w, http.StatusUnauthorized, "X-Tenant-ID and X-Actor-ID headers are required (insecure dev-only auth stopgap)")
 			return
 		}
-		if !tenantIDPattern.MatchString(tenantID) {
-			WriteError(w, http.StatusUnauthorized, "X-Tenant-ID is not a valid tenant id")
-			return
-		}
-		ctx := WithRequestContext(r.Context(), RequestContext{
-			TenantID: tenantID,
-			Actor:    audit.Actor{Type: audit.ActorHuman, ID: actorID},
-		})
-		next.ServeHTTP(w, r.WithContext(ctx))
+		next.ServeHTTP(w, r.WithContext(WithRequestContext(r.Context(), rc)))
 	})
+}
+
+// TryDevAuth is DevAuth's own header check exposed as a non-enforcing
+// peek: it returns ok=false (never writes a response) whenever
+// INSECURE_DEV_AUTH isn't set or the headers are missing/malformed,
+// instead of 401ing. It exists for callers like the public "/" landing
+// page (internal/api/dashboard.go) that want to show an authenticated
+// view *if* a session already exists — via either DevAuth's headers or
+// webauth's cookie — but must never demand one to render at all. Trust
+// model is identical to DevAuth: still gated by DevAuthEnabled(), still
+// trusts the headers verbatim, still not a security boundary.
+func TryDevAuth(r *http.Request) (RequestContext, bool) {
+	if !DevAuthEnabled() {
+		return RequestContext{}, false
+	}
+	tenantID := strings.TrimSpace(r.Header.Get("X-Tenant-ID"))
+	actorID := strings.TrimSpace(r.Header.Get("X-Actor-ID"))
+	if tenantID == "" || actorID == "" || !tenantIDPattern.MatchString(tenantID) {
+		return RequestContext{}, false
+	}
+	return RequestContext{
+		TenantID: tenantID,
+		Actor:    audit.Actor{Type: audit.ActorHuman, ID: actorID},
+	}, true
 }
