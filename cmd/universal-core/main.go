@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,7 +22,39 @@ import (
 	"github.com/universaltill/universal-core/internal/httpx"
 	"github.com/universaltill/universal-core/internal/i18n"
 	"github.com/universaltill/universal-core/internal/webauth"
+	"github.com/universaltill/universal-core/internal/worker"
 )
+
+// workerConfigFromEnv builds a worker.Config from WORKFLOW_* environment
+// variables, falling back to worker.Config's own defaults (loud on a
+// malformed value, same pattern as webauthConfigFromEnv — a silently
+// ignored typo in a duration/count here would just look like "workflows
+// are slow" or "jobs never run" with no clue why).
+func workerConfigFromEnv() worker.Config {
+	var cfg worker.Config
+	if raw := os.Getenv("WORKFLOW_POLL_INTERVAL"); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil {
+			cfg.PollInterval = d
+		} else {
+			log.Printf("WORKFLOW_POLL_INTERVAL=%q is not a valid duration, using default", raw)
+		}
+	}
+	if raw := os.Getenv("WORKFLOW_LEASE_TIMEOUT"); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil {
+			cfg.LeaseTimeout = d
+		} else {
+			log.Printf("WORKFLOW_LEASE_TIMEOUT=%q is not a valid duration, using default", raw)
+		}
+	}
+	if raw := os.Getenv("WORKFLOW_WORKER_CONCURRENCY"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			cfg.Concurrency = n
+		} else {
+			log.Printf("WORKFLOW_WORKER_CONCURRENCY=%q is not a valid integer, using default", raw)
+		}
+	}
+	return cfg
+}
 
 // webauthConfigFromEnv builds a webauth.Config from OIDC_* environment
 // variables. Every field empty is the expected, safe default (Enabled()
@@ -110,6 +143,23 @@ func main() {
 		log.Fatalf("load i18n catalog: %v", err)
 	}
 	api.New(sqlDB, catalog, auth).Routes(mux)
+
+	// The durable workflow job queue (internal/kernel/workflow.Queue) has
+	// existed since the definition-registry increment, but nothing ever
+	// actually ran it — RegistryDefinitionLookup's own doc comment called
+	// this out as "a worker process, not built yet." Wire it in: it runs
+	// for the lifetime of the process, alongside the HTTP server, with no
+	// graceful-shutdown handling yet (consistent with ListenAndServe below,
+	// which doesn't have any either — ctx here is process lifetime, not a
+	// signal-driven one, on purpose, so this doesn't silently change how
+	// the process responds to SIGINT/SIGTERM while that's still unhandled
+	// everywhere else in this binary).
+	workerRunner, err := worker.New(sqlDB, nil, workerConfigFromEnv())
+	if err != nil {
+		log.Fatalf("configure workflow worker: %v", err)
+	}
+	workerRunner.RunConcurrent(context.Background())
+	log.Printf("workflow worker started")
 
 	addr := os.Getenv("LISTEN_ADDR")
 	if addr == "" {
