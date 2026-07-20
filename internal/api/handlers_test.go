@@ -1547,6 +1547,57 @@ func TestAPI_RecordList_EnumColumnShowsTranslatedLabel(t *testing.T) {
 	}
 }
 
+// TestAPI_RecordList_ColumnHeaderIsTranslated confirms list-page column
+// headers resolve through "field.{EntityType}.{FieldName}" rather than
+// showing the raw snake_case field name regardless of locale — the other
+// half of the gap QUEUE.md flagged (per-field labels worked on forms via
+// the enum-translation branch, but list columns were never wired up).
+func TestAPI_RecordList_ColumnHeaderIsTranslated(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	poDef := &entity.Definition{
+		EntityType: "PurchaseOrder",
+		Version:    1,
+		Fields:     []entity.Field{{Name: "po_number", Type: entity.FieldString, Required: true}},
+	}
+	poFormDef := &form.Definition{
+		EntityType: "PurchaseOrder",
+		Version:    1,
+		Sections: []form.Section{{
+			Title: "Header", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "po_number", Label: "PO Number"}},
+		}},
+	}
+	publishEntityAndForm(t, db, tenantID, poDef, poFormDef)
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	// Column headers only render alongside a non-empty table (the empty
+	// state is a plain "no records yet" message, no <thead> at all) —
+	// same reason TestAPI_RecordList_EnumColumnShowsTranslatedLabel above
+	// creates a record first.
+	createReq := newRequest("POST", "/api/records/PurchaseOrder", tenantID, "farshid", []byte(`{"po_number":"PO-1"}`))
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", createRec.Code, createRec.Body.String())
+	}
+
+	req := newRequest("GET", "/records/PurchaseOrder?lang=ar", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "رقم أمر الشراء") {
+		t.Fatalf("expected the Arabic column header \"رقم أمر الشراء\" for po_number, got:\n%s", body)
+	}
+	if strings.Contains(body, "<th>po_number</th>") {
+		t.Fatalf("expected no raw untranslated \"po_number\" column header, got:\n%s", body)
+	}
+}
+
 func TestAPI_RecordList_EmptyShowsEmptyMessage(t *testing.T) {
 	db := testDB(t)
 	withDevAuthEnabled(t)
