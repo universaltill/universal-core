@@ -191,3 +191,41 @@ func TestPublish_LeavesRolledBackVersionAlone(t *testing.T) {
 		t.Fatalf("expected Party to stay rolled back (no published version), got: %v", err)
 	}
 }
+
+// TestPublishForms_PublishesEveryFoundationForm is PublishForms' proof
+// that a published Party form is actually reachable through the
+// form_definitions registry — the real gap found by dogfooding the
+// purchasing module: without this, GET /forms/Party/... always 404s
+// regardless of whether Publish (entities only) has run, since no code
+// path ever published the form itself outside a test.
+func TestPublishForms_PublishesEveryFoundationForm(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	tenantID := seedTenant(t, db)
+	formRepo := data.NewFormDefinitionRepo(db)
+
+	if err := PublishForms(ctx, db, tenantID, humanActor()); err != nil {
+		t.Fatalf("PublishForms: %v", err)
+	}
+
+	v, err := formRepo.GetPublished(ctx, tenantID, "Party")
+	if err != nil {
+		t.Fatalf("GetPublished(Party form): %v", err)
+	}
+	if v.Version != PartyForm().Version {
+		t.Fatalf("expected published form version %d, got %d", PartyForm().Version, v.Version)
+	}
+}
+
+func TestPublishForms_IsIdempotent(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	tenantID := seedTenant(t, db)
+
+	if err := PublishForms(ctx, db, tenantID, humanActor()); err != nil {
+		t.Fatalf("first PublishForms: %v", err)
+	}
+	if err := PublishForms(ctx, db, tenantID, humanActor()); err != nil {
+		t.Fatalf("second PublishForms should be a no-op, got: %v", err)
+	}
+}
