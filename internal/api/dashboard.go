@@ -82,7 +82,8 @@ func (h *Handler) writeDashboard(w http.ResponseWriter, r *http.Request, rc http
 		writeInternalError(w, "render dashboard", err)
 		return
 	}
-	if err := renderShell(w, buf.String()); err != nil {
+	nav := h.renderNav(r.Context(), &rc, locale)
+	if err := renderShell(w, nav, template.HTML(buf.String())); err != nil {
 		writeInternalError(w, "render dashboard shell", err)
 	}
 }
@@ -113,7 +114,8 @@ func (h *Handler) renderWelcome(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, "render welcome", err)
 		return
 	}
-	if err := renderShell(w, buf.String()); err != nil {
+	nav := h.renderNav(r.Context(), nil, locale)
+	if err := renderShell(w, nav, template.HTML(buf.String())); err != nil {
 		writeInternalError(w, "render welcome shell", err)
 	}
 }
@@ -173,12 +175,11 @@ var dashboardTmpl = template.Must(template.New("dashboard").Parse(`
 {{if not .Modules}}
 <p>{{.Empty}}</p>
 {{else}}
-<ul class="uc-dashboard-modules">
+<ul class="uc-modules">
 {{range .Modules}}
-<li>
-<strong>{{.EntityType}}</strong>
-— <a href="/forms/{{.EntityType}}/new">{{$.NewLabel}}</a>
-· <a href="/import/{{.EntityType}}">{{$.ImportLink}}</a>
+<li class="uc-module-card">
+<strong><a href="/records/{{.EntityType}}">{{.EntityType}}</a></strong>
+<span class="uc-module-actions"><a href="/forms/{{.EntityType}}/new">{{$.NewLabel}}</a> · <a href="/import/{{.EntityType}}">{{$.ImportLink}}</a></span>
 </li>
 {{end}}
 </ul>
