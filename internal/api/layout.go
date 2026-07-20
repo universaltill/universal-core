@@ -4,6 +4,7 @@ import (
 	_ "embed"
 	"fmt"
 	"html/template"
+	"log"
 	"net/http"
 )
 
@@ -26,7 +27,9 @@ var htmxJS []byte
 func serveHTMX(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
 	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-	w.Write(htmxJS)
+	if _, err := w.Write(htmxJS); err != nil {
+		log.Printf("api: serve htmx.min.js: %v", err)
+	}
 }
 
 // shellTmpl wraps a page fragment in the minimal HTML document a real
