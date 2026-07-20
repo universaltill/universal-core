@@ -22,5 +22,6 @@
   "welcome.sign_in_prompt": "Sign in to see your modules.",
   "welcome.sign_in_link": "Sign in",
   "welcome.dev_auth_hint": "No session yet. This deployment has developer auth enabled — send the X-Tenant-ID and X-Actor-ID request headers to continue.",
-  "welcome.no_auth_configured": "This deployment does not have sign-in configured yet."
+  "welcome.no_auth_configured": "This deployment does not have sign-in configured yet.",
+  "list.empty": "No records yet."
 }
