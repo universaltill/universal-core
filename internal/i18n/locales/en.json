@@ -42,5 +42,18 @@
   "entity.Item.name": "Item",
   "entity.PurchaseOrder.name": "Purchase Order",
   "entity.POLine.name": "PO Line",
-  "entity.InventoryItem.name": "Inventory Item"
+  "entity.InventoryItem.name": "Inventory Item",
+  "module.finance.name": "Finance",
+  "module.sales.name": "Sales",
+  "module.manufacturing.name": "Manufacturing",
+  "module.inventory.name": "Inventory",
+  "module.warehouse.name": "Warehouse",
+  "module.supplychain.name": "Supply Chain",
+  "module.crm.name": "CRM",
+  "module.projects.name": "Projects",
+  "module.hr.name": "Human Resources",
+  "module.ecommerce.name": "Ecommerce",
+  "module.marketing.name": "Marketing",
+  "module.reporting.name": "Reporting",
+  "module.coming_soon": "Coming soon"
 }
