@@ -93,6 +93,14 @@ func POLineForm() *form.Definition {
 	}
 }
 
+// AllForms returns every Form Definition this package defines — the
+// source of truth seed.go's PublishForms iterates (see
+// foundation.AllForms's doc comment for why this exists instead of a
+// second, separately-maintained list).
+func AllForms() []*form.Definition {
+	return []*form.Definition{ItemForm(), PurchaseOrderForm(), POLineForm(), InventoryItemForm()}
+}
+
 func InventoryItemForm() *form.Definition {
 	return &form.Definition{
 		EntityType: "InventoryItem",
