@@ -248,7 +248,7 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 
 		switch s.Component {
 		case form.ComponentFields:
-			fields, err := buildFields(s, ent, effective, data.ReferenceOptions)
+			fields, err := r.buildFields(s, ent, effective, data.ReferenceOptions, locale)
 			if err != nil {
 				return viewModel{}, fmt.Errorf("section %q: %w", s.Title, err)
 			}
@@ -367,7 +367,7 @@ func FormatFieldValue(v any) string {
 	}
 }
 
-func buildFields(s form.Section, ent *entity.Definition, record map[string]any, referenceOptions map[string][]ReferenceOption) ([]fieldView, error) {
+func (r *Renderer) buildFields(s form.Section, ent *entity.Definition, record map[string]any, referenceOptions map[string][]ReferenceOption, locale string) ([]fieldView, error) {
 	var out []fieldView
 	for _, ff := range s.Fields {
 		visible, err := evalVisibleIf(ff.VisibleIf, record)
@@ -401,19 +401,54 @@ func buildFields(s form.Section, ent *entity.Definition, record map[string]any, 
 			fv.Checked, _ = record[ff.Name].(bool)
 		case entity.FieldEnum:
 			current, _ := record[ff.Name].(string)
+			if current == "" {
+				// A new record with no explicit value honors the
+				// Definition's own declared Default (e.g. Item.item_type's
+				// Default: "stock") — found necessary after the empty-
+				// option fix below regressed a real e2e test: Default was
+				// declared on several Definitions but never actually
+				// consulted anywhere before this, so it only ever "worked"
+				// by the accident of a browser auto-selecting whichever
+				// <option> happened to render first, which coincidentally
+				// matched EnumValues[0] more often than not. Now it's
+				// honored for the right reason, not by coincidence.
+				if def, ok := ef.Default.(string); ok {
+					current = def
+				}
+			}
+			if current == "" {
+				// A genuinely undefaulted, unset enum must stay a real,
+				// selectable choice — see the identical reasoning on
+				// FieldReference below. This also makes `required` on a
+				// <select> actually mean something: an empty-string option
+				// is what makes a browser's native "please select an item"
+				// validation fire at all; without it, the browser's own
+				// default (whichever option renders first) always counts
+				// as a value present, so `required` never blocked anything.
+				fv.Options = append(fv.Options, optionView{Value: "", Label: "", Selected: true})
+			}
 			for _, ev := range ef.EnumValues {
-				fv.Options = append(fv.Options, optionView{Value: ev, Label: ev, Selected: ev == current})
+				label := r.i18n.TOrDefault(locale, "field."+ent.EntityType+"."+ff.Name+"."+ev, ev)
+				fv.Options = append(fv.Options, optionView{Value: ev, Label: label, Selected: ev == current})
 			}
 		case entity.FieldReference:
 			current, _ := record[ff.Name].(string)
-			if !ef.Required {
+			if current == "" {
 				// An unset reference must stay a real, selectable choice
 				// — without this, the browser's own <select> default
 				// (whatever option happens to render first) would look
 				// selected on an untouched new-record form even though
 				// no value was actually chosen, and submitting it would
-				// silently write that first option's id.
-				fv.Options = append(fv.Options, optionView{Value: "", Label: "", Selected: current == ""})
+				// silently write that first option's id. Unconditional
+				// on Required now (was only added for optional fields
+				// originally): a *required* reference with no value is
+				// exactly the case that most needs a real empty state,
+				// so the browser's native validation can actually catch
+				// an unmade choice instead of silently accepting
+				// whichever option rendered first (found by review after
+				// this field type first shipped as a usable dropdown —
+				// see uc-infra's 2026-07-20 reference-dropdowns review).
+				fv.Options = append(fv.Options, optionView{Value: "", Label: "", Selected: true})
 			}
 			for _, opt := range referenceOptions[ff.Name] {
 				fv.Options = append(fv.Options, optionView{Value: opt.ID, Label: opt.Label, Selected: opt.ID == current})

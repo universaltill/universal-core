@@ -130,7 +130,7 @@ func TestRender_ReferenceFieldRendersAsSelectWithLabels(t *testing.T) {
 // (whichever option renders first) would look selected on an untouched
 // new-record form even though nothing was actually chosen, and
 // submitting it would silently write that first option's id.
-func TestRender_OptionalReferenceFieldGetsEmptyOption(t *testing.T) {
+func TestRender_UnsetOptionalReferenceFieldGetsEmptyOption(t *testing.T) {
 	r := testRenderer(t)
 	ent := &entity.Definition{
 		EntityType: "Item",
@@ -156,6 +156,176 @@ func TestRender_OptionalReferenceFieldGetsEmptyOption(t *testing.T) {
 	body := buf.String()
 	if !strings.Contains(body, `<option value="" selected></option>`) {
 		t.Fatalf("expected a selected empty option on an unset optional reference field, got:\n%s", body)
+	}
+}
+
+// TestRender_UnsetRequiredReferenceFieldGetsEmptyOptionToo is the
+// regression test for a real gap independent review found once
+// reference fields actually became usable dropdowns (previously masked
+// by the field being an unusable text input): a *required* reference
+// field with no current value used to have no selectable empty state
+// at all, so the browser's own <select> default (whichever option
+// happened to render first) counted as a value present — `required`
+// never actually blocked submitting an unmade choice. Same fix now
+// applies uniformly regardless of Required: the empty option only
+// disappears once a real value exists.
+func TestRender_UnsetRequiredReferenceFieldGetsEmptyOptionToo(t *testing.T) {
+	r := testRenderer(t)
+	ent := &entity.Definition{
+		EntityType: "PurchaseOrder",
+		Fields:     []entity.Field{{Name: "vendor_id", Type: entity.FieldReference, Required: true, Target: "Party"}},
+	}
+	def := &form.Definition{
+		EntityType: "PurchaseOrder",
+		Sections: []form.Section{{
+			Title: "Header", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "vendor_id", Label: "Vendor"}},
+		}},
+	}
+	data := Data{
+		Record: map[string]any{},
+		ReferenceOptions: map[string][]ReferenceOption{
+			"vendor_id": {{ID: "vendor-1", Label: "Acme Textiles"}},
+		},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, def, ent, data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	body := buf.String()
+	if !strings.Contains(body, `<select id="vendor_id" name="vendor_id" required>`+"\n"+`<option value="" selected></option>`) {
+		t.Fatalf("expected a required select to still start with a selected empty option when unset, got:\n%s", body)
+	}
+}
+
+// TestRender_UnsetRequiredEnumFieldGetsEmptyOption is FieldEnum's
+// sibling of the reference-field fix above — the identical gap existed
+// there first (found pre-existing during the reference-field review),
+// now fixed for both field types the same way.
+func TestRender_UnsetRequiredEnumFieldGetsEmptyOption(t *testing.T) {
+	r := testRenderer(t)
+	ent := &entity.Definition{
+		EntityType: "Party",
+		Fields: []entity.Field{
+			{Name: "party_type", Type: entity.FieldEnum, Required: true, EnumValues: []string{"person", "organization"}},
+		},
+	}
+	def := &form.Definition{
+		EntityType: "Party",
+		Sections: []form.Section{{
+			Title: "Header", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "party_type", Label: "Type"}},
+		}},
+	}
+	data := Data{Record: map[string]any{}}
+	var buf strings.Builder
+	if err := r.Render(&buf, def, ent, data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	body := buf.String()
+	if !strings.Contains(body, `<select id="party_type" name="party_type" required>`+"\n"+`<option value="" selected></option>`) {
+		t.Fatalf("expected a required enum select to start with a selected empty option when unset, got:\n%s", body)
+	}
+}
+
+// TestRender_SetEnumFieldHasNoEmptyOption confirms the fix doesn't
+// regress the ordinary case: once a field has a real current value, no
+// spurious empty option appears alongside it.
+func TestRender_SetEnumFieldHasNoEmptyOption(t *testing.T) {
+	r := testRenderer(t)
+	ent := &entity.Definition{
+		EntityType: "Party",
+		Fields: []entity.Field{
+			{Name: "party_type", Type: entity.FieldEnum, Required: true, EnumValues: []string{"person", "organization"}},
+		},
+	}
+	def := &form.Definition{
+		EntityType: "Party",
+		Sections: []form.Section{{
+			Title: "Header", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "party_type", Label: "Type"}},
+		}},
+	}
+	data := Data{Record: map[string]any{"party_type": "organization"}}
+	var buf strings.Builder
+	if err := r.Render(&buf, def, ent, data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if strings.Contains(buf.String(), `<option value="" selected>`) {
+		t.Fatalf("expected no empty option once a real value is set, got:\n%s", buf.String())
+	}
+}
+
+// TestRender_UnsetEnumFieldHonorsDeclaredDefault is the regression test
+// for a real e2e failure this same fix caused and then fixed: forcing
+// an empty "please choose" option onto every unset enum field broke
+// TestFormSaveButton_RealBrowser, because Item.item_type declares
+// Default: "stock" but nothing ever consulted entity.Field.Default —
+// the old "browser auto-selects whichever option renders first"
+// behavior only ever honored it by coincidence (EnumValues[0] happened
+// to match). Now Default is actually read: an unset field with a
+// declared Default pre-selects it (no empty option shown), and only a
+// genuinely undefaulted unset field gets the forced empty choice.
+func TestRender_UnsetEnumFieldHonorsDeclaredDefault(t *testing.T) {
+	r := testRenderer(t)
+	ent := &entity.Definition{
+		EntityType: "Item",
+		Fields: []entity.Field{
+			{Name: "item_type", Type: entity.FieldEnum, Required: true,
+				EnumValues: []string{"stock", "service", "non_stock"}, Default: "stock"},
+		},
+	}
+	def := &form.Definition{
+		EntityType: "Item",
+		Sections: []form.Section{{
+			Title: "Header", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "item_type", Label: "Type"}},
+		}},
+	}
+	data := Data{Record: map[string]any{}}
+	var buf strings.Builder
+	if err := r.Render(&buf, def, ent, data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	body := buf.String()
+	if strings.Contains(body, `<option value="" selected>`) {
+		t.Fatalf("expected no empty option when a Default is declared, got:\n%s", body)
+	}
+	if !strings.Contains(body, `<option value="stock" selected>Stock</option>`) {
+		t.Fatalf("expected the declared Default (\"stock\") pre-selected, got:\n%s", body)
+	}
+}
+
+// TestRender_EnumOptionLabelsAreTranslated confirms an enum field's
+// options show a translated label ("field.{EntityType}.{FieldName}.
+// {Value}" in the i18n catalog), not the raw stored value — Farshid
+// asked directly for enum field data (e.g. status) to be multilingual,
+// not just UI chrome. The stored/submitted <option value=""> stays the
+// raw enum value regardless of locale — only the visible text changes.
+func TestRender_EnumOptionLabelsAreTranslated(t *testing.T) {
+	r := testRenderer(t)
+	ent := &entity.Definition{
+		EntityType: "Item",
+		Fields: []entity.Field{
+			{Name: "item_type", Type: entity.FieldEnum, Required: true,
+				EnumValues: []string{"stock", "service", "non_stock"}},
+		},
+	}
+	def := &form.Definition{
+		EntityType: "Item",
+		Sections: []form.Section{{
+			Title: "Header", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "item_type", Label: "Type"}},
+		}},
+	}
+	data := Data{Record: map[string]any{"item_type": "non_stock"}}
+	var buf strings.Builder
+	if err := r.Render(&buf, def, ent, data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	body := buf.String()
+	if !strings.Contains(body, `<option value="non_stock" selected>Non-Stock</option>`) {
+		t.Fatalf("expected the translated label \"Non-Stock\" for the raw value \"non_stock\", got:\n%s", body)
 	}
 }
 
