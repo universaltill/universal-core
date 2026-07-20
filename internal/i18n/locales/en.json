@@ -14,5 +14,9 @@
   "import.row_status_error": "Error",
   "import.result_heading": "Import Result",
   "import.result_succeeded": "succeeded",
-  "import.result_failed": "failed"
+  "import.result_failed": "failed",
+  "dashboard.title": "Universal Core",
+  "dashboard.empty": "No modules are available yet for this tenant.",
+  "dashboard.new_link": "New",
+  "dashboard.import_link": "Import"
 }

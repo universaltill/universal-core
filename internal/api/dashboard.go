@@ -3,9 +3,13 @@ package api
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"html/template"
 	"net/http"
 	"sort"
+
+	"github.com/universaltill/universal-core/internal/data"
 )
 
 // renderDashboard is what a browser lands on at "/" — until this
@@ -30,6 +34,7 @@ func (h *Handler) renderDashboard(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	locale := localeFromRequest(r)
 
 	entityTypes, err := h.entityDefs.ListPublishedEntityTypes(r.Context(), rc.TenantID)
 	if err != nil {
@@ -44,7 +49,14 @@ func (h *Handler) renderDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var buf bytes.Buffer
-	if err := dashboardTmpl.Execute(&buf, dashboardView{Modules: modules}); err != nil {
+	err = dashboardTmpl.Execute(&buf, dashboardView{
+		Modules:    modules,
+		Title:      h.catalog.T(locale, "dashboard.title"),
+		Empty:      h.catalog.T(locale, "dashboard.empty"),
+		NewLabel:   h.catalog.T(locale, "dashboard.new_link"),
+		ImportLink: h.catalog.T(locale, "dashboard.import_link"),
+	})
+	if err != nil {
 		writeInternalError(w, "render dashboard", err)
 		return
 	}
@@ -53,11 +65,22 @@ func (h *Handler) renderDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// dashboardModules filters entityTypes down to the ones with a
+// published form. A genuine lookup failure (anything other than "no
+// form published for this entity type") is returned, not swallowed —
+// found by independent review: the original version treated every
+// GetPublished error identically, so a transient DB error would
+// silently drop a module from the dashboard and still return 200, with
+// no log line anywhere pointing at why.
 func (h *Handler) dashboardModules(ctx context.Context, tenantID string, entityTypes []string) ([]dashboardModule, error) {
 	var modules []dashboardModule
 	for _, entityType := range entityTypes {
-		if _, err := h.formDefs.GetPublished(ctx, tenantID, entityType); err != nil {
+		_, err := h.formDefs.GetPublished(ctx, tenantID, entityType)
+		if errors.Is(err, data.ErrNotFound) {
 			continue // no published form for this entity type — nothing to link to yet
+		}
+		if err != nil {
+			return nil, fmt.Errorf("look up form for %s: %w", entityType, err)
 		}
 		modules = append(modules, dashboardModule{EntityType: entityType})
 	}
@@ -70,20 +93,24 @@ type dashboardModule struct {
 }
 
 type dashboardView struct {
-	Modules []dashboardModule
+	Modules    []dashboardModule
+	Title      string
+	Empty      string
+	NewLabel   string
+	ImportLink string
 }
 
 var dashboardTmpl = template.Must(template.New("dashboard").Parse(`
-<h1>Universal Core</h1>
+<h1>{{.Title}}</h1>
 {{if not .Modules}}
-<p>No modules are available yet for this tenant.</p>
+<p>{{.Empty}}</p>
 {{else}}
 <ul class="uc-dashboard-modules">
 {{range .Modules}}
 <li>
 <strong>{{.EntityType}}</strong>
-— <a href="/forms/{{.EntityType}}/new">New</a>
-· <a href="/import/{{.EntityType}}">Import</a>
+— <a href="/forms/{{.EntityType}}/new">{{$.NewLabel}}</a>
+· <a href="/import/{{.EntityType}}">{{$.ImportLink}}</a>
 </li>
 {{end}}
 </ul>
