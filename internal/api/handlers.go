@@ -327,15 +327,41 @@ func isHTMXRequest(r *http.Request) bool {
 func parseRecordFields(r *http.Request, entDef *entity.Definition) (map[string]any, error) {
 	ct := r.Header.Get("Content-Type")
 	if strings.HasPrefix(ct, "application/x-www-form-urlencoded") || strings.HasPrefix(ct, "multipart/form-data") {
+		// ParseMultipartForm calls ParseForm first regardless of content
+		// type, so r.PostForm ends up populated either way; the
+		// ErrNotMultipart it returns for a plain urlencoded body is
+		// expected and safely ignored.
+		if err := r.ParseMultipartForm(32 << 20); err != nil && !errors.Is(err, http.ErrNotMultipart) {
+			return nil, fmt.Errorf("parse form: %w", err)
+		}
 		fields := make(map[string]any, len(entDef.Fields))
 		for _, f := range entDef.Fields {
-			raw := r.PostFormValue(f.Name)
+			vals := r.PostForm[f.Name]
+			if len(vals) == 0 {
+				// Absent entirely, not just empty: formrender always
+				// submits every entDef field now (either a visible
+				// input, or one of its own hidden fallbacks — see
+				// formrender.buildHiddenFields), so a field genuinely
+				// missing from the submission means a non-formrender
+				// caller (or a hand-built request) chose not to send it,
+				// same "absent means don't touch it" reading a JSON
+				// caller already gets by omitting a key.
+				continue
+			}
+			// The LAST value wins, not the first: a FieldBool renders as
+			// <input type=hidden value=false><input type=checkbox
+			// value=true> in that order, so an unchecked box submits
+			// only "false" but a checked one submits "false" then
+			// "true" — the browser preserves DOM order in the request
+			// body, and the checkbox's real state is whichever value
+			// came last.
+			raw := vals[len(vals)-1]
 			if raw == "" {
-				// Empty means absent, not a zero value — the same
-				// convention csvimport.buildRowData uses, and the only
-				// sane reading of an unchecked FieldBool checkbox, which
-				// HTML omits from the submission entirely rather than
-				// sending it as "false".
+				// Empty means "explicitly present, but blank" for a
+				// formrender-submitted field (a real value cleared to
+				// nothing) — treated as absent (not stored as an empty
+				// string) matching csvimport.buildRowData's identical
+				// convention for a blank CSV cell.
 				continue
 			}
 			v, err := csvimport.Coerce(f.Type, raw)
