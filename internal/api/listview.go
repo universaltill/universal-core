@@ -5,10 +5,19 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/formrender"
 )
+
+// listPageSize is how many records one list-page shows before paginating
+// — not user-configurable yet (no list_columns/page-size concept exists
+// anywhere in a Definition), just a fixed value that turns "every record,
+// unbounded" into something that stays usable once a tenant has more than
+// a screenful of data (QUEUE.md, flagged "not built yet" on 2026-07-20).
+const listPageSize = 25
 
 // renderRecordList is the module's actual landing page — a table of
 // every record the tenant has for entityType, one row per record,
@@ -40,7 +49,24 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 		writeDefinitionLookupError(w, entityType, err)
 		return
 	}
-	records, err := h.crud.List(r.Context(), def, rc.TenantID)
+
+	total, err := h.crud.Count(r.Context(), def, rc.TenantID)
+	if err != nil {
+		writeInternalError(w, fmt.Sprintf("count %s records for list page", entityType), err)
+		return
+	}
+	totalPages := (total + listPageSize - 1) / listPageSize
+	if totalPages < 1 {
+		totalPages = 1
+	}
+	page, _ := strconv.Atoi(r.URL.Query().Get("page")) // 0/negative/unparsable all clamp to 1 below
+	if page < 1 {
+		page = 1
+	}
+	if page > totalPages {
+		page = totalPages
+	}
+	records, err := h.crud.ListPage(r.Context(), def, rc.TenantID, listPageSize, (page-1)*listPageSize)
 	if err != nil {
 		writeInternalError(w, fmt.Sprintf("list %s records for list page", entityType), err)
 		return
@@ -75,6 +101,21 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 		NewLabel:   h.catalog.T(locale, "dashboard.new_link"),
 		ImportLink: h.catalog.T(locale, "dashboard.import_link"),
 		Empty:      h.catalog.T(locale, "list.empty"),
+	}
+	if totalPages > 1 {
+		listHref := "/records/" + entityType
+		pageLabel := h.catalog.T(locale, "list.page_of")
+		pageLabel = strings.ReplaceAll(pageLabel, "{page}", strconv.Itoa(page))
+		pageLabel = strings.ReplaceAll(pageLabel, "{total}", strconv.Itoa(totalPages))
+		view.PageLabel = pageLabel
+		if page > 1 {
+			view.PrevHref = fmt.Sprintf("%s?page=%d", listHref, page-1)
+			view.PrevLabel = h.catalog.T(locale, "list.prev")
+		}
+		if page < totalPages {
+			view.NextHref = fmt.Sprintf("%s?page=%d", listHref, page+1)
+			view.NextLabel = h.catalog.T(locale, "list.next")
+		}
 	}
 	for _, f := range def.Fields {
 		// Same "field.{EntityType}.{FieldName}" convention formrender
@@ -137,6 +178,15 @@ type recordListView struct {
 	NewLabel   string
 	ImportLink string
 	Empty      string
+	// PageLabel is "" when there's only one page (no pager to show) —
+	// PrevHref/NextHref are independently "" at whichever boundary has
+	// no such page (first/last), so the template can render each link
+	// only when there's somewhere for it to actually go.
+	PageLabel string
+	PrevHref  string
+	PrevLabel string
+	NextHref  string
+	NextLabel string
 }
 
 type recordRowView struct {
@@ -163,5 +213,12 @@ var recordListTmpl = template.Must(template.New("recordList").Parse(`
 {{end}}
 </tbody>
 </table>
+{{if .PageLabel}}
+<div class="uc-list-pager">
+{{if .PrevHref}}<a href="{{.PrevHref}}">{{.PrevLabel}}</a>{{end}}
+<span>{{.PageLabel}}</span>
+{{if .NextHref}}<a href="{{.NextHref}}">{{.NextLabel}}</a>{{end}}
+</div>
+{{end}}
 {{end}}
 `))
