@@ -17,6 +17,14 @@ func TestSanitizeReturnTo(t *testing.T) {
 		"//evil.example.com":   "/",
 		"https://evil.example": "/",
 		"not-a-path":           "/",
+		// Regression case for a confirmed open redirect (independent
+		// review): a leading backslash passes the plain "/" prefix +
+		// not-"//" check, but browsers normalize \ to / per the WHATWG
+		// URL spec before following a Location header — turning this
+		// into a protocol-relative "//evil.example.com" once the
+		// browser actually navigates there.
+		`/\evil.example.com`:  "/",
+		`/\/evil.example.com`: "/",
 	}
 	for in, want := range cases {
 		if got := sanitizeReturnTo(in); got != want {
