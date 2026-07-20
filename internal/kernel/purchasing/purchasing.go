@@ -30,7 +30,7 @@ import "github.com/universaltill/universal-core/internal/kernel/entity"
 func Item() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "Item",
-		Version:    1,
+		Version:    2,
 		Module:     "purchasing",
 		Fields: []entity.Field{
 			{Name: "sku", Type: entity.FieldString, Required: true},
@@ -50,7 +50,7 @@ func Item() *entity.Definition {
 func PurchaseOrder() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "PurchaseOrder",
-		Version:    1,
+		Version:    2,
 		Module:     "purchasing",
 		Fields: []entity.Field{
 			{Name: "vendor_id", Type: entity.FieldReference, Required: true, Target: "Party"},
@@ -81,7 +81,7 @@ func PurchaseOrder() *entity.Definition {
 func POLine() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "POLine",
-		Version:    1,
+		Version:    2,
 		Module:     "purchasing",
 		Fields: []entity.Field{
 			{Name: "purchase_order_id", Type: entity.FieldReference, Required: true, Target: "PurchaseOrder"},
@@ -100,7 +100,7 @@ func POLine() *entity.Definition {
 func InventoryItem() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "InventoryItem",
-		Version:    1,
+		Version:    2,
 		Module:     "purchasing",
 		Fields: []entity.Field{
 			{Name: "item_id", Type: entity.FieldReference, Required: true, Target: "Item"},

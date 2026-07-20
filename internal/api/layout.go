@@ -1,7 +1,9 @@
 package api
 
 import (
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"fmt"
 	"html/template"
 	"log"
@@ -41,9 +43,27 @@ func serveHTMX(w http.ResponseWriter, r *http.Request) {
 //go:embed static/app.css
 var appCSS []byte
 
-// serveCSS serves the vendored app.css. Registered unauthenticated, same
-// reasoning as serveHTMX: a static asset with no tenant-specific
-// content, needed before auth can even render an error page.
+// appCSSPath embeds a content hash into app.css's own URL
+// (/static/app-{hash}.css), computed once at process start. Unlike
+// htmxJS (a pinned, rarely-changing vendored file, where a stable
+// filename + immutable cache header is correct), app.css changes on
+// almost every deploy during active development — serving it from a
+// fixed "/static/app.css" URL with a one-year immutable cache header
+// (the bug this fixed) meant a browser that had ever loaded the page
+// before kept serving a stale, pre-hub, pre-i18n-switcher stylesheet
+// for up to a year, never even revalidating: exactly the "no circles,
+// just plain text" symptom Farshid saw. Baking the hash into the URL
+// means every content change is automatically a new URL, so the long
+// immutable cache header becomes safe again rather than the bug.
+var appCSSPath = func() string {
+	sum := sha256.Sum256(appCSS)
+	return "/static/app-" + hex.EncodeToString(sum[:])[:12] + ".css"
+}()
+
+// serveCSS serves the vendored app.css at its content-hashed path (see
+// appCSSPath). Registered unauthenticated, same reasoning as serveHTMX:
+// a static asset with no tenant-specific content, needed before auth
+// can even render an error page.
 func serveCSS(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/css; charset=utf-8")
 	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
@@ -79,11 +99,11 @@ func serveCSS(w http.ResponseWriter, r *http.Request) {
 // strings translated but the surrounding layout still reading the wrong
 // direction is arguably worse than not translating at all. See
 // locale.go's localeDir.
-var shellTmpl = template.Must(template.New("shell").Parse(`<!doctype html>
+var shellTmpl = template.Must(template.New("shell").Parse(fmt.Sprintf(`<!doctype html>
 <html lang="{{.Lang}}" dir="{{.Dir}}">
 <head>
 <meta charset="utf-8">
-<link rel="stylesheet" href="/static/app.css">
+<link rel="stylesheet" href="%s">
 <script src="/static/htmx.min.js"></script>
 </head>
 <body>
@@ -93,7 +113,7 @@ var shellTmpl = template.Must(template.New("shell").Parse(`<!doctype html>
 </main>
 </body>
 </html>
-`))
+`, appCSSPath)))
 
 type shellView struct {
 	Lang string

@@ -42,5 +42,18 @@
   "entity.Item.name": "الصنف",
   "entity.PurchaseOrder.name": "أمر الشراء",
   "entity.POLine.name": "بند أمر الشراء",
-  "entity.InventoryItem.name": "صنف المخزون"
+  "entity.InventoryItem.name": "صنف المخزون",
+  "module.finance.name": "المالية",
+  "module.sales.name": "المبيعات",
+  "module.manufacturing.name": "التصنيع",
+  "module.inventory.name": "المخزون",
+  "module.warehouse.name": "المستودعات",
+  "module.supplychain.name": "سلسلة التوريد",
+  "module.crm.name": "إدارة علاقات العملاء",
+  "module.projects.name": "المشاريع",
+  "module.hr.name": "الموارد البشرية",
+  "module.ecommerce.name": "التجارة الإلكترونية",
+  "module.marketing.name": "التسويق",
+  "module.reporting.name": "التقارير",
+  "module.coming_soon": "قريباً"
 }
