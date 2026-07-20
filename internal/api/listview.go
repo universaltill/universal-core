@@ -6,6 +6,7 @@ import (
 	"html/template"
 	"net/http"
 
+	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/formrender"
 )
 
@@ -45,6 +46,27 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Reference columns show the target record's own label (the same
+	// resolution the form's dropdown already uses, see
+	// loadReferenceOptions's own doc comment), not the raw id every
+	// list row used to show before this — a page of GUIDs a user can't
+	// tell apart is exactly the gap Farshid pointed out after the
+	// reference-dropdown fix only fixed the form view, not the list.
+	// referenceLabels indexes each reference field's options by id for
+	// O(1) lookup per cell; a stale id with no matching option (the
+	// target record was deleted after this one referenced it) falls
+	// back to showing the raw id — visible-but-broken beats silently
+	// hiding that the reference is dangling.
+	refOptions := h.loadReferenceOptions(r.Context(), rc.TenantID, def)
+	referenceLabels := make(map[string]map[string]string, len(refOptions))
+	for field, opts := range refOptions {
+		byID := make(map[string]string, len(opts))
+		for _, opt := range opts {
+			byID[opt.ID] = opt.Label
+		}
+		referenceLabels[field] = byID
+	}
+
 	view := recordListView{
 		Name:       h.entityDisplayName(locale, entityType),
 		Code:       entityType,
@@ -60,7 +82,7 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 	for _, rec := range records {
 		row := recordRowView{Href: "/forms/" + entityType + "/" + rec.ID}
 		for _, f := range def.Fields {
-			row.Cells = append(row.Cells, formrender.FormatFieldValue(rec.Data[f.Name]))
+			row.Cells = append(row.Cells, h.cellText(entityType, f, rec.Data[f.Name], referenceLabels, locale))
 		}
 		view.Rows = append(view.Rows, row)
 	}
@@ -74,6 +96,30 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 	if err := renderShell(w, locale, nav, template.HTML(buf.String())); err != nil {
 		writeInternalError(w, fmt.Sprintf("render %s list shell", entityType), err)
 	}
+}
+
+// cellText formats one list-row cell — a reference field resolves to
+// its target's label via referenceLabels (falling back to the raw
+// stored id for a dangling/unresolvable reference); an enum field
+// resolves through the same "field.{EntityType}.{FieldName}.{Value}"
+// i18n convention the form dropdown uses (see buildFields' identical
+// lookup), so a status of "active"/"draft" reads in the visitor's own
+// language on the list page too, not just inside the form. Every other
+// field type uses the same formatting the form renderer already uses.
+func (h *Handler) cellText(entityType string, f entity.Field, value any, referenceLabels map[string]map[string]string, locale string) string {
+	switch f.Type {
+	case entity.FieldReference:
+		if id, ok := value.(string); ok && id != "" {
+			if label, ok := referenceLabels[f.Name][id]; ok {
+				return label
+			}
+		}
+	case entity.FieldEnum:
+		if v, ok := value.(string); ok && v != "" {
+			return h.catalog.TOrDefault(locale, "field."+entityType+"."+f.Name+"."+v, v)
+		}
+	}
+	return formrender.FormatFieldValue(value)
 }
 
 type recordListView struct {

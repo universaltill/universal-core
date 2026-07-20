@@ -8,6 +8,7 @@ package entity
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 )
 
 // FieldType enumerates the kinds of field a Definition can declare.
@@ -112,6 +113,26 @@ func (d *Definition) Validate() error {
 		seen[f.Name] = true
 		if f.Type == FieldEnum && len(f.EnumValues) == 0 {
 			return fmt.Errorf("field %q is type enum but has no enum_values", f.Name)
+		}
+		if f.Type == FieldEnum && f.Default != nil {
+			// Default only started being consulted by
+			// internal/kernel/formrender's form rendering once reference/
+			// enum fields got real "unselected" empty-option handling
+			// (2026-07-20) — before that it was declared but inert
+			// everywhere, so a typo'd Default was harmless dead data.
+			// Now it sets the pre-selected <option>, and a Default that
+			// isn't one of EnumValues would silently produce a <select>
+			// with nothing selected despite formrender believing a
+			// default was applied — catch it at definition-validation
+			// time instead, the same "fail loud on schema drift" this
+			// method already applies to enum_values/target.
+			def, ok := f.Default.(string)
+			if !ok {
+				return fmt.Errorf("field %q is type enum but default %v is not a string", f.Name, f.Default)
+			}
+			if !slices.Contains(f.EnumValues, def) {
+				return fmt.Errorf("field %q default %q is not one of its enum_values %v", f.Name, def, f.EnumValues)
+			}
 		}
 		if f.Type == FieldReference && f.Target == "" {
 			return fmt.Errorf("field %q is type reference but has no target", f.Name)

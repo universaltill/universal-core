@@ -72,6 +72,41 @@ func TestDefinitionValidate(t *testing.T) {
 			},
 			wantErr: false,
 		},
+		{
+			// Regression coverage for a real gap independent review
+			// found once formrender actually started consulting
+			// Default (2026-07-20) — before that a typo'd Default was
+			// harmless dead data; now it silently produces a <select>
+			// with nothing selected, so it's caught here instead.
+			name: "enum default not one of enum_values",
+			def: Definition{
+				EntityType: "Item",
+				Fields: []Field{
+					{Name: "item_type", Type: FieldEnum, EnumValues: []string{"stock", "service"}, Default: "actve"},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "enum default is a valid enum value",
+			def: Definition{
+				EntityType: "Item",
+				Fields: []Field{
+					{Name: "item_type", Type: FieldEnum, EnumValues: []string{"stock", "service"}, Default: "stock"},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "enum default not a string",
+			def: Definition{
+				EntityType: "Item",
+				Fields: []Field{
+					{Name: "item_type", Type: FieldEnum, EnumValues: []string{"stock", "service"}, Default: float64(1)},
+				},
+			},
+			wantErr: true,
+		},
 	}
 
 	for _, tc := range cases {

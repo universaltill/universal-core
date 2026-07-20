@@ -75,6 +75,19 @@ func (c *Catalog) T(locale, key string) string {
 	return key
 }
 
+// TOrDefault is T for a key built from data rather than authored UI
+// copy — an entity type name, a module key, an enum value — where T's
+// own fallback (the literal key string, e.g. "field.Item.item_type.stock")
+// would be a meaningless string to show a user, not a legible English
+// default. Returns fallback (the raw underlying value) instead of the
+// key whenever no locale in T's chain has a translation for it.
+func (c *Catalog) TOrDefault(locale, key, fallback string) string {
+	if v := c.T(locale, key); v != key {
+		return v
+	}
+	return fallback
+}
+
 // Available returns the sorted locale codes that have at least one message.
 func (c *Catalog) Available() []string {
 	out := make([]string, 0, len(c.messages))
