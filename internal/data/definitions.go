@@ -209,6 +209,37 @@ func (r *definitionRepo) getPublished(ctx context.Context, tenantID, key string)
 	)
 }
 
+// listPublishedKeys returns every distinct key (entity_type, for
+// EntityDefinitionRepo) with at least one published version for
+// tenantID — what a landing page needs to say "here's what you can
+// actually open", without hardcoding any entity type into the generic
+// engine (CLAUDE.md's kernel/deterministic-core boundary rule). DISTINCT
+// because a key can have more than one published row at once (an older
+// version stays 'published' even after a newer one is; see
+// getPublished's own doc comment on "current" meaning highest version,
+// not "only" version) — this only needs the type names, not versions.
+func (r *definitionRepo) listPublishedKeys(ctx context.Context, tenantID string) ([]string, error) {
+	rows, err := r.db.QueryContext(ctx,
+		fmt.Sprintf(`SELECT DISTINCT %s FROM %s WHERE tenant_id = $1 AND status = 'published' ORDER BY %s`,
+			r.keyColumn, r.table, r.keyColumn),
+		tenantID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list published %s: %w", r.table, err)
+	}
+	defer rows.Close()
+
+	var keys []string
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return nil, fmt.Errorf("scan %s: %w", r.table, err)
+		}
+		keys = append(keys, k)
+	}
+	return keys, rows.Err()
+}
+
 func (r *definitionRepo) getVersion(ctx context.Context, tenantID, key string, version int) (DefinitionVersion, error) {
 	return r.getOne(ctx,
 		fmt.Sprintf(
@@ -266,6 +297,14 @@ func (e *EntityDefinitionRepo) GetPublished(ctx context.Context, tenantID, entit
 
 func (e *EntityDefinitionRepo) GetVersion(ctx context.Context, tenantID, entityType string, version int) (DefinitionVersion, error) {
 	return e.r.getVersion(ctx, tenantID, entityType, version)
+}
+
+// ListPublishedEntityTypes returns every entity type tenantID currently
+// has at least one published Definition for — the landing page's data
+// source (internal/api's dashboard handler), reading the registry
+// instead of hardcoding a module list.
+func (e *EntityDefinitionRepo) ListPublishedEntityTypes(ctx context.Context, tenantID string) ([]string, error) {
+	return e.r.listPublishedKeys(ctx, tenantID)
 }
 
 // FormDefinitionRepo is the repository for form_definitions.

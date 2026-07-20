@@ -14,5 +14,9 @@
   "import.row_status_error": "خطأ",
   "import.result_heading": "نتيجة الاستيراد",
   "import.result_succeeded": "نجح",
-  "import.result_failed": "فشل"
+  "import.result_failed": "فشل",
+  "dashboard.title": "يونيفرسال كور",
+  "dashboard.empty": "لا توجد وحدات متاحة بعد لهذا المستأجر.",
+  "dashboard.new_link": "جديد",
+  "dashboard.import_link": "استيراد"
 }
