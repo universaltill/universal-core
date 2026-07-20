@@ -62,7 +62,8 @@ func (h *Handler) importUploadPage(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, "render import upload page", err)
 		return
 	}
-	if err := renderShell(w, buf.String()); err != nil {
+	nav := h.renderNav(r.Context(), &rc, locale)
+	if err := renderShell(w, nav, template.HTML(buf.String())); err != nil {
 		writeInternalError(w, "render import upload page shell", err)
 	}
 }

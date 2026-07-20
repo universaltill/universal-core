@@ -306,12 +306,12 @@ func buildHiddenFields(ent *entity.Definition, record map[string]any, rendered m
 		if rendered[ef.Name] {
 			continue
 		}
-		out = append(out, hiddenFieldView{Name: ef.Name, Value: formatFieldValue(record[ef.Name])})
+		out = append(out, hiddenFieldView{Name: ef.Name, Value: FormatFieldValue(record[ef.Name])})
 	}
 	return out
 }
 
-// formatFieldValue renders a record field's stored Go value (whatever
+// FormatFieldValue renders a record field's stored Go value (whatever
 // entity.ValidateRecord accepted — string, float64, bool, or nil for
 // "not set") as the plain text an HTML attribute/hidden input carries,
 // and internal/api.parseRecordFields's csvimport.Coerce round-trips back
@@ -319,7 +319,7 @@ func buildHiddenFields(ent *entity.Definition, record map[string]any, rendered m
 // "" (matching csvimport's own "empty means absent" convention on the
 // way back in), not the string "<nil>" text/template's default
 // stringification would otherwise produce.
-func formatFieldValue(v any) string {
+func FormatFieldValue(v any) string {
 	switch val := v.(type) {
 	case nil:
 		return ""
@@ -365,7 +365,7 @@ func buildFields(s form.Section, ent *entity.Definition, record map[string]any) 
 			Label:    label,
 			Type:     ef.Type,
 			Required: ef.Required,
-			Value:    formatFieldValue(record[ff.Name]),
+			Value:    FormatFieldValue(record[ff.Name]),
 		}
 
 		switch ef.Type {
