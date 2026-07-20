@@ -19,6 +19,7 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/audit"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/form"
+	"github.com/universaltill/universal-core/internal/kernel/foundation"
 )
 
 func testDB(t *testing.T) *sql.DB {
@@ -733,7 +734,13 @@ func TestAPI_NoAuthHeaders_Is401(t *testing.T) {
 // root page ("/") lists an entity type only when it has BOTH a
 // published entity Definition and a published Form Definition — a link
 // to an entity with no form would just 404.
-func TestAPI_Dashboard_ListsEntityTypesWithPublishedForms(t *testing.T) {
+// TestAPI_Dashboard_ShowsHubNodePerModule is the regression test for the
+// hub-and-spoke home page (see dashboard.go's hubLayout): one connected,
+// clickable node per module the tenant has access to, not a flat list
+// of entity types. vendorEntityDef has no Module set, so it falls into
+// the "general" bucket — accessibleModules' documented degrade path for
+// an entity Definition that never declared one.
+func TestAPI_Dashboard_ShowsHubNodePerModule(t *testing.T) {
 	db := testDB(t)
 	withDevAuthEnabled(t)
 	tenantID := seedTenant(t, db)
@@ -753,11 +760,85 @@ func TestAPI_Dashboard_ListsEntityTypesWithPublishedForms(t *testing.T) {
 	if !strings.Contains(body, `<script src="/static/htmx.min.js"></script>`) {
 		t.Fatalf("expected the dashboard to load htmx.js like every other page navigation, got:\n%s", body)
 	}
+	if !strings.Contains(body, `class="uc-hub-node uc-hub-node-0" href="/modules/general"`) {
+		t.Fatalf("expected a hub node linking to the general module, got:\n%s", body)
+	}
+	if !strings.Contains(body, `class="uc-hub-lines"`) {
+		t.Fatalf("expected the connecting-line svg, got:\n%s", body)
+	}
+	if strings.Contains(body, `href="/forms/Vendor/new"`) {
+		t.Fatalf("expected no direct entity links on the hub itself — that's the module menu's job, got:\n%s", body)
+	}
+}
+
+// TestAPI_ModuleMenu_ShowsEntitiesWithSearchAndActions is the regression
+// test for the page a hub node/nav link actually lands on: a searchable
+// menu of the module's own entity types, each with New/Import links —
+// the level the old flat dashboard used to put directly on "/".
+func TestAPI_ModuleMenu_ShowsEntitiesWithSearchAndActions(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := newRequest("GET", "/modules/general", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `class="uc-menu-search"`) {
+		t.Fatalf("expected a search box, got:\n%s", body)
+	}
+	if !strings.Contains(body, `data-search="vendor vendor"`) {
+		t.Fatalf("expected a lowercased searchable key combining Vendor's display name and code, got:\n%s", body)
+	}
+	if !strings.Contains(body, `href="/records/Vendor"`) {
+		t.Fatalf("expected a link to Vendor's list page, got:\n%s", body)
+	}
 	if !strings.Contains(body, `href="/forms/Vendor/new"`) {
 		t.Fatalf("expected a link to the Vendor form, got:\n%s", body)
 	}
 	if !strings.Contains(body, `href="/import/Vendor"`) {
 		t.Fatalf("expected a link to the Vendor import wizard, got:\n%s", body)
+	}
+}
+
+func TestAPI_ModuleMenu_UnknownKeyIs404(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := newRequest("GET", "/modules/no-such-module", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAPI_ModuleMenu_RequiresAuth(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := httptest.NewRequest("GET", "/modules/general", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with no auth headers, got %d", rec.Code)
 	}
 }
 
@@ -1211,8 +1292,8 @@ func TestAPI_Nav_LinksToPublishedModules(t *testing.T) {
 	if !strings.Contains(body, `class="uc-nav"`) {
 		t.Fatalf("expected a nav bar, got:\n%s", body)
 	}
-	if !strings.Contains(body, `class="uc-nav-link" href="/records/Vendor"`) {
-		t.Fatalf("expected a nav link to Vendor's list page, got:\n%s", body)
+	if !strings.Contains(body, `class="uc-nav-link" href="/modules/general"`) {
+		t.Fatalf("expected a nav link to the general module's menu, got:\n%s", body)
 	}
 }
 
@@ -1238,6 +1319,184 @@ func TestAPI_Nav_AnonymousIsBrandOnly(t *testing.T) {
 	}
 	if strings.Contains(body, `uc-nav-link`) {
 		t.Fatalf("expected no module links on the anonymous welcome page, got:\n%s", body)
+	}
+}
+
+// TestAPI_Locale_QueryParamSetsCookieAndRTLDir is the regression test
+// for the actual multilingual gap Farshid flagged: the i18n catalog
+// existing server-side isn't the same as a visitor being able to use
+// the app in Arabic. ?lang=ar must (1) actually switch rendered text,
+// (2) flip the document to dir="rtl" (translated text in a
+// left-to-right layout is still wrong), and (3) persist via a cookie so
+// the very next click — a plain <a href> with no ?lang= of its own —
+// doesn't silently revert to English.
+func TestAPI_Locale_QueryParamSetsCookieAndRTLDir(t *testing.T) {
+	db := testDB(t)
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := httptest.NewRequest("GET", "/?lang=ar", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `<html lang="ar" dir="rtl">`) {
+		t.Fatalf("expected an RTL document for ar, got:\n%s", body)
+	}
+	if !strings.Contains(body, "يونيفرسال كور") {
+		t.Fatalf("expected the Arabic brand string, got:\n%s", body)
+	}
+
+	var localeCookieSet bool
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == "uc_locale" && c.Value == "ar" {
+			localeCookieSet = true
+		}
+	}
+	if !localeCookieSet {
+		t.Fatalf("expected ?lang=ar to persist a uc_locale=ar cookie, got: %v", rec.Result().Cookies())
+	}
+
+	// The next request — a plain click with no ?lang= — must still be
+	// Arabic, via the cookie alone.
+	req2 := httptest.NewRequest("GET", "/", nil)
+	req2.AddCookie(&http.Cookie{Name: "uc_locale", Value: "ar"})
+	rec2 := httptest.NewRecorder()
+	mux.ServeHTTP(rec2, req2)
+	if !strings.Contains(rec2.Body.String(), `<html lang="ar" dir="rtl">`) {
+		t.Fatalf("expected the locale cookie alone to keep the page in Arabic, got:\n%s", rec2.Body.String())
+	}
+}
+
+func TestAPI_Locale_UnsupportedLangIgnored(t *testing.T) {
+	db := testDB(t)
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := httptest.NewRequest("GET", "/?lang=zz", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `<html lang="en" dir="ltr">`) {
+		t.Fatalf("expected an unsupported locale to fall back to English, got:\n%s", rec.Body.String())
+	}
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == "uc_locale" {
+			t.Fatalf("expected an unsupported locale to never be persisted into a cookie, got: %+v", c)
+		}
+	}
+}
+
+func TestAPI_Nav_ShowsLanguageSwitcher(t *testing.T) {
+	db := testDB(t)
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := httptest.NewRequest("GET", "/", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `class="uc-nav-lang uc-nav-lang-active" href="/?lang=en"`) {
+		t.Fatalf("expected an active English switcher link, got:\n%s", body)
+	}
+	if !strings.Contains(body, `class="uc-nav-lang" href="/?lang=ar"`) {
+		t.Fatalf("expected an Arabic switcher link, got:\n%s", body)
+	}
+}
+
+// TestAPI_Nav_ShowsLogoutOnlyWithRealLogin confirms the logout link
+// never appears when webauth is disabled — /ui/logout isn't even
+// registered on that deployment (see webauth.Authenticator.Register),
+// so linking to it would be a dead link to a 404, not a working control.
+// testHandler's Handler always has a nil *webauth.Authenticator
+// (Enabled() == false), matching every dev-auth-only deployment.
+func TestAPI_Nav_ShowsLogoutOnlyWithRealLogin(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := newRequest("GET", "/", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if strings.Contains(rec.Body.String(), `href="/ui/logout"`) {
+		t.Fatalf("expected no logout link when webauth is disabled, got:\n%s", rec.Body.String())
+	}
+}
+
+// TestNavTmpl_RendersLogoutLinkWhenShown is the positive-case sibling
+// of TestAPI_Nav_ShowsLogoutOnlyWithRealLogin: that test only ever
+// exercises ShowLogout=false (testHandler's Handler always has a nil
+// *webauth.Authenticator, so Enabled() is always false — there's no way
+// to construct a real "enabled" Authenticator from this package, since
+// webauth.New requires live OIDC discovery). Exercises navTmpl directly
+// with ShowLogout=true instead, confirming the template itself actually
+// renders a working /ui/logout link when the view says to — the half
+// of the gating logic the other test structurally cannot reach.
+func TestNavTmpl_RendersLogoutLinkWhenShown(t *testing.T) {
+	var buf bytes.Buffer
+	if err := navTmpl.Execute(&buf, navView{
+		Brand:       "Universal Core",
+		Locale:      "en",
+		CurrentPath: "/",
+		Locales:     []string{"en"},
+		ShowLogout:  true,
+		LogoutLabel: "Log out",
+	}); err != nil {
+		t.Fatalf("execute navTmpl: %v", err)
+	}
+	if !strings.Contains(buf.String(), `<a class="uc-nav-link" href="/ui/logout">Log out</a>`) {
+		t.Fatalf("expected a rendered logout link, got:\n%s", buf.String())
+	}
+}
+
+// TestAPI_ModuleMenu_ShowsTranslatedEntityNames confirms a real shipped
+// entity (not a test fixture) gets its actual translated display name,
+// not just its raw technical EntityType — the same "backend i18n
+// existing isn't the same as it being visible" gap the language
+// switcher itself fixes, applied to entity labels.
+func TestAPI_ModuleMenu_ShowsTranslatedEntityNames(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	ctx := context.Background()
+	actor := humanActor()
+	if err := foundation.Publish(ctx, db, tenantID, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := foundation.PublishForms(ctx, db, tenantID, actor); err != nil {
+		t.Fatalf("foundation.PublishForms: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := newRequest("GET", "/modules/foundation?lang=ar", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "طرف") {
+		t.Fatalf("expected Party's Arabic display name, got:\n%s", body)
+	}
+	if !strings.Contains(body, `<span class="uc-menu-item-code">Party</span>`) {
+		t.Fatalf("expected Party's technical code shown alongside its name, got:\n%s", body)
 	}
 }
 

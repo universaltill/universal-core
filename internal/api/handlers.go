@@ -110,6 +110,10 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	// dashboard, since New/Import alone give nowhere to go look at data
 	// that already exists).
 	mux.Handle("GET /records/{entityType}", auth(h.renderRecordList))
+	// A module's searchable menu of its own entity types — the page
+	// each dashboard hub node/nav link actually lands on (see
+	// modulemenu.go's doc comment).
+	mux.Handle("GET /modules/{key}", auth(h.renderModuleMenu))
 	mux.Handle("GET /import/{entityType}", auth(h.importUploadPage))
 	mux.Handle("POST /import/{entityType}/preview", auth(h.importPreview))
 	mux.Handle("POST /import/{entityType}/commit", auth(h.importCommit))
@@ -435,7 +439,7 @@ func (h *Handler) writeRecordFormFragment(w http.ResponseWriter, r *http.Request
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := h.renderer.Render(w, formDef, entDef, renderData, localeFromRequest(r)); err != nil {
+	if err := h.renderer.Render(w, formDef, entDef, renderData, localeFromRequest(w, r)); err != nil {
 		log.Printf("api: render %s form fragment (id=%q): %v", entityType, id, err)
 		httpx.WriteError(w, http.StatusInternalServerError, "internal error")
 	}
@@ -490,10 +494,7 @@ func (h *Handler) renderForm(w http.ResponseWriter, r *http.Request, id string) 
 		return
 	}
 	entityType := r.PathValue("entityType")
-	locale := r.URL.Query().Get("lang")
-	if locale == "" {
-		locale = "en"
-	}
+	locale := localeFromRequest(w, r)
 	if id != "" && !isValidID(id) {
 		httpx.WriteError(w, http.StatusBadRequest, "invalid record id")
 		return
@@ -536,8 +537,8 @@ func (h *Handler) renderForm(w http.ResponseWriter, r *http.Request, id string) 
 		httpx.WriteError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	nav := h.renderNav(r.Context(), &rc, locale)
-	if err := renderShell(w, nav, template.HTML(buf.String())); err != nil {
+	nav := h.renderNav(r, &rc, locale)
+	if err := renderShell(w, locale, nav, template.HTML(buf.String())); err != nil {
 		log.Printf("api: render %s form shell (id=%q): %v", entityType, id, err)
 	}
 }
