@@ -81,4 +81,19 @@ jobs:
         env:
           GOMODCACHE: ${{ runner.temp }}/gomodcache
           GOCACHE: ${{ runner.temp }}/gobuildcache
-        run: go test ./... -race -count=1
+        # -p 1: every package's tests share ONE live Postgres database
+        # (TEST_DATABASE_URL above) — fine while packages only touch their
+        # own tenant-scoped rows, but internal/worker's tests run real
+        # background pollers against workflow_jobs, and
+        # ClaimNext/ReclaimStale are deliberately tenant-*global* (a real
+        # deployment has one shared dispatcher servicing every tenant, see
+        # queue.go). Without -p 1, Go runs different packages' test
+        # binaries concurrently by default, so internal/worker's poller
+        # can claim a job internal/kernel/workflow's own synchronous test
+        # just enqueued before that test's own ProcessOne call reaches it
+        # — a real, if intermittent, cross-package race (first seen
+        # 2026-07-21, several merges after internal/worker landed, not on
+        # every run). -p 1 serializes package-level test execution so the
+        # two can never overlap; -race stays for the same-package data-race
+        # detection it's always done, unaffected by this.
+        run: go test ./... -race -count=1 -p 1
