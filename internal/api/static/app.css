@@ -315,6 +315,19 @@ table.uc-table tbody tr:last-child td {
   border-radius: 6px;
 }
 
+.uc-list-pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  margin-top: 1rem;
+  color: var(--uc-muted);
+}
+
+.uc-list-pager a {
+  font-weight: 600;
+}
+
 /* Forms (formrender) */
 form.uc-form {
   background: #fff;

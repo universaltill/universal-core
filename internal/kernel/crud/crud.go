@@ -101,6 +101,17 @@ func (e *Engine) List(ctx context.Context, def *entity.Definition, tenantID stri
 	return e.records.List(ctx, tenantID, def.EntityType)
 }
 
+// Count returns how many def records tenantID has — see
+// data.RecordRepo.CountByEntityType.
+func (e *Engine) Count(ctx context.Context, def *entity.Definition, tenantID string) (int, error) {
+	return e.records.CountByEntityType(ctx, tenantID, def.EntityType)
+}
+
+// ListPage returns one page of def records — see data.RecordRepo.ListPage.
+func (e *Engine) ListPage(ctx context.Context, def *entity.Definition, tenantID string, limit, offset int) ([]data.Record, error) {
+	return e.records.ListPage(ctx, tenantID, def.EntityType, limit, offset)
+}
+
 // ListByField returns every def record whose fieldName == value — used
 // to fetch a master-detail section's child rows (see
 // data.RecordRepo.ListByField).
