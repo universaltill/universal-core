@@ -17,6 +17,7 @@ import (
 	"log"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/universaltill/universal-core/internal/data"
@@ -555,7 +556,9 @@ func (h *Handler) renderForm(w http.ResponseWriter, r *http.Request, id string) 
 // copies that could silently drift (e.g. one remembering to populate
 // master-detail children, the other not).
 func (h *Handler) buildFormRenderData(ctx context.Context, tenantID string, entDef *entity.Definition, formDef *form.Definition, id string) (formrender.Data, error) {
-	renderData := formrender.Data{}
+	renderData := formrender.Data{
+		ReferenceOptions: h.loadReferenceOptions(ctx, tenantID, entDef),
+	}
 	if id == "" {
 		return renderData, nil
 	}
@@ -572,6 +575,80 @@ func (h *Handler) buildFormRenderData(ctx context.Context, tenantID string, entD
 	}
 	renderData.Children = children
 	return renderData, nil
+}
+
+// loadReferenceOptions builds every FieldReference field's dropdown
+// options — the fix for a field that otherwise renders as a plain text
+// box the user has to type a raw record id into by hand (found true of
+// every reference field in the kernel today: PurchaseOrder.vendor_id,
+// POLine.item_id, Item.base_uom_id, and more — reference fields were
+// simply unusable for real data entry until this existed). One target
+// entity type is only ever fetched once per render even if multiple
+// fields reference it (e.g. PartyRelationship's party_id_from and
+// party_id_to both target Party).
+//
+// A target entity/form lookup or record listing failure degrades to no
+// options for that field (logged, not surfaced) rather than failing the
+// whole form render — the same reasoning nav.go's renderNav already
+// applies to its own registry lookups: a broken reference target
+// shouldn't block viewing or editing the record that merely points at
+// it, and an empty dropdown is still a usable (if incomplete) form.
+func (h *Handler) loadReferenceOptions(ctx context.Context, tenantID string, entDef *entity.Definition) map[string][]formrender.ReferenceOption {
+	byTarget := map[string][]formrender.ReferenceOption{}
+	out := map[string][]formrender.ReferenceOption{}
+	for _, f := range entDef.Fields {
+		if f.Type != entity.FieldReference {
+			continue
+		}
+		opts, ok := byTarget[f.Target]
+		if !ok {
+			var err error
+			opts, err = h.referenceOptionsFor(ctx, tenantID, f.Target)
+			if err != nil {
+				log.Printf("api: load reference options for %s.%s -> %s: %v", entDef.EntityType, f.Name, f.Target, err)
+				opts = nil
+			}
+			byTarget[f.Target] = opts
+		}
+		out[f.Name] = opts
+	}
+	return out
+}
+
+// referenceOptionsFor lists every record of targetType for tenantID,
+// labeled by that entity's "name" field if it has one (the overwhelming
+// convention in this kernel's own Definitions — Party, Item, and every
+// other real entity so far all declare one) or its raw id otherwise.
+// Record data itself is tenant-owned business data, not UI chrome — no
+// i18n applies to the label the way it does to entity/module type
+// names (see locale.go's entityDisplayName, a genuinely different
+// concern: translating "PurchaseOrder" the identifier, not translating
+// one specific vendor's name).
+func (h *Handler) referenceOptionsFor(ctx context.Context, tenantID, targetType string) ([]formrender.ReferenceOption, error) {
+	targetDef, err := h.entityDef(ctx, tenantID, targetType)
+	if err != nil {
+		return nil, fmt.Errorf("look up target entity %s: %w", targetType, err)
+	}
+	records, err := h.crud.List(ctx, targetDef, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("list %s records: %w", targetType, err)
+	}
+	labelField := "name"
+	if _, ok := targetDef.FieldByName(labelField); !ok {
+		labelField = ""
+	}
+	opts := make([]formrender.ReferenceOption, len(records))
+	for i, rec := range records {
+		label := rec.ID
+		if labelField != "" {
+			if s, ok := rec.Data[labelField].(string); ok && s != "" {
+				label = s
+			}
+		}
+		opts[i] = formrender.ReferenceOption{ID: rec.ID, Label: label}
+	}
+	sort.Slice(opts, func(i, j int) bool { return opts[i].Label < opts[j].Label })
+	return opts, nil
 }
 
 // loadMasterDetailChildren fetches the child rows for every

@@ -75,11 +75,22 @@ func purchaseOrderForm() *form.Definition {
 // into the generic text-input branch rather than a picker widget. Fine as
 // a spike default — this test exists so a future picker-widget change is
 // a deliberate decision against a known baseline, not an unnoticed drift.
-func TestRender_ReferenceFieldRendersAsTextInput(t *testing.T) {
+// TestRender_ReferenceFieldRendersAsSelectWithLabels is the regression
+// test for a real usability gap: a FieldReference field used to render
+// as a plain text input, meaning the only way to fill it in was typing
+// a target record's raw id (a UUID) from memory — every reference
+// field in the whole kernel (PurchaseOrder.vendor_id, POLine.item_id,
+// Item.base_uom_id, ...) was effectively unusable for real data entry.
+// Now it's a <select> populated from Data.ReferenceOptions (built by
+// internal/api's loadReferenceOptions, which this package has no
+// access to itself — see ReferenceOption's own doc comment), showing
+// each option's human label, not its id, with the record's current
+// value pre-selected.
+func TestRender_ReferenceFieldRendersAsSelectWithLabels(t *testing.T) {
 	r := testRenderer(t)
 	ent := &entity.Definition{
 		EntityType: "PurchaseOrder",
-		Fields:     []entity.Field{{Name: "vendor_id", Type: entity.FieldReference, Target: "Vendor"}},
+		Fields:     []entity.Field{{Name: "vendor_id", Type: entity.FieldReference, Required: true, Target: "Party"}},
 	}
 	def := &form.Definition{
 		EntityType: "PurchaseOrder",
@@ -88,13 +99,90 @@ func TestRender_ReferenceFieldRendersAsTextInput(t *testing.T) {
 			Fields: []form.FormField{{Name: "vendor_id", Label: "Vendor"}},
 		}},
 	}
-	data := Data{Record: map[string]any{"vendor_id": "vendor-42"}}
+	data := Data{
+		Record: map[string]any{"vendor_id": "vendor-42"},
+		ReferenceOptions: map[string][]ReferenceOption{
+			"vendor_id": {
+				{ID: "vendor-1", Label: "Acme Textiles"},
+				{ID: "vendor-42", Label: "Beta Supplies"},
+			},
+		},
+	}
 	var buf strings.Builder
 	if err := r.Render(&buf, def, ent, data, "en"); err != nil {
 		t.Fatalf("render: %v", err)
 	}
-	if !strings.Contains(buf.String(), `<input type="text" id="vendor_id" name="vendor_id" value="vendor-42">`) {
-		t.Fatalf("expected reference field to render as a plain text input, got:\n%s", buf.String())
+	body := buf.String()
+	if !strings.Contains(body, `<select id="vendor_id" name="vendor_id" required>`) {
+		t.Fatalf("expected reference field to render as a required select, got:\n%s", body)
+	}
+	if !strings.Contains(body, `<option value="vendor-1" >Acme Textiles</option>`) {
+		t.Fatalf("expected an unselected option with a human label, not a raw id, got:\n%s", body)
+	}
+	if !strings.Contains(body, `<option value="vendor-42" selected>Beta Supplies</option>`) {
+		t.Fatalf("expected the current value's option to be selected, got:\n%s", body)
+	}
+}
+
+// TestRender_OptionalReferenceFieldGetsEmptyOption confirms an
+// optional (not required) reference field always offers a real "leave
+// unset" choice — without this, a browser's own <select> default
+// (whichever option renders first) would look selected on an untouched
+// new-record form even though nothing was actually chosen, and
+// submitting it would silently write that first option's id.
+func TestRender_OptionalReferenceFieldGetsEmptyOption(t *testing.T) {
+	r := testRenderer(t)
+	ent := &entity.Definition{
+		EntityType: "Item",
+		Fields:     []entity.Field{{Name: "base_uom_id", Type: entity.FieldReference, Target: "UnitOfMeasure"}},
+	}
+	def := &form.Definition{
+		EntityType: "Item",
+		Sections: []form.Section{{
+			Title: "Header", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "base_uom_id", Label: "Unit"}},
+		}},
+	}
+	data := Data{
+		Record: map[string]any{},
+		ReferenceOptions: map[string][]ReferenceOption{
+			"base_uom_id": {{ID: "uom-1", Label: "Each"}},
+		},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, def, ent, data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	body := buf.String()
+	if !strings.Contains(body, `<option value="" selected></option>`) {
+		t.Fatalf("expected a selected empty option on an unset optional reference field, got:\n%s", body)
+	}
+}
+
+// TestRender_ReferenceFieldWithNoOptionsRendersEmptySelect confirms a
+// missing/broken target (internal/api's loadReferenceOptions degrades
+// to no entry rather than failing the whole render) still produces a
+// usable, if incomplete, form — not a render error.
+func TestRender_ReferenceFieldWithNoOptionsRendersEmptySelect(t *testing.T) {
+	r := testRenderer(t)
+	ent := &entity.Definition{
+		EntityType: "PurchaseOrder",
+		Fields:     []entity.Field{{Name: "vendor_id", Type: entity.FieldReference, Target: "Party"}},
+	}
+	def := &form.Definition{
+		EntityType: "PurchaseOrder",
+		Sections: []form.Section{{
+			Title: "Header", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "vendor_id", Label: "Vendor"}},
+		}},
+	}
+	data := Data{Record: map[string]any{}}
+	var buf strings.Builder
+	if err := r.Render(&buf, def, ent, data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if !strings.Contains(buf.String(), `<select id="vendor_id" name="vendor_id">`) {
+		t.Fatalf("expected an empty but valid select, got:\n%s", buf.String())
 	}
 }
 
