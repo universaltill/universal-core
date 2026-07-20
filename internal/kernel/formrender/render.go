@@ -73,7 +73,16 @@ type viewModel struct {
 	// URL-context attribute html/template auto-escapes for that purpose
 	// (only attribute-context escaping applies), so a raw RecordID could
 	// otherwise inject query structure into the form's own submit target.
-	PostHref          string
+	PostHref string
+	// HiddenFields carries every entDef field the form doesn't show in
+	// any fields section, at its current stored value — see this file's
+	// package-level note above buildHiddenFields for why this exists:
+	// without it, a deliberately partial form (foundation.go explicitly
+	// encourages building one as each field is actually needed, not the
+	// whole entity at once) would silently wipe every field it doesn't
+	// show on every save, since the record-write path is a full
+	// replacement, not a merge.
+	HiddenFields      []hiddenFieldView
 	Sections          []sectionView
 	Actions           []actionView
 	RequiredSuffix    string
@@ -105,6 +114,13 @@ type sectionView struct {
 	// attributes the way it does href/src).
 	AddHref         string
 	RelatedListHref string
+}
+
+// hiddenFieldView is one entDef field the form doesn't visibly show —
+// see viewModel.HiddenFields.
+type hiddenFieldView struct {
+	Name  string
+	Value string
 }
 
 type fieldView struct {
@@ -184,6 +200,7 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 		rollUpTotals[s.RollUpTarget] = total
 		effective[s.RollUpTarget] = total
 	}
+	vm.HiddenFields = buildHiddenFields(def, ent, effective)
 
 	for _, s := range def.Sections {
 		sv := sectionView{Title: s.Title, Component: s.Component, Target: s.Target}
@@ -230,6 +247,66 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 	return vm, nil
 }
 
+// buildHiddenFields is the fix for a real data-loss bug: the record-write
+// path (internal/data.RecordRepo.UpdateTx) is a full replacement, not a
+// merge — SET data = $1, not a per-field patch. A form only shows the
+// fields it was built to show (foundation.go explicitly encourages
+// building a form field-by-field, only "as each is actually needed by a
+// real screen", not the whole entity up front), so without carrying
+// every other entDef field through as a hidden input at its current
+// value, saving a genuinely partial form would silently drop every field
+// it doesn't display — found the hard way (independent review, opus,
+// on internal/api's form-submit-htmx branch): an entity with a field not
+// on its form lost that field's data on the very first real save.
+func buildHiddenFields(def *form.Definition, ent *entity.Definition, record map[string]any) []hiddenFieldView {
+	shown := make(map[string]bool, len(ent.Fields))
+	for _, s := range def.Sections {
+		if s.Component != form.ComponentFields {
+			continue
+		}
+		for _, ff := range s.Fields {
+			shown[ff.Name] = true
+		}
+	}
+
+	var out []hiddenFieldView
+	for _, ef := range ent.Fields {
+		if shown[ef.Name] {
+			continue
+		}
+		out = append(out, hiddenFieldView{Name: ef.Name, Value: formatFieldValue(record[ef.Name])})
+	}
+	return out
+}
+
+// formatFieldValue renders a record field's stored Go value (whatever
+// entity.ValidateRecord accepted — string, float64, bool, or nil for
+// "not set") as the plain text an HTML attribute/hidden input carries,
+// and internal/api.parseRecordFields's csvimport.Coerce round-trips back
+// into the same Go type on the next submit. A nil/absent value becomes
+// "" (matching csvimport's own "empty means absent" convention on the
+// way back in), not the string "<nil>" text/template's default
+// stringification would otherwise produce.
+func formatFieldValue(v any) string {
+	switch val := v.(type) {
+	case nil:
+		return ""
+	case float64:
+		// Matches rollup.go's own float formatting — avoids
+		// strconv/fmt's default switch to scientific notation for large
+		// or precise values, which csvimport.Coerce's strconv.ParseFloat
+		// would round-trip correctly but is worth staying consistent
+		// with anyway.
+		return strconv.FormatFloat(val, 'f', -1, 64)
+	case bool:
+		return strconv.FormatBool(val)
+	case string:
+		return val
+	default:
+		return fmt.Sprint(val)
+	}
+}
+
 func buildFields(s form.Section, ent *entity.Definition, record map[string]any) ([]fieldView, error) {
 	var out []fieldView
 	for _, ff := range s.Fields {
@@ -251,20 +328,12 @@ func buildFields(s form.Section, ent *entity.Definition, record map[string]any) 
 			label = ff.Name
 		}
 
-		value := record[ff.Name]
-		if n, ok := value.(float64); ok {
-			// Format explicitly (matching rollup.go's display format)
-			// rather than relying on text/template's default float
-			// printing, which can switch to scientific notation.
-			value = strconv.FormatFloat(n, 'f', -1, 64)
-		}
-
 		fv := fieldView{
 			Name:     ff.Name,
 			Label:    label,
 			Type:     ef.Type,
 			Required: ef.Required,
-			Value:    value,
+			Value:    formatFieldValue(record[ff.Name]),
 		}
 
 		switch ef.Type {
@@ -305,6 +374,8 @@ func buildChildRows(children []map[string]any) []childRowView {
 }
 
 const tmplSrc = `<form class="uc-form" data-entity-type="{{.EntityType}}" hx-post="{{.PostHref}}" hx-target="this" hx-swap="outerHTML">
+{{range .HiddenFields}}<input type="hidden" name="{{.Name}}" value="{{.Value}}">
+{{end}}
 {{range .Sections}}
 <section class="uc-section" data-component="{{.Component}}">
 <h2>{{.Title}}</h2>
@@ -312,7 +383,7 @@ const tmplSrc = `<form class="uc-form" data-entity-type="{{.EntityType}}" hx-pos
 {{range .Fields}}
 <div class="uc-field">
 <label for="{{.Name}}">{{.Label}}{{if .Required}}{{$.RequiredSuffix}}{{end}}</label>
-{{if eq .Type "bool"}}<input type="checkbox" id="{{.Name}}" name="{{.Name}}" {{if .Checked}}checked{{end}}{{if .Required}} required{{end}}>
+{{if eq .Type "bool"}}<input type="hidden" name="{{.Name}}" value="false"><input type="checkbox" id="{{.Name}}" name="{{.Name}}" value="true" {{if .Checked}}checked{{end}}{{if .Required}} required{{end}}>
 {{else if eq .Type "enum"}}<select id="{{.Name}}" name="{{.Name}}"{{if .Required}} required{{end}}>
 {{range .Options}}<option value="{{.Value}}" {{if .Selected}}selected{{end}}>{{.Value}}</option>{{end}}
 </select>
