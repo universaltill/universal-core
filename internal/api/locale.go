@@ -88,9 +88,5 @@ func localeDir(locale string) string {
 // module's entity nobody has translated yet) still renders something
 // legible rather than a blank or a raw i18n key.
 func (h *Handler) entityDisplayName(locale, entityType string) string {
-	key := "entity." + entityType + ".name"
-	if label := h.catalog.T(locale, key); label != key {
-		return label
-	}
-	return entityType
+	return h.catalog.TOrDefault(locale, "entity."+entityType+".name", entityType)
 }

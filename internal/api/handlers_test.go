@@ -1448,6 +1448,105 @@ func TestAPI_RecordList_ShowsExistingRecords(t *testing.T) {
 	}
 }
 
+// TestAPI_RecordList_ReferenceColumnShowsLabelNotRawID is the
+// regression test for Farshid pointing out the list page showed "long
+// guid numbers which is not useful" — the reference-dropdown fix
+// (2026-07-20) only fixed the form view; list rows still showed a
+// reference field's raw stored id. Now resolves to the target record's
+// own label, the same lookup the form's dropdown already uses.
+func TestAPI_RecordList_ReferenceColumnShowsLabelNotRawID(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+	publishEntityAndForm(t, db, tenantID, orderEntityDefWithVendorReference(), orderFormDefWithVendorReference())
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	createVendor := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{"name":"Acme Textiles"}`))
+	createVendorRec := httptest.NewRecorder()
+	mux.ServeHTTP(createVendorRec, createVendor)
+	var vendor struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(createVendorRec.Body.Bytes(), &vendor); err != nil {
+		t.Fatalf("unmarshal vendor create response: %v", err)
+	}
+
+	createOrder := newRequest("POST", "/api/records/Order", tenantID, "farshid",
+		[]byte(`{"vendor_id":"`+vendor.Data.ID+`"}`))
+	createOrderRec := httptest.NewRecorder()
+	mux.ServeHTTP(createOrderRec, createOrder)
+	if createOrderRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 creating the Order, got %d: %s", createOrderRec.Code, createOrderRec.Body.String())
+	}
+
+	req := newRequest("GET", "/records/Order", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, ">Acme Textiles</a></td>") {
+		t.Fatalf("expected the vendor's name resolved in the list cell, got:\n%s", body)
+	}
+	if strings.Contains(body, ">"+vendor.Data.ID+"</a></td>") {
+		t.Fatalf("expected no raw vendor id shown as a cell value, got:\n%s", body)
+	}
+}
+
+// TestAPI_RecordList_EnumColumnShowsTranslatedLabel confirms an enum
+// field's list-page cell shows its translated label ("field.Item.
+// item_type.stock" -> "Stock"), not the raw stored value — the same
+// "field data like status should be multilingual" gap Farshid pointed
+// out, on the list page rather than just the form.
+func TestAPI_RecordList_EnumColumnShowsTranslatedLabel(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	itemDef := &entity.Definition{
+		EntityType: "Item",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "item_type", Type: entity.FieldEnum, Required: true,
+				EnumValues: []string{"stock", "service", "non_stock"}},
+		},
+	}
+	itemFormDef := &form.Definition{
+		EntityType: "Item",
+		Version:    1,
+		Sections: []form.Section{{
+			Title: "Details", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "item_type", Label: "Type"}},
+		}},
+	}
+	publishEntityAndForm(t, db, tenantID, itemDef, itemFormDef)
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	createReq := newRequest("POST", "/api/records/Item", tenantID, "farshid", []byte(`{"item_type":"stock"}`))
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", createRec.Code, createRec.Body.String())
+	}
+
+	req := newRequest("GET", "/records/Item", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, ">Stock</a></td>") {
+		t.Fatalf("expected the translated label \"Stock\", got:\n%s", body)
+	}
+	if strings.Contains(body, ">stock</a></td>") {
+		t.Fatalf("expected no raw untranslated \"stock\" value shown, got:\n%s", body)
+	}
+}
+
 func TestAPI_RecordList_EmptyShowsEmptyMessage(t *testing.T) {
 	db := testDB(t)
 	withDevAuthEnabled(t)
