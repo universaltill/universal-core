@@ -32,6 +32,26 @@ func serveHTMX(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// appCSS is the kernel's one global stylesheet — every page (dashboard,
+// welcome, forms, list views, the import wizard) shares it via shellTmpl
+// below, the same "one shared thing, not per-page styling" reasoning as
+// htmxJS. Deliberately plain (no build step, no framework) — see
+// static/app.css's own header comment.
+//
+//go:embed static/app.css
+var appCSS []byte
+
+// serveCSS serves the vendored app.css. Registered unauthenticated, same
+// reasoning as serveHTMX: a static asset with no tenant-specific
+// content, needed before auth can even render an error page.
+func serveCSS(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/css; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	if _, err := w.Write(appCSS); err != nil {
+		log.Printf("api: serve app.css: %v", err)
+	}
+}
+
 // shellTmpl wraps a page fragment in the minimal HTML document a real
 // browser needs to actually run htmx: without a real <script> tag
 // loading htmx.js somewhere, every hx-* attribute this kernel's
@@ -48,26 +68,41 @@ func serveHTMX(w http.ResponseWriter, r *http.Request) {
 // a bare fragment, since htmx replaces an existing element's innerHTML/
 // outerHTML with exactly that response; wrapping a swap response in a
 // full <html> document would break the swap, not fix anything.
+//
+// Nav is pre-rendered HTML (see nav.go's renderNav) so shellTmpl itself
+// never needs to know about tenants/modules/auth state — it's just
+// layout, same separation formrender already keeps between rendering
+// and the registry lookups that feed it.
 var shellTmpl = template.Must(template.New("shell").Parse(`<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
+<link rel="stylesheet" href="/static/app.css">
 <script src="/static/htmx.min.js"></script>
 </head>
 <body>
-{{.}}
+{{.Nav}}
+<main class="uc-container">
+{{.Body}}
+</main>
 </body>
 </html>
 `))
 
-// renderShell writes fragment wrapped in shellTmpl. fragment is already-
-// rendered, already-escaped HTML (from formrender or importTmpl, both of
-// which use html/template themselves), not raw user input — passed as
+type shellView struct {
+	Nav  template.HTML
+	Body template.HTML
+}
+
+// renderShell writes fragment wrapped in shellTmpl, with nav as the
+// page's top chrome. Both are already-rendered, already-escaped HTML
+// (nav from renderNav, fragment from formrender/importTmpl/dashboardTmpl,
+// all html/template output), not raw user input — passed as
 // template.HTML deliberately, the same trust boundary formrender's own
 // Render already crossed once for this exact content.
-func renderShell(w http.ResponseWriter, fragment string) error {
+func renderShell(w http.ResponseWriter, nav, fragment template.HTML) error {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := shellTmpl.Execute(w, template.HTML(fragment)); err != nil { //nolint:gosec // fragment is our own already-escaped template output, not raw user input
+	if err := shellTmpl.Execute(w, shellView{Nav: nav, Body: fragment}); err != nil {
 		return fmt.Errorf("render page shell: %w", err)
 	}
 	return nil

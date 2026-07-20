@@ -1076,6 +1076,171 @@ func TestAPI_ServesHTMXScript_Unauthenticated(t *testing.T) {
 	}
 }
 
+func TestAPI_ServesCSS_Unauthenticated(t *testing.T) {
+	db := testDB(t)
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := httptest.NewRequest("GET", "/static/app.css", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 with no auth headers, got %d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "css") {
+		t.Fatalf("expected a css content type, got %q", ct)
+	}
+}
+
+// TestAPI_RecordList_ShowsExistingRecords is the regression test for
+// the actual gap Farshid found logging in for the first time: the
+// dashboard only ever linked to "New" (a blank form) and "Import" —
+// there was nowhere to go look at records that already existed short of
+// the JSON-only GET /api/records/{entityType}.
+func TestAPI_RecordList_ShowsExistingRecords(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	createReq := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{"name":"Acme Textiles"}`))
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", createRec.Code, createRec.Body.String())
+	}
+
+	req := newRequest("GET", "/records/Vendor", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "Acme Textiles") {
+		t.Fatalf("expected the record's data in the list page, got:\n%s", body)
+	}
+	if !strings.Contains(body, `<script src="/static/htmx.min.js"></script>`) {
+		t.Fatalf("expected the list page to load htmx.js like every other page navigation, got:\n%s", body)
+	}
+	if !strings.Contains(body, `href="/forms/Vendor/new"`) {
+		t.Fatalf("expected a link to the Vendor new-record form, got:\n%s", body)
+	}
+}
+
+func TestAPI_RecordList_EmptyShowsEmptyMessage(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := newRequest("GET", "/records/Vendor", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "No records yet") {
+		t.Fatalf("expected the empty-state message, got:\n%s", rec.Body.String())
+	}
+}
+
+func TestAPI_RecordList_UnknownEntityTypeIs404(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := newRequest("GET", "/records/NoSuchEntity", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAPI_RecordList_RequiresAuth(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := httptest.NewRequest("GET", "/records/Vendor", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with no auth headers, got %d", rec.Code)
+	}
+}
+
+// TestAPI_Nav_LinksToPublishedModules confirms the shared top nav (see
+// nav.go) shows up on an authenticated page and links to each module's
+// list page — the actual "go to a separate system" switcher Farshid
+// asked about, not just a per-page New/Import link.
+func TestAPI_Nav_LinksToPublishedModules(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := newRequest("GET", "/", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `class="uc-nav"`) {
+		t.Fatalf("expected a nav bar, got:\n%s", body)
+	}
+	if !strings.Contains(body, `class="uc-nav-link" href="/records/Vendor"`) {
+		t.Fatalf("expected a nav link to Vendor's list page, got:\n%s", body)
+	}
+}
+
+// TestAPI_Nav_AnonymousIsBrandOnly confirms the welcome page (no
+// session) never tries to list modules for a tenant it doesn't have —
+// nav degrades to brand-only rather than erroring or leaking anything.
+func TestAPI_Nav_AnonymousIsBrandOnly(t *testing.T) {
+	db := testDB(t)
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := httptest.NewRequest("GET", "/", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `class="uc-nav-brand"`) {
+		t.Fatalf("expected a brand link, got:\n%s", body)
+	}
+	if strings.Contains(body, `uc-nav-link`) {
+		t.Fatalf("expected no module links on the anonymous welcome page, got:\n%s", body)
+	}
+}
+
 func TestAPI_RenderForm_UnknownRecordIs404(t *testing.T) {
 	db := testDB(t)
 	withDevAuthEnabled(t)
