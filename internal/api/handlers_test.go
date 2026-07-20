@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -70,6 +71,37 @@ func vendorFormDef() *form.Definition {
 		Version:    1,
 		Sections: []form.Section{
 			{Title: "Details", Component: form.ComponentFields, Fields: []form.FormField{{Name: "name", Label: "Name"}}},
+		},
+	}
+}
+
+// itemWithFlagEntityDef/itemWithFlagFormDef are for the two form-submit
+// regression tests below: a bool field (real HTML checkbox semantics)
+// and a field the form deliberately doesn't show (a partial form —
+// exactly what foundation.go's own doc comment encourages building).
+func itemWithFlagEntityDef() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "ItemWithFlag",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "sku", Type: entity.FieldString, Required: true},
+			{Name: "is_urgent", Type: entity.FieldBool},
+			{Name: "internal_note", Type: entity.FieldString},
+		},
+	}
+}
+
+// itemWithFlagFormDef deliberately shows only sku/is_urgent — not
+// internal_note.
+func itemWithFlagFormDef() *form.Definition {
+	return &form.Definition{
+		EntityType: "ItemWithFlag",
+		Version:    1,
+		Sections: []form.Section{
+			{Title: "Details", Component: form.ComponentFields, Fields: []form.FormField{
+				{Name: "sku", Label: "SKU"},
+				{Name: "is_urgent", Label: "Urgent"},
+			}},
 		},
 	}
 }
@@ -250,6 +282,365 @@ func TestAPI_CreateRecord_MalformedJSONIs400(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for malformed JSON, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestAPI_CreateRecord_FormURLEncodedBody is the regression test for the
+// bug found by internal/e2e's real-browser testing: formrender's own
+// <form> submits as application/x-www-form-urlencoded (htmx's default —
+// no hx-encoding override on the form tag), which the old JSON-only
+// decoder rejected outright with "invalid JSON body" before the request
+// ever reached validation. Every real "Save" click was silently broken.
+func TestAPI_CreateRecord_FormURLEncodedBody(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := httptest.NewRequest("POST", "/api/records/Vendor", strings.NewReader("name=Acme+Textiles"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-Tenant-ID", tenantID)
+	req.Header.Set("X-Actor-ID", "farshid")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "Acme Textiles") {
+		t.Fatalf("expected the form-encoded name to round-trip, got %s", rec.Body.String())
+	}
+}
+
+// TestAPI_CreateRecord_HTMXRequest_ReturnsHTMLFragment confirms an
+// htmx-issued create (HX-Request: true, set automatically by htmx on
+// every request — see isHTMXRequest) gets back the re-rendered form as
+// a bare HTML fragment, matching formrender's own
+// hx-target="this" hx-swap="outerHTML" contract — not the JSON envelope
+// a browser has nothing to do with once swapped into a <form> element's
+// place. The returned form points at the new record's own id (a
+// "create" form becomes an "edit" form for what it just created, the
+// standard htmx pattern), and is NOT wrapped in the page shell (layout.go)
+// — this is a swap response, not a page navigation.
+func TestAPI_CreateRecord_HTMXRequest_ReturnsHTMLFragment(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := httptest.NewRequest("POST", "/api/records/Vendor", strings.NewReader("name=Acme+Textiles"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("HX-Request", "true")
+	req.Header.Set("X-Tenant-ID", tenantID)
+	req.Header.Set("X-Actor-ID", "farshid")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Fatalf("expected text/html, got %q", ct)
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "<html") {
+		t.Fatalf("expected a bare fragment (no page shell) for an htmx-swap response, got:\n%s", body)
+	}
+	if !strings.Contains(body, `value="Acme Textiles"`) {
+		t.Fatalf("expected the saved value pre-filled in the returned form, got:\n%s", body)
+	}
+	if !strings.Contains(body, `hx-post="/api/records/Vendor/`) {
+		t.Fatalf("expected the form to now target its own record id, got:\n%s", body)
+	}
+}
+
+// TestAPI_UpdateRecord_FullLoop is the regression test for the second,
+// more severe half of the same bug: POST /api/records/{entityType}/{id}
+// had no route registered at all before this fix — saving an *existing*
+// record's form 404'd outright, unconditionally, regardless of body
+// format.
+func TestAPI_UpdateRecord_FullLoop(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	createReq := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{"name":"Acme Textiles"}`))
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	var created struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal create response: %v", err)
+	}
+
+	updateReq := newRequest("POST", "/api/records/Vendor/"+created.Data.ID, tenantID, "farshid", []byte(`{"name":"Acme Textiles Ltd"}`))
+	updateRec := httptest.NewRecorder()
+	mux.ServeHTTP(updateRec, updateReq)
+	if updateRec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", updateRec.Code, updateRec.Body.String())
+	}
+	if !strings.Contains(updateRec.Body.String(), "Acme Textiles Ltd") {
+		t.Fatalf("expected the updated name in the response, got %s", updateRec.Body.String())
+	}
+
+	getReq := newRequest("GET", "/api/records/Vendor/"+created.Data.ID, tenantID, "farshid", nil)
+	getRec := httptest.NewRecorder()
+	mux.ServeHTTP(getRec, getReq)
+	if !strings.Contains(getRec.Body.String(), "Acme Textiles Ltd") {
+		t.Fatalf("expected the update to persist, got %s", getRec.Body.String())
+	}
+}
+
+func TestAPI_UpdateRecord_HTMXRequest_ReturnsHTMLFragment(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	createReq := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{"name":"Acme Textiles"}`))
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	var created struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal create response: %v", err)
+	}
+
+	req := httptest.NewRequest("POST", "/api/records/Vendor/"+created.Data.ID, strings.NewReader("name=Acme+Textiles+Ltd"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("HX-Request", "true")
+	req.Header.Set("X-Tenant-ID", tenantID)
+	req.Header.Set("X-Actor-ID", "farshid")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Fatalf("expected text/html, got %q", ct)
+	}
+	if !strings.Contains(rec.Body.String(), `value="Acme Textiles Ltd"`) {
+		t.Fatalf("expected the updated value in the returned form, got:\n%s", rec.Body.String())
+	}
+}
+
+func TestAPI_UpdateRecord_UnknownRecordIs404(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := newRequest("POST", "/api/records/Vendor/99999999-9999-9999-9999-999999999999", tenantID, "farshid", []byte(`{"name":"X"}`))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for an unknown record id, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAPI_UpdateRecord_ValidationFailureIs400(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	createReq := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{"name":"Acme Textiles"}`))
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	var created struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal create response: %v", err)
+	}
+
+	// "name" is required; omit it.
+	updateReq := newRequest("POST", "/api/records/Vendor/"+created.Data.ID, tenantID, "farshid", []byte(`{}`))
+	updateRec := httptest.NewRecorder()
+	mux.ServeHTTP(updateRec, updateReq)
+	if updateRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a validation failure, got %d: %s", updateRec.Code, updateRec.Body.String())
+	}
+}
+
+// TestAPI_FormSubmit_CheckedBoolFieldSavesCorrectly is the end-to-end
+// regression test (real HTTP handler, real Postgres) for the checkbox
+// bug independent review found: a real browser checking a box and
+// submitting the form used to 400 with "field is_urgent: \"on\" is not
+// a bool", because formrender emitted a bare <input type="checkbox"> (no
+// value attribute — browsers default a checked box's submitted value to
+// "on") and csvimport.Coerce's strconv.ParseBool rejects "on" outright.
+// Simulates exactly what a real browser now submits after formrender's
+// fix: the hidden false-fallback, then the checkbox's own explicit
+// value="true" — form-urlencoded body order matches DOM order, so this
+// is "false" then "true" for the same key when checked.
+func TestAPI_FormSubmit_CheckedBoolFieldSavesCorrectly(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, itemWithFlagEntityDef(), itemWithFlagFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := httptest.NewRequest("POST", "/api/records/ItemWithFlag", strings.NewReader("sku=STEEL-BAR-10&is_urgent=false&is_urgent=true"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-Tenant-ID", tenantID)
+	req.Header.Set("X-Actor-ID", "farshid")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		Data struct {
+			Data map[string]any `json:"data"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if created.Data.Data["is_urgent"] != true {
+		t.Fatalf("expected is_urgent to save as true, got %+v", created.Data.Data)
+	}
+}
+
+// TestAPI_FormSubmit_UncheckedBoolFieldSavesFalse is the unchecked-box
+// counterpart: a real browser omits an unchecked checkbox from the
+// submission entirely, sending only the hidden false-fallback.
+func TestAPI_FormSubmit_UncheckedBoolFieldSavesFalse(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, itemWithFlagEntityDef(), itemWithFlagFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := httptest.NewRequest("POST", "/api/records/ItemWithFlag", strings.NewReader("sku=STEEL-BAR-10&is_urgent=false"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-Tenant-ID", tenantID)
+	req.Header.Set("X-Actor-ID", "farshid")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		Data struct {
+			Data map[string]any `json:"data"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if created.Data.Data["is_urgent"] != false {
+		t.Fatalf("expected is_urgent to save as false, got %+v", created.Data.Data)
+	}
+}
+
+// TestAPI_FormSubmit_PartialFormPreservesOffFormFields is the end-to-end
+// regression test (real HTTP handler, real Postgres, real formrender
+// output round-tripped back through parseRecordFields) for the more
+// severe of the two bugs independent review found: updateRecord's
+// underlying write is a full replacement, not a merge, so saving a
+// deliberately partial form (itemWithFlagFormDef doesn't show
+// internal_note) used to silently wipe internal_note from the stored
+// record. This drives the ACTUAL rendered form's own HTML back through
+// the update endpoint — not a hand-built body — so it fails if
+// formrender's hidden-field fix and parseRecordFields' handling of it
+// ever drift apart from each other.
+func TestAPI_FormSubmit_PartialFormPreservesOffFormFields(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, itemWithFlagEntityDef(), itemWithFlagFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	createReq := newRequest("POST", "/api/records/ItemWithFlag", tenantID, "farshid",
+		[]byte(`{"sku":"STEEL-BAR-10","is_urgent":false,"internal_note":"IMPORTANT, DO NOT LOSE"}`))
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	var created struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal create response: %v", err)
+	}
+
+	// Fetch the real rendered edit form — the actual HTML a browser
+	// would get, hidden fields included — and parse the real
+	// application/x-www-form-urlencoded body a submission of it would
+	// produce, rather than hand-constructing one.
+	formReq := newRequest("GET", "/forms/ItemWithFlag/"+created.Data.ID, tenantID, "farshid", nil)
+	formRec := httptest.NewRecorder()
+	mux.ServeHTTP(formRec, formReq)
+	if formRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 rendering the form, got %d: %s", formRec.Code, formRec.Body.String())
+	}
+	if !strings.Contains(formRec.Body.String(), `name="internal_note" value="IMPORTANT, DO NOT LOSE"`) {
+		t.Fatalf("expected the rendered form to carry internal_note as a hidden field, got:\n%s", formRec.Body.String())
+	}
+
+	// Only the fields the form actually shows are changed — sku is
+	// edited, internal_note is left exactly as the form rendered it
+	// (its hidden fallback), matching what a real form submission does.
+	body := "sku=" + url.QueryEscape("STEEL-BAR-10-REV2") +
+		"&is_urgent=false" +
+		"&internal_note=" + url.QueryEscape("IMPORTANT, DO NOT LOSE")
+	updateReq := httptest.NewRequest("POST", "/api/records/ItemWithFlag/"+created.Data.ID, strings.NewReader(body))
+	updateReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	updateReq.Header.Set("X-Tenant-ID", tenantID)
+	updateReq.Header.Set("X-Actor-ID", "farshid")
+	updateRec := httptest.NewRecorder()
+	mux.ServeHTTP(updateRec, updateReq)
+	if updateRec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", updateRec.Code, updateRec.Body.String())
+	}
+
+	getReq := newRequest("GET", "/api/records/ItemWithFlag/"+created.Data.ID, tenantID, "farshid", nil)
+	getRec := httptest.NewRecorder()
+	mux.ServeHTTP(getRec, getReq)
+	if !strings.Contains(getRec.Body.String(), "IMPORTANT, DO NOT LOSE") {
+		t.Fatalf("expected internal_note to survive a partial-form save, got %s", getRec.Body.String())
+	}
+	if !strings.Contains(getRec.Body.String(), "STEEL-BAR-10-REV2") {
+		t.Fatalf("expected the visibly-edited sku to have actually changed, got %s", getRec.Body.String())
 	}
 }
 

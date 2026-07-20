@@ -98,6 +98,118 @@ func TestRender_ReferenceFieldRendersAsTextInput(t *testing.T) {
 	}
 }
 
+// TestRender_BoolFieldHasHiddenFalseFallbackAndTrueCheckboxValue is the
+// regression test for a real bug caught by independent review on
+// internal/api's form-submit-htmx branch: an unchecked HTML checkbox is
+// omitted from a form submission entirely (never sent as "false"), and
+// this renderer used to emit <input type="checkbox" ...> with no value
+// attribute at all, meaning a browser defaults an unset checkbox's
+// submitted value to "on" when checked — which
+// internal/kernel/csvimport.Coerce's strconv.ParseBool rejects outright
+// (it only accepts 1/t/T/TRUE/true/True and their false counterparts,
+// not "on"). Every real "save a checked box" click 400'd. Fixed by
+// pairing every bool field with a hidden fallback (value="false", so an
+// unchecked box submits exactly that) followed by the checkbox itself
+// explicitly given value="true" — the browser preserves DOM order in the
+// submission, so a checked box submits "false" then "true", and the
+// server takes the *last* value for that key (see
+// internal/api/handlers.go's parseRecordFields).
+func TestRender_BoolFieldHasHiddenFalseFallbackAndTrueCheckboxValue(t *testing.T) {
+	r := testRenderer(t)
+	ent := &entity.Definition{
+		EntityType: "Item",
+		Fields:     []entity.Field{{Name: "is_urgent", Type: entity.FieldBool}},
+	}
+	def := &form.Definition{
+		EntityType: "Item",
+		Sections: []form.Section{{
+			Title: "Details", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "is_urgent", Label: "Urgent"}},
+		}},
+	}
+	data := Data{Record: map[string]any{"is_urgent": true}}
+	var buf strings.Builder
+	if err := r.Render(&buf, def, ent, data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	body := buf.String()
+	if !strings.Contains(body, `<input type="hidden" name="is_urgent" value="false"><input type="checkbox" id="is_urgent" name="is_urgent" value="true" checked>`) {
+		t.Fatalf("expected a hidden false-fallback immediately before a checkbox with an explicit true value, got:\n%s", body)
+	}
+}
+
+// TestRender_HiddenFieldsPreserveEntityFieldsNotShownOnForm is the
+// regression test for the more severe of the two bugs independent
+// review found: internal/data.RecordRepo.UpdateTx is a full replacement
+// (SET data = $1), not a merge, so a deliberately partial form (this
+// package's own foundation.go doc comment explicitly encourages building
+// one field at a time, "as each is actually needed by a real screen")
+// used to silently drop every entity field it doesn't visibly show, the
+// very first time that form was saved. Fixed: every entDef field not
+// referenced by any fields section now gets a hidden input carrying its
+// current value, so a partial form still round-trips the complete
+// record on submit.
+func TestRender_HiddenFieldsPreserveEntityFieldsNotShownOnForm(t *testing.T) {
+	r := testRenderer(t)
+	ent := &entity.Definition{
+		EntityType: "Item",
+		Fields: []entity.Field{
+			{Name: "sku", Type: entity.FieldString},
+			{Name: "internal_note", Type: entity.FieldString},
+		},
+	}
+	// Deliberately only shows "sku" — "internal_note" is a real entity
+	// field this form was never built to display.
+	def := &form.Definition{
+		EntityType: "Item",
+		Sections: []form.Section{{
+			Title: "Details", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "sku", Label: "SKU"}},
+		}},
+	}
+	data := Data{Record: map[string]any{"sku": "STEEL-BAR-10", "internal_note": "IMPORTANT, DO NOT LOSE"}}
+	var buf strings.Builder
+	if err := r.Render(&buf, def, ent, data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	body := buf.String()
+	if !strings.Contains(body, `<input type="hidden" name="internal_note" value="IMPORTANT, DO NOT LOSE">`) {
+		t.Fatalf("expected a hidden field preserving the off-form entity field's current value, got:\n%s", body)
+	}
+	if strings.Contains(body, `name="internal_note" value="IMPORTANT, DO NOT LOSE"><input type="hidden" name="internal_note"`) {
+		t.Fatalf("expected internal_note to appear exactly once (no duplicate hidden field), got:\n%s", body)
+	}
+}
+
+// TestRender_HiddenFieldsSkipFieldsAlreadyShownOnForm confirms a field
+// that IS visibly shown doesn't also get a redundant separate hidden
+// fallback (which would submit two different values for the same name,
+// with the hidden one — the record's last-saved value, not whatever the
+// user just typed — silently winning if it happened to be ordered last).
+func TestRender_HiddenFieldsSkipFieldsAlreadyShownOnForm(t *testing.T) {
+	r := testRenderer(t)
+	ent := &entity.Definition{
+		EntityType: "Item",
+		Fields:     []entity.Field{{Name: "sku", Type: entity.FieldString}},
+	}
+	def := &form.Definition{
+		EntityType: "Item",
+		Sections: []form.Section{{
+			Title: "Details", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "sku", Label: "SKU"}},
+		}},
+	}
+	data := Data{Record: map[string]any{"sku": "STEEL-BAR-10"}}
+	var buf strings.Builder
+	if err := r.Render(&buf, def, ent, data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	body := buf.String()
+	if strings.Contains(body, `<input type="hidden" name="sku"`) {
+		t.Fatalf("expected no redundant hidden fallback for a field already shown on the form, got:\n%s", body)
+	}
+}
+
 func testRenderer(t *testing.T) *Renderer {
 	t.Helper()
 	cat, err := i18n.Load("en")
@@ -118,8 +230,43 @@ func TestRender_HidesFieldWhenVisibleIfFalse(t *testing.T) {
 	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
 		t.Fatalf("render: %v", err)
 	}
-	if strings.Contains(buf.String(), `name="lc_reference"`) {
-		t.Fatalf("expected lc_reference to be hidden when payment_method != LC, got:\n%s", buf.String())
+	if strings.Contains(buf.String(), `<label for="lc_reference"`) {
+		t.Fatalf("expected lc_reference to have no visible input when payment_method != LC, got:\n%s", buf.String())
+	}
+}
+
+// TestRender_VisibleIfHiddenFieldStillPreservesItsValue is the
+// regression test for a real bug independent review found re-verifying
+// the off-form-field data-loss fix: a field the form DOES list, but
+// whose VisibleIf currently evaluates false for this record, was
+// neither rendered as a visible input NOR preserved as a hidden
+// fallback — buildHiddenFields' first version only checked whether a
+// field was *listed* in the Definition, not whether it actually
+// rendered, so a conditionally-hidden field's stored value fell through
+// both paths and was silently wiped on the next save (proved by the
+// reviewer using this exact fixture: an LC purchase order's
+// lc_reference, saved while temporarily displaying as a Wire order).
+func TestRender_VisibleIfHiddenFieldStillPreservesItsValue(t *testing.T) {
+	r := testRenderer(t)
+	data := Data{
+		RecordID: "po-1",
+		// payment_method is "Wire", so lc_reference's VisibleIf
+		// ("payment_method == 'LC'") is currently false — but the order
+		// still carries a real lc_reference value from when it was
+		// previously an LC order.
+		Record:   map[string]any{"vendor_id": "v1", "payment_method": "Wire", "lc_reference": "LC-OLD-VALUE"},
+		Children: map[string][]map[string]any{},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	body := buf.String()
+	if strings.Contains(body, `<label for="lc_reference"`) {
+		t.Fatalf("expected no visible lc_reference input when payment_method != LC, got:\n%s", body)
+	}
+	if !strings.Contains(body, `<input type="hidden" name="lc_reference" value="LC-OLD-VALUE">`) {
+		t.Fatalf("expected lc_reference's value preserved as a hidden field despite being VisibleIf-hidden, got:\n%s", body)
 	}
 }
 
