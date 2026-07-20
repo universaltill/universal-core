@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"os"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -90,10 +89,25 @@ func fastTestConfig() Config {
 	return Config{PollInterval: 20 * time.Millisecond, LeaseTimeout: 200 * time.Millisecond, Concurrency: 1}
 }
 
+// startRunner runs r.Run(ctx) in the background and returns a function
+// that blocks until Run has actually returned. Every test must call the
+// returned stop func (after cancelling ctx) before letting t.Cleanup close
+// db out from under it — without this, Run's goroutine can still be
+// mid-query when cleanup runs, racing the test's own teardown (found by
+// independent review: logged "context canceled" errors after several
+// tests had already returned).
+func startRunner(r *Runner, ctx context.Context) (stop func()) {
+	done := make(chan struct{})
+	go func() {
+		r.Run(ctx)
+		close(done)
+	}()
+	return func() { <-done }
+}
+
 func TestRunner_ProcessesEnqueuedJobViaPolling(t *testing.T) {
 	db := testDB(t)
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	tenantID := seedTenant(t, db)
 
 	def := &workflow.Definition{
@@ -125,7 +139,8 @@ func TestRunner_ProcessesEnqueuedJobViaPolling(t *testing.T) {
 		t.Fatalf("Enqueue: %v", err)
 	}
 
-	go r.Run(ctx)
+	stop := startRunner(r, ctx)
+	defer func() { cancel(); stop() }()
 
 	select {
 	case gotID := <-processed:
@@ -149,7 +164,6 @@ func TestRunner_ProcessesEnqueuedJobViaPolling(t *testing.T) {
 func TestRunner_ReclaimsStaleJobsEachTick(t *testing.T) {
 	db := testDB(t)
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	tenantID := seedTenant(t, db)
 
 	def := &workflow.Definition{
@@ -192,7 +206,8 @@ func TestRunner_ReclaimsStaleJobsEachTick(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	go r.Run(ctx)
+	stop := startRunner(r, ctx)
+	defer func() { cancel(); stop() }()
 
 	select {
 	case gotID := <-processed:
@@ -233,7 +248,6 @@ func TestRunner_StopsOnContextCancellation(t *testing.T) {
 func TestRunner_RunConcurrent_ProcessesAllJobsExactlyOnce(t *testing.T) {
 	db := testDB(t)
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	tenantID := seedTenant(t, db)
 
 	def := &workflow.Definition{
@@ -258,7 +272,6 @@ func TestRunner_RunConcurrent_ProcessesAllJobsExactlyOnce(t *testing.T) {
 		}
 	}
 
-	var processedCount atomic.Int64
 	var mu sync.Mutex
 	seen := map[string]bool{}
 	cfg := fastTestConfig()
@@ -273,7 +286,6 @@ func TestRunner_RunConcurrent_ProcessesAllJobsExactlyOnce(t *testing.T) {
 			}
 			seen[job.ID] = true
 			mu.Unlock()
-			processedCount.Add(1)
 			return nil
 		},
 	}, cfg)
@@ -281,16 +293,39 @@ func TestRunner_RunConcurrent_ProcessesAllJobsExactlyOnce(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	r.RunConcurrent(ctx)
+	// Spawn Concurrency pollers manually (rather than r.RunConcurrent,
+	// which by design doesn't hand back a way to wait for them) so this
+	// test can join every goroutine before returning — otherwise a
+	// poller can still be mid-query against db when t.Cleanup closes it.
+	var wg sync.WaitGroup
+	for range cfg.Concurrency {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r.Run(ctx)
+		}()
+	}
+	defer func() { cancel(); wg.Wait() }()
 
-	deadline := time.After(5 * time.Second)
-	for {
-		if processedCount.Load() == n {
-			break
+	// Poll the database directly for the terminal state, not the
+	// in-process seen count — the StepHandler above runs before
+	// Queue.ProcessOne's own MarkDone commits, so counting inside the
+	// handler could observe "processed" before status='done' is
+	// actually visible to a fresh query.
+	countDone := func() int {
+		var n int
+		if err := db.QueryRowContext(ctx,
+			`SELECT count(*) FROM workflow_jobs WHERE tenant_id = $1 AND status = 'done'`, tenantID,
+		).Scan(&n); err != nil {
+			t.Fatalf("count done jobs: %v", err)
 		}
+		return n
+	}
+	deadline := time.After(5 * time.Second)
+	for countDone() < n {
 		select {
 		case <-deadline:
-			t.Fatalf("timed out: only %d/%d jobs processed", processedCount.Load(), n)
+			t.Fatalf("timed out: only %d/%d jobs done", countDone(), n)
 		case <-time.After(20 * time.Millisecond):
 		}
 	}
