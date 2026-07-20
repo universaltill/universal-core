@@ -179,7 +179,7 @@ func TestPublish_LeavesRolledBackVersionAlone(t *testing.T) {
 	if err := Publish(ctx, db, tenantID, actor); err != nil {
 		t.Fatalf("first Publish: %v", err)
 	}
-	if err := repo.Rollback(ctx, tenantID, "Party", 1, actor); err != nil {
+	if err := repo.Rollback(ctx, tenantID, "Party", 2, actor); err != nil {
 		t.Fatalf("Rollback: %v", err)
 	}
 
