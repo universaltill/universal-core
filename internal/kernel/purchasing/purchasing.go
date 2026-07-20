@@ -31,6 +31,7 @@ func Item() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "Item",
 		Version:    1,
+		Module:     "purchasing",
 		Fields: []entity.Field{
 			{Name: "sku", Type: entity.FieldString, Required: true},
 			{Name: "name", Type: entity.FieldString, Required: true},
@@ -50,6 +51,7 @@ func PurchaseOrder() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "PurchaseOrder",
 		Version:    1,
+		Module:     "purchasing",
 		Fields: []entity.Field{
 			{Name: "vendor_id", Type: entity.FieldReference, Required: true, Target: "Party"},
 			{Name: "order_date", Type: entity.FieldDate, Required: true},
@@ -80,6 +82,7 @@ func POLine() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "POLine",
 		Version:    1,
+		Module:     "purchasing",
 		Fields: []entity.Field{
 			{Name: "purchase_order_id", Type: entity.FieldReference, Required: true, Target: "PurchaseOrder"},
 			{Name: "item_id", Type: entity.FieldReference, Required: true, Target: "Item"},
@@ -98,6 +101,7 @@ func InventoryItem() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "InventoryItem",
 		Version:    1,
+		Module:     "purchasing",
 		Fields: []entity.Field{
 			{Name: "item_id", Type: entity.FieldReference, Required: true, Target: "Item"},
 			{Name: "qty_on_hand", Type: entity.FieldNumber, Required: true, Default: float64(0)},
