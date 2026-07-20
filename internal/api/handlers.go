@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html/template"
 	"log"
 	"net/http"
 	"regexp"
@@ -72,6 +73,7 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	// (a 401/redirect for the very script tag meant to make that page
 	// itself interactive) before auth can even run.
 	mux.HandleFunc("GET /static/htmx.min.js", serveHTMX)
+	mux.HandleFunc("GET /static/app.css", serveCSS)
 	// webauth's own /ui/login, /ui/auth/callback, /ui/logout — never
 	// wrapped in Guard themselves; that's how a request gets a session
 	// in the first place. No-op registration when webauth is disabled.
@@ -102,6 +104,12 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	mux.Handle("POST /api/records/{entityType}/{id}", auth(h.updateRecord))
 	mux.Handle("GET /forms/{entityType}/new", auth(h.renderNewForm))
 	mux.Handle("GET /forms/{entityType}/{id}", auth(h.renderRecordForm))
+	// The module's actual landing page — a table of existing records,
+	// not just New/Import links (see listview.go's doc comment: found
+	// missing the first time a real login actually reached the
+	// dashboard, since New/Import alone give nowhere to go look at data
+	// that already exists).
+	mux.Handle("GET /records/{entityType}", auth(h.renderRecordList))
 	mux.Handle("GET /import/{entityType}", auth(h.importUploadPage))
 	mux.Handle("POST /import/{entityType}/preview", auth(h.importPreview))
 	mux.Handle("POST /import/{entityType}/commit", auth(h.importCommit))
@@ -528,7 +536,8 @@ func (h *Handler) renderForm(w http.ResponseWriter, r *http.Request, id string) 
 		httpx.WriteError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	if err := renderShell(w, buf.String()); err != nil {
+	nav := h.renderNav(r.Context(), &rc, locale)
+	if err := renderShell(w, nav, template.HTML(buf.String())); err != nil {
 		log.Printf("api: render %s form shell (id=%q): %v", entityType, id, err)
 	}
 }
