@@ -26,6 +26,7 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/form"
 	"github.com/universaltill/universal-core/internal/kernel/formrender"
+	"github.com/universaltill/universal-core/internal/webauth"
 )
 
 // Handler wires the registry, crud.Engine, and formrender.Renderer
@@ -36,44 +37,64 @@ type Handler struct {
 	crud       *crud.Engine
 	renderer   *formrender.Renderer
 	catalog    *i18n.Catalog
+	auth       *webauth.Authenticator
 }
 
 // New builds a Handler. catalog is the i18n.Catalog forms (and the
-// import wizard, import.go) render against (internal/i18n.Load).
-func New(db *sql.DB, catalog *i18n.Catalog) *Handler {
+// import wizard, import.go) render against (internal/i18n.Load). auth
+// may be nil or disabled (webauth.Config.Enabled() == false) — Routes
+// wires it unconditionally either way, since Guard/Register are both
+// safe no-ops on a disabled Authenticator (see webauth's own doc
+// comments).
+func New(db *sql.DB, catalog *i18n.Catalog, auth *webauth.Authenticator) *Handler {
 	return &Handler{
 		entityDefs: data.NewEntityDefinitionRepo(db),
 		formDefs:   data.NewFormDefinitionRepo(db),
 		crud:       crud.NewEngine(db),
 		renderer:   formrender.New(catalog),
 		catalog:    catalog,
+		auth:       auth,
 	}
 }
 
-// Routes registers every handler onto mux, wrapped in httpx.DevAuth (the
-// insecure stopgap — see that package's doc comment; main.go always
-// registers Routes, relying on DevAuth itself to fail closed).
+// Routes registers every handler onto mux, wrapped in
+// h.auth.Guard(httpx.DevAuth(...)) — real login (webauth) is tried
+// first; DevAuth (the insecure stopgap — see that package's doc
+// comment) only ever runs when webauth is disabled entirely for this
+// deployment, since Guard either populates the request context itself
+// or redirects before DevAuth gets a chance (see DevAuth's own doc
+// comment on why that composition is safe either way main.go always
+// registers Routes, relying on DevAuth's own fail-closed default when
+// neither is configured).
 func (h *Handler) Routes(mux *http.ServeMux) {
 	// Unauthenticated: a static asset with no tenant-specific content —
-	// gating it behind DevAuth would only break the page that needs it
-	// (a 401 for the very script tag meant to make the 401 page itself
-	// interactive) before auth can even run.
+	// gating it behind auth would only break the page that needs it
+	// (a 401/redirect for the very script tag meant to make that page
+	// itself interactive) before auth can even run.
 	mux.HandleFunc("GET /static/htmx.min.js", serveHTMX)
-	mux.Handle("GET /api/records/{entityType}", httpx.DevAuth(http.HandlerFunc(h.listRecords)))
-	mux.Handle("POST /api/records/{entityType}", httpx.DevAuth(http.HandlerFunc(h.createRecord)))
-	mux.Handle("GET /api/records/{entityType}/{id}", httpx.DevAuth(http.HandlerFunc(h.getRecord)))
+	// webauth's own /ui/login, /ui/auth/callback, /ui/logout — never
+	// wrapped in Guard themselves; that's how a request gets a session
+	// in the first place. No-op registration when webauth is disabled.
+	h.auth.Register(mux)
+
+	auth := func(handler http.HandlerFunc) http.Handler {
+		return h.auth.Guard(httpx.DevAuth(handler))
+	}
+	mux.Handle("GET /api/records/{entityType}", auth(h.listRecords))
+	mux.Handle("POST /api/records/{entityType}", auth(h.createRecord))
+	mux.Handle("GET /api/records/{entityType}/{id}", auth(h.getRecord))
 	// POST, not PUT: formrender's own <form> tag always submits via
 	// hx-post regardless of new vs. existing record (see render.go's
 	// tmplSrc) — until this route existed at all, saving an existing
 	// record's form 404'd outright (found via internal/e2e's real-browser
 	// testing, not curl — no existing test ever exercised editing a
 	// record that already existed).
-	mux.Handle("POST /api/records/{entityType}/{id}", httpx.DevAuth(http.HandlerFunc(h.updateRecord)))
-	mux.Handle("GET /forms/{entityType}/new", httpx.DevAuth(http.HandlerFunc(h.renderNewForm)))
-	mux.Handle("GET /forms/{entityType}/{id}", httpx.DevAuth(http.HandlerFunc(h.renderRecordForm)))
-	mux.Handle("GET /import/{entityType}", httpx.DevAuth(http.HandlerFunc(h.importUploadPage)))
-	mux.Handle("POST /import/{entityType}/preview", httpx.DevAuth(http.HandlerFunc(h.importPreview)))
-	mux.Handle("POST /import/{entityType}/commit", httpx.DevAuth(http.HandlerFunc(h.importCommit)))
+	mux.Handle("POST /api/records/{entityType}/{id}", auth(h.updateRecord))
+	mux.Handle("GET /forms/{entityType}/new", auth(h.renderNewForm))
+	mux.Handle("GET /forms/{entityType}/{id}", auth(h.renderRecordForm))
+	mux.Handle("GET /import/{entityType}", auth(h.importUploadPage))
+	mux.Handle("POST /import/{entityType}/preview", auth(h.importPreview))
+	mux.Handle("POST /import/{entityType}/commit", auth(h.importCommit))
 }
 
 // requestContext fetches the httpx.RequestContext a preceding DevAuth (or

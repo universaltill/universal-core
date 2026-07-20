@@ -10,14 +10,47 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
+	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/universaltill/universal-core/internal/api"
+	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/db"
 	"github.com/universaltill/universal-core/internal/httpx"
 	"github.com/universaltill/universal-core/internal/i18n"
+	"github.com/universaltill/universal-core/internal/webauth"
 )
+
+// webauthConfigFromEnv builds a webauth.Config from OIDC_* environment
+// variables. Every field empty is the expected, safe default (Enabled()
+// is false, api.New wires Routes exactly as if webauth didn't exist) —
+// there's nothing to configure until a real Zitadel org/app exists for
+// this deployment (uc-infra's zitadel.tf).
+func webauthConfigFromEnv() webauth.Config {
+	ttl := 12 * time.Hour
+	if raw := os.Getenv("OIDC_SESSION_TTL"); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil {
+			ttl = d
+		} else {
+			log.Printf("OIDC_SESSION_TTL=%q is not a valid duration, using default %s", raw, ttl)
+		}
+	}
+	var scopes []string
+	if raw := os.Getenv("OIDC_SCOPES"); raw != "" {
+		scopes = strings.Split(raw, ",")
+	}
+	return webauth.Config{
+		IssuerURL:     os.Getenv("OIDC_ISSUER_URL"),
+		ClientID:      os.Getenv("OIDC_CLIENT_ID"),
+		RedirectURL:   os.Getenv("OIDC_REDIRECT_URL"),
+		PostLogoutURL: os.Getenv("OIDC_POST_LOGOUT_URL"),
+		CookieKeyB64:  os.Getenv("OIDC_COOKIE_KEY"),
+		Scopes:        scopes,
+		SessionTTL:    ttl,
+	}
+}
 
 func main() {
 	dbURL := os.Getenv("DATABASE_URL")
@@ -50,25 +83,33 @@ func main() {
 		w.Write([]byte(`{"data":{"status":"ok"},"error":null}`))
 	})
 
-	// /api and /forms are always registered; httpx.DevAuth (wrapped
-	// around every one of them in api.Routes) is what actually gates
-	// access — it fails closed (401) unless INSECURE_DEV_AUTH=true, so
-	// there's no need to hide the routes themselves here too. Always
-	// registering means a client gets a consistent JSON 401 either way,
-	// not a plain-text 404 when auth happens to be off.
-	if httpx.DevAuthEnabled() {
+	// /api and /forms are always registered; webauth.Guard wrapped around
+	// httpx.DevAuth (see api.Routes) is what actually gates access — real
+	// login when configured, DevAuth's own fail-closed 401 default
+	// otherwise. Always registering the routes means a client gets a
+	// consistent response either way, not a plain-text 404 when auth
+	// happens to be off.
+	webauthCfg := webauthConfigFromEnv()
+	auth, err := webauth.New(context.Background(), webauthCfg, data.NewTenantRepo(sqlDB))
+	if err != nil {
+		log.Fatalf("configure webauth: %v", err)
+	}
+	if auth.Enabled() {
+		log.Printf("webauth: real login enabled (issuer=%s client_id=%s) — /api and /forms redirect unauthenticated browsers to /ui/login", webauthCfg.IssuerURL, webauthCfg.ClientID)
+	} else if httpx.DevAuthEnabled() {
 		// INSECURE_DEV_AUTH: see internal/httpx/devauth.go's doc comment.
 		// Loud on purpose — this must never be silently true in a real
-		// deployment.
+		// deployment. Only reachable at all when webauth itself isn't
+		// configured (DevAuth is a no-op fallback behind Guard once it is).
 		log.Printf("WARNING: INSECURE_DEV_AUTH=true — /api and /forms routes trust X-Tenant-ID/X-Actor-ID headers with ZERO verification. Do not set this on a publicly reachable deployment.")
 	} else {
-		log.Printf("INSECURE_DEV_AUTH not set — /api and /forms routes will 401 every request (no auth backend configured yet, see QUEUE.md)")
+		log.Printf("no auth backend configured — /api and /forms routes will 401 every request (see QUEUE.md)")
 	}
 	catalog, err := i18n.Load("en")
 	if err != nil {
 		log.Fatalf("load i18n catalog: %v", err)
 	}
-	api.New(sqlDB, catalog).Routes(mux)
+	api.New(sqlDB, catalog, auth).Routes(mux)
 
 	addr := os.Getenv("LISTEN_ADDR")
 	if addr == "" {

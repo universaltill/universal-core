@@ -23,12 +23,17 @@ type ctxKey int
 
 const requestContextKey ctxKey = 0
 
-func withRequestContext(ctx context.Context, rc RequestContext) context.Context {
+// WithRequestContext attaches rc to ctx — exported so internal/webauth's
+// real-login middleware can populate the same RequestContext DevAuth
+// does, from a verified session instead of trusted-verbatim headers.
+// Both middlewares produce the exact same downstream shape, so
+// internal/api's handlers never need to know which one actually ran.
+func WithRequestContext(ctx context.Context, rc RequestContext) context.Context {
 	return context.WithValue(ctx, requestContextKey, rc)
 }
 
 // FromContext returns the RequestContext a preceding auth middleware
-// (DevAuth, or its eventual Zitadel/OIDC replacement) attached to ctx.
+// (DevAuth, webauth, or a future replacement) attached to ctx.
 func FromContext(ctx context.Context) (RequestContext, bool) {
 	rc, ok := ctx.Value(requestContextKey).(RequestContext)
 	return rc, ok
@@ -62,8 +67,22 @@ var tenantIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-f
 // forgets to wire real auth therefore serves nothing through these
 // routes rather than silently trusting spoofable headers — the opposite
 // of what a permissive default would do.
+//
+// Composes as a fallback behind a real auth middleware (internal/api
+// wraps every route as webauth.Guard(DevAuth(handler))): if a
+// RequestContext is already attached — webauth.Guard already verified a
+// real session — DevAuth does nothing and passes the request straight
+// through, never re-checking headers on top of an already-authenticated
+// request. This is also what makes DevAuth's own headers genuinely
+// inert the moment real login is configured for a deployment: Guard
+// either populates the context itself or redirects before DevAuth ever
+// runs, so INSECURE_DEV_AUTH has no effect once webauth.Config.Enabled().
 func DevAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := FromContext(r.Context()); ok {
+			next.ServeHTTP(w, r)
+			return
+		}
 		if !DevAuthEnabled() {
 			WriteError(w, http.StatusUnauthorized, "no auth backend configured")
 			return
@@ -78,7 +97,7 @@ func DevAuth(next http.Handler) http.Handler {
 			WriteError(w, http.StatusUnauthorized, "X-Tenant-ID is not a valid tenant id")
 			return
 		}
-		ctx := withRequestContext(r.Context(), RequestContext{
+		ctx := WithRequestContext(r.Context(), RequestContext{
 			TenantID: tenantID,
 			Actor:    audit.Actor{Type: audit.ActorHuman, ID: actorID},
 		})

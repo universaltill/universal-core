@@ -6,6 +6,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/universaltill/universal-core/internal/kernel/audit"
 )
 
 // withDevAuthEnabled sets INSECURE_DEV_AUTH for the duration of a test
@@ -105,6 +107,35 @@ func TestDevAuth_RejectsMalformedTenantID(t *testing.T) {
 
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for a malformed X-Tenant-ID, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestDevAuth_PassesThroughWhenAlreadyAuthenticated is the regression
+// test for the composability property internal/webauth's Guard depends
+// on: a request that already carries a RequestContext (a preceding real-
+// auth middleware already verified it) must reach the handler unchanged
+// — DevAuth doesn't re-check headers, doesn't require INSECURE_DEV_AUTH
+// to be set, and doesn't overwrite the already-attached context. This is
+// what makes DevAuth's own headers genuinely inert once real login is
+// configured for a deployment (Guard either populates the context first
+// or redirects before DevAuth ever runs).
+func TestDevAuth_PassesThroughWhenAlreadyAuthenticated(t *testing.T) {
+	withDevAuthEnabled(t, false) // deliberately disabled — must not matter
+	req := httptest.NewRequest("GET", "/", nil)
+	ctx := WithRequestContext(req.Context(), RequestContext{
+		TenantID: testTenantID,
+		Actor:    audit.Actor{Type: audit.ActorHuman, ID: "real-user"},
+	})
+	req = req.WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	DevAuth(okHandler()).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 (pass-through), got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"actor_id":"real-user"`) {
+		t.Fatalf("expected the pre-existing RequestContext to survive unchanged, got %s", rec.Body.String())
 	}
 }
 
