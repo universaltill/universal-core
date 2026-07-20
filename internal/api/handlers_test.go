@@ -1183,6 +1183,121 @@ func poLineFormDef() *form.Definition {
 // "list where field X == this id" query — see loadMasterDetailChildren's
 // doc comment). This confirms a real child row now shows up, and that
 // its line_total actually rolls up into the header.
+func orderEntityDefWithVendorReference() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "Order",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "vendor_id", Type: entity.FieldReference, Target: "Vendor"},
+		},
+	}
+}
+
+func orderFormDefWithVendorReference() *form.Definition {
+	return &form.Definition{
+		EntityType: "Order",
+		Version:    1,
+		Sections: []form.Section{
+			{Title: "Header", Component: form.ComponentFields, Fields: []form.FormField{{Name: "vendor_id", Label: "Vendor"}}},
+		},
+	}
+}
+
+// TestAPI_RenderForm_ReferenceFieldShowsTargetRecordsAsDropdown is the
+// end-to-end regression test for the actual usability fix (formrender's
+// own tests cover the template logic in isolation): a real published
+// Vendor record's name shows up as a selectable option on a real
+// PurchaseOrder-shaped form's vendor_id field, sourced by
+// internal/api's loadReferenceOptions — not a text box requiring the
+// vendor's raw id.
+func TestAPI_RenderForm_ReferenceFieldShowsTargetRecordsAsDropdown(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+	publishEntityAndForm(t, db, tenantID, orderEntityDefWithVendorReference(), orderFormDefWithVendorReference())
+
+	createReq := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{"name":"Acme Textiles"}`))
+	createRec := httptest.NewRecorder()
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+	mux.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 creating the Vendor, got %d: %s", createRec.Code, createRec.Body.String())
+	}
+	var created struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal create response: %v", err)
+	}
+
+	req := newRequest("GET", "/forms/Order/new", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `<select id="vendor_id" name="vendor_id">`) {
+		t.Fatalf("expected vendor_id to render as a select, got:\n%s", body)
+	}
+	if !strings.Contains(body, `<option value="`+created.Data.ID+`" >Acme Textiles</option>`) {
+		t.Fatalf("expected the Vendor's name as an option label (not its raw id), got:\n%s", body)
+	}
+}
+
+// TestAPI_RenderForm_ReferenceFieldWithoutNameFieldFallsBackToID
+// confirms a target entity with no "name" field still produces a
+// usable (if less friendly) dropdown, labeled by id, rather than an
+// error or an empty option.
+func TestAPI_RenderForm_ReferenceFieldWithoutNameFieldFallsBackToID(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	noNameEntDef := &entity.Definition{
+		EntityType: "Vendor",
+		Version:    1,
+		Fields:     []entity.Field{{Name: "code", Type: entity.FieldString, Required: true}},
+	}
+	noNameFormDef := &form.Definition{
+		EntityType: "Vendor",
+		Version:    1,
+		Sections:   []form.Section{{Title: "Details", Component: form.ComponentFields, Fields: []form.FormField{{Name: "code", Label: "Code"}}}},
+	}
+	publishEntityAndForm(t, db, tenantID, noNameEntDef, noNameFormDef)
+	publishEntityAndForm(t, db, tenantID, orderEntityDefWithVendorReference(), orderFormDefWithVendorReference())
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	createReq := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{"code":"V-001"}`))
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", createRec.Code, createRec.Body.String())
+	}
+	var created struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal create response: %v", err)
+	}
+
+	req := newRequest("GET", "/forms/Order/new", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if !strings.Contains(rec.Body.String(), `<option value="`+created.Data.ID+`" >`+created.Data.ID+`</option>`) {
+		t.Fatalf("expected the option labeled by id when the target has no name field, got:\n%s", rec.Body.String())
+	}
+}
+
 func TestAPI_RenderRecordForm_ShowsMasterDetailChildren(t *testing.T) {
 	db := testDB(t)
 	withDevAuthEnabled(t)
