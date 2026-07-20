@@ -329,6 +329,63 @@ func TestRender_EnumOptionLabelsAreTranslated(t *testing.T) {
 	}
 }
 
+// TestRender_FieldLabelIsTranslated confirms a form's <label> text comes
+// from the "field.{EntityType}.{FieldName}" i18n key, not just the
+// hard-coded English form.FormField.Label — Arabic is used specifically
+// because "الحالة" can't be mistaken for a coincidental match with the Go-
+// declared "Status" fallback the way an untranslated locale might.
+func TestRender_FieldLabelIsTranslated(t *testing.T) {
+	r := testRenderer(t)
+	ent := &entity.Definition{
+		EntityType: "PurchaseOrder",
+		Fields: []entity.Field{
+			{Name: "status", Type: entity.FieldEnum, Required: true, EnumValues: []string{"draft"}},
+		},
+	}
+	def := &form.Definition{
+		EntityType: "PurchaseOrder",
+		Sections: []form.Section{{
+			Title: "Header", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "status", Label: "Status"}},
+		}},
+	}
+	data := Data{Record: map[string]any{"status": "draft"}}
+	var buf strings.Builder
+	if err := r.Render(&buf, def, ent, data, "ar"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if !strings.Contains(buf.String(), `<label for="status">الحالة`) {
+		t.Fatalf("expected the Arabic field label \"الحالة\", got:\n%s", buf.String())
+	}
+}
+
+// TestRender_UntranslatedFieldLabelFallsBackToDeclaredLabel confirms a
+// field with no "field.{EntityType}.{FieldName}" key yet still renders
+// exactly as it did before this convention existed — additive, not a
+// requirement to translate every field before it can render.
+func TestRender_UntranslatedFieldLabelFallsBackToDeclaredLabel(t *testing.T) {
+	r := testRenderer(t)
+	ent := &entity.Definition{
+		EntityType: "NoSuchEntity",
+		Fields:     []entity.Field{{Name: "widget_count", Type: entity.FieldNumber}},
+	}
+	def := &form.Definition{
+		EntityType: "NoSuchEntity",
+		Sections: []form.Section{{
+			Title: "Header", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "widget_count", Label: "Widget Count"}},
+		}},
+	}
+	data := Data{Record: map[string]any{"widget_count": float64(3)}}
+	var buf strings.Builder
+	if err := r.Render(&buf, def, ent, data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if !strings.Contains(buf.String(), `<label for="widget_count">Widget Count`) {
+		t.Fatalf("expected the declared fallback label \"Widget Count\", got:\n%s", buf.String())
+	}
+}
+
 // TestRender_ReferenceFieldWithNoOptionsRendersEmptySelect confirms a
 // missing/broken target (internal/api's loadReferenceOptions degrades
 // to no entry rather than failing the whole render) still produces a
