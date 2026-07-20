@@ -44,8 +44,15 @@ func (h *Handler) importUploadPage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	locale := localeFromRequest(r)
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	err := importTmpl.ExecuteTemplate(w, "page", importPageView{
+	// Rendered into a buffer first, not straight to w — this is a
+	// top-level page navigation, not an htmx-swap response, so it needs
+	// the real <html><head> shell that loads htmx.js (see layout.go);
+	// without it the Preview button's hx-post is inert markup, a real
+	// browser has nothing to execute it. The preview/commit fragments
+	// this page's own htmx swaps into #uc-import-result stay bare —
+	// only the very first page load gets the shell.
+	var buf bytes.Buffer
+	err := importTmpl.ExecuteTemplate(&buf, "page", importPageView{
 		EntityType:   entityType,
 		PreviewHref:  "/import/" + entityType + "/preview",
 		ChooseFile:   h.catalog.T(locale, "import.choose_file"),
@@ -53,6 +60,10 @@ func (h *Handler) importUploadPage(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		writeInternalError(w, "render import upload page", err)
+		return
+	}
+	if err := renderShell(w, buf.String()); err != nil {
+		writeInternalError(w, "render import upload page shell", err)
 	}
 }
 
