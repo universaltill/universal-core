@@ -146,13 +146,19 @@ func publishEntityAndForm(t *testing.T, db *sql.DB, tenantID string, entDef *ent
 	}
 }
 
+// testHandler builds a Handler with webauth disabled (nil Authenticator)
+// — every existing test in this file authenticates via DevAuth's
+// X-Tenant-ID/X-Actor-ID headers, and a nil Authenticator's Guard is a
+// pure pass-through straight to DevAuth (see webauth.Authenticator.Guard
+// and httpx.DevAuth's own doc comments on how the two compose).
+// internal/webauth's own tests cover the real-login path.
 func testHandler(t *testing.T, db *sql.DB) *Handler {
 	t.Helper()
 	catalog, err := i18n.Load("en")
 	if err != nil {
 		t.Fatalf("load i18n catalog: %v", err)
 	}
-	return New(db, catalog)
+	return New(db, catalog, nil)
 }
 
 func newRequest(method, target, tenantID, actorID string, body []byte) *http.Request {

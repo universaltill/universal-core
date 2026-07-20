@@ -1,0 +1,14 @@
+-- Universal Till ID (Zitadel) login: the join key from a Zitadel
+-- organization to a Universal Core tenant. Each customer company gets its
+-- own Zitadel org (matching Zitadel's own multi-tenancy primitive) and its
+-- own tenants row here; internal/webauth resolves an id_token's org claim
+-- to this column at login, once, to populate the session's tenant_id — not
+-- on every request (the sealed session cookie carries the already-resolved
+-- tenant_id, so a lookup here happens only at sign-in, not per request).
+--
+-- Nullable: a tenant provisioned before real login exists (every tenant so
+-- far, via cmd/provision-tenant) has no Zitadel org linked yet, and DevAuth
+-- doesn't need one. UNIQUE: a Zitadel org maps to at most one tenant, so a
+-- misconfigured second tenant can't silently claim someone else's org and
+-- start resolving their users into itself.
+ALTER TABLE tenants ADD COLUMN zitadel_org_id TEXT UNIQUE;
