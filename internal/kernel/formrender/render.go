@@ -383,10 +383,17 @@ func (r *Renderer) buildFields(s form.Section, ent *entity.Definition, record ma
 			return nil, fmt.Errorf("form field %q has no matching field on entity %q", ff.Name, ent.EntityType)
 		}
 
-		label := ff.Label
-		if label == "" {
-			label = ff.Name
+		fallback := ff.Label
+		if fallback == "" {
+			fallback = ff.Name
 		}
+		// "field.{EntityType}.{FieldName}" mirrors the enum-value
+		// convention below ("field.{EntityType}.{FieldName}.{Value}") —
+		// falls back to the form.FormField.Label Go declared (or the raw
+		// field name) when no translation exists yet, so this is
+		// additive: an untranslated field still renders exactly as
+		// before, it just isn't multilingual until a key is added.
+		label := r.i18n.TOrDefault(locale, "field."+ent.EntityType+"."+ff.Name, fallback)
 
 		fv := fieldView{
 			Name:     ff.Name,
