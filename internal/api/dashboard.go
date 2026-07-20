@@ -12,6 +12,7 @@ import (
 
 	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/httpx"
+	"github.com/universaltill/universal-core/internal/i18n"
 )
 
 // renderRoot is what every browser lands on at "/" — until this existed,
@@ -61,13 +62,16 @@ func (h *Handler) writeDashboard(w http.ResponseWriter, r *http.Request, rc http
 		return
 	}
 
+	nodes, containerPx := hubLayout(modules, locale, h.catalog)
+
 	var buf bytes.Buffer
 	err = dashboardTmpl.Execute(&buf, dashboardView{
-		Nodes:        hubLayout(modules),
+		Nodes:        nodes,
 		Title:        h.catalog.T(locale, "dashboard.title"),
 		Empty:        h.catalog.T(locale, "dashboard.empty"),
-		ContainerPx:  hubContainerPx,
-		CenterPx:     hubCenterPx,
+		ComingSoon:   h.catalog.T(locale, "module.coming_soon"),
+		ContainerPx:  containerPx,
+		CenterPx:     containerPx / 2,
 		CenterSizePx: hubCenterSizePx,
 	})
 	if err != nil {
@@ -139,6 +143,7 @@ type moduleEntity struct {
 type moduleGroup struct {
 	Key      string
 	Name     string
+	Icon     string
 	Entities []moduleEntity
 }
 
@@ -203,6 +208,7 @@ func (h *Handler) accessibleModules(ctx context.Context, tenantID, locale string
 		modules = append(modules, moduleGroup{
 			Key:      key,
 			Name:     h.catalog.T(locale, "module."+key+".name"),
+			Icon:     moduleIcon(key),
 			Entities: entities,
 		})
 	}
@@ -210,28 +216,86 @@ func (h *Handler) accessibleModules(ctx context.Context, tenantID, locale string
 	return modules, nil
 }
 
+// plannedModuleKeys are the standard ERP domains this kernel doesn't
+// have a real module for yet (BACKLOG.md's R8 domain list) — shown on
+// the hub as non-clickable "coming soon" nodes rather than left off
+// entirely, per Farshid asking for "all ERP modules going to their
+// area but just say coming soon." Purely presentational: unlike
+// moduleGroup (built from the registry), these aren't tied to any
+// Entity Definition or tenant access — a real module landing later
+// under one of these keys (see foundation.go/purchasing.go's own
+// Module field) automatically takes over its slot instead of
+// duplicating it (see hubNodes' dedup below), no code change needed
+// here.
+var plannedModuleKeys = []string{
+	"finance", "sales", "manufacturing", "inventory", "warehouse",
+	"supplychain", "crm", "projects", "hr", "ecommerce", "marketing",
+	"reporting",
+}
+
+// moduleIcons is a plain emoji per module key — zero-dependency
+// (no icon font, no SVG sprite sheet, no CDN), matching this kernel's
+// "vendor nothing" static-asset pattern elsewhere (htmxJS, appCSS).
+// Good enough to make the hub read as colorful/graphical the way
+// Farshid's SAP/ERP reference infographics did; a real icon set is a
+// fair future upgrade, not a blocker for this.
+var moduleIcons = map[string]string{
+	"foundation":    "🧱",
+	"purchasing":    "🛒",
+	"general":       "📁",
+	"finance":       "💰",
+	"sales":         "📈",
+	"manufacturing": "🏭",
+	"inventory":     "📦",
+	"warehouse":     "🏬",
+	"supplychain":   "🚚",
+	"crm":           "🤝",
+	"projects":      "📋",
+	"hr":            "👥",
+	"ecommerce":     "🛍️",
+	"marketing":     "📣",
+	"reporting":     "📊",
+}
+
+func moduleIcon(key string) string {
+	if icon, ok := moduleIcons[key]; ok {
+		return icon
+	}
+	return "🔷"
+}
+
 // dashboardView is the hub-and-spoke home page: Universal Core at the
-// center, one connected node per accessible module around it — the
-// graphical module switcher Farshid asked for after seeing the
-// SAP-style "modules around a hub" diagram, instead of a flat tile
-// grid. Node positions are computed server-side (evenly spaced around
-// a circle, starting at 12 o'clock) since html/template has no
-// trigonometry of its own — see hubLayout.
+// center, one connected node per module around it — real, clickable
+// modules the tenant has access to, plus every other standard ERP
+// domain as a muted, non-clickable "coming soon" node (plannedModuleKeys)
+// — the graphical module switcher Farshid asked for after seeing
+// SAP/ERP infographics, instead of a flat tile grid or a hub with only
+// 1-2 nodes on it. Node positions/sizes are computed server-side (see
+// hubGeometry/hubLayout) since html/template has no trigonometry of
+// its own, and because the layout must adapt to however many nodes
+// there actually are (2 real modules today, 14 total with placeholders)
+// without nodes overlapping.
 type dashboardView struct {
 	Nodes        []hubNode
 	Title        string
 	Empty        string
+	ComingSoon   string
 	ContainerPx  int
 	CenterPx     int
 	CenterSizePx int
 }
 
-// hubNode is one positioned, colored module link.
+// hubNode is one positioned, colored module node — a real clickable
+// module (Href set) or a muted placeholder (Placeholder true, no Href).
 type hubNode struct {
-	Key        string
-	Name       string
-	X, Y       int
-	ColorIndex int
+	Key         string
+	Name        string
+	Icon        string
+	Href        string
+	Placeholder bool
+	X, Y        int
+	SizePx      int
+	ColorIndex  int
 }
 
 // hubColorCount is how many distinct node colors static/app.css
@@ -241,33 +305,84 @@ type hubNode struct {
 // same layout/colors on every load, not a shuffled one.
 const hubColorCount = 10
 
-const (
-	hubContainerPx  = 600
-	hubRadiusPx     = 220
-	hubCenterPx     = hubContainerPx / 2
-	hubCenterSizePx = 180
-	// hubNodeSizePx must match static/app.css's .uc-hub-node
-	// width/height — kept in sync by hand (a plain CSS file has no way
-	// to read a Go const), noted here and there so a future resize of
-	// one doesn't silently drift from the other.
-	hubNodeSizePx = 140
-)
+const hubCenterSizePx = 180
 
-func hubLayout(modules []moduleGroup) []hubNode {
-	nodes := make([]hubNode, len(modules))
-	n := len(modules)
-	for i, m := range modules {
+// hubGeometry sizes the hub to however many nodes there actually are —
+// a fixed radius/node-size (the original version) works for 2 nodes
+// but overlaps badly once placeholders bring the count to a dozen-plus.
+// minRadius is derived from the chord-length between adjacent nodes
+// (2*radius*sin(pi/n)) needing to exceed nodeSize+gap, so neighboring
+// circles never overlap regardless of n.
+func hubGeometry(n int) (containerPx, radiusPx, nodeSizePx int) {
+	nodeSizePx = 140
+	switch {
+	case n > 12:
+		nodeSizePx = 92
+	case n > 8:
+		nodeSizePx = 112
+	}
+	if n <= 1 {
+		radiusPx = 180
+	} else {
+		const gapPx = 14
+		minRadius := float64(nodeSizePx+gapPx) / (2 * math.Sin(math.Pi/float64(n)))
+		radiusPx = int(math.Max(180, minRadius))
+	}
+	containerPx = radiusPx*2 + nodeSizePx + 80
+	return
+}
+
+// hubLayout combines real modules with plannedModuleKeys (skipping any
+// planned key a real module already owns — a real module always wins
+// its slot, never duplicated as also-a-placeholder) and lays every node
+// out evenly spaced around a circle starting at 12 o'clock.
+func hubLayout(modules []moduleGroup, locale string, catalog *i18n.Catalog) ([]hubNode, int) {
+	real := make(map[string]bool, len(modules))
+	for _, m := range modules {
+		real[m.Key] = true
+	}
+
+	type entry struct {
+		key, name, icon string
+		href            string
+		placeholder     bool
+	}
+	entries := make([]entry, 0, len(modules)+len(plannedModuleKeys))
+	for _, m := range modules {
+		entries = append(entries, entry{key: m.Key, name: m.Name, icon: m.Icon, href: "/modules/" + m.Key})
+	}
+	for _, key := range plannedModuleKeys {
+		if real[key] {
+			continue
+		}
+		entries = append(entries, entry{
+			key:         key,
+			name:        catalog.T(locale, "module."+key+".name"),
+			icon:        moduleIcon(key),
+			placeholder: true,
+		})
+	}
+
+	n := len(entries)
+	containerPx, radiusPx, nodeSizePx := hubGeometry(n)
+	centerPx := containerPx / 2
+	nodes := make([]hubNode, n)
+	for i, e := range entries {
 		angleDeg := -90.0 + float64(i)*(360.0/float64(n))
 		rad := angleDeg * math.Pi / 180
 		nodes[i] = hubNode{
-			Key:        m.Key,
-			Name:       m.Name,
-			X:          hubCenterPx + int(hubRadiusPx*math.Cos(rad)),
-			Y:          hubCenterPx + int(hubRadiusPx*math.Sin(rad)),
-			ColorIndex: i % hubColorCount,
+			Key:         e.key,
+			Name:        e.name,
+			Icon:        e.icon,
+			Href:        e.href,
+			Placeholder: e.placeholder,
+			X:           centerPx + int(float64(radiusPx)*math.Cos(rad)),
+			Y:           centerPx + int(float64(radiusPx)*math.Sin(rad)),
+			SizePx:      nodeSizePx,
+			ColorIndex:  i % hubColorCount,
 		}
 	}
-	return nodes
+	return nodes, containerPx
 }
 
 var dashboardTmpl = template.Must(template.New("dashboard").Parse(`
@@ -282,8 +397,18 @@ var dashboardTmpl = template.Must(template.New("dashboard").Parse(`
 {{range .Nodes}}<line x1="{{$center}}" y1="{{$center}}" x2="{{.X}}" y2="{{.Y}}"></line>{{end}}
 </svg>
 <div class="uc-hub-center" style="left:{{.CenterPx}}px;top:{{.CenterPx}}px;width:{{.CenterSizePx}}px;height:{{.CenterSizePx}}px;">{{.Title}}</div>
+{{$comingSoon := .ComingSoon}}
 {{range .Nodes}}
-<a class="uc-hub-node uc-hub-node-{{.ColorIndex}}" href="/modules/{{.Key}}" style="left:{{.X}}px;top:{{.Y}}px;">{{.Name}}</a>
+{{if .Placeholder}}
+<div class="uc-hub-node uc-hub-node-placeholder" style="left:{{.X}}px;top:{{.Y}}px;width:{{.SizePx}}px;height:{{.SizePx}}px;">
+<span class="uc-hub-node-icon">{{.Icon}}</span>{{.Name}}
+<span class="uc-hub-node-badge">{{$comingSoon}}</span>
+</div>
+{{else}}
+<a class="uc-hub-node uc-hub-node-{{.ColorIndex}}" href="{{.Href}}" style="left:{{.X}}px;top:{{.Y}}px;width:{{.SizePx}}px;height:{{.SizePx}}px;">
+<span class="uc-hub-node-icon">{{.Icon}}</span>{{.Name}}
+</a>
+{{end}}
 {{end}}
 </div>
 </div>
