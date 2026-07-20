@@ -15,13 +15,23 @@ package webauth
 const zitadelProjectRolesClaim = "urn:zitadel:iam:org:project:roles"
 
 // orgIDFromClaims extracts a Zitadel organization id out of the
-// project-roles claim — the first (only, in Universal Core's case: one
-// role, one grant) org key under any asserted role. Returns ok=false if
-// the claim is absent or empty, which happens for a real Zitadel user
-// with zero role grants in Universal Core's project (never added to any
-// tenant) — Authenticator.handleCallback treats that the same as "no
-// matching tenant", not a different error, since neither case has
-// anywhere to route the user.
+// project-roles claim. Returns ok=false if the claim is absent or
+// empty — a real Zitadel user with zero role grants in Universal
+// Core's project (never added to any tenant) — Authenticator.
+// handleCallback treats that the same as "no matching tenant".
+//
+// Also ok=false if MORE than one distinct org id is asserted (a user
+// legitimately granted tenant_member in two different customer orgs —
+// a shared accountant, say). Found by independent review: the original
+// version returned whichever org happened to come out of Go's
+// randomized map iteration first, so the same user could silently land
+// in a different customer's tenant on every other sign-in — not a
+// cross-tenant *leak* (they're authorized for both), but landing in
+// the wrong company's data with no warning is still a real bug.
+// Failing closed here (same "no matching tenant" page a zero-grant
+// user gets) is the safe default until there's an actual tenant-picker
+// UI to resolve the ambiguity explicitly; this package doesn't assume
+// away multi-org membership, it refuses to guess.
 func orgIDFromClaims(claims map[string]any) (orgID string, ok bool) {
 	val, present := claims[zitadelProjectRolesClaim]
 	if !present {
@@ -31,16 +41,23 @@ func orgIDFromClaims(claims map[string]any) (orgID string, ok bool) {
 	if !isMap {
 		return "", false
 	}
+	found := make(map[string]bool)
 	for _, orgs := range roles {
 		orgMap, isMap := orgs.(map[string]any)
 		if !isMap {
 			continue
 		}
 		for id := range orgMap {
-			return id, true
+			found[id] = true
 		}
 	}
-	return "", false
+	if len(found) != 1 {
+		return "", false
+	}
+	for id := range found {
+		return id, true
+	}
+	return "", false // unreachable
 }
 
 func stringClaim(claims map[string]any, key string) string {

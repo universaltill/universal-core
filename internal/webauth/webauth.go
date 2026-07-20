@@ -313,9 +313,19 @@ func (a *Authenticator) notLinked(w http.ResponseWriter) {
 }
 
 // sanitizeReturnTo prevents open redirects: only a same-site absolute
-// path is honoured.
+// path is honoured. Rejects a leading backslash as well as a leading
+// "//" — found by independent review: "/\evil.com" passed the original
+// "/" prefix + not-"//"-prefix check, but browsers normalize a
+// backslash to a forward slash per the WHATWG URL spec *before*
+// interpreting the result, turning it into "//evil.com" — a
+// protocol-relative URL — once it reaches http.Redirect's Location
+// header. A victim sent /ui/login?returnTo=/\evil.com would land on
+// evil.com right after a real, successful sign-in.
 func sanitizeReturnTo(raw string) string {
-	if raw == "" || !strings.HasPrefix(raw, "/") || strings.HasPrefix(raw, "//") {
+	if raw == "" || strings.ContainsRune(raw, '\\') {
+		return "/"
+	}
+	if !strings.HasPrefix(raw, "/") || strings.HasPrefix(raw, "//") {
 		return "/"
 	}
 	return raw
