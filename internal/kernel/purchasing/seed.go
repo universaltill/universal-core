@@ -8,7 +8,6 @@ import (
 
 	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
-	"github.com/universaltill/universal-core/internal/kernel/form"
 	"github.com/universaltill/universal-core/internal/kernel/moduleseed"
 )
 
@@ -47,7 +46,7 @@ func Publish(ctx context.Context, db *sql.DB, tenantID string, actor audit.Actor
 // a presentation choice, not the "always present" entity guarantee).
 func PublishForms(ctx context.Context, db *sql.DB, tenantID string, actor audit.Actor) error {
 	repo := data.NewFormDefinitionRepo(db)
-	forms := []*form.Definition{ItemForm(), PurchaseOrderForm(), POLineForm(), InventoryItemForm()}
+	forms := AllForms()
 	items := make([]moduleseed.Item, 0, len(forms))
 	for _, f := range forms {
 		if err := f.Validate(); err != nil {

@@ -33,3 +33,13 @@ func PartyForm() *form.Definition {
 		},
 	}
 }
+
+// AllForms returns every Form Definition this package defines — the
+// source of truth seed.go's PublishForms iterates, so a newly added form
+// constructor is published automatically instead of needing a second,
+// separately-maintained list a caller could forget to update (exactly
+// the gap that left every form unpublished in production until
+// PublishForms existed at all).
+func AllForms() []*form.Definition {
+	return []*form.Definition{PartyForm()}
+}
