@@ -3,11 +3,13 @@ package crud
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"testing"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 )
@@ -234,5 +236,97 @@ func TestEngine_List_ScopesToTenantAndEntityType(t *testing.T) {
 		if r.Data["name"] == "B-Vendor-1" {
 			t.Fatal("tenant A's list leaked a record belonging to tenant B")
 		}
+	}
+}
+
+func TestEngine_Count_ScopesToTenantAndEntityType(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	tenantA := seedTenant(t, db)
+	tenantB := seedTenant(t, db)
+	engine := NewEngine(db)
+	def := vendorDef()
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	for _, name := range []string{"A-Vendor-1", "A-Vendor-2", "A-Vendor-3"} {
+		if _, err := engine.Create(ctx, def, tenantA, map[string]any{"name": name}, actor); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+	}
+	if _, err := engine.Create(ctx, def, tenantB, map[string]any{"name": "B-Vendor-1"}, actor); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	count, err := engine.Count(ctx, def, tenantA)
+	if err != nil {
+		t.Fatalf("Count: %v", err)
+	}
+	if count != 3 {
+		t.Fatalf("expected 3 records for tenant A, got %d", count)
+	}
+}
+
+// TestEngine_ListPage_ReturnsPagesInStableCreationOrder confirms
+// ListPage's paging actually partitions the full set (no record
+// duplicated or skipped across consecutive pages) in a stable order —
+// the property a "Page N of M" UI depends on being true every time, not
+// just on average.
+func TestEngine_ListPage_ReturnsPagesInStableCreationOrder(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	tenantID := seedTenant(t, db)
+	engine := NewEngine(db)
+	def := vendorDef()
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	const total = 5
+	var created []string
+	for i := range total {
+		rec, err := engine.Create(ctx, def, tenantID, map[string]any{"name": fmt.Sprintf("Vendor-%d", i)}, actor)
+		if err != nil {
+			t.Fatalf("create %d: %v", i, err)
+		}
+		created = append(created, rec.ID)
+	}
+
+	page1, err := engine.ListPage(ctx, def, tenantID, 2, 0)
+	if err != nil {
+		t.Fatalf("ListPage page 1: %v", err)
+	}
+	page2, err := engine.ListPage(ctx, def, tenantID, 2, 2)
+	if err != nil {
+		t.Fatalf("ListPage page 2: %v", err)
+	}
+	page3, err := engine.ListPage(ctx, def, tenantID, 2, 4)
+	if err != nil {
+		t.Fatalf("ListPage page 3: %v", err)
+	}
+
+	if len(page1) != 2 || len(page2) != 2 || len(page3) != 1 {
+		t.Fatalf("expected page sizes 2, 2, 1 for %d records, got %d, %d, %d", total, len(page1), len(page2), len(page3))
+	}
+
+	var gotIDs []string
+	for _, p := range [][]data.Record{page1, page2, page3} {
+		for _, r := range p {
+			gotIDs = append(gotIDs, r.ID)
+		}
+	}
+	if len(gotIDs) != total {
+		t.Fatalf("expected %d records across all pages, got %d", total, len(gotIDs))
+	}
+	for i, id := range created {
+		if gotIDs[i] != id {
+			t.Fatalf("expected creation order preserved across pages: position %d expected %s, got %s", i, id, gotIDs[i])
+		}
+	}
+
+	// A page past the end returns no records, not an error.
+	emptyPage, err := engine.ListPage(ctx, def, tenantID, 2, 10)
+	if err != nil {
+		t.Fatalf("ListPage past the end: %v", err)
+	}
+	if len(emptyPage) != 0 {
+		t.Fatalf("expected no records past the end, got %d", len(emptyPage))
 	}
 }
