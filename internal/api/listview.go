@@ -77,7 +77,12 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 		Empty:      h.catalog.T(locale, "list.empty"),
 	}
 	for _, f := range def.Fields {
-		view.Columns = append(view.Columns, f.Name)
+		// Same "field.{EntityType}.{FieldName}" convention formrender
+		// uses for form labels (falls back to the raw field name when no
+		// translation exists yet) — previously every list page showed
+		// raw snake_case column headers regardless of locale (QUEUE.md,
+		// flagged "not built yet" on 2026-07-20).
+		view.Columns = append(view.Columns, h.catalog.TOrDefault(locale, "field."+entityType+"."+f.Name, f.Name))
 	}
 	for _, rec := range records {
 		row := recordRowView{Href: "/forms/" + entityType + "/" + rec.ID}
