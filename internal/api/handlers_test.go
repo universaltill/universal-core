@@ -729,6 +729,119 @@ func TestAPI_NoAuthHeaders_Is401(t *testing.T) {
 	}
 }
 
+// TestAPI_Dashboard_ListsEntityTypesWithPublishedForms confirms the
+// root page ("/") lists an entity type only when it has BOTH a
+// published entity Definition and a published Form Definition — a link
+// to an entity with no form would just 404.
+func TestAPI_Dashboard_ListsEntityTypesWithPublishedForms(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := newRequest("GET", "/", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `<script src="/static/htmx.min.js"></script>`) {
+		t.Fatalf("expected the dashboard to load htmx.js like every other page navigation, got:\n%s", body)
+	}
+	if !strings.Contains(body, `href="/forms/Vendor/new"`) {
+		t.Fatalf("expected a link to the Vendor form, got:\n%s", body)
+	}
+	if !strings.Contains(body, `href="/import/Vendor"`) {
+		t.Fatalf("expected a link to the Vendor import wizard, got:\n%s", body)
+	}
+}
+
+// TestAPI_Dashboard_OmitsEntityWithoutPublishedForm is the regression
+// test for the "would just 404" reasoning above: an entity published
+// with no matching form must not appear at all.
+func TestAPI_Dashboard_OmitsEntityWithoutPublishedForm(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	ctx := context.Background()
+	actor := humanActor()
+
+	// Publish only the entity Definition — deliberately no form.
+	entDef := vendorEntityDef()
+	entRaw, err := json.Marshal(entDef)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	entRepo := data.NewEntityDefinitionRepo(db)
+	if _, err := entRepo.CreateDraft(ctx, tenantID, entDef.EntityType, entDef.Version, entRaw, actor); err != nil {
+		t.Fatalf("CreateDraft: %v", err)
+	}
+	if err := entRepo.Approve(ctx, tenantID, entDef.EntityType, entDef.Version, actor); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	if err := entRepo.Publish(ctx, tenantID, entDef.EntityType, entDef.Version, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := newRequest("GET", "/", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "Vendor") {
+		t.Fatalf("expected Vendor to be omitted (no published form), got:\n%s", rec.Body.String())
+	}
+}
+
+// TestAPI_Dashboard_RequiresAuth confirms the root page is behind the
+// same auth as every other route — not accidentally left open.
+func TestAPI_Dashboard_RequiresAuth(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := httptest.NewRequest("GET", "/", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with no auth headers, got %d", rec.Code)
+	}
+}
+
+// TestAPI_UnknownPathStill404s is the regression test for the real
+// footgun in registering "GET /{$}": a plain "GET /" pattern in Go's
+// net/http.ServeMux acts as a subtree catch-all and would have silently
+// swallowed every unmatched path into the dashboard instead of a real
+// 404 — "{$}" is the exact-match-only wildcard that avoids that.
+func TestAPI_UnknownPathStill404s(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := newRequest("GET", "/this/path/does/not/exist", "", "", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected a genuine 404 for an unmatched path, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
 // TestAPI_RenderNewForm_ProducesHTML is the first genuine end-to-end
 // proof of the whole point of this increment: a Definition published
 // through the real registry, rendered to real HTML through formrender,

@@ -80,6 +80,13 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	auth := func(handler http.HandlerFunc) http.Handler {
 		return h.auth.Guard(httpx.DevAuth(handler))
 	}
+	// "/{$}" — the Go 1.22+ ServeMux exact-match wildcard — not plain
+	// "/", which would act as a catch-all subtree match and silently
+	// swallow every unmatched path into the dashboard instead of a real
+	// 404. Until this route existed at all, "/" 404'd outright: a real
+	// user with a real, working login had nowhere to land without
+	// already knowing a specific /forms/{entityType}/... URL by heart.
+	mux.Handle("GET /{$}", auth(h.renderDashboard))
 	mux.Handle("GET /api/records/{entityType}", auth(h.listRecords))
 	mux.Handle("POST /api/records/{entityType}", auth(h.createRecord))
 	mux.Handle("GET /api/records/{entityType}/{id}", auth(h.getRecord))
