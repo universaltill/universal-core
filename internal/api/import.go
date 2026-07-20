@@ -43,7 +43,7 @@ func (h *Handler) importUploadPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	locale := localeFromRequest(r)
+	locale := localeFromRequest(w, r)
 	// Rendered into a buffer first, not straight to w — this is a
 	// top-level page navigation, not an htmx-swap response, so it needs
 	// the real <html><head> shell that loads htmx.js (see layout.go);
@@ -62,8 +62,8 @@ func (h *Handler) importUploadPage(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, "render import upload page", err)
 		return
 	}
-	nav := h.renderNav(r.Context(), &rc, locale)
-	if err := renderShell(w, nav, template.HTML(buf.String())); err != nil {
+	nav := h.renderNav(r, &rc, locale)
+	if err := renderShell(w, locale, nav, template.HTML(buf.String())); err != nil {
 		writeInternalError(w, "render import upload page shell", err)
 	}
 }
@@ -96,7 +96,7 @@ func (h *Handler) importPreview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	entityType := r.PathValue("entityType")
-	locale := localeFromRequest(r)
+	locale := localeFromRequest(w, r)
 
 	def, err := h.entityDef(r.Context(), rc.TenantID, entityType)
 	if err != nil {
@@ -151,7 +151,7 @@ func (h *Handler) importCommit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	entityType := r.PathValue("entityType")
-	locale := localeFromRequest(r)
+	locale := localeFromRequest(w, r)
 
 	def, err := h.entityDef(r.Context(), rc.TenantID, entityType)
 	if err != nil {
@@ -285,13 +285,6 @@ func mappingFromForm(r *http.Request) csvimport.ColumnMapping {
 		mapping[header] = values[0]
 	}
 	return mapping
-}
-
-func localeFromRequest(r *http.Request) string {
-	if l := r.URL.Query().Get("lang"); l != "" {
-		return l
-	}
-	return "en"
 }
 
 // --- view models ---

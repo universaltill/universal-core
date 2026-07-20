@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"math"
 	"net/http"
 	"sort"
 
@@ -42,48 +43,39 @@ func (h *Handler) sessionContext(r *http.Request) (httpx.RequestContext, bool) {
 	return httpx.TryDevAuth(r)
 }
 
-// writeDashboard lists every entity type the given tenant currently has
-// BOTH a published entity Definition AND a published Form Definition
-// for — reading the registry, not a hardcoded module list, so this never
-// needs a code change when a new module is provisioned (CLAUDE.md's
-// kernel/deterministic-core boundary rule: no entity-type branching in a
-// generic engine).
-//
-// An entity type with a published entity Definition but no published
-// form (e.g. a foundation entity nobody has built a screen for yet —
-// see foundation.go's own doc comment on building forms "as each is
-// actually needed") is deliberately left off the list: a link to
-// /forms/{that type}/new would just 404, which is a worse experience
-// than not offering it at all.
+// writeDashboard is the home page: one tile per MODULE the tenant has
+// access to — not a flat list of entity types (that was the original
+// version; Farshid pointed out after logging in for real that a flat
+// list is actually "menus from one module", not a module switcher, and
+// asked for the two-level structure every big ERP actually uses: modules
+// on the first page, each module's own searchable menu of screens
+// inside it). "Access" today means accessibleModules' definition of it
+// (see that function's own doc comment) — there's no separate
+// per-module entitlement/licensing system yet (BACKLOG.md's R13).
 func (h *Handler) writeDashboard(w http.ResponseWriter, r *http.Request, rc httpx.RequestContext) {
-	locale := localeFromRequest(r)
+	locale := localeFromRequest(w, r)
 
-	entityTypes, err := h.entityDefs.ListPublishedEntityTypes(r.Context(), rc.TenantID)
+	modules, err := h.accessibleModules(r.Context(), rc.TenantID, locale)
 	if err != nil {
-		writeInternalError(w, "list published entity types", err)
-		return
-	}
-
-	modules, err := h.dashboardModules(r.Context(), rc.TenantID, entityTypes)
-	if err != nil {
-		writeInternalError(w, "build dashboard modules", err)
+		writeInternalError(w, "build accessible modules", err)
 		return
 	}
 
 	var buf bytes.Buffer
 	err = dashboardTmpl.Execute(&buf, dashboardView{
-		Modules:    modules,
-		Title:      h.catalog.T(locale, "dashboard.title"),
-		Empty:      h.catalog.T(locale, "dashboard.empty"),
-		NewLabel:   h.catalog.T(locale, "dashboard.new_link"),
-		ImportLink: h.catalog.T(locale, "dashboard.import_link"),
+		Nodes:        hubLayout(modules),
+		Title:        h.catalog.T(locale, "dashboard.title"),
+		Empty:        h.catalog.T(locale, "dashboard.empty"),
+		ContainerPx:  hubContainerPx,
+		CenterPx:     hubCenterPx,
+		CenterSizePx: hubCenterSizePx,
 	})
 	if err != nil {
 		writeInternalError(w, "render dashboard", err)
 		return
 	}
-	nav := h.renderNav(r.Context(), &rc, locale)
-	if err := renderShell(w, nav, template.HTML(buf.String())); err != nil {
+	nav := h.renderNav(r, &rc, locale)
+	if err := renderShell(w, locale, nav, template.HTML(buf.String())); err != nil {
 		writeInternalError(w, "render dashboard shell", err)
 	}
 }
@@ -94,7 +86,7 @@ func (h *Handler) writeDashboard(w http.ResponseWriter, r *http.Request, rc http
 // enabled — otherwise the honest message is that this deployment has no
 // working sign-in yet, not a link that would just redirect nowhere.
 func (h *Handler) renderWelcome(w http.ResponseWriter, r *http.Request) {
-	locale := localeFromRequest(r)
+	locale := localeFromRequest(w, r)
 	view := welcomeView{
 		Title: h.catalog.T(locale, "dashboard.title"),
 	}
@@ -114,8 +106,8 @@ func (h *Handler) renderWelcome(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, "render welcome", err)
 		return
 	}
-	nav := h.renderNav(r.Context(), nil, locale)
-	if err := renderShell(w, nav, template.HTML(buf.String())); err != nil {
+	nav := h.renderNav(r, nil, locale)
+	if err := renderShell(w, locale, nav, template.HTML(buf.String())); err != nil {
 		writeInternalError(w, "render welcome shell", err)
 	}
 }
@@ -135,53 +127,165 @@ var welcomeTmpl = template.Must(template.New("welcome").Parse(`
 {{end}}
 `))
 
-// dashboardModules filters entityTypes down to the ones with a
-// published form. A genuine lookup failure (anything other than "no
-// form published for this entity type") is returned, not swallowed —
-// found by independent review: the original version treated every
-// GetPublished error identically, so a transient DB error would
-// silently drop a module from the dashboard and still return 200, with
-// no log line anywhere pointing at why.
-func (h *Handler) dashboardModules(ctx context.Context, tenantID string, entityTypes []string) ([]dashboardModule, error) {
-	var modules []dashboardModule
-	for _, entityType := range entityTypes {
-		_, err := h.formDefs.GetPublished(ctx, tenantID, entityType)
-		if errors.Is(err, data.ErrNotFound) {
-			continue // no published form for this entity type — nothing to link to yet
-		}
-		if err != nil {
-			return nil, fmt.Errorf("look up form for %s: %w", entityType, err)
-		}
-		modules = append(modules, dashboardModule{EntityType: entityType})
-	}
-	sort.Slice(modules, func(i, j int) bool { return modules[i].EntityType < modules[j].EntityType })
-	return modules, nil
-}
-
-type dashboardModule struct {
+// moduleEntity is one entity type within a module group — the unit
+// accessibleModules groups, and modulemenu.go's own list items.
+type moduleEntity struct {
 	EntityType string
 }
 
+// moduleGroup is one module the tenant has access to: a key (matches
+// entity.Definition.Module, e.g. "purchasing"), an i18n'd display name,
+// and the entity types inside it.
+type moduleGroup struct {
+	Key      string
+	Name     string
+	Entities []moduleEntity
+}
+
+// accessibleModules groups every entity type the tenant currently has
+// BOTH a published entity Definition AND a published Form Definition
+// for (same "nothing to link to yet otherwise" reasoning the original
+// flat dashboard used) by entity.Definition.Module — reading the
+// registry, not a hardcoded module list, so a new module shows up
+// correctly grouped the moment its own package sets Module on its
+// Definitions (CLAUDE.md's kernel boundary rule: no entity-type
+// branching in a generic engine — this reads data, it doesn't special-
+// case any specific module or entity type by name).
+//
+// "Access" here means exactly "this tenant has this published" — there
+// is no separate per-module entitlement/licensing system yet
+// (BACKLOG.md's R13 is that future work); until it exists, published-
+// for-tenant is the only notion of access this kernel has.
+//
+// An entity type whose Definition never set Module (shouldn't happen
+// for anything in this repo today, but degrades safely rather than
+// panicking or dropping the entity) falls into a "general" bucket.
+func (h *Handler) accessibleModules(ctx context.Context, tenantID, locale string) ([]moduleGroup, error) {
+	entityTypes, err := h.entityDefs.ListPublishedEntityTypes(ctx, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("list published entity types: %w", err)
+	}
+
+	byKey := map[string][]moduleEntity{}
+	for _, entityType := range entityTypes {
+		if _, err := h.formDefs.GetPublished(ctx, tenantID, entityType); err != nil {
+			if errors.Is(err, data.ErrNotFound) {
+				continue // no published form for this entity type — nothing to link to yet
+			}
+			return nil, fmt.Errorf("look up form for %s: %w", entityType, err)
+		}
+		def, err := h.entityDef(ctx, tenantID, entityType)
+		if err != nil {
+			if errors.Is(err, data.ErrNotFound) {
+				// entityType came from ListPublishedEntityTypes moments
+				// ago, so this is a narrow race (a Rollback landing
+				// between that call and this one), not a caller
+				// mistake — same skip-don't-fail treatment as the form
+				// lookup above. Found by review: the original version
+				// hard-failed the whole function here, and since this
+				// runs on every page via renderNav (not just the
+				// dashboard), that race could have broken page chrome
+				// anywhere, not just the home page.
+				continue
+			}
+			return nil, fmt.Errorf("look up entity definition for %s: %w", entityType, err)
+		}
+		key := def.Module
+		if key == "" {
+			key = "general"
+		}
+		byKey[key] = append(byKey[key], moduleEntity{EntityType: entityType})
+	}
+
+	modules := make([]moduleGroup, 0, len(byKey))
+	for key, entities := range byKey {
+		sort.Slice(entities, func(i, j int) bool { return entities[i].EntityType < entities[j].EntityType })
+		modules = append(modules, moduleGroup{
+			Key:      key,
+			Name:     h.catalog.T(locale, "module."+key+".name"),
+			Entities: entities,
+		})
+	}
+	sort.Slice(modules, func(i, j int) bool { return modules[i].Key < modules[j].Key })
+	return modules, nil
+}
+
+// dashboardView is the hub-and-spoke home page: Universal Core at the
+// center, one connected node per accessible module around it — the
+// graphical module switcher Farshid asked for after seeing the
+// SAP-style "modules around a hub" diagram, instead of a flat tile
+// grid. Node positions are computed server-side (evenly spaced around
+// a circle, starting at 12 o'clock) since html/template has no
+// trigonometry of its own — see hubLayout.
 type dashboardView struct {
-	Modules    []dashboardModule
-	Title      string
-	Empty      string
-	NewLabel   string
-	ImportLink string
+	Nodes        []hubNode
+	Title        string
+	Empty        string
+	ContainerPx  int
+	CenterPx     int
+	CenterSizePx int
+}
+
+// hubNode is one positioned, colored module link.
+type hubNode struct {
+	Key        string
+	Name       string
+	X, Y       int
+	ColorIndex int
+}
+
+// hubColorCount is how many distinct node colors static/app.css
+// defines (.uc-hub-node-0 .. .uc-hub-node-9) — cycled by index,
+// deterministic per module (not per request), same rationale as
+// sorting modules by Key: a stable order so the same tenant sees the
+// same layout/colors on every load, not a shuffled one.
+const hubColorCount = 10
+
+const (
+	hubContainerPx  = 600
+	hubRadiusPx     = 220
+	hubCenterPx     = hubContainerPx / 2
+	hubCenterSizePx = 180
+	// hubNodeSizePx must match static/app.css's .uc-hub-node
+	// width/height — kept in sync by hand (a plain CSS file has no way
+	// to read a Go const), noted here and there so a future resize of
+	// one doesn't silently drift from the other.
+	hubNodeSizePx = 140
+)
+
+func hubLayout(modules []moduleGroup) []hubNode {
+	nodes := make([]hubNode, len(modules))
+	n := len(modules)
+	for i, m := range modules {
+		angleDeg := -90.0 + float64(i)*(360.0/float64(n))
+		rad := angleDeg * math.Pi / 180
+		nodes[i] = hubNode{
+			Key:        m.Key,
+			Name:       m.Name,
+			X:          hubCenterPx + int(hubRadiusPx*math.Cos(rad)),
+			Y:          hubCenterPx + int(hubRadiusPx*math.Sin(rad)),
+			ColorIndex: i % hubColorCount,
+		}
+	}
+	return nodes
 }
 
 var dashboardTmpl = template.Must(template.New("dashboard").Parse(`
 <h1>{{.Title}}</h1>
-{{if not .Modules}}
+{{if not .Nodes}}
 <p>{{.Empty}}</p>
 {{else}}
-<ul class="uc-modules">
-{{range .Modules}}
-<li class="uc-module-card">
-<strong><a href="/records/{{.EntityType}}">{{.EntityType}}</a></strong>
-<span class="uc-module-actions"><a href="/forms/{{.EntityType}}/new">{{$.NewLabel}}</a> · <a href="/import/{{.EntityType}}">{{$.ImportLink}}</a></span>
-</li>
+<div class="uc-hub-wrap">
+<div class="uc-hub" style="width:{{.ContainerPx}}px;height:{{.ContainerPx}}px;">
+<svg class="uc-hub-lines" width="{{.ContainerPx}}" height="{{.ContainerPx}}">
+{{$center := .CenterPx}}
+{{range .Nodes}}<line x1="{{$center}}" y1="{{$center}}" x2="{{.X}}" y2="{{.Y}}"></line>{{end}}
+</svg>
+<div class="uc-hub-center" style="left:{{.CenterPx}}px;top:{{.CenterPx}}px;width:{{.CenterSizePx}}px;height:{{.CenterSizePx}}px;">{{.Title}}</div>
+{{range .Nodes}}
+<a class="uc-hub-node uc-hub-node-{{.ColorIndex}}" href="/modules/{{.Key}}" style="left:{{.X}}px;top:{{.Y}}px;">{{.Name}}</a>
 {{end}}
-</ul>
+</div>
+</div>
 {{end}}
 `))

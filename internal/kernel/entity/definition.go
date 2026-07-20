@@ -69,8 +69,17 @@ type Relationship struct {
 // entity_definitions.definition (JSONB); this Go type is the schema for
 // that JSON, not a database model itself.
 type Definition struct {
-	EntityType    string         `json:"entity_type"`
-	Version       int            `json:"version"`
+	EntityType string `json:"entity_type"`
+	Version    int    `json:"version"`
+	// Module is the module key this entity belongs to (e.g.
+	// "purchasing", "foundation") — set by the module's own seed
+	// package (foundation.go, purchasing.go), used only to group the
+	// UI's module switcher/menu (internal/api/nav.go,
+	// internal/api/modulemenu.go). Purely descriptive metadata never
+	// consulted by a generic engine (crud, formrender) — CLAUDE.md's
+	// kernel boundary rule is about behavior, not about a Definition
+	// carrying data a UI groups by.
+	Module        string         `json:"module,omitempty"`
 	Fields        []Field        `json:"fields"`
 	Relationships []Relationship `json:"relationships,omitempty"`
 }

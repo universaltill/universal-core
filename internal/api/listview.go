@@ -32,7 +32,7 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	entityType := r.PathValue("entityType")
-	locale := localeFromRequest(r)
+	locale := localeFromRequest(w, r)
 
 	def, err := h.entityDef(r.Context(), rc.TenantID, entityType)
 	if err != nil {
@@ -46,7 +46,8 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	view := recordListView{
-		EntityType: entityType,
+		Name:       h.entityDisplayName(locale, entityType),
+		Code:       entityType,
 		NewHref:    "/forms/" + entityType + "/new",
 		ImportHref: "/import/" + entityType,
 		NewLabel:   h.catalog.T(locale, "dashboard.new_link"),
@@ -69,14 +70,15 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, fmt.Sprintf("render %s list", entityType), err)
 		return
 	}
-	nav := h.renderNav(r.Context(), &rc, locale)
-	if err := renderShell(w, nav, template.HTML(buf.String())); err != nil {
+	nav := h.renderNav(r, &rc, locale)
+	if err := renderShell(w, locale, nav, template.HTML(buf.String())); err != nil {
 		writeInternalError(w, fmt.Sprintf("render %s list shell", entityType), err)
 	}
 }
 
 type recordListView struct {
-	EntityType string
+	Name       string
+	Code       string
 	Columns    []string
 	Rows       []recordRowView
 	NewHref    string
@@ -93,7 +95,7 @@ type recordRowView struct {
 
 var recordListTmpl = template.Must(template.New("recordList").Parse(`
 <div class="uc-list-toolbar">
-<h1>{{.EntityType}}</h1>
+<h1>{{.Name}} <span class="uc-menu-item-code">{{.Code}}</span></h1>
 <div><a href="{{.NewHref}}">{{.NewLabel}}</a> · <a href="{{.ImportHref}}">{{.ImportLink}}</a></div>
 </div>
 {{if not .Rows}}

@@ -73,8 +73,14 @@ func serveCSS(w http.ResponseWriter, r *http.Request) {
 // never needs to know about tenants/modules/auth state — it's just
 // layout, same separation formrender already keeps between rendering
 // and the registry lookups that feed it.
+//
+// lang/dir on <html> is not cosmetic: without dir="rtl" for Arabic, the
+// page is still laid out left-to-right underneath Arabic text — i18n
+// strings translated but the surrounding layout still reading the wrong
+// direction is arguably worse than not translating at all. See
+// locale.go's localeDir.
 var shellTmpl = template.Must(template.New("shell").Parse(`<!doctype html>
-<html>
+<html lang="{{.Lang}}" dir="{{.Dir}}">
 <head>
 <meta charset="utf-8">
 <link rel="stylesheet" href="/static/app.css">
@@ -90,19 +96,23 @@ var shellTmpl = template.Must(template.New("shell").Parse(`<!doctype html>
 `))
 
 type shellView struct {
+	Lang string
+	Dir  string
 	Nav  template.HTML
 	Body template.HTML
 }
 
 // renderShell writes fragment wrapped in shellTmpl, with nav as the
-// page's top chrome. Both are already-rendered, already-escaped HTML
-// (nav from renderNav, fragment from formrender/importTmpl/dashboardTmpl,
-// all html/template output), not raw user input — passed as
-// template.HTML deliberately, the same trust boundary formrender's own
-// Render already crossed once for this exact content.
-func renderShell(w http.ResponseWriter, nav, fragment template.HTML) error {
+// page's top chrome and locale driving the document's lang/dir. nav and
+// fragment are already-rendered, already-escaped HTML (nav from
+// renderNav, fragment from formrender/importTmpl/dashboardTmpl, all
+// html/template output), not raw user input — passed as template.HTML
+// deliberately, the same trust boundary formrender's own Render already
+// crossed once for this exact content.
+func renderShell(w http.ResponseWriter, locale string, nav, fragment template.HTML) error {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := shellTmpl.Execute(w, shellView{Nav: nav, Body: fragment}); err != nil {
+	view := shellView{Lang: locale, Dir: localeDir(locale), Nav: nav, Body: fragment}
+	if err := shellTmpl.Execute(w, view); err != nil {
 		return fmt.Errorf("render page shell: %w", err)
 	}
 	return nil
