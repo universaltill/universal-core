@@ -65,6 +65,12 @@ func (h *Handler) renderModuleMenu(w http.ResponseWriter, r *http.Request) {
 		NewLabel:          h.catalog.T(locale, "dashboard.new_link"),
 		ImportLink:        h.catalog.T(locale, "dashboard.import_link"),
 	}
+	for _, link := range moduleReportLinks[key] {
+		view.Reports = append(view.Reports, moduleMenuReport{
+			Label: h.catalog.T(locale, link.LabelKey),
+			Href:  link.Href,
+		})
+	}
 	for _, e := range group.Entities {
 		name := h.entityDisplayName(locale, e.EntityType)
 		view.Entities = append(view.Entities, moduleMenuEntity{
@@ -88,12 +94,29 @@ func (h *Handler) renderModuleMenu(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// moduleReportLinks are hand-declared report pages that live one level
+// inside a module's menu rather than being a browsable/importable entity
+// type of their own (a report is a read-only view over other entities'
+// data, not a Definition an admin publishes) — same reasoning
+// dashboard.go's moduleIcons gives for a plain hardcoded map: exactly
+// one small, stable piece of presentation data, not worth a registry of
+// its own for a single report per module today.
+var moduleReportLinks = map[string][]struct{ LabelKey, Href string }{
+	"purchasing": {{"report.purchasing.nav_label", "/reports/purchasing"}},
+}
+
 type moduleMenuView struct {
 	Name              string
 	SearchPlaceholder string
 	NewLabel          string
 	ImportLink        string
+	Reports           []moduleMenuReport
 	Entities          []moduleMenuEntity
+}
+
+type moduleMenuReport struct {
+	Label string
+	Href  string
 }
 
 type moduleMenuEntity struct {
@@ -107,6 +130,11 @@ type moduleMenuEntity struct {
 
 var moduleMenuTmpl = template.Must(template.New("moduleMenu").Parse(`
 <h1>{{.Name}}</h1>
+{{if .Reports}}
+<p class="uc-module-reports">
+{{range .Reports}}<a href="{{.Href}}">{{.Label}}</a> {{end}}
+</p>
+{{end}}
 <input type="text" class="uc-menu-search" placeholder="{{.SearchPlaceholder}}"
   oninput="document.querySelectorAll('.uc-menu-item').forEach(function(el){
     el.style.display = el.dataset.search.indexOf(this.value.toLowerCase()) === -1 ? 'none' : '';
