@@ -126,6 +126,23 @@ func testServer(t *testing.T, db *sql.DB) (srv *httptest.Server, tenantID string
 	).Scan(&id); err != nil {
 		t.Fatalf("seed tenant: %v", err)
 	}
+	// workflow_jobs cleanup: ClaimNext/ProcessOne are deliberately
+	// tenant-global (one shared dispatcher servicing every tenant — see
+	// internal/kernel/workflow/queue.go), so a job an e2e test enqueues
+	// and leaves 'queued' (e.g. TestWorkflowInbox_ApproveButton_
+	// RealBrowser, approved but never run to completion since no worker
+	// runs inside this httptest.Server) is fair game for a LATER
+	// package's ProcessOne call once go test ./... -p 1 moves on — found
+	// exactly this way, the same class of cross-package race already
+	// fixed twice this session (internal/api/handlers_test.go's own
+	// seedTenant, ci.yml's -p 1 itself). Fixed at the shared helper, not
+	// just the one test that happened to trigger it, so any future e2e
+	// test that enqueues a workflow job is covered automatically.
+	t.Cleanup(func() {
+		if _, err := db.Exec(`DELETE FROM workflow_jobs WHERE tenant_id = $1`, id); err != nil {
+			t.Errorf("cleanup workflow_jobs for tenant %s: %v", id, err)
+		}
+	})
 	if err := foundation.Publish(ctx, db, id, actor); err != nil {
 		t.Fatalf("foundation.Publish: %v", err)
 	}

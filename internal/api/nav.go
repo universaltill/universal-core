@@ -46,6 +46,11 @@ func (h *Handler) renderNav(r *http.Request, rc *httpx.RequestContext, locale st
 		} else {
 			view.Modules = modules
 		}
+		// Always shown for any authenticated visitor, not gated on any
+		// module (approvals aren't module-scoped — a workflow can trigger
+		// against any entity type a tenant has, per triggerWorkflows).
+		view.ShowApprovals = true
+		view.ApprovalsLabel = h.catalog.T(locale, "nav.approvals")
 		if h.auth.Enabled() {
 			view.ShowLogout = true
 			view.LogoutLabel = h.catalog.T(locale, "nav.logout")
@@ -61,19 +66,22 @@ func (h *Handler) renderNav(r *http.Request, rc *httpx.RequestContext, locale st
 }
 
 type navView struct {
-	Brand       string
-	Locale      string
-	CurrentPath string
-	Locales     []string
-	Modules     []moduleGroup
-	ShowLogout  bool
-	LogoutLabel string
+	Brand          string
+	Locale         string
+	CurrentPath    string
+	Locales        []string
+	Modules        []moduleGroup
+	ShowApprovals  bool
+	ApprovalsLabel string
+	ShowLogout     bool
+	LogoutLabel    string
 }
 
 var navTmpl = template.Must(template.New("nav").Parse(`
 <nav class="uc-nav">
 <a class="uc-nav-brand" href="/">{{.Brand}}</a>
 {{range .Modules}}<a class="uc-nav-link" href="/modules/{{.Key}}">{{.Name}}</a>{{end}}
+{{if .ShowApprovals}}<a class="uc-nav-link" href="/workflow-jobs">{{.ApprovalsLabel}}</a>{{end}}
 <span class="uc-nav-spacer"></span>
 {{if .ShowLogout}}<a class="uc-nav-link" href="/ui/logout">{{.LogoutLabel}}</a>{{end}}
 {{$path := .CurrentPath}}
