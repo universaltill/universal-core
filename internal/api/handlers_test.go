@@ -2511,3 +2511,125 @@ func TestAPI_ApproveWorkflowJob_TenantIsolation(t *testing.T) {
 		t.Fatalf("expected tenant B approving tenant A's job to 404, got %d: %s", approveRec.Code, approveRec.Body.String())
 	}
 }
+
+// TestAPI_ListWorkflowJobs_ReturnsMatchingStatusOnly is the read side of
+// the approval loop's own HTTP surface: GET /api/workflow-jobs?
+// status=waiting_approval must return exactly the jobs actually waiting,
+// not jobs in other statuses and not another tenant's jobs.
+func TestAPI_ListWorkflowJobs_ReturnsMatchingStatusOnly(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantA := seedTenant(t, db)
+	tenantB := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantA, vendorEntityDef(), vendorFormDef())
+	publishEntityAndForm(t, db, tenantB, vendorEntityDef(), vendorFormDef())
+	def := &workflow.Definition{
+		Name: "vendor_approval", Version: 1,
+		Trigger: workflow.Trigger{Type: workflow.TriggerOnCreate, EntityType: "Vendor"},
+		Steps:   []workflow.Step{{Kind: workflow.StepRequireApproval}},
+	}
+	publishWorkflow(t, db, tenantA, def)
+	publishWorkflow(t, db, tenantB, def)
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	// Tenant A: one Vendor whose workflow will be driven to
+	// waiting_approval. Tenant B: same setup, must not leak into A's list.
+	for _, tid := range []string{tenantA, tenantB} {
+		req := newRequest("POST", "/api/records/Vendor", tid, "farshid", []byte(`{"name":"Acme Textiles"}`))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("create Vendor for tenant %s: expected 201, got %d: %s", tid, rec.Code, rec.Body.String())
+		}
+	}
+
+	q, err := workflow.NewQueue(db, nil)
+	if err != nil {
+		t.Fatalf("NewQueue: %v", err)
+	}
+	lookup := workflow.RegistryDefinitionLookup(db)
+	// Two ProcessOne calls: one per tenant's enqueued job (ClaimNext is
+	// tenant-global, oldest due first — both jobs are due, so this drains
+	// both to waiting_approval).
+	for range 2 {
+		if _, err := q.ProcessOne(context.Background(), lookup); err != nil {
+			t.Fatalf("ProcessOne: %v", err)
+		}
+	}
+
+	var tenantAJobID string
+	if err := db.QueryRow(`SELECT id FROM workflow_jobs WHERE tenant_id = $1 AND workflow_name = $2`, tenantA, def.Name).Scan(&tenantAJobID); err != nil {
+		t.Fatalf("find tenant A's job: %v", err)
+	}
+
+	listReq := newRequest("GET", "/api/workflow-jobs?status=waiting_approval", tenantA, "farshid", nil)
+	listRec := httptest.NewRecorder()
+	mux.ServeHTTP(listRec, listReq)
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", listRec.Code, listRec.Body.String())
+	}
+
+	var got struct {
+		Data []struct {
+			ID     string `json:"id"`
+			Status string `json:"status"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(listRec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal list response: %v", err)
+	}
+	if len(got.Data) != 1 || got.Data[0].ID != tenantAJobID || got.Data[0].Status != "waiting_approval" {
+		t.Fatalf("expected exactly tenant A's one waiting_approval job, got %+v", got.Data)
+	}
+
+	// A status with nothing matching returns an empty list, not an error.
+	doneReq := newRequest("GET", "/api/workflow-jobs?status=done", tenantA, "farshid", nil)
+	doneRec := httptest.NewRecorder()
+	mux.ServeHTTP(doneRec, doneReq)
+	var gotDone struct {
+		Data []any `json:"data"`
+	}
+	if err := json.Unmarshal(doneRec.Body.Bytes(), &gotDone); err != nil {
+		t.Fatalf("unmarshal done-status response: %v", err)
+	}
+	if len(gotDone.Data) != 0 {
+		t.Fatalf("expected no done jobs, got %+v", gotDone.Data)
+	}
+}
+
+func TestAPI_ListWorkflowJobs_MissingStatusIs400(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := newRequest("GET", "/api/workflow-jobs", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a missing status query param, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestAPI_ListWorkflowJobs_UnknownStatusIs400 confirms a typo'd status
+// (e.g. "waitng_approval") comes back as a clear 400, not a silent empty
+// list a caller could easily mistake for "nothing is actually waiting."
+func TestAPI_ListWorkflowJobs_UnknownStatusIs400(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := newRequest("GET", "/api/workflow-jobs?status=waitng_approval", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an unknown status value, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
