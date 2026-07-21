@@ -263,6 +263,52 @@ a.uc-hub-node:hover {
   font-size: 0.85rem;
 }
 
+/* A module menu's own report link(s), e.g. Purchasing's "Reports"
+   (internal/api/modulemenu.go's moduleReportLinks). */
+.uc-module-reports {
+  margin: -0.5rem 0 1rem;
+}
+
+.uc-module-reports a {
+  font-weight: 600;
+}
+
+/* The mgmt reporting workbench (internal/api/reporting.go) — a row of
+   at-a-glance stat cards above each report's tables. */
+.uc-report-cards {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  margin: 1rem 0 1.5rem;
+}
+
+.uc-report-card {
+  background: #fff;
+  border: 1px solid var(--uc-border);
+  border-radius: 6px;
+  padding: 0.85rem 1.1rem;
+  min-width: 9rem;
+}
+
+.uc-report-card-label {
+  color: var(--uc-muted);
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  margin-bottom: 0.25rem;
+}
+
+.uc-report-card-value {
+  font-size: 1.4rem;
+  font-weight: 700;
+}
+
+.uc-report-card-sub {
+  color: var(--uc-muted);
+  font-size: 0.85rem;
+  margin-top: 0.15rem;
+}
+
 /* Record list tables */
 .uc-list-toolbar {
   display: flex;
