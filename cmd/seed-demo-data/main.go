@@ -168,7 +168,10 @@ func (s *seeder) seedParties() (vendors, customers map[string]string) {
 	}
 
 	vendors = map[string]string{}
-	for _, name := range []string{"Acme Textiles", "Gulf Steel Supply", "Anatolia Parts Co."} {
+	for _, name := range []string{
+		"Acme Textiles", "Gulf Steel Supply", "Anatolia Parts Co.",
+		"Doha Fasteners LLC", "Istanbul Weaving Mills", "Manchester Packaging Ltd",
+	} {
 		id := s.getOrCreate("Party", "name", name, map[string]any{
 			"party_type": "organization", "name": name, "status": "active",
 		})
@@ -193,7 +196,15 @@ func (s *seeder) seedItems(uoms map[string]string) map[string]string {
 		{"SKU-1001", "Steel Bolt 10mm", "stock", "EA"},
 		{"SKU-1002", "Cotton Fabric Roll", "stock", "BOX"},
 		{"SKU-1003", "Packaging Material", "stock", "KG"},
+		{"SKU-1004", "Steel Bolt 12mm", "stock", "EA"},
+		{"SKU-1005", "Denim Fabric Roll", "stock", "BOX"},
+		{"SKU-1006", "Zipper Pack (100ct)", "stock", "BOX"},
+		{"SKU-1007", "Corrugated Box, Medium", "stock", "EA"},
+		{"SKU-1008", "Stretch Wrap Film", "stock", "KG"},
+		{"SKU-1009", "Steel Washer 10mm", "stock", "EA"},
+		{"SKU-1010", "Wool Fabric Roll", "stock", "BOX"},
 		{"SKU-2001", "Installation Consulting", "service", "EA"},
+		{"SKU-2002", "Fabric Quality Inspection", "service", "EA"},
 	} {
 		fields := map[string]any{"sku": it.sku, "name": it.name, "item_type": it.itemType}
 		if uomID, ok := uoms[it.uom]; ok {
@@ -204,14 +215,31 @@ func (s *seeder) seedItems(uoms map[string]string) map[string]string {
 	return ids
 }
 
-// seedInventory gives every stock Item an on-hand quantity — service
-// items (no natural inventory concept) are deliberately skipped, same
-// as InventoryItem's own doc comment describes the entity's scope.
+// seedInventory gives every stock Item an on-hand + available-to-promise
+// level — service items (no natural inventory concept) are deliberately
+// skipped, same as InventoryItem's own doc comment describes the
+// entity's scope. onHand and availableToPromise deliberately differ for
+// a few SKUs (fully or over-committed against existing sales
+// allocations, not modeled by this simplified kernel — see
+// InventoryItem's own doc comment) so the mgmt reporting workbench's
+// stockout-risk table (internal/api/reporting.go, qty_available_to_promise
+// <= 0) has real rows to show, not just a demo of an empty state.
 func (s *seeder) seedInventory(items map[string]string) {
 	def := s.def("InventoryItem")
-	levels := map[string]float64{"SKU-1001": 500, "SKU-1002": 120, "SKU-1003": 300}
+	levels := map[string]struct{ onHand, atp float64 }{
+		"SKU-1001": {500, 500},
+		"SKU-1002": {120, 120},
+		"SKU-1003": {300, 300},
+		"SKU-1004": {80, 0}, // fully committed — stockout risk
+		"SKU-1005": {45, 45},
+		"SKU-1006": {600, 600},
+		"SKU-1007": {25, -10}, // over-committed — stockout risk
+		"SKU-1008": {200, 200},
+		"SKU-1009": {0, 0}, // never restocked — stockout risk
+		"SKU-1010": {60, 60},
+	}
 	for sku, itemID := range items {
-		qty, ok := levels[sku]
+		level, ok := levels[sku]
 		if !ok {
 			continue
 		}
@@ -223,7 +251,7 @@ func (s *seeder) seedInventory(items map[string]string) {
 			continue
 		}
 		if _, err := s.crud.Create(s.ctx, def, s.tenantID, map[string]any{
-			"item_id": itemID, "qty_on_hand": qty, "qty_available_to_promise": qty,
+			"item_id": itemID, "qty_on_hand": level.onHand, "qty_available_to_promise": level.atp,
 		}, s.actor); err != nil {
 			log.Fatalf("create InventoryItem: %v", err)
 		}
@@ -259,6 +287,13 @@ func (s *seeder) seedPurchaseOrders(vendors, currencies, items map[string]string
 		{"PO-2026-0001", "Acme Textiles", "USD", "2026-07-01", "approved", []line{{"SKU-1002", 40, 18.5}}},
 		{"PO-2026-0002", "Gulf Steel Supply", "QAR", "2026-07-10", "submitted", []line{{"SKU-1001", 2000, 0.35}}},
 		{"PO-2026-0003", "Anatolia Parts Co.", "TRY", "2026-07-15", "draft", []line{{"SKU-1003", 150, 4.2}, {"SKU-2001", 8, 120}}},
+		{"PO-2026-0004", "Acme Textiles", "USD", "2026-07-18", "received", []line{{"SKU-1005", 60, 22}, {"SKU-1006", 30, 9.5}}},
+		{"PO-2026-0005", "Doha Fasteners LLC", "QAR", "2026-07-19", "received", []line{{"SKU-1004", 3000, 0.42}, {"SKU-1009", 5000, 0.08}}},
+		{"PO-2026-0006", "Istanbul Weaving Mills", "TRY", "2026-07-19", "approved", []line{{"SKU-1010", 90, 26.5}}},
+		{"PO-2026-0007", "Manchester Packaging Ltd", "GBP", "2026-07-20", "submitted", []line{{"SKU-1007", 400, 3.1}, {"SKU-1008", 250, 5.75}}},
+		{"PO-2026-0008", "Gulf Steel Supply", "QAR", "2026-07-20", "cancelled", []line{{"SKU-1001", 500, 0.35}}},
+		{"PO-2026-0009", "Anatolia Parts Co.", "TRY", "2026-07-21", "draft", []line{{"SKU-2002", 4, 90}}},
+		{"PO-2026-0010", "Doha Fasteners LLC", "QAR", "2026-07-21", "approved", []line{{"SKU-1009", 8000, 0.08}}},
 	}
 	for _, o := range orders {
 		existing, err := s.crud.ListByField(s.ctx, poDef, s.tenantID, "po_number", o.poNumber)
