@@ -44,6 +44,7 @@ type Handler struct {
 	catalog       *i18n.Catalog
 	auth          *webauth.Authenticator
 	workflowQueue *workflow.Queue
+	reporting     *data.ReportingRepo
 }
 
 // New builds a Handler. catalog is the i18n.Catalog forms (and the
@@ -75,6 +76,7 @@ func New(db *sql.DB, catalog *i18n.Catalog, auth *webauth.Authenticator) *Handle
 		catalog:       catalog,
 		auth:          auth,
 		workflowQueue: workflowQueue,
+		reporting:     data.NewReportingRepo(db),
 	}
 }
 
@@ -151,6 +153,9 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	// The human-facing page on top of the two routes above — see
 	// renderWorkflowInbox's doc comment.
 	mux.Handle("GET /workflow-jobs", auth(h.renderWorkflowInbox))
+	// The mgmt reporting workbench (QUEUE.md's Ansar Group opportunity
+	// entry) — see reporting.go's doc comment.
+	mux.Handle("GET /reports/purchasing", auth(h.renderPurchasingReport))
 }
 
 // requestContext fetches the httpx.RequestContext a preceding DevAuth (or
