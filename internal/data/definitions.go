@@ -370,3 +370,12 @@ func (w *WorkflowDefinitionRepo) GetPublished(ctx context.Context, tenantID, nam
 func (w *WorkflowDefinitionRepo) GetVersion(ctx context.Context, tenantID, name string, version int) (DefinitionVersion, error) {
 	return w.r.getVersion(ctx, tenantID, name, version)
 }
+
+// ListPublishedNames returns every workflow name tenantID currently has
+// at least one published Definition for — what internal/api's trigger
+// wiring needs to find which workflows might fire for a given entity
+// type + trigger, without hardcoding a workflow name anywhere (same
+// registry-driven pattern as EntityDefinitionRepo.ListPublishedEntityTypes).
+func (w *WorkflowDefinitionRepo) ListPublishedNames(ctx context.Context, tenantID string) ([]string, error) {
+	return w.r.listPublishedKeys(ctx, tenantID)
+}
