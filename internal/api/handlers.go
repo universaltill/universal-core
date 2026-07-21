@@ -29,18 +29,21 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/form"
 	"github.com/universaltill/universal-core/internal/kernel/formrender"
+	"github.com/universaltill/universal-core/internal/kernel/workflow"
 	"github.com/universaltill/universal-core/internal/webauth"
 )
 
 // Handler wires the registry, crud.Engine, and formrender.Renderer
 // together behind HTTP. One Handler serves every entity/form type.
 type Handler struct {
-	entityDefs *data.EntityDefinitionRepo
-	formDefs   *data.FormDefinitionRepo
-	crud       *crud.Engine
-	renderer   *formrender.Renderer
-	catalog    *i18n.Catalog
-	auth       *webauth.Authenticator
+	entityDefs    *data.EntityDefinitionRepo
+	formDefs      *data.FormDefinitionRepo
+	workflowDefs  *data.WorkflowDefinitionRepo
+	crud          *crud.Engine
+	renderer      *formrender.Renderer
+	catalog       *i18n.Catalog
+	auth          *webauth.Authenticator
+	workflowQueue *workflow.Queue
 }
 
 // New builds a Handler. catalog is the i18n.Catalog forms (and the
@@ -50,13 +53,28 @@ type Handler struct {
 // safe no-ops on a disabled Authenticator (see webauth's own doc
 // comments).
 func New(db *sql.DB, catalog *i18n.Catalog, auth *webauth.Authenticator) *Handler {
+	// nil handlers: same default no-op notify handler internal/worker's
+	// Runner gets from workflow.NewQueue — this Handler only ever calls
+	// Enqueue/ResumeAfterApproval, never ProcessOne, so no StepHandler of
+	// its own is needed here regardless.
+	workflowQueue, err := workflow.NewQueue(db, nil)
+	if err != nil {
+		// Only returns an error for a caller-supplied require_approval
+		// handler, which nil (no handlers at all) can never trigger —
+		// unreachable in practice, but New has no error return of its own
+		// to propagate this through, so fail loud instead of silently
+		// leaving workflowQueue nil for something later to panic on.
+		panic(fmt.Sprintf("api.New: build workflow queue: %v", err))
+	}
 	return &Handler{
-		entityDefs: data.NewEntityDefinitionRepo(db),
-		formDefs:   data.NewFormDefinitionRepo(db),
-		crud:       crud.NewEngine(db),
-		renderer:   formrender.New(catalog),
-		catalog:    catalog,
-		auth:       auth,
+		entityDefs:    data.NewEntityDefinitionRepo(db),
+		formDefs:      data.NewFormDefinitionRepo(db),
+		workflowDefs:  data.NewWorkflowDefinitionRepo(db),
+		crud:          crud.NewEngine(db),
+		renderer:      formrender.New(catalog),
+		catalog:       catalog,
+		auth:          auth,
+		workflowQueue: workflowQueue,
 	}
 }
 
@@ -123,6 +141,11 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	mux.Handle("GET /import/{entityType}", auth(h.importUploadPage))
 	mux.Handle("POST /import/{entityType}/preview", auth(h.importPreview))
 	mux.Handle("POST /import/{entityType}/commit", auth(h.importCommit))
+	// Resumes a job halted at a require_approval step — see workflow.go's
+	// doc comment. Not entity-scoped in the URL: a workflow_jobs row is
+	// tenant+id addressed, same as workflow_definitions being keyed by
+	// name rather than entity_type.
+	mux.Handle("POST /api/workflow-jobs/{id}/approve", auth(h.approveWorkflowJob))
 }
 
 // requestContext fetches the httpx.RequestContext a preceding DevAuth (or
@@ -290,6 +313,7 @@ func (h *Handler) createRecord(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, fmt.Sprintf("create %s record", entityType), err)
 		return
 	}
+	h.triggerWorkflows(r.Context(), rc.TenantID, entityType, rec.ID, workflow.TriggerOnCreate, rc.Actor)
 
 	if isHTMXRequest(r) {
 		h.writeRecordFormFragment(w, r, rc.TenantID, entDef, entityType, rec.ID)
@@ -355,6 +379,7 @@ func (h *Handler) updateRecord(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, fmt.Sprintf("update %s %s", entityType, id), err)
 		return
 	}
+	h.triggerWorkflows(r.Context(), rc.TenantID, entityType, id, workflow.TriggerOnUpdate, rc.Actor)
 
 	if isHTMXRequest(r) {
 		h.writeRecordFormFragment(w, r, rc.TenantID, entDef, entityType, id)
