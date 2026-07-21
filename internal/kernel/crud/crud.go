@@ -66,31 +66,41 @@ func (e *Engine) Create(ctx context.Context, def *entity.Definition, tenantID st
 }
 
 // Update validates and applies a full replacement of fields, atomically
-// with its audit entry.
-func (e *Engine) Update(ctx context.Context, def *entity.Definition, tenantID, id string, fields map[string]any, actor audit.Actor) error {
+// with its audit entry. expectedVersion is optimistic-locking's hook —
+// nil skips the check (unconditional update, the original behaviour);
+// non-nil rejects with data.ErrVersionConflict if the record has moved on
+// since the caller last read it (see data.RecordRepo.Update). Returns the
+// record's new version on success, so a caller re-rendering the record
+// (a form, an API response) can embed the version it should check against
+// next time.
+func (e *Engine) Update(ctx context.Context, def *entity.Definition, tenantID, id string, fields map[string]any, expectedVersion *int, actor audit.Actor) (int, error) {
 	if err := entity.ValidateRecord(def, fields); err != nil {
-		return fmt.Errorf("validation failed: %w", err)
+		return 0, fmt.Errorf("validation failed: %w", err)
 	}
 
 	tx, err := e.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
+		return 0, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	if err := e.records.UpdateTx(ctx, tx, tenantID, def.EntityType, id, fields); err != nil {
-		return fmt.Errorf("update record: %w", err)
+	newVersion, err := e.records.UpdateTx(ctx, tx, tenantID, def.EntityType, id, fields, expectedVersion)
+	if err != nil {
+		return 0, fmt.Errorf("update record: %w", err)
 	}
 
 	auditEntry, err := audit.New(tenantID, def.EntityType, id, audit.ActionUpdate, actor, fields)
 	if err != nil {
-		return fmt.Errorf("build audit entry: %w", err)
+		return 0, fmt.Errorf("build audit entry: %w", err)
 	}
 	if err := e.audit.Insert(ctx, tx, auditEntry); err != nil {
-		return fmt.Errorf("write audit entry: %w", err)
+		return 0, fmt.Errorf("write audit entry: %w", err)
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit tx: %w", err)
+	}
+	return newVersion, nil
 }
 
 func (e *Engine) Get(ctx context.Context, def *entity.Definition, tenantID, id string) (data.Record, error) {

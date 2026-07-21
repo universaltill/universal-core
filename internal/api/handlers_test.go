@@ -500,6 +500,143 @@ func TestAPI_UpdateRecord_ValidationFailureIs400(t *testing.T) {
 	}
 }
 
+// TestAPI_RenderForm_IncludesVersionHiddenField confirms an existing
+// record's edit form actually carries the "_version" hidden field a real
+// browser needs to round-trip for optimistic-locking protection — a new/
+// unsaved record's form must NOT have one (nothing to check yet).
+func TestAPI_RenderForm_IncludesVersionHiddenField(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	newFormReq := newRequest("GET", "/forms/Vendor/new", tenantID, "farshid", nil)
+	newFormRec := httptest.NewRecorder()
+	mux.ServeHTTP(newFormRec, newFormReq)
+	if strings.Contains(newFormRec.Body.String(), `name="_version"`) {
+		t.Fatalf("expected no _version field on a new/unsaved record's form, got:\n%s", newFormRec.Body.String())
+	}
+
+	createReq := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{"name":"Acme Textiles"}`))
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	var created struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal create response: %v", err)
+	}
+
+	editFormReq := newRequest("GET", "/forms/Vendor/"+created.Data.ID, tenantID, "farshid", nil)
+	editFormRec := httptest.NewRecorder()
+	mux.ServeHTTP(editFormRec, editFormReq)
+	if !strings.Contains(editFormRec.Body.String(), `<input type="hidden" name="_version" value="1">`) {
+		t.Fatalf("expected a freshly created record's edit form to carry _version=1, got:\n%s", editFormRec.Body.String())
+	}
+}
+
+// TestAPI_UpdateRecord_StaleVersionReturns409JSON is optimistic locking's
+// real-world scenario over the JSON API: two clients both read the
+// record, one saves first (moving its version on), and the second's save
+// — built against the version it originally read — must be rejected
+// rather than silently winning and erasing the first save.
+func TestAPI_UpdateRecord_StaleVersionReturns409JSON(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	createReq := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{"name":"Acme Textiles"}`))
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	var created struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal create response: %v", err)
+	}
+
+	// The first save (against version 1, the record's version at create)
+	// succeeds and moves the record to version 2.
+	firstUpdateReq := newRequest("POST", "/api/records/Vendor/"+created.Data.ID, tenantID, "farshid",
+		[]byte(`{"name":"Editor A's change","_version":1}`))
+	firstUpdateRec := httptest.NewRecorder()
+	mux.ServeHTTP(firstUpdateRec, firstUpdateReq)
+	if firstUpdateRec.Code != http.StatusOK {
+		t.Fatalf("expected the first update to succeed with 200, got %d: %s", firstUpdateRec.Code, firstUpdateRec.Body.String())
+	}
+
+	// The second save was built against the same version 1 (it read the
+	// record before the first save happened) — must be rejected, not
+	// silently applied on top of Editor A's change.
+	secondUpdateReq := newRequest("POST", "/api/records/Vendor/"+created.Data.ID, tenantID, "farshid",
+		[]byte(`{"name":"Editor B's change","_version":1}`))
+	secondUpdateRec := httptest.NewRecorder()
+	mux.ServeHTTP(secondUpdateRec, secondUpdateReq)
+	if secondUpdateRec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for a stale _version, got %d: %s", secondUpdateRec.Code, secondUpdateRec.Body.String())
+	}
+
+	getReq := newRequest("GET", "/api/records/Vendor/"+created.Data.ID, tenantID, "farshid", nil)
+	getRec := httptest.NewRecorder()
+	mux.ServeHTTP(getRec, getReq)
+	if !strings.Contains(getRec.Body.String(), "Editor A's change") {
+		t.Fatalf("expected Editor A's change to have survived, got:\n%s", getRec.Body.String())
+	}
+	if strings.Contains(getRec.Body.String(), "Editor B's change") {
+		t.Fatalf("expected Editor B's rejected change to NOT be persisted, got:\n%s", getRec.Body.String())
+	}
+}
+
+// TestAPI_UpdateRecord_MissingVersionSkipsCheck confirms backward
+// compatibility explicitly: a JSON caller that never sends "_version" (as
+// every API client/test predating this feature does) keeps updating
+// unconditionally — optimistic locking is opt-in per request, not a
+// breaking change to the existing contract.
+func TestAPI_UpdateRecord_MissingVersionSkipsCheck(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	createReq := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{"name":"Acme Textiles"}`))
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	var created struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal create response: %v", err)
+	}
+
+	// Two consecutive updates, neither sending _version — both must
+	// succeed even though the record's real version moved on between them.
+	for i, name := range []string{"First Edit", "Second Edit"} {
+		body := fmt.Appendf(nil, `{"name":%q}`, name)
+		req := newRequest("POST", "/api/records/Vendor/"+created.Data.ID, tenantID, "farshid", body)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("update %d (no _version): expected 200, got %d: %s", i, rec.Code, rec.Body.String())
+		}
+	}
+}
+
 // TestAPI_FormSubmit_CheckedBoolFieldSavesCorrectly is the end-to-end
 // regression test (real HTTP handler, real Postgres) for the checkbox
 // bug independent review found: a real browser checking a box and

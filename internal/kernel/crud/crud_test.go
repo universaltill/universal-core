@@ -3,6 +3,7 @@ package crud
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -178,10 +179,10 @@ func TestEngine_Update_ChangesDataAndAppendsAudit(t *testing.T) {
 		t.Fatalf("Create failed: %v", err)
 	}
 
-	err = engine.Update(ctx, def, tenantID, rec.ID, map[string]any{
+	_, err = engine.Update(ctx, def, tenantID, rec.ID, map[string]any{
 		"name":           "Acme Textiles Ltd",
 		"lead_time_days": float64(45),
-	}, actor)
+	}, nil, actor)
 	if err != nil {
 		t.Fatalf("Update failed: %v", err)
 	}
@@ -203,6 +204,119 @@ func TestEngine_Update_ChangesDataAndAppendsAudit(t *testing.T) {
 	}
 	if auditCount != 2 { // one for create, one for update
 		t.Fatalf("expected 2 audit rows (create+update), got %d", auditCount)
+	}
+}
+
+// TestEngine_Create_StartsAtVersion1 pins the documented starting value
+// (005_record_version.sql: "version starts at 1, not 0") — 0 is reserved
+// to mean "never checked" in the pointer-based expectedVersion API, so a
+// real record must never legitimately have version 0.
+func TestEngine_Create_StartsAtVersion1(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	tenantID := seedTenant(t, db)
+	engine := NewEngine(db)
+	def := vendorDef()
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	rec, err := engine.Create(ctx, def, tenantID, map[string]any{"name": "Acme"}, actor)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	if rec.Version != 1 {
+		t.Fatalf("expected a freshly created record at version 1, got %d", rec.Version)
+	}
+}
+
+// TestEngine_Update_NilExpectedVersionSkipsCheck confirms the backward-
+// compatible path: a caller that never passes an expectedVersion (every
+// caller written before optimistic locking existed) keeps updating
+// unconditionally, exactly as before — the version field increments as a
+// side effect, but nothing rejects the write.
+func TestEngine_Update_NilExpectedVersionSkipsCheck(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	tenantID := seedTenant(t, db)
+	engine := NewEngine(db)
+	def := vendorDef()
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	rec, err := engine.Create(ctx, def, tenantID, map[string]any{"name": "Acme"}, actor)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	// Two consecutive unconditional updates, neither checking a version —
+	// the second must not fail just because the first already moved the
+	// record's version on from what it was at Create time.
+	if _, err := engine.Update(ctx, def, tenantID, rec.ID, map[string]any{"name": "First Edit"}, nil, actor); err != nil {
+		t.Fatalf("first unconditional Update failed: %v", err)
+	}
+	newVersion, err := engine.Update(ctx, def, tenantID, rec.ID, map[string]any{"name": "Second Edit"}, nil, actor)
+	if err != nil {
+		t.Fatalf("second unconditional Update failed: %v", err)
+	}
+	if newVersion != 3 { // 1 at create, 2 after first edit, 3 after second
+		t.Fatalf("expected version 3 after two edits from version 1, got %d", newVersion)
+	}
+}
+
+// TestEngine_Update_StaleExpectedVersionRejected is optimistic locking's
+// whole reason to exist: two "concurrent" edits of the same record — the
+// second one's expectedVersion was captured before the first one saved,
+// so it must be rejected with data.ErrVersionConflict instead of silently
+// overwriting the first edit.
+func TestEngine_Update_StaleExpectedVersionRejected(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	tenantID := seedTenant(t, db)
+	engine := NewEngine(db)
+	def := vendorDef()
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	rec, err := engine.Create(ctx, def, tenantID, map[string]any{"name": "Acme"}, actor)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	staleVersion := rec.Version // both "concurrent" edits read the record at this version
+
+	if _, err := engine.Update(ctx, def, tenantID, rec.ID, map[string]any{"name": "Editor A's change"}, &staleVersion, actor); err != nil {
+		t.Fatalf("first Update (the one that actually wins the race) failed: %v", err)
+	}
+
+	_, err = engine.Update(ctx, def, tenantID, rec.ID, map[string]any{"name": "Editor B's change"}, &staleVersion, actor)
+	if !errors.Is(err, data.ErrVersionConflict) {
+		t.Fatalf("expected ErrVersionConflict for a stale expectedVersion, got %v", err)
+	}
+
+	// Editor A's change survived; Editor B's was correctly rejected, not
+	// silently applied on top.
+	got, err := engine.Get(ctx, def, tenantID, rec.ID)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if got.Data["name"] != "Editor A's change" {
+		t.Fatalf("expected Editor A's change to have won, got %v", got.Data["name"])
+	}
+}
+
+// TestEngine_Update_NonexistentRecordReturnsNotFoundNotConflict confirms
+// the two failure modes stay distinguishable — a version mismatch and a
+// genuinely missing record must not both collapse into the same error,
+// since a caller needs to tell "reload and retry" (409) apart from "this
+// is gone" (404).
+func TestEngine_Update_NonexistentRecordReturnsNotFoundNotConflict(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	tenantID := seedTenant(t, db)
+	engine := NewEngine(db)
+	def := vendorDef()
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	v := 1
+	_, err := engine.Update(ctx, def, tenantID, "00000000-0000-0000-0000-000000000000", map[string]any{"name": "Ghost"}, &v, actor)
+	if !errors.Is(err, data.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for a nonexistent record, got %v", err)
 	}
 }
 
