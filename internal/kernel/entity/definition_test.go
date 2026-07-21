@@ -37,6 +37,17 @@ func TestDefinitionValidate(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			// The "_" namespace is reserved for request metadata like
+			// "_version" (internal/api's optimistic-locking extraction) —
+			// a declared field can't collide with it.
+			name: "reserved underscore-prefixed field name",
+			def: Definition{
+				EntityType: "Vendor",
+				Fields:     []Field{{Name: "_version", Type: FieldString}},
+			},
+			wantErr: true,
+		},
+		{
 			name: "enum without values",
 			def: Definition{
 				EntityType: "PurchaseOrder",
