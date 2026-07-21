@@ -21,6 +21,7 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/form"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
+	"github.com/universaltill/universal-core/internal/kernel/workflow"
 )
 
 func testDB(t *testing.T) *sql.DB {
@@ -50,6 +51,22 @@ func seedTenant(t *testing.T, db *sql.DB) string {
 	if err != nil {
 		t.Fatalf("seed tenant: %v", err)
 	}
+	// workflow_jobs cleanup matters here more than for any other table
+	// this file touches: ClaimNext/ProcessOne are deliberately tenant-
+	// global (one shared dispatcher servicing every tenant — see
+	// queue.go), so a job left 'queued' by one test (e.g. an on_create
+	// trigger test that never drove its own job to completion) is fair
+	// game for a LATER test's ProcessOne call, regardless of tenant —
+	// found exactly this way when TestAPI_ApproveWorkflowJob_
+	// ResumesWaitingApproval's ProcessOne claimed a different, older,
+	// already-queued job left over from an earlier trigger test instead
+	// of its own. Same fix internal/kernel/workflow's own test-local
+	// seedTenant already applies, mirrored here.
+	t.Cleanup(func() {
+		if _, err := db.Exec(`DELETE FROM workflow_jobs WHERE tenant_id = $1`, id); err != nil {
+			t.Errorf("cleanup workflow_jobs for tenant %s: %v", id, err)
+		}
+	})
 	return id
 }
 
@@ -145,6 +162,30 @@ func publishEntityAndForm(t *testing.T, db *sql.DB, tenantID string, entDef *ent
 	}
 	if err := formRepo.Publish(ctx, tenantID, formDef.EntityType, formDef.Version, actor); err != nil {
 		t.Fatalf("Publish form: %v", err)
+	}
+}
+
+// publishWorkflow drives def through CreateDraft -> Approve -> Publish —
+// the real registry-backed lifecycle a trigger-matching test needs
+// (triggerWorkflows reads published workflow_definitions rows directly,
+// not a stub).
+func publishWorkflow(t *testing.T, db *sql.DB, tenantID string, def *workflow.Definition) {
+	t.Helper()
+	ctx := context.Background()
+	actor := humanActor()
+	raw, err := json.Marshal(def)
+	if err != nil {
+		t.Fatalf("marshal workflow def: %v", err)
+	}
+	repo := data.NewWorkflowDefinitionRepo(db)
+	if _, err := repo.CreateDraft(ctx, tenantID, def.Name, def.Version, raw, actor); err != nil {
+		t.Fatalf("CreateDraft workflow: %v", err)
+	}
+	if err := repo.Approve(ctx, tenantID, def.Name, def.Version, actor); err != nil {
+		t.Fatalf("Approve workflow: %v", err)
+	}
+	if err := repo.Publish(ctx, tenantID, def.Name, def.Version, actor); err != nil {
+		t.Fatalf("Publish workflow: %v", err)
 	}
 }
 
@@ -2196,5 +2237,277 @@ func TestAPI_InternalErrors_NeverLeakRawDriverText(t *testing.T) {
 		if strings.Contains(rec.Body.String(), "SQLSTATE") || strings.Contains(rec.Body.String(), "ERROR:") {
 			t.Fatalf("%s: response leaked a raw driver error: %s", target, rec.Body.String())
 		}
+	}
+}
+
+// workflowJobStatuses queries a tenant's workflow_jobs rows for
+// entityType directly — the trigger-wiring tests below need to observe
+// what triggerWorkflows actually enqueued without a worker process
+// running to process it (this test file builds a bare Handler, not
+// internal/worker.Runner), so "did it get enqueued at all, with the
+// right shape" is checked at the DB level.
+func workflowJobStatuses(t *testing.T, db *sql.DB, tenantID, entityType string) []string {
+	t.Helper()
+	rows, err := db.Query(`SELECT status FROM workflow_jobs WHERE tenant_id = $1 AND entity_type = $2 ORDER BY created_at`, tenantID, entityType)
+	if err != nil {
+		t.Fatalf("query workflow_jobs: %v", err)
+	}
+	defer rows.Close()
+	var statuses []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			t.Fatalf("scan status: %v", err)
+		}
+		statuses = append(statuses, s)
+	}
+	return statuses
+}
+
+// TestAPI_CreateRecord_TriggersOnCreateWorkflow is the point of wiring
+// triggerWorkflows into createRecord at all: before this, workflow.
+// Queue.Enqueue was reachable only from tests, since nothing in a real
+// deployment ever called it — creating a record silently never started
+// any workflow, no matter what on_create Definition was published.
+func TestAPI_CreateRecord_TriggersOnCreateWorkflow(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+	publishWorkflow(t, db, tenantID, &workflow.Definition{
+		Name: "vendor_onboarding", Version: 1,
+		Trigger: workflow.Trigger{Type: workflow.TriggerOnCreate, EntityType: "Vendor"},
+		Steps:   []workflow.Step{{Kind: workflow.StepNotify}},
+	})
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{"name":"Acme Textiles"}`))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	statuses := workflowJobStatuses(t, db, tenantID, "Vendor")
+	if len(statuses) != 1 || statuses[0] != "queued" {
+		t.Fatalf("expected exactly one queued workflow job for the new Vendor, got %v", statuses)
+	}
+}
+
+// TestAPI_CreateRecord_NoMatchingWorkflow_NoJobEnqueued confirms
+// triggerWorkflows doesn't fire indiscriminately — a published workflow
+// for a DIFFERENT entity type must not enqueue anything when an
+// unrelated entity type is created.
+func TestAPI_CreateRecord_NoMatchingWorkflow_NoJobEnqueued(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+	publishWorkflow(t, db, tenantID, &workflow.Definition{
+		Name: "item_onboarding", Version: 1,
+		Trigger: workflow.Trigger{Type: workflow.TriggerOnCreate, EntityType: "Item"},
+		Steps:   []workflow.Step{{Kind: workflow.StepNotify}},
+	})
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{"name":"Acme Textiles"}`))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	if statuses := workflowJobStatuses(t, db, tenantID, "Vendor"); len(statuses) != 0 {
+		t.Fatalf("expected no workflow job for an entity type with no matching trigger, got %v", statuses)
+	}
+}
+
+// TestAPI_UpdateRecord_TriggersOnUpdateWorkflow is on_create's sibling
+// case — an on_update-triggered workflow must fire on updateRecord, not
+// just createRecord.
+func TestAPI_UpdateRecord_TriggersOnUpdateWorkflow(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+	publishWorkflow(t, db, tenantID, &workflow.Definition{
+		Name: "vendor_change_review", Version: 1,
+		Trigger: workflow.Trigger{Type: workflow.TriggerOnUpdate, EntityType: "Vendor"},
+		Steps:   []workflow.Step{{Kind: workflow.StepNotify}},
+	})
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	createReq := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{"name":"Acme Textiles"}`))
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	var created struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal create response: %v", err)
+	}
+	// on_create doesn't match this workflow's trigger, so create alone
+	// must not have enqueued anything yet.
+	if statuses := workflowJobStatuses(t, db, tenantID, "Vendor"); len(statuses) != 0 {
+		t.Fatalf("expected no workflow job from create (trigger is on_update), got %v", statuses)
+	}
+
+	updateReq := newRequest("POST", "/api/records/Vendor/"+created.Data.ID, tenantID, "farshid", []byte(`{"name":"Acme Textiles Ltd"}`))
+	updateRec := httptest.NewRecorder()
+	mux.ServeHTTP(updateRec, updateReq)
+	if updateRec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", updateRec.Code, updateRec.Body.String())
+	}
+
+	statuses := workflowJobStatuses(t, db, tenantID, "Vendor")
+	if len(statuses) != 1 || statuses[0] != "queued" {
+		t.Fatalf("expected exactly one queued workflow job after the update, got %v", statuses)
+	}
+}
+
+// TestAPI_ApproveWorkflowJob_ResumesWaitingApproval exercises the HTTP
+// endpoint ResumeAfterApproval's own doc comment says didn't exist yet.
+// Drives a job to waiting_approval directly via workflow.Queue (standing
+// in for the real worker, which isn't running in this test) to isolate
+// what's actually under test: the HTTP layer correctly calling
+// ResumeAfterApproval, not the worker's own poll loop (internal/worker
+// already covers that).
+func TestAPI_ApproveWorkflowJob_ResumesWaitingApproval(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+	def := &workflow.Definition{
+		Name: "vendor_approval", Version: 1,
+		Trigger: workflow.Trigger{Type: workflow.TriggerOnCreate, EntityType: "Vendor"},
+		Steps: []workflow.Step{
+			{Kind: workflow.StepRequireApproval},
+			{Kind: workflow.StepNotify},
+		},
+	}
+	publishWorkflow(t, db, tenantID, def)
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	createReq := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{"name":"Acme Textiles"}`))
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", createRec.Code, createRec.Body.String())
+	}
+
+	// Stand in for the worker: claim and run the job to its
+	// require_approval halt.
+	q, err := workflow.NewQueue(db, nil)
+	if err != nil {
+		t.Fatalf("NewQueue: %v", err)
+	}
+	if _, err := q.ProcessOne(context.Background(), workflow.RegistryDefinitionLookup(db)); err != nil {
+		t.Fatalf("ProcessOne (halt at approval): %v", err)
+	}
+
+	jobRepo := data.NewWorkflowJobRepo(db)
+	var jobID string
+	if err := db.QueryRow(`SELECT id FROM workflow_jobs WHERE tenant_id = $1 AND workflow_name = $2`, tenantID, def.Name).Scan(&jobID); err != nil {
+		t.Fatalf("find enqueued job: %v", err)
+	}
+	got, err := jobRepo.Get(context.Background(), tenantID, jobID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status != "waiting_approval" {
+		t.Fatalf("expected the job to be halted at waiting_approval before testing the approve endpoint, got %q", got.Status)
+	}
+
+	approveReq := newRequest("POST", "/api/workflow-jobs/"+jobID+"/approve", tenantID, "farshid", nil)
+	approveRec := httptest.NewRecorder()
+	mux.ServeHTTP(approveRec, approveReq)
+	if approveRec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", approveRec.Code, approveRec.Body.String())
+	}
+
+	got, err = jobRepo.Get(context.Background(), tenantID, jobID)
+	if err != nil {
+		t.Fatalf("Get after approve: %v", err)
+	}
+	if got.Status != "queued" {
+		t.Fatalf("expected the job back to queued (ready for a worker to pick up the remaining steps) after approval, got %q", got.Status)
+	}
+	if got.StepIndex != 1 {
+		t.Fatalf("expected step_index advanced past the require_approval step (0) to 1, got %d", got.StepIndex)
+	}
+}
+
+func TestAPI_ApproveWorkflowJob_UnknownJobIs404(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := newRequest("POST", "/api/workflow-jobs/99999999-9999-9999-9999-999999999999/approve", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for an unknown job id, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestAPI_ApproveWorkflowJob_TenantIsolation confirms a tenant can't
+// resume another tenant's job by guessing/reusing its id — the same
+// isolation internal/kernel/workflow's own
+// TestWorkflowJobRepo_TenantIsolation already proves at the repo layer,
+// checked again here at the HTTP layer where a caller-supplied id
+// actually originates.
+func TestAPI_ApproveWorkflowJob_TenantIsolation(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantA := seedTenant(t, db)
+	tenantB := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantA, vendorEntityDef(), vendorFormDef())
+	def := &workflow.Definition{
+		Name: "vendor_approval", Version: 1,
+		Trigger: workflow.Trigger{Type: workflow.TriggerOnCreate, EntityType: "Vendor"},
+		Steps:   []workflow.Step{{Kind: workflow.StepRequireApproval}},
+	}
+	publishWorkflow(t, db, tenantA, def)
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	createReq := newRequest("POST", "/api/records/Vendor", tenantA, "farshid", []byte(`{"name":"Acme Textiles"}`))
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", createRec.Code, createRec.Body.String())
+	}
+
+	q, err := workflow.NewQueue(db, nil)
+	if err != nil {
+		t.Fatalf("NewQueue: %v", err)
+	}
+	if _, err := q.ProcessOne(context.Background(), workflow.RegistryDefinitionLookup(db)); err != nil {
+		t.Fatalf("ProcessOne (halt at approval): %v", err)
+	}
+	var jobID string
+	if err := db.QueryRow(`SELECT id FROM workflow_jobs WHERE tenant_id = $1 AND workflow_name = $2`, tenantA, def.Name).Scan(&jobID); err != nil {
+		t.Fatalf("find enqueued job: %v", err)
+	}
+
+	approveReq := newRequest("POST", "/api/workflow-jobs/"+jobID+"/approve", tenantB, "farshid", nil)
+	approveRec := httptest.NewRecorder()
+	mux.ServeHTTP(approveRec, approveReq)
+	if approveRec.Code != http.StatusNotFound {
+		t.Fatalf("expected tenant B approving tenant A's job to 404, got %d: %s", approveRec.Code, approveRec.Body.String())
 	}
 }
