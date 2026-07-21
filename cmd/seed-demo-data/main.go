@@ -297,10 +297,11 @@ func (s *seeder) seedPurchaseOrders(vendors, currencies, items map[string]string
 		// patch (entity.ValidateRecord runs against exactly what's
 		// passed here) — po_number has to be repeated even though it's
 		// unchanged, same as every other field already was.
-		if err := s.crud.Update(s.ctx, poDef, s.tenantID, poID.ID, map[string]any{
+		expectedVersion := poID.Version
+		if _, err := s.crud.Update(s.ctx, poDef, s.tenantID, poID.ID, map[string]any{
 			"po_number": o.poNumber, "vendor_id": vendors[o.vendor], "currency_id": currencies[o.currency],
 			"order_date": o.date, "status": o.status, "total": total,
-		}, s.actor); err != nil {
+		}, &expectedVersion, s.actor); err != nil {
 			log.Fatalf("update PurchaseOrder total: %v", err)
 		}
 	}

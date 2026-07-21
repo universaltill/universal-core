@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/universaltill/universal-core/internal/data"
@@ -329,9 +330,25 @@ func (h *Handler) updateRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = h.crud.Update(r.Context(), entDef, rc.TenantID, id, fields, rc.Actor)
+	expectedVersion, err := extractVersion(r, fields)
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	_, err = h.crud.Update(r.Context(), entDef, rc.TenantID, id, fields, expectedVersion, rc.Actor)
 	if errors.Is(err, data.ErrNotFound) {
 		httpx.WriteError(w, http.StatusNotFound, fmt.Sprintf("%s %q not found", entityType, id))
+		return
+	}
+	if errors.Is(err, data.ErrVersionConflict) {
+		// 409: the record is real, just not at the version this request
+		// was based on — someone else (or the same user, another tab)
+		// saved a change since this caller last read it. Not surfaced as
+		// a friendlier in-form message yet (QUEUE.md) — closing the
+		// actual data-loss gap (a stale save no longer silently wins)
+		// takes priority over that polish.
+		httpx.WriteError(w, http.StatusConflict, fmt.Sprintf("%s %q was changed by someone else — reload and try again", entityType, id))
 		return
 	}
 	if err != nil {
@@ -427,6 +444,43 @@ func parseRecordFields(r *http.Request, entDef *entity.Definition) (map[string]a
 	return fields, nil
 }
 
+// extractVersion pulls the optimistic-locking "_version" value out of an
+// update request, reading whichever channel parseRecordFields itself used
+// — r.PostForm for a form-encoded submission (formrender's own
+// "_version" hidden field, see render.go's viewModel.VersionKnown; never
+// collected into fields since it isn't a declared entity field), or the
+// fields map itself for a JSON body (parseRecordFields's JSON branch
+// decodes the whole body unfiltered, so "_version" would otherwise leak
+// into fields and get stored as bogus record data — deleted here either
+// way). Returns nil when absent: no check requested, matching this
+// endpoint's original unconditional-update behaviour for any caller that
+// predates versioning (every existing JSON API client/test included).
+func extractVersion(r *http.Request, fields map[string]any) (*int, error) {
+	ct := r.Header.Get("Content-Type")
+	if strings.HasPrefix(ct, "application/x-www-form-urlencoded") || strings.HasPrefix(ct, "multipart/form-data") {
+		raw := r.PostForm.Get("_version")
+		if raw == "" {
+			return nil, nil
+		}
+		v, err := strconv.Atoi(raw)
+		if err != nil {
+			return nil, fmt.Errorf("_version: %w", err)
+		}
+		return &v, nil
+	}
+	raw, ok := fields["_version"]
+	delete(fields, "_version")
+	if !ok {
+		return nil, nil
+	}
+	n, ok := raw.(float64) // encoding/json decodes any JSON number as float64
+	if !ok {
+		return nil, fmt.Errorf("_version: expected a number")
+	}
+	v := int(n)
+	return &v, nil
+}
+
 // writeRecordFormFragment re-renders entityType/id's form (bare fragment,
 // no page shell — this is an htmx-swap response, not a page navigation;
 // wrapping it in layout.go's full <html> document would break the swap
@@ -462,10 +516,15 @@ type recordResponse struct {
 	ID         string         `json:"id"`
 	EntityType string         `json:"entity_type"`
 	Data       map[string]any `json:"data"`
+	// Version is the optimistic-locking counter (data.Record.Version) —
+	// a JSON API client round-trips this back as "_version" on its next
+	// update to get the same conflict protection formrender's own hidden
+	// field gives a browser-driven save (see extractVersion).
+	Version int `json:"version"`
 }
 
 func toRecordResponse(r data.Record) recordResponse {
-	return recordResponse{ID: r.ID, EntityType: r.EntityType, Data: r.Data}
+	return recordResponse{ID: r.ID, EntityType: r.EntityType, Data: r.Data, Version: r.Version}
 }
 
 // renderNewForm renders def/entityType's form for a not-yet-saved
@@ -567,6 +626,7 @@ func (h *Handler) buildFormRenderData(ctx context.Context, tenantID string, entD
 		return formrender.Data{}, err
 	}
 	renderData.RecordID = rec.ID
+	renderData.Version = rec.Version
 	renderData.Record = rec.Data
 
 	children, err := h.loadMasterDetailChildren(ctx, tenantID, entDef, formDef, id)
