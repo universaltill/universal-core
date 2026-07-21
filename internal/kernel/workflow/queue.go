@@ -198,6 +198,14 @@ func (q *Queue) ResumeAfterApproval(ctx context.Context, tenantID, jobID string)
 	return q.jobs.ResumeAfterApproval(ctx, tenantID, jobID)
 }
 
+// ListByStatus returns every tenantID job currently in status, oldest
+// first — see data.WorkflowJobRepo.ListByStatus. The read side of the
+// approval loop: ResumeAfterApproval resumes a job by id, this is how a
+// caller finds which ids are actually waiting without direct DB access.
+func (q *Queue) ListByStatus(ctx context.Context, tenantID, status string) ([]data.WorkflowJob, error) {
+	return q.jobs.ListByStatus(ctx, tenantID, status)
+}
+
 // ReclaimStale requeues jobs stuck in 'running' past leaseTimeout — see
 // data.WorkflowJobRepo.ReclaimStale. Call this periodically (e.g. once
 // per poll loop, before ProcessOne) from whatever process runs the queue;
