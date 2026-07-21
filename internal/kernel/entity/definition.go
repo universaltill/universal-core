@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strings"
 )
 
 // FieldType enumerates the kinds of field a Definition can declare.
@@ -106,6 +107,22 @@ func (d *Definition) Validate() error {
 	for _, f := range d.Fields {
 		if f.Name == "" {
 			return fmt.Errorf("field with empty name in %s", d.EntityType)
+		}
+		if strings.HasPrefix(f.Name, "_") {
+			// The "_"-prefix namespace is reserved for request metadata a
+			// caller round-trips alongside real fields — "_version" is the
+			// one that exists today (internal/api's extractVersion,
+			// optimistic locking) — not a declarable entity field. Without
+			// this, a field genuinely named "_version" would collide with
+			// that mechanism: independent review found the two extraction
+			// paths (form-encoded vs JSON) don't even agree on which
+			// duplicate value wins, and JSON's own two-pass validate/
+			// extract order means a Required "_version" field would pass
+			// one validation pass and fail the other. Catching it here
+			// (fail loud on schema drift, same discipline as every other
+			// check in this method) is simpler than making both paths
+			// robust to a collision nothing legitimately needs.
+			return fmt.Errorf("field %q in %s: names starting with \"_\" are reserved", f.Name, d.EntityType)
 		}
 		if seen[f.Name] {
 			return fmt.Errorf("duplicate field %q in %s", f.Name, d.EntityType)
