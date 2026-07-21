@@ -146,6 +146,8 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	// tenant+id addressed, same as workflow_definitions being keyed by
 	// name rather than entity_type.
 	mux.Handle("POST /api/workflow-jobs/{id}/approve", auth(h.approveWorkflowJob))
+	// The read side of the same loop — see listWorkflowJobs' doc comment.
+	mux.Handle("GET /api/workflow-jobs", auth(h.listWorkflowJobs))
 }
 
 // requestContext fetches the httpx.RequestContext a preceding DevAuth (or
