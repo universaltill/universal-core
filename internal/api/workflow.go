@@ -103,3 +103,53 @@ func (h *Handler) approveWorkflowJob(w http.ResponseWriter, r *http.Request) {
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "resumed"})
 }
+
+// workflowJobResponse is the JSON shape for one row of listWorkflowJobs —
+// a caller-facing view of data.WorkflowJob, same reasoning as
+// recordResponse existing separately from data.Record (snake_case JSON
+// tags, only the fields a caller actually needs, per CLAUDE.md's API
+// conventions).
+type workflowJobResponse struct {
+	ID              string `json:"id"`
+	WorkflowName    string `json:"workflow_name"`
+	WorkflowVersion int    `json:"workflow_version"`
+	EntityType      string `json:"entity_type"`
+	RecordID        string `json:"record_id"`
+	StepIndex       int    `json:"step_index"`
+	Status          string `json:"status"`
+}
+
+// listWorkflowJobs is the read side of the approval loop —
+// approveWorkflowJob resumes a job by id, but nothing before this told a
+// caller which ids actually exist to resume. GET /api/workflow-jobs?
+// status=waiting_approval is the minimal task list: which jobs, for
+// which records, are actually waiting on a human right now. Deliberately
+// not a full inbox UI (no role-based filtering, no pagination, no
+// notification) — QUEUE.md scopes that as R17's broader remaining work;
+// this is the mechanism a UI would call, built first because the
+// mechanism has to exist before any UI can be built on top of it.
+func (h *Handler) listWorkflowJobs(w http.ResponseWriter, r *http.Request) {
+	rc, ok := requestContext(w, r)
+	if !ok {
+		return
+	}
+	status := r.URL.Query().Get("status")
+	if status == "" {
+		httpx.WriteError(w, http.StatusBadRequest, "status query parameter is required (e.g. ?status=waiting_approval)")
+		return
+	}
+
+	jobs, err := h.workflowQueue.ListByStatus(r.Context(), rc.TenantID, status)
+	if err != nil {
+		writeInternalError(w, fmt.Sprintf("list workflow jobs with status %s", status), err)
+		return
+	}
+	out := make([]workflowJobResponse, len(jobs))
+	for i, j := range jobs {
+		out[i] = workflowJobResponse{
+			ID: j.ID, WorkflowName: j.WorkflowName, WorkflowVersion: j.WorkflowVersion,
+			EntityType: j.EntityType, RecordID: j.RecordID, StepIndex: j.StepIndex, Status: j.Status,
+		}
+	}
+	httpx.WriteJSON(w, http.StatusOK, out)
+}
