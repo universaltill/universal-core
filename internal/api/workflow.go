@@ -8,9 +8,11 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"html/template"
 	"log"
 	"net/http"
 
@@ -82,6 +84,17 @@ func (h *Handler) triggerWorkflows(ctx context.Context, tenantID, entityType, re
 // flips the job back to 'queued' and requeues it; the next poll picks
 // it up. This endpoint returns as soon as that's durably recorded, not
 // after the workflow finishes running.
+//
+// On success, an htmx caller (the inbox page's own Approve button, see
+// renderWorkflowInbox) gets an empty 200 body instead of the JSON
+// envelope every other caller gets: the button's hx-target="closest tr"
+// hx-swap="outerHTML" removes the whole row by replacing it with nothing,
+// the standard htmx "delete this row" idiom — a JSON body there would
+// render as literal text inside the table. Error responses stay JSON
+// either way (httpx.WriteError): htmx doesn't swap on a non-2xx response
+// by default, so the row simply stays and the request fails silently in
+// the UI for now — see QUEUE.md's note on the equivalent gap already
+// documented for optimistic locking's 409.
 func (h *Handler) approveWorkflowJob(w http.ResponseWriter, r *http.Request) {
 	rc, ok := requestContext(w, r)
 	if !ok {
@@ -99,6 +112,14 @@ func (h *Handler) approveWorkflowJob(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeInternalError(w, fmt.Sprintf("approve workflow job %s", id), err)
+		return
+	}
+	if isHTMXRequest(r) {
+		// Content-Type set explicitly, same convention
+		// writeRecordFormFragment's own HTML fragment responses use —
+		// harmless and correct even though the body is empty here.
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "resumed"})
@@ -169,3 +190,100 @@ func (h *Handler) listWorkflowJobs(w http.ResponseWriter, r *http.Request) {
 	}
 	httpx.WriteJSON(w, http.StatusOK, out)
 }
+
+// renderWorkflowInbox is the actual human-facing surface listWorkflowJobs
+// was built to serve — "GET /api/workflow-jobs?status=waiting_approval
+// gives a human something to look at" was the API alone; this is the
+// page. Fixed to waiting_approval (not a general status browser — a
+// human's inbox is specifically "what needs me right now", the other
+// statuses are ops/debugging views this page isn't trying to be).
+//
+// Each row's Approve button is a real htmx interaction (hx-post + row
+// removal, see approveWorkflowJob's doc comment) — deliberately not a
+// plain <form> POST, since the approve endpoint returns JSON/empty
+// bodies, not a redirect a plain form submission could follow to a
+// sensible next page.
+func (h *Handler) renderWorkflowInbox(w http.ResponseWriter, r *http.Request) {
+	rc, ok := requestContext(w, r)
+	if !ok {
+		return
+	}
+	locale := localeFromRequest(w, r)
+
+	jobs, err := h.workflowQueue.ListByStatus(r.Context(), rc.TenantID, "waiting_approval")
+	if err != nil {
+		writeInternalError(w, "list waiting-approval workflow jobs for inbox", err)
+		return
+	}
+
+	view := workflowInboxView{
+		Title:          h.catalog.T(locale, "workflow_inbox.title"),
+		Empty:          h.catalog.T(locale, "workflow_inbox.empty"),
+		ColumnWorkflow: h.catalog.T(locale, "workflow_inbox.column_workflow"),
+		ColumnEntity:   h.catalog.T(locale, "workflow_inbox.column_entity"),
+		ColumnRecord:   h.catalog.T(locale, "workflow_inbox.column_record"),
+		ApproveLabel:   h.catalog.T(locale, "workflow_inbox.approve_button"),
+	}
+	for _, j := range jobs {
+		view.Rows = append(view.Rows, workflowInboxRowView{
+			ID:           j.ID,
+			WorkflowName: j.WorkflowName,
+			EntityLabel:  h.entityDisplayName(locale, j.EntityType),
+			RecordHref:   "/forms/" + j.EntityType + "/" + j.RecordID,
+			RecordID:     j.RecordID,
+			ApproveHref:  "/api/workflow-jobs/" + j.ID + "/approve",
+		})
+	}
+
+	var buf bytes.Buffer
+	if err := workflowInboxTmpl.Execute(&buf, view); err != nil {
+		writeInternalError(w, "render workflow inbox", err)
+		return
+	}
+	nav := h.renderNav(r, &rc, locale)
+	if err := renderShell(w, locale, nav, template.HTML(buf.String())); err != nil {
+		writeInternalError(w, "render workflow inbox shell", err)
+	}
+}
+
+type workflowInboxView struct {
+	Title          string
+	Empty          string
+	ColumnWorkflow string
+	ColumnEntity   string
+	ColumnRecord   string
+	ApproveLabel   string
+	Rows           []workflowInboxRowView
+}
+
+type workflowInboxRowView struct {
+	ID           string
+	WorkflowName string
+	EntityLabel  string
+	RecordHref   string
+	RecordID     string
+	ApproveHref  string
+}
+
+var workflowInboxTmpl = template.Must(template.New("workflowInbox").Parse(`
+<div class="uc-list-toolbar">
+<h1>{{.Title}}</h1>
+</div>
+{{if not .Rows}}
+<p class="uc-empty">{{.Empty}}</p>
+{{else}}
+<table class="uc-table">
+<thead><tr><th>{{.ColumnWorkflow}}</th><th>{{.ColumnEntity}}</th><th>{{.ColumnRecord}}</th><th></th></tr></thead>
+<tbody>
+{{range .Rows}}
+<tr id="workflow-job-{{.ID}}">
+<td>{{.WorkflowName}}</td>
+<td>{{.EntityLabel}}</td>
+<td><a href="{{.RecordHref}}">{{.RecordID}}</a></td>
+<td><button hx-post="{{.ApproveHref}}" hx-target="closest tr" hx-swap="outerHTML">{{$.ApproveLabel}}</button></td>
+</tr>
+{{end}}
+</tbody>
+</table>
+{{end}}
+`))

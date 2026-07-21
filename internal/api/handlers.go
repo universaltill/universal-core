@@ -148,6 +148,9 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	mux.Handle("POST /api/workflow-jobs/{id}/approve", auth(h.approveWorkflowJob))
 	// The read side of the same loop — see listWorkflowJobs' doc comment.
 	mux.Handle("GET /api/workflow-jobs", auth(h.listWorkflowJobs))
+	// The human-facing page on top of the two routes above — see
+	// renderWorkflowInbox's doc comment.
+	mux.Handle("GET /workflow-jobs", auth(h.renderWorkflowInbox))
 }
 
 // requestContext fetches the httpx.RequestContext a preceding DevAuth (or
