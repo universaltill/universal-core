@@ -45,6 +45,13 @@ func New(catalog *i18n.Catalog) *Renderer {
 // but worth a key change (e.g. by section Title) if that need shows up.
 type Data struct {
 	RecordID string // empty for a new/unsaved record
+	// Version is the record's optimistic-locking counter (data.Record.
+	// Version) at the moment this form was loaded — round-tripped through
+	// a hidden "_version" field so the save this form eventually submits
+	// can be rejected (409) if someone else saved a change in between,
+	// instead of silently overwriting it. Meaningless for a new/unsaved
+	// record (RecordID == ""), where it's simply not rendered.
+	Version  int
 	Record   map[string]any
 	Children map[string][]map[string]any
 	// ReferenceOptions holds every FieldReference field's picker options,
@@ -76,6 +83,13 @@ func (r *Renderer) Render(w io.Writer, def *form.Definition, ent *entity.Definit
 type viewModel struct {
 	EntityType string
 	RecordID   string
+	// Version renders as a hidden "_version" input when RecordID != "" —
+	// see Data.Version's doc comment. Zero value (0) for a new record,
+	// but VersionKnown gates whether the template emits the input at all,
+	// so a genuinely new record never submits a meaningless "_version=0"
+	// that could be misread as "check against version 0".
+	Version      int
+	VersionKnown bool
 	// PostHref is the form's own hx-post target, pre-built via
 	// url.PathEscape the same way AddHref/RelatedListHref/WorkflowHref/
 	// ReportHref are — EntityType/RecordID must not be interpolated
@@ -200,6 +214,8 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 	vm := viewModel{
 		EntityType:        def.EntityType,
 		RecordID:          data.RecordID,
+		Version:           data.Version,
+		VersionKnown:      data.RecordID != "",
 		PostHref:          postHref,
 		RequiredSuffix:    r.i18n.T(locale, "form.field.required_suffix"),
 		RelatedListEmpty:  r.i18n.T(locale, "form.related_list.empty"),
@@ -490,6 +506,8 @@ func buildChildRows(children []map[string]any) []childRowView {
 }
 
 const tmplSrc = `<form class="uc-form" data-entity-type="{{.EntityType}}" hx-post="{{.PostHref}}" hx-target="this" hx-swap="outerHTML">
+{{if .VersionKnown}}<input type="hidden" name="_version" value="{{.Version}}">
+{{end}}
 {{range .HiddenFields}}<input type="hidden" name="{{.Name}}" value="{{.Value}}">
 {{end}}
 {{range .Sections}}
