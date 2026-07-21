@@ -230,6 +230,47 @@ func (r *WorkflowJobRepo) Get(ctx context.Context, tenantID, id string) (Workflo
 	return j, nil
 }
 
+// ListByStatus returns every tenantID job currently in status, oldest
+// first — what a task-list/inbox needs to show a human what's actually
+// waiting on them ("waiting_approval") without requiring the caller to
+// already know a job id (approveWorkflowJob's own gap: it resumes a job
+// by id, but nothing before this could tell a caller which ids exist).
+// idx_workflow_jobs_tenant_status (tenant_id, status) backs this
+// directly — the same index the claim/reclaim paths' own tenant-status
+// lookups already benefit from.
+func (r *WorkflowJobRepo) ListByStatus(ctx context.Context, tenantID, status string) ([]WorkflowJob, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT id, tenant_id, workflow_name, workflow_version, entity_type, record_id,
+		        step_index, status, attempts, max_attempts, last_error, run_after,
+		        actor_type, actor_id, model_version
+		 FROM workflow_jobs WHERE tenant_id = $1 AND status = $2 ORDER BY created_at`,
+		tenantID, status,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list workflow jobs by status: %w", err)
+	}
+	defer rows.Close()
+
+	var out []WorkflowJob
+	for rows.Next() {
+		var j WorkflowJob
+		var modelVersion, lastError sql.NullString
+		if err := rows.Scan(&j.ID, &j.TenantID, &j.WorkflowName, &j.WorkflowVersion, &j.EntityType, &j.RecordID,
+			&j.StepIndex, &j.Status, &j.Attempts, &j.MaxAttempts, &lastError, &j.RunAfter,
+			&j.Actor.Type, &j.Actor.ID, &modelVersion); err != nil {
+			return nil, fmt.Errorf("scan workflow job: %w", err)
+		}
+		if modelVersion.Valid {
+			j.Actor.ModelVersion = modelVersion.String
+		}
+		if lastError.Valid {
+			j.LastError = lastError.String
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
 // ReclaimStale requeues jobs stuck in 'running' whose updated_at is older
 // than leaseTimeout — the reaper for a worker that was SIGKILL'd, OOM'd,
 // or panicked between ClaimNext's commit (which releases the row lock)

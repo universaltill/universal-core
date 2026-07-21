@@ -337,6 +337,64 @@ func TestWorkflowJobRepo_Get_NotFound(t *testing.T) {
 	}
 }
 
+// TestQueue_ListByStatus_ReturnsOnlyMatchingStatusForTenant is the read
+// side of the approval loop's whole point: a caller needs to find jobs
+// actually waiting_approval without already knowing an id, and must not
+// see another tenant's jobs or jobs in a different status mixed in.
+func TestQueue_ListByStatus_ReturnsOnlyMatchingStatusForTenant(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	tenantA := seedTenant(t, db)
+	tenantB := seedTenant(t, db)
+	def := poApprovalWorkflow()
+	q, err := NewQueue(db, nil)
+	if err != nil {
+		t.Fatalf("NewQueue: %v", err)
+	}
+
+	// Tenant A: one job halted at waiting_approval, one job left queued.
+	waitingJob, err := q.Enqueue(ctx, def, tenantA, "PurchaseOrder", "11111111-1111-1111-1111-111111111111", humanActor())
+	if err != nil {
+		t.Fatalf("Enqueue waiting job: %v", err)
+	}
+	if _, err := q.ProcessOne(ctx, lookupFor(def)); err != nil {
+		t.Fatalf("ProcessOne (halt at approval): %v", err)
+	}
+	notifyOnly := &Definition{
+		Name: "notify_only", Version: 1,
+		Trigger: Trigger{Type: TriggerManual},
+		Steps:   []Step{{Kind: StepNotify}},
+	}
+	if _, err := q.Enqueue(ctx, notifyOnly, tenantA, "PurchaseOrder", "22222222-2222-2222-2222-222222222222", humanActor()); err != nil {
+		t.Fatalf("Enqueue queued job: %v", err)
+	}
+
+	// Tenant B: also has a waiting_approval job — must not leak into
+	// tenant A's list.
+	if _, err := q.Enqueue(ctx, def, tenantB, "PurchaseOrder", "33333333-3333-3333-3333-333333333333", humanActor()); err != nil {
+		t.Fatalf("Enqueue tenant B job: %v", err)
+	}
+	if _, err := q.ProcessOne(ctx, lookupFor(def)); err != nil {
+		t.Fatalf("ProcessOne tenant B (halt at approval): %v", err)
+	}
+
+	waiting, err := q.ListByStatus(ctx, tenantA, "waiting_approval")
+	if err != nil {
+		t.Fatalf("ListByStatus: %v", err)
+	}
+	if len(waiting) != 1 || waiting[0].ID != waitingJob.ID {
+		t.Fatalf("expected exactly tenant A's one waiting_approval job, got %+v", waiting)
+	}
+
+	queued, err := q.ListByStatus(ctx, tenantA, "queued")
+	if err != nil {
+		t.Fatalf("ListByStatus queued: %v", err)
+	}
+	if len(queued) != 1 || queued[0].WorkflowName != "notify_only" {
+		t.Fatalf("expected exactly tenant A's one queued job, got %+v", queued)
+	}
+}
+
 // TestWorkflowJobRepo_TenantIsolation is the regression test for the
 // code-review finding that by-ID methods without a tenant check would let
 // one tenant's request read or resume another tenant's job — Get and
