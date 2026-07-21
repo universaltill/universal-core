@@ -1,0 +1,11 @@
+-- Optimistic locking for records (QUEUE.md, flagged unfixed across two
+-- code-review rounds on 2026-07-20): every save today submits the whole
+-- record as a point-in-time snapshot, so two concurrent partial-form
+-- edits of the same record race for the *entire* record, not just the
+-- fields each one actually touched, with no way to detect it happened.
+--
+-- version starts at 1 (not 0) so a caller can tell "never checked" (no
+-- _version sent, today's unconditional-update behaviour, preserved for
+-- backward compatibility) apart from "checked against version 0" — 0
+-- never legitimately occurs.
+ALTER TABLE records ADD COLUMN version INTEGER NOT NULL DEFAULT 1;
