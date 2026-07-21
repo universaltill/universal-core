@@ -2633,3 +2633,131 @@ func TestAPI_ListWorkflowJobs_UnknownStatusIs400(t *testing.T) {
 		t.Fatalf("expected 400 for an unknown status value, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
+
+// TestAPI_WorkflowInbox_ShowsWaitingJobAndApproveButton confirms the
+// human-facing page actually renders a waiting job with a working
+// Approve control pointed at the real approve endpoint — the page
+// listWorkflowJobs alone doesn't give anyone without a JSON client.
+func TestAPI_WorkflowInbox_ShowsWaitingJobAndApproveButton(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+	def := &workflow.Definition{
+		Name: "vendor_approval", Version: 1,
+		Trigger: workflow.Trigger{Type: workflow.TriggerOnCreate, EntityType: "Vendor"},
+		Steps:   []workflow.Step{{Kind: workflow.StepRequireApproval}},
+	}
+	publishWorkflow(t, db, tenantID, def)
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	createReq := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{"name":"Acme Textiles"}`))
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", createRec.Code, createRec.Body.String())
+	}
+
+	q, err := workflow.NewQueue(db, nil)
+	if err != nil {
+		t.Fatalf("NewQueue: %v", err)
+	}
+	if _, err := q.ProcessOne(context.Background(), workflow.RegistryDefinitionLookup(db)); err != nil {
+		t.Fatalf("ProcessOne (halt at approval): %v", err)
+	}
+	var jobID string
+	if err := db.QueryRow(`SELECT id FROM workflow_jobs WHERE tenant_id = $1 AND workflow_name = $2`, tenantID, def.Name).Scan(&jobID); err != nil {
+		t.Fatalf("find enqueued job: %v", err)
+	}
+
+	req := newRequest("GET", "/workflow-jobs", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "vendor_approval") {
+		t.Fatalf("expected the waiting workflow's name in the inbox, got:\n%s", body)
+	}
+	if !strings.Contains(body, `id="workflow-job-`+jobID+`"`) {
+		t.Fatalf("expected a row for the waiting job, got:\n%s", body)
+	}
+	if !strings.Contains(body, `hx-post="/api/workflow-jobs/`+jobID+`/approve"`) {
+		t.Fatalf("expected the Approve button to hx-post the real approve endpoint, got:\n%s", body)
+	}
+}
+
+func TestAPI_WorkflowInbox_EmptyShowsEmptyMessage(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := newRequest("GET", "/workflow-jobs", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "Nothing waiting for your approval.") {
+		t.Fatalf("expected the empty-state message, got:\n%s", rec.Body.String())
+	}
+}
+
+// TestAPI_ApproveWorkflowJob_HTMXRequestGetsEmptyBody confirms the
+// htmx-specific response shape approveWorkflowJob's doc comment
+// describes: an empty 200, not the JSON envelope a non-htmx caller gets,
+// so hx-swap="outerHTML" removes the row cleanly instead of rendering a
+// JSON blob inside the table.
+func TestAPI_ApproveWorkflowJob_HTMXRequestGetsEmptyBody(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+	def := &workflow.Definition{
+		Name: "vendor_approval", Version: 1,
+		Trigger: workflow.Trigger{Type: workflow.TriggerOnCreate, EntityType: "Vendor"},
+		Steps:   []workflow.Step{{Kind: workflow.StepRequireApproval}},
+	}
+	publishWorkflow(t, db, tenantID, def)
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	createReq := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{"name":"Acme Textiles"}`))
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", createRec.Code, createRec.Body.String())
+	}
+
+	q, err := workflow.NewQueue(db, nil)
+	if err != nil {
+		t.Fatalf("NewQueue: %v", err)
+	}
+	if _, err := q.ProcessOne(context.Background(), workflow.RegistryDefinitionLookup(db)); err != nil {
+		t.Fatalf("ProcessOne (halt at approval): %v", err)
+	}
+	var jobID string
+	if err := db.QueryRow(`SELECT id FROM workflow_jobs WHERE tenant_id = $1 AND workflow_name = $2`, tenantID, def.Name).Scan(&jobID); err != nil {
+		t.Fatalf("find enqueued job: %v", err)
+	}
+
+	req := httptest.NewRequest("POST", "/api/workflow-jobs/"+jobID+"/approve", nil)
+	req.Header.Set("HX-Request", "true")
+	req.Header.Set("X-Tenant-ID", tenantID)
+	req.Header.Set("X-Actor-ID", "farshid")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("expected an empty body for an htmx approve request (so hx-swap removes the row cleanly), got:\n%s", rec.Body.String())
+	}
+}
