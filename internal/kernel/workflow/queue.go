@@ -187,12 +187,13 @@ func (q *Queue) fail(ctx context.Context, job data.WorkflowJob, stepErr error) e
 }
 
 // ResumeAfterApproval advances a job halted at a require_approval step to
-// its next step and requeues it. Call this from wherever a human's
-// approval action is handled (that handler isn't built yet — see
-// QUEUE.md). tenantID must be the caller's authenticated tenant scope —
-// this is the one method in this package a request handler calls
-// directly with a caller-supplied job ID, so the tenant check is
-// load-bearing, not just defense in depth.
+// its next step and requeues it. Called from internal/api's
+// approveWorkflowJob (POST /api/workflow-jobs/{id}/approve, added
+// 2026-07-21 — see QUEUE.md), the handler for a human's approval action.
+// tenantID must be the caller's authenticated tenant scope — this is the
+// one method in this package a request handler calls directly with a
+// caller-supplied job ID, so the tenant check is load-bearing, not just
+// defense in depth.
 func (q *Queue) ResumeAfterApproval(ctx context.Context, tenantID, jobID string) error {
 	return q.jobs.ResumeAfterApproval(ctx, tenantID, jobID)
 }
