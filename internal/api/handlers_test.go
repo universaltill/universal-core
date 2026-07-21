@@ -2614,3 +2614,22 @@ func TestAPI_ListWorkflowJobs_MissingStatusIs400(t *testing.T) {
 		t.Fatalf("expected 400 for a missing status query param, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
+
+// TestAPI_ListWorkflowJobs_UnknownStatusIs400 confirms a typo'd status
+// (e.g. "waitng_approval") comes back as a clear 400, not a silent empty
+// list a caller could easily mistake for "nothing is actually waiting."
+func TestAPI_ListWorkflowJobs_UnknownStatusIs400(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	req := newRequest("GET", "/api/workflow-jobs?status=waitng_approval", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an unknown status value, got %d: %s", rec.Code, rec.Body.String())
+	}
+}

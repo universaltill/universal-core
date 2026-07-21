@@ -119,6 +119,18 @@ type workflowJobResponse struct {
 	Status          string `json:"status"`
 }
 
+// validWorkflowJobStatuses mirrors the CHECK constraint on
+// workflow_jobs.status (002_workflow_jobs.sql) — kept here, not in
+// internal/kernel/workflow, since validating untrusted external input is
+// this HTTP layer's job, not the kernel's. Without this, a caller's typo
+// (?status=waitng_approval) would 200 with an empty list indistinguishable
+// from "nothing is actually waiting" — the one case this endpoint most
+// needs to get right, since its whole purpose is telling a human what's
+// stuck.
+var validWorkflowJobStatuses = map[string]bool{
+	"queued": true, "running": true, "waiting_approval": true, "done": true, "dead_letter": true,
+}
+
 // listWorkflowJobs is the read side of the approval loop —
 // approveWorkflowJob resumes a job by id, but nothing before this told a
 // caller which ids actually exist to resume. GET /api/workflow-jobs?
@@ -136,6 +148,10 @@ func (h *Handler) listWorkflowJobs(w http.ResponseWriter, r *http.Request) {
 	status := r.URL.Query().Get("status")
 	if status == "" {
 		httpx.WriteError(w, http.StatusBadRequest, "status query parameter is required (e.g. ?status=waiting_approval)")
+		return
+	}
+	if !validWorkflowJobStatuses[status] {
+		httpx.WriteError(w, http.StatusBadRequest, fmt.Sprintf("unknown status %q (must be one of: queued, running, waiting_approval, done, dead_letter)", status))
 		return
 	}
 
