@@ -8,6 +8,7 @@
   "import.commit_button": "Commit",
   "import.repreview_button": "Preview again",
   "import.mapping_heading": "Column Mapping",
+  "import.ai_suggested_note": "(AI-suggested — please confirm)",
   "import.rows_heading": "Preview Rows",
   "import.unmapped_option": "— skip —",
   "import.row_status_ok": "OK",
