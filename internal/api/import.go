@@ -2,13 +2,17 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"html/template"
 	"io"
+	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/universaltill/universal-core/internal/httpx"
+	"github.com/universaltill/universal-core/internal/kernel/aiassist"
 	"github.com/universaltill/universal-core/internal/kernel/csvimport"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 )
@@ -111,21 +115,22 @@ func (h *Handler) importPreview(w http.ResponseWriter, r *http.Request) {
 
 	submitted := mappingFromForm(r)
 
-	headers, mapping, results, mappingErr, err := previewUpload(data, xlsx, def, submitted)
+	headers, mapping, aiSuggested, results, mappingErr, err := previewUpload(r.Context(), h.ai, data, xlsx, def, submitted)
 	if err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	view := importPreviewView{
-		EntityType:     entityType,
-		PreviewHref:    "/import/" + entityType + "/preview",
-		CommitHref:     "/import/" + entityType + "/commit",
-		MappingHeading: h.catalog.T(locale, "import.mapping_heading"),
-		RowsHeading:    h.catalog.T(locale, "import.rows_heading"),
-		CommitLabel:    h.catalog.T(locale, "import.commit_button"),
-		RepreviewLabel: h.catalog.T(locale, "import.repreview_button"),
-		Mappings:       buildMappingRows(headers, mapping, def, h.catalog.T(locale, "import.unmapped_option")),
+		EntityType:      entityType,
+		PreviewHref:     "/import/" + entityType + "/preview",
+		CommitHref:      "/import/" + entityType + "/commit",
+		MappingHeading:  h.catalog.T(locale, "import.mapping_heading"),
+		RowsHeading:     h.catalog.T(locale, "import.rows_heading"),
+		CommitLabel:     h.catalog.T(locale, "import.commit_button"),
+		RepreviewLabel:  h.catalog.T(locale, "import.repreview_button"),
+		AISuggestedNote: h.catalog.T(locale, "import.ai_suggested_note"),
+		Mappings:        buildMappingRows(headers, mapping, aiSuggested, def, h.catalog.T(locale, "import.unmapped_option")),
 	}
 	if mappingErr != nil {
 		view.MappingError = mappingErr.Error()
@@ -228,30 +233,70 @@ func readUploadedFile(w http.ResponseWriter, r *http.Request) (data []byte, xlsx
 }
 
 // previewUpload reads data's headers, resolves a mapping (submitted if
-// non-empty, otherwise csvimport.SuggestMapping's guess), and — only if
-// that mapping passes csvimport.ValidateMapping — runs the row-level
-// preview. A failing mapping is reported via mappingErr, not err: err is
-// reserved for the file itself being unreadable (a real 400, nothing
-// left to show the user); mappingErr is recoverable, the caller still
-// has headers+mapping to render the editable mapping table with.
-func previewUpload(data []byte, xlsx bool, def *entity.Definition, submitted csvimport.ColumnMapping) (headers []string, mapping csvimport.ColumnMapping, results []csvimport.RowResult, mappingErr error, err error) {
+// non-empty, otherwise a guess), and — only if that mapping passes
+// csvimport.ValidateMapping — runs the row-level preview. A failing
+// mapping is reported via mappingErr, not err: err is reserved for the
+// file itself being unreadable (a real 400, nothing left to show the
+// user); mappingErr is recoverable, the caller still has headers+
+// mapping to render the editable mapping table with.
+//
+// The initial guess (submitted empty — this is the very first preview
+// of a freshly uploaded file, not the user resubmitting after editing
+// the mapping dropdowns) is csvimport.SuggestMapping's exact
+// normalized-name match, then — only for whatever SuggestMapping
+// couldn't resolve, and only when ai is enabled — csvimport.
+// SuggestMappingAI's turn to fill the rest by actually looking at
+// sample values, not just header text. AI never runs on a resubmission
+// (submitted non-empty): once a human has started editing the mapping
+// table, only their own choices matter, an AI guess overwriting an
+// edit mid-review would be exactly the kind of silent surprise this
+// wizard's whole "confirm or edit before anything is written" design
+// exists to prevent. aiSuggested names which of the returned mapping's
+// entries came from the AI pass, purely for the UI to visibly flag
+// those (still fully editable) rows as worth a closer look — see
+// buildMappingRows.
+func previewUpload(ctx context.Context, ai *aiassist.Client, data []byte, xlsx bool, def *entity.Definition, submitted csvimport.ColumnMapping) (headers []string, mapping csvimport.ColumnMapping, aiSuggested map[string]bool, results []csvimport.RowResult, mappingErr error, err error) {
+	var sampleRows [][]string
 	if xlsx {
-		headers, err = csvimport.HeadersXLSX(bytes.NewReader(data))
+		headers, sampleRows, err = csvimport.SampleRowsXLSX(bytes.NewReader(data))
 	} else {
-		headers, err = csvimport.Headers(bytes.NewReader(data))
+		headers, sampleRows, err = csvimport.SampleRows(bytes.NewReader(data))
 	}
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("read uploaded file: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("read uploaded file: %w", err)
 	}
 
+	aiSuggested = map[string]bool{}
 	if len(submitted) > 0 {
 		mapping = submitted
 	} else {
 		mapping = csvimport.SuggestMapping(headers, def)
+		if ai.Enabled() {
+			// aiassist's own default timeout (90s) is a ceiling meant for
+			// a caller with no tighter budget of its own — this one has
+			// one: an interactive HTMX preview request shouldn't be able
+			// to tie up a request goroutine anywhere near that long just
+			// because Ollama is cold or overloaded. 25s comfortably
+			// covers the ~13-18s this took against the real homelab-k8s
+			// instance (small model, 2-node Raspberry Pi hardware) with
+			// headroom, while still failing fast enough that a slow
+			// model degrades to "the heuristic-only mapping, a beat
+			// later" rather than "the page hangs."
+			aiCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
+			var aiErr error
+			mapping, aiSuggested, aiErr = csvimport.SuggestMappingAI(aiCtx, ai, headers, sampleRows, def, mapping)
+			cancel()
+			if aiErr != nil {
+				// Advisory only (see SuggestMappingAI's own doc comment)
+				// — mapping is always still whatever SuggestMapping alone
+				// produced, never blocked or failed by an AI hiccup.
+				log.Printf("api: AI mapping suggestion for %s: %v", def.EntityType, aiErr)
+			}
+		}
 	}
 
 	if mappingErr = csvimport.ValidateMapping(def, headers, mapping); mappingErr != nil {
-		return headers, mapping, nil, mappingErr, nil
+		return headers, mapping, aiSuggested, nil, mappingErr, nil
 	}
 
 	if xlsx {
@@ -260,9 +305,9 @@ func previewUpload(data []byte, xlsx bool, def *entity.Definition, submitted csv
 		results, err = csvimport.Preview(bytes.NewReader(data), def, mapping)
 	}
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
-	return headers, mapping, results, nil, nil
+	return headers, mapping, aiSuggested, results, nil, nil
 }
 
 // mappingFromForm reconstructs a csvimport.ColumnMapping from the
@@ -304,7 +349,12 @@ type importPreviewView struct {
 	RowsHeading    string
 	CommitLabel    string
 	RepreviewLabel string
-	Mappings       []mappingRowView
+	// AISuggestedNote is the label shown next to any mapping row
+	// buildMappingRows flags AISuggested — only ever rendered when at
+	// least one row actually is (see the template), so a deployment
+	// with no OLLAMA_URL configured never shows AI-related copy at all.
+	AISuggestedNote string
+	Mappings        []mappingRowView
 	// MappingError is set instead of Rows when the current mapping fails
 	// csvimport.ValidateMapping (e.g. a required field still unmapped) —
 	// the template shows the mapping table plus this message and a
@@ -314,8 +364,15 @@ type importPreviewView struct {
 }
 
 type mappingRowView struct {
-	Header  string
-	Options []mappingOptionView
+	Header string
+	// AISuggested marks a row whose currently-selected option came from
+	// csvimport.SuggestMappingAI rather than SuggestMapping's exact
+	// name match — still just pre-filling the same editable <select>
+	// every row already has, per the "confirm or edit" design: this is
+	// purely a visible hint to look twice, never a different trust
+	// level in what the wizard will actually do with the row.
+	AISuggested bool
+	Options     []mappingOptionView
 }
 
 type mappingOptionView struct {
@@ -342,7 +399,7 @@ type importResultView struct {
 	Rows           []previewRowView
 }
 
-func buildMappingRows(headers []string, mapping csvimport.ColumnMapping, def *entity.Definition, unmappedLabel string) []mappingRowView {
+func buildMappingRows(headers []string, mapping csvimport.ColumnMapping, aiSuggested map[string]bool, def *entity.Definition, unmappedLabel string) []mappingRowView {
 	mappings := make([]mappingRowView, 0, len(headers))
 	for _, header := range headers {
 		selectedField := mapping[header]
@@ -351,7 +408,7 @@ func buildMappingRows(headers []string, mapping csvimport.ColumnMapping, def *en
 		for _, f := range def.Fields {
 			options = append(options, mappingOptionView{Value: f.Name, Label: f.Name, Selected: f.Name == selectedField})
 		}
-		mappings = append(mappings, mappingRowView{Header: header, Options: options})
+		mappings = append(mappings, mappingRowView{Header: header, AISuggested: aiSuggested[header], Options: options})
 	}
 	return mappings
 }
@@ -391,7 +448,7 @@ var importTmpl = template.Must(template.New("import").Parse(`
 <tbody>
 {{range .Mappings}}
 <tr>
-<td>{{.Header}}</td>
+<td>{{.Header}}{{if .AISuggested}} <span class="uc-ai-suggested">{{$.AISuggestedNote}}</span>{{end}}</td>
 <td>
 <select name="mapping.{{.Header}}">
 {{range .Options}}<option value="{{.Value}}" {{if .Selected}}selected{{end}}>{{.Label}}</option>{{end}}

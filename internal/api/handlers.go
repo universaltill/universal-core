@@ -24,6 +24,7 @@ import (
 	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/httpx"
 	"github.com/universaltill/universal-core/internal/i18n"
+	"github.com/universaltill/universal-core/internal/kernel/aiassist"
 	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/csvimport"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
@@ -36,13 +37,17 @@ import (
 // Handler wires the registry, crud.Engine, and formrender.Renderer
 // together behind HTTP. One Handler serves every entity/form type.
 type Handler struct {
-	entityDefs    *data.EntityDefinitionRepo
-	formDefs      *data.FormDefinitionRepo
-	workflowDefs  *data.WorkflowDefinitionRepo
-	crud          *crud.Engine
-	renderer      *formrender.Renderer
-	catalog       *i18n.Catalog
-	auth          *webauth.Authenticator
+	entityDefs   *data.EntityDefinitionRepo
+	formDefs     *data.FormDefinitionRepo
+	workflowDefs *data.WorkflowDefinitionRepo
+	crud         *crud.Engine
+	renderer     *formrender.Renderer
+	catalog      *i18n.Catalog
+	auth         *webauth.Authenticator
+	// ai is nil (Enabled() == false) unless OLLAMA_URL is configured —
+	// see aiassist's own doc comment on why every caller can treat that
+	// as "AI assistance unavailable" without a separate nil check.
+	ai            *aiassist.Client
 	workflowQueue *workflow.Queue
 	reporting     *data.ReportingRepo
 }
@@ -52,8 +57,10 @@ type Handler struct {
 // may be nil or disabled (webauth.Config.Enabled() == false) — Routes
 // wires it unconditionally either way, since Guard/Register are both
 // safe no-ops on a disabled Authenticator (see webauth's own doc
-// comments).
-func New(db *sql.DB, catalog *i18n.Catalog, auth *webauth.Authenticator) *Handler {
+// comments). ai may be nil — every caller of it (currently just the
+// import wizard's mapping suggestion) treats a disabled client as
+// "AI assistance unavailable," never an error.
+func New(db *sql.DB, catalog *i18n.Catalog, auth *webauth.Authenticator, ai *aiassist.Client) *Handler {
 	// nil handlers: same default no-op notify handler internal/worker's
 	// Runner gets from workflow.NewQueue — this Handler only ever calls
 	// Enqueue/ResumeAfterApproval, never ProcessOne, so no StepHandler of
@@ -75,6 +82,7 @@ func New(db *sql.DB, catalog *i18n.Catalog, auth *webauth.Authenticator) *Handle
 		renderer:      formrender.New(catalog),
 		catalog:       catalog,
 		auth:          auth,
+		ai:            ai,
 		workflowQueue: workflowQueue,
 		reporting:     data.NewReportingRepo(db),
 	}

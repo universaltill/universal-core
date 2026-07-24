@@ -3,11 +3,18 @@ package api
 import (
 	"archive/zip"
 	"bytes"
+	"database/sql"
+	"encoding/json"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/universaltill/universal-core/internal/i18n"
+	"github.com/universaltill/universal-core/internal/kernel/aiassist"
+	"github.com/universaltill/universal-core/internal/kernel/entity"
+	"github.com/universaltill/universal-core/internal/kernel/form"
 )
 
 // newMultipartRequest builds a POST request with a multipart/form-data
@@ -362,5 +369,210 @@ func TestImport_Commit_XLSXFile(t *testing.T) {
 	mux.ServeHTTP(listRec, listReq)
 	if !strings.Contains(listRec.Body.String(), "Delta Holdings") {
 		t.Fatalf("expected the .xlsx-committed row to actually be queryable afterward, got:\n%s", listRec.Body.String())
+	}
+}
+
+// --- AI-assisted mapping suggestion ---
+
+// orderEntityDef/orderFormDef deliberately use field names ("vendor_id",
+// "order_date") that don't normalize-name-match plausible real-world CSV
+// headers ("Vendor Nm", "Order Dt") — exactly the gap SuggestMapping's
+// exact match can't close and csvimport.SuggestMappingAI exists for.
+func orderEntityDef() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "Order",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "vendor_id", Type: entity.FieldString, Required: true},
+			{Name: "order_date", Type: entity.FieldDate, Required: true},
+		},
+	}
+}
+
+func orderFormDef() *form.Definition {
+	return &form.Definition{
+		EntityType: "Order",
+		Version:    1,
+		Sections: []form.Section{{
+			Title: "Details", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "vendor_id", Label: "Vendor"}, {Name: "order_date", Label: "Order Date"}},
+		}},
+	}
+}
+
+// testHandlerWithAI is testHandler plus an aiassist.Client — kept
+// separate rather than adding an ai parameter to testHandler itself so
+// every other test in this package stays exactly as it was (AI
+// disabled, matching a deployment with no OLLAMA_URL configured).
+func testHandlerWithAI(t *testing.T, db *sql.DB, ai *aiassist.Client) *Handler {
+	t.Helper()
+	catalog, err := i18n.Load("en")
+	if err != nil {
+		t.Fatalf("load i18n catalog: %v", err)
+	}
+	return New(db, catalog, nil, ai)
+}
+
+// fakeAIServer stands in for Ollama's /api/generate, always returning
+// mappings — the same wire shape aiassist.Client.GenerateJSON expects
+// (see aiassist's and csvimport's own tests for the contract this
+// mirrors). called is set true the first time the server actually
+// receives a request, so a test can assert the AI path was (or, more
+// importantly, was NOT) exercised at all.
+func fakeAIServer(t *testing.T, mappings []map[string]string, called *bool) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if called != nil {
+			*called = true
+		}
+		respJSON, err := json.Marshal(map[string]any{"mappings": mappings})
+		if err != nil {
+			t.Fatalf("marshal fake mappings: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"response": string(respJSON), "done": true})
+	}))
+}
+
+// TestImport_Preview_AIFillsGapsAndMarksSuggestedRows is the API-layer
+// end-to-end proof, mirroring what was manually verified against the
+// real homelab-k8s Ollama instance: a CSV whose headers don't exact-
+// match any field gets AI-suggested selections pre-filled, each visibly
+// flagged in the rendered HTML — still just the same editable <select>
+// every mapping row already had.
+func TestImport_Preview_AIFillsGapsAndMarksSuggestedRows(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, orderEntityDef(), orderFormDef())
+
+	var called bool
+	srv := fakeAIServer(t, []map[string]string{
+		{"column": "Vendor Nm", "database_field": "vendor_id"},
+		{"column": "Order Dt", "database_field": "order_date"},
+	}, &called)
+	defer srv.Close()
+	ai := aiassist.NewClient(srv.URL, "llama3.2:3b")
+
+	mux := http.NewServeMux()
+	testHandlerWithAI(t, db, ai).Routes(mux)
+
+	csvContent := []byte("Vendor Nm,Order Dt\nAcme Textiles,2026-07-01\n")
+	req := newMultipartRequest(t, "/import/Order/preview", tenantID, "farshid", "orders.csv", csvContent, nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !called {
+		t.Fatal("expected the AI server to actually be called for headers SuggestMapping couldn't resolve")
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `value="vendor_id" selected`) {
+		t.Fatalf("expected Vendor Nm -> vendor_id pre-selected, got:\n%s", body)
+	}
+	if !strings.Contains(body, `value="order_date" selected`) {
+		t.Fatalf("expected Order Dt -> order_date pre-selected, got:\n%s", body)
+	}
+	if strings.Count(body, "uc-ai-suggested") != 2 {
+		t.Fatalf("expected exactly 2 AI-suggested badges (one per AI-filled row), got:\n%s", body)
+	}
+}
+
+// TestImport_Preview_ResubmissionNeverCallsAI confirms the design
+// contract previewUpload's own doc comment describes: once a human has
+// mapping.* fields to resubmit (they've started editing the table),
+// their choices are the only source of truth for that mapping — an AI
+// call overwriting a mid-review edit would be exactly the silent
+// surprise the wizard's whole confirm-before-write design exists to
+// prevent.
+func TestImport_Preview_ResubmissionNeverCallsAI(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, orderEntityDef(), orderFormDef())
+
+	var called bool
+	srv := fakeAIServer(t, nil, &called)
+	defer srv.Close()
+	ai := aiassist.NewClient(srv.URL, "llama3.2:3b")
+
+	mux := http.NewServeMux()
+	testHandlerWithAI(t, db, ai).Routes(mux)
+
+	csvContent := []byte("Vendor Nm,Order Dt\nAcme Textiles,2026-07-01\n")
+	req := newMultipartRequest(t, "/import/Order/preview", tenantID, "farshid", "orders.csv", csvContent,
+		map[string]string{"mapping.Vendor Nm": "vendor_id", "mapping.Order Dt": "order_date"})
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if called {
+		t.Fatal("expected the AI server to never be called on a resubmission with an explicit mapping already present")
+	}
+}
+
+// TestImport_Preview_AIServerErrorFallsBackGracefully confirms an AI
+// failure (network/server error) never surfaces to the user as a
+// broken request — the wizard just falls back to whatever
+// SuggestMapping's exact-match pass alone produced, per
+// SuggestMappingAI's own "err is advisory only" contract.
+func TestImport_Preview_AIServerErrorFallsBackGracefully(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	ai := aiassist.NewClient(srv.URL, "llama3.2:3b")
+
+	mux := http.NewServeMux()
+	testHandlerWithAI(t, db, ai).Routes(mux)
+
+	// "name" exact-matches Vendor's own field, so this must still work
+	// via SuggestMapping alone even though the AI call for it will fail.
+	csvContent := []byte("name\nAcme Textiles\n")
+	req := newMultipartRequest(t, "/import/Vendor/preview", tenantID, "farshid", "vendors.csv", csvContent, nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 despite the AI server failing, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `value="name" selected`) {
+		t.Fatalf("expected SuggestMapping's own exact match to still apply, got:\n%s", rec.Body.String())
+	}
+}
+
+// TestImport_Preview_AIDisabledShowsNoBadges is the regression
+// safeguard for every other test in this file (all built with
+// testHandler, which always passes a nil ai) — no OLLAMA_URL configured
+// must render byte-for-byte the same mapping UI this wizard always had,
+// no stray "AI-suggested" copy appearing when there's no AI involved.
+func TestImport_Preview_AIDisabledShowsNoBadges(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, db).Routes(mux)
+
+	csvContent := []byte("name\nAcme Textiles\n")
+	req := newMultipartRequest(t, "/import/Vendor/preview", tenantID, "farshid", "vendors.csv", csvContent, nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "uc-ai-suggested") {
+		t.Fatalf("expected no AI-suggested badge with no AI client configured, got:\n%s", rec.Body.String())
 	}
 }
