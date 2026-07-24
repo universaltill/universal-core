@@ -317,6 +317,19 @@ func (h *Handler) createRecord(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// isCreate=true, id/version both ignored: Create generates the
+	// record's id itself, and a create's only requirement is starting in
+	// an is_initial status — there's no prior state to race against, so
+	// no expectedVersion is needed (see ValidateStatusTransition's doc
+	// comment).
+	if err := h.crud.ValidateStatusTransition(r.Context(), entDef, rc.TenantID, "", fields, true, nil); err != nil {
+		if errors.Is(err, crud.ErrInvalidTransition) {
+			httpx.WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeInternalError(w, fmt.Sprintf("validate status transition for new %s", entityType), err)
+		return
+	}
 
 	rec, err := h.crud.Create(r.Context(), entDef, rc.TenantID, fields, rc.Actor)
 	if err != nil {
@@ -363,10 +376,28 @@ func (h *Handler) updateRecord(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
+	// Extracted before ValidateStatusTransition, not after: a real status
+	// transition requires expectedVersion to be non-nil (see that
+	// method's doc comment on why an unversioned update can't safely
+	// validate a transition), so the version has to be known first.
 	expectedVersion, err := extractVersion(r, fields)
 	if err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := h.crud.ValidateStatusTransition(r.Context(), entDef, rc.TenantID, id, fields, false, expectedVersion); err != nil {
+		if errors.Is(err, data.ErrNotFound) {
+			// Matches the 404 crud.Update itself would have returned for
+			// this id — the status check runs first, so it has to report
+			// the same "no such record" outcome, not a generic 500.
+			httpx.WriteError(w, http.StatusNotFound, fmt.Sprintf("%s %q not found", entityType, id))
+			return
+		}
+		if errors.Is(err, crud.ErrInvalidTransition) {
+			httpx.WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeInternalError(w, fmt.Sprintf("validate status transition for %s %s", entityType, id), err)
 		return
 	}
 
