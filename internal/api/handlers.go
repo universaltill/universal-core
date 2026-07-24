@@ -317,6 +317,17 @@ func (h *Handler) createRecord(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// isCreate=true, id ignored: Create generates the record's id itself,
+	// so there's nothing to look an existing status up against yet — see
+	// ValidateStatusTransition's doc comment.
+	if err := h.crud.ValidateStatusTransition(r.Context(), entDef, rc.TenantID, "", fields, true); err != nil {
+		if errors.Is(err, crud.ErrInvalidTransition) {
+			httpx.WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeInternalError(w, fmt.Sprintf("validate status transition for new %s", entityType), err)
+		return
+	}
 
 	rec, err := h.crud.Create(r.Context(), entDef, rc.TenantID, fields, rc.Actor)
 	if err != nil {
@@ -361,6 +372,14 @@ func (h *Handler) updateRecord(w http.ResponseWriter, r *http.Request) {
 	// genuine 500.
 	if err := entity.ValidateRecord(entDef, fields); err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := h.crud.ValidateStatusTransition(r.Context(), entDef, rc.TenantID, id, fields, false); err != nil {
+		if errors.Is(err, crud.ErrInvalidTransition) {
+			httpx.WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeInternalError(w, fmt.Sprintf("validate status transition for %s %s", entityType, id), err)
 		return
 	}
 
