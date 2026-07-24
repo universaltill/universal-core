@@ -48,13 +48,32 @@ type PurchaseOrderStatusCount struct {
 // order (draft, submitted, approved, received, cancelled) should
 // reorder the result themselves — this returns whatever combination of
 // statuses actually has at least one order, in no particular order.
+//
+// Joins to Status for its code rather than reading a plain enum value
+// off PurchaseOrder directly — status_id/StatusTypeCode
+// (purchasing.PurchaseOrder's own doc comment) replaced the old
+// FieldEnum "status" field, so the human-readable code this report (and
+// internal/api/reporting.go's field.PurchaseOrder.status.<code> i18n
+// lookup) has always kept as PurchaseOrderStatusCount.Status now lives
+// on the referenced Status record, not PurchaseOrder's own JSONB blob.
+// Same uuidPattern guard as TopVendorsBySpend/StockoutRiskItems below:
+// a malformed status_id (bad CSV import, say) is excluded from the
+// breakdown rather than aborting the whole aggregate with a cast error.
 func (r *ReportingRepo) PurchaseOrderStatusBreakdown(ctx context.Context, tenantID string) ([]PurchaseOrderStatusCount, error) {
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT data->>'status' AS status, count(*), coalesce(sum((data->>'total')::numeric), 0)
-		 FROM records
-		 WHERE tenant_id = $1 AND entity_type = 'PurchaseOrder' AND deleted_at IS NULL
-		 GROUP BY data->>'status'`,
-		tenantID,
+		`SELECT st.data->>'code' AS status, count(*), coalesce(sum((po.data->>'total')::numeric), 0)
+		 FROM records po
+		 JOIN records st
+		   ON st.tenant_id = po.tenant_id
+		  AND st.entity_type = 'Status'
+		  AND st.deleted_at IS NULL
+		  AND st.id = (po.data->>'status_id')::uuid
+		 WHERE po.tenant_id = $1
+		   AND po.entity_type = 'PurchaseOrder'
+		   AND po.deleted_at IS NULL
+		   AND po.data->>'status_id' ~ $2
+		 GROUP BY st.data->>'code'`,
+		tenantID, uuidPattern,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("purchase order status breakdown: %w", err)

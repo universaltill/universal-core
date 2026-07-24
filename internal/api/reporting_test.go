@@ -44,6 +44,15 @@ func TestAPI_PurchasingReport_TenantScopedAndEscapesRecordData(t *testing.T) {
 	records := data.NewRecordRepo(db)
 	ctx := context.Background()
 
+	statusA, err := records.Create(ctx, tenantA, "Status", map[string]any{"code": "approved", "name": "Approved"})
+	if err != nil {
+		t.Fatalf("create Status for tenant A: %v", err)
+	}
+	statusB, err := records.Create(ctx, tenantB, "Status", map[string]any{"code": "approved", "name": "Approved"})
+	if err != nil {
+		t.Fatalf("create Status for tenant B: %v", err)
+	}
+
 	vendorA, err := records.Create(ctx, tenantA, "Party", map[string]any{
 		"name": `Acme" onmouseover="alert(1)<script>alert(2)</script>`, "party_type": "organization",
 	})
@@ -51,7 +60,7 @@ func TestAPI_PurchasingReport_TenantScopedAndEscapesRecordData(t *testing.T) {
 		t.Fatalf("create Party for tenant A: %v", err)
 	}
 	if _, err := records.Create(ctx, tenantA, "PurchaseOrder", map[string]any{
-		"po_number": "PO-A1", "vendor_id": vendorA.ID, "status": "approved", "total": 1234.5,
+		"po_number": "PO-A1", "vendor_id": vendorA.ID, "status_id": statusA.ID, "total": 1234.5,
 	}); err != nil {
 		t.Fatalf("create PurchaseOrder for tenant A: %v", err)
 	}
@@ -61,7 +70,7 @@ func TestAPI_PurchasingReport_TenantScopedAndEscapesRecordData(t *testing.T) {
 		t.Fatalf("create Party for tenant B: %v", err)
 	}
 	if _, err := records.Create(ctx, tenantB, "PurchaseOrder", map[string]any{
-		"po_number": "PO-B1", "vendor_id": vendorB.ID, "status": "approved", "total": 999999.0,
+		"po_number": "PO-B1", "vendor_id": vendorB.ID, "status_id": statusB.ID, "total": 999999.0,
 	}); err != nil {
 		t.Fatalf("create PurchaseOrder for tenant B: %v", err)
 	}
