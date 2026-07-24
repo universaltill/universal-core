@@ -47,11 +47,44 @@ func Item() *entity.Definition {
 // Vendor entity — matching the Party-Role pattern's whole point
 // (reference-data-model.md §0): a vendor is a Party holding the vendor
 // PartyRole, not a second master record for the same real-world company.
+//
+// status_id/StatusTypeCode ("purchase_order_status") is the first real
+// entity to opt into foundation.go's generic Status/StatusType pattern —
+// the plain FieldEnum this replaces let an update jump straight from
+// "draft" to "cancelled" bypassing "submitted"/"approved" with nothing
+// to stop it. The actual transition graph (draft is the only initial
+// status; draft->submitted->approved->received is the happy path;
+// cancellation reachable from draft/submitted/approved but not from
+// received, since goods already arrived at that point — reversing that
+// is a return/credit-note event, not a status edit) is seeded as real
+// tenant data, not part of this Definition — see
+// purchasing.PublishStatuses (seed.go), which every Purchasing-licensed
+// tenant needs run once (cmd/provision-tenant) before any PurchaseOrder
+// create/update can pass crud.Engine.ValidateStatusTransition.
+//
+// No backfill for PurchaseOrder rows written before this Version bump
+// (3->4, plain "status" enum -> "status_id" reference): this kernel has
+// no record-data migration mechanism at all (internal/db/migrations only
+// ever touches schema), and this is the first Version bump that replaces
+// an existing Required-bearing field rather than adding one, so that gap
+// is newly load-bearing here. A pre-existing row's old "status" string
+// just sits unread in its JSONB — it drops out of
+// internal/data/reporting.go's status breakdown (status_id is NULL, the
+// join guard excludes it) and crud.Engine.ValidateStatusTransition
+// treats its next edit as a fresh, unversioned "predates opting in"
+// entry that can only move it to an is_initial status (draft) — a
+// silent lifecycle reset, not a crash. Acceptable to ship only because
+// no production tenant exists yet (QUEUE.md); a stale local/demo tenant
+// needs a wipe + full reseed, not just a re-run of cmd/seed-demo-data
+// (its po_number dedup would skip the broken rows rather than repair
+// them). Must be revisited — a real backfill, or at least a documented
+// operational runbook — before this kernel's first real launch.
 func PurchaseOrder() *entity.Definition {
 	return &entity.Definition{
-		EntityType: "PurchaseOrder",
-		Version:    3,
-		Module:     "purchasing",
+		EntityType:     "PurchaseOrder",
+		Version:        4,
+		Module:         "purchasing",
+		StatusTypeCode: "purchase_order_status",
 		Fields: []entity.Field{
 			// po_number is the natural key reference-data-model.md's own
 			// PurchaseOrder row was missing (every real PO has one — a
@@ -66,8 +99,7 @@ func PurchaseOrder() *entity.Definition {
 			{Name: "vendor_id", Type: entity.FieldReference, Required: true, Target: "Party"},
 			{Name: "order_date", Type: entity.FieldDate, Required: true},
 			{Name: "currency_id", Type: entity.FieldReference, Target: "Currency"},
-			{Name: "status", Type: entity.FieldEnum, Required: true,
-				EnumValues: []string{"draft", "submitted", "approved", "received", "cancelled"}, Default: "draft"},
+			{Name: "status_id", Type: entity.FieldReference, Required: true, Target: "Status"},
 			{Name: "total", Type: entity.FieldNumber, Default: float64(0)},
 		},
 		Relationships: []entity.Relationship{

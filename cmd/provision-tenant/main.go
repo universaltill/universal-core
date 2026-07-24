@@ -37,15 +37,23 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/purchasing"
 )
 
-// modulePublishers maps a -modules name to its Publish/PublishForms
-// pair. Foundation is not in this map — it's always published,
-// unconditionally, per ADR-0001 §8's "always present" requirement; it's
-// not something an operator opts into per tenant.
+// modulePublishers maps a -modules name to its Publish/PublishForms(/
+// PublishStatuses) set. Foundation is not in this map — it's always
+// published, unconditionally, per ADR-0001 §8's "always present"
+// requirement; it's not something an operator opts into per tenant.
+//
+// publishStatuses is nilable: it exists because purchasing.PurchaseOrder
+// is the first entity to opt into foundation.go's Status/StatusType
+// pattern (see purchasing.PublishStatuses's doc comment for why that's
+// required tenant data, not optional like cmd/seed-demo-data's sample
+// business data) — a future module with no status-managed entity simply
+// has nothing to seed here.
 var modulePublishers = map[string]struct {
-	publish      func(ctx context.Context, db *sql.DB, tenantID string, actor audit.Actor) error
-	publishForms func(ctx context.Context, db *sql.DB, tenantID string, actor audit.Actor) error
+	publish         func(ctx context.Context, db *sql.DB, tenantID string, actor audit.Actor) error
+	publishForms    func(ctx context.Context, db *sql.DB, tenantID string, actor audit.Actor) error
+	publishStatuses func(ctx context.Context, db *sql.DB, tenantID string, actor audit.Actor) error
 }{
-	"purchasing": {purchasing.Publish, purchasing.PublishForms},
+	"purchasing": {purchasing.Publish, purchasing.PublishForms, purchasing.PublishStatuses},
 }
 
 func main() {
@@ -123,6 +131,11 @@ func main() {
 		}
 		if err := p.publishForms(ctx, sqlDB, id, actor); err != nil {
 			log.Fatalf("publish %s forms: %v", m, err)
+		}
+		if p.publishStatuses != nil {
+			if err := p.publishStatuses(ctx, sqlDB, id, actor); err != nil {
+				log.Fatalf("publish %s statuses: %v", m, err)
+			}
 		}
 		log.Printf("%s module published (entities + forms)", m)
 	}
