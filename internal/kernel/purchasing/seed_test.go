@@ -12,6 +12,9 @@ import (
 
 	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
+	"github.com/universaltill/universal-core/internal/kernel/crud"
+	"github.com/universaltill/universal-core/internal/kernel/entity"
+	"github.com/universaltill/universal-core/internal/kernel/foundation"
 )
 
 func testDB(t *testing.T) *sql.DB {
@@ -239,5 +242,141 @@ func TestPublishForms_IsIdempotent(t *testing.T) {
 	}
 	if err := PublishForms(ctx, db, tenantID, humanActor()); err != nil {
 		t.Fatalf("second PublishForms should be a no-op, got: %v", err)
+	}
+}
+
+// TestPublishStatuses_SeedsGraph confirms PublishStatuses actually
+// creates the purchase_order_status StatusType, its 5 Status records
+// (draft the only is_initial one; received/cancelled is_terminal), and
+// all 6 declared StatusTransition edges — the real data
+// crud.Engine.ValidateStatusTransition needs to exist before any
+// PurchaseOrder create/update through internal/api can pass (see
+// PublishStatuses's doc comment). Only needs foundation.Publish first
+// (StatusType/Status/StatusTransition are foundation Definitions), not
+// purchasing.Publish itself — PublishStatuses never looks PurchaseOrder
+// up.
+func TestPublishStatuses_SeedsGraph(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	tenantID := seedTenant(t, db)
+	actor := humanActor()
+
+	if err := foundation.Publish(ctx, db, tenantID, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := PublishStatuses(ctx, db, tenantID, actor); err != nil {
+		t.Fatalf("PublishStatuses: %v", err)
+	}
+
+	entityDefs := data.NewEntityDefinitionRepo(db)
+	engine := crud.NewEngine(db)
+	def := func(entityType string) *entity.Definition {
+		v, err := entityDefs.GetPublished(ctx, tenantID, entityType)
+		if err != nil {
+			t.Fatalf("GetPublished(%s): %v", entityType, err)
+		}
+		d, err := entity.Unmarshal(v.Definition)
+		if err != nil {
+			t.Fatalf("unmarshal %s: %v", entityType, err)
+		}
+		return d
+	}
+
+	statusTypes, err := engine.ListByField(ctx, def("StatusType"), tenantID, "code", "purchase_order_status")
+	if err != nil {
+		t.Fatalf("list StatusType: %v", err)
+	}
+	if len(statusTypes) != 1 {
+		t.Fatalf("expected exactly 1 purchase_order_status StatusType, got %d", len(statusTypes))
+	}
+
+	statuses, err := engine.ListByField(ctx, def("Status"), tenantID, "status_type_id", statusTypes[0].ID)
+	if err != nil {
+		t.Fatalf("list Status: %v", err)
+	}
+	wantStatuses := map[string]struct{ isInitial, isTerminal bool }{
+		"draft":     {true, false},
+		"submitted": {false, false},
+		"approved":  {false, false},
+		"received":  {false, true},
+		"cancelled": {false, true},
+	}
+	if len(statuses) != len(wantStatuses) {
+		t.Fatalf("expected %d Status records, got %d", len(wantStatuses), len(statuses))
+	}
+	statusIDs := map[string]string{}
+	for _, s := range statuses {
+		code, _ := s.Data["code"].(string)
+		want, ok := wantStatuses[code]
+		if !ok {
+			t.Fatalf("unexpected Status code %q", code)
+		}
+		if got := s.Data["is_initial"]; got != want.isInitial {
+			t.Errorf("Status %q: expected is_initial=%v, got %v", code, want.isInitial, got)
+		}
+		if got := s.Data["is_terminal"]; got != want.isTerminal {
+			t.Errorf("Status %q: expected is_terminal=%v, got %v", code, want.isTerminal, got)
+		}
+		statusIDs[code] = s.ID
+	}
+
+	transitionDef := def("StatusTransition")
+	wantEdges := [][2]string{
+		{"draft", "submitted"}, {"submitted", "approved"}, {"approved", "received"},
+		{"draft", "cancelled"}, {"submitted", "cancelled"}, {"approved", "cancelled"},
+	}
+	for _, edge := range wantEdges {
+		rows, err := engine.ListByField(ctx, transitionDef, tenantID, "from_status_id", statusIDs[edge[0]])
+		if err != nil {
+			t.Fatalf("list StatusTransition from %s: %v", edge[0], err)
+		}
+		found := false
+		for _, r := range rows {
+			if to, _ := r.Data["to_status_id"].(string); to == statusIDs[edge[1]] {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected a declared %s->%s StatusTransition", edge[0], edge[1])
+		}
+	}
+}
+
+// TestPublishStatuses_IsIdempotent confirms a second call doesn't
+// duplicate the StatusType/Status/StatusTransition rows — same
+// getOrCreate-by-natural-key discipline as cmd/seed-demo-data.
+func TestPublishStatuses_IsIdempotent(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	tenantID := seedTenant(t, db)
+	actor := humanActor()
+
+	if err := foundation.Publish(ctx, db, tenantID, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := PublishStatuses(ctx, db, tenantID, actor); err != nil {
+		t.Fatalf("first PublishStatuses: %v", err)
+	}
+	if err := PublishStatuses(ctx, db, tenantID, actor); err != nil {
+		t.Fatalf("second PublishStatuses should be a no-op, got: %v", err)
+	}
+
+	entityDefs := data.NewEntityDefinitionRepo(db)
+	engine := crud.NewEngine(db)
+	v, err := entityDefs.GetPublished(ctx, tenantID, "Status")
+	if err != nil {
+		t.Fatalf("GetPublished(Status): %v", err)
+	}
+	statusDef, err := entity.Unmarshal(v.Definition)
+	if err != nil {
+		t.Fatalf("unmarshal Status: %v", err)
+	}
+	all, err := engine.List(ctx, statusDef, tenantID)
+	if err != nil {
+		t.Fatalf("list Status: %v", err)
+	}
+	if len(all) != 5 {
+		t.Fatalf("expected exactly 5 Status records after two PublishStatuses calls, got %d", len(all))
 	}
 }

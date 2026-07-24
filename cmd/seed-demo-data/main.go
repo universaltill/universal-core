@@ -22,6 +22,7 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/audit"
 	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
+	"github.com/universaltill/universal-core/internal/kernel/purchasing"
 )
 
 func main() {
@@ -55,6 +56,17 @@ func main() {
 		entityDefs: data.NewEntityDefinitionRepo(sqlDB),
 		crud:       crud.NewEngine(sqlDB),
 		defs:       map[string]*entity.Definition{},
+	}
+
+	// PurchaseOrder.status_id needs purchase_order_status's StatusType/
+	// Status/StatusTransition rows to already exist for this tenant —
+	// normally cmd/provision-tenant's job (required module setup, not
+	// sample data — see purchasing.PublishStatuses's doc comment), but
+	// idempotent and cheap enough to also run here so this command stays
+	// self-sufficient against a tenant provisioned before this seeder
+	// grew a PurchaseOrder step that depends on it.
+	if err := purchasing.PublishStatuses(context.Background(), sqlDB, *tenantID, s.actor); err != nil {
+		log.Fatalf("publish purchase_order_status: %v", err)
 	}
 
 	currencies := s.seedCurrencies()
@@ -270,6 +282,23 @@ func (s *seeder) seedInventory(items map[string]string) {
 func (s *seeder) seedPurchaseOrders(vendors, currencies, items map[string]string) {
 	poDef := s.def("PurchaseOrder")
 	lineDef := s.def("POLine")
+	statusDef := s.def("Status")
+
+	// purchasing.PublishStatuses (called in main before this) already
+	// seeded these by code — only one StatusType exists today
+	// (purchase_order_status), so a plain code lookup is unambiguous;
+	// see that function's doc comment if a second StatusType ever makes
+	// this need scoping by status_type_id too.
+	statusID := func(code string) string {
+		recs, err := s.crud.ListByField(s.ctx, statusDef, s.tenantID, "code", code)
+		if err != nil {
+			log.Fatalf("list Status by code %q: %v", code, err)
+		}
+		if len(recs) == 0 {
+			log.Fatalf("no Status record for code %q (was purchasing.PublishStatuses run?)", code)
+		}
+		return recs[0].ID
+	}
 
 	type line struct {
 		sku      string
@@ -309,7 +338,7 @@ func (s *seeder) seedPurchaseOrders(vendors, currencies, items map[string]string
 			"vendor_id":   vendors[o.vendor],
 			"currency_id": currencies[o.currency],
 			"order_date":  o.date,
-			"status":      o.status,
+			"status_id":   statusID(o.status),
 		}, s.actor)
 		if err != nil {
 			log.Fatalf("create PurchaseOrder for %s: %v", o.vendor, err)
@@ -335,7 +364,7 @@ func (s *seeder) seedPurchaseOrders(vendors, currencies, items map[string]string
 		expectedVersion := poID.Version
 		if _, err := s.crud.Update(s.ctx, poDef, s.tenantID, poID.ID, map[string]any{
 			"po_number": o.poNumber, "vendor_id": vendors[o.vendor], "currency_id": currencies[o.currency],
-			"order_date": o.date, "status": o.status, "total": total,
+			"order_date": o.date, "status_id": statusID(o.status), "total": total,
 		}, &expectedVersion, s.actor); err != nil {
 			log.Fatalf("update PurchaseOrder total: %v", err)
 		}

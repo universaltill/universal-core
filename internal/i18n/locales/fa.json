@@ -153,7 +153,7 @@
   "field.PurchaseOrder.vendor_id": "تأمین‌کننده",
   "field.PurchaseOrder.order_date": "تاریخ سفارش",
   "field.PurchaseOrder.currency_id": "ارز",
-  "field.PurchaseOrder.status": "وضعیت",
+  "field.PurchaseOrder.status_id": "وضعیت",
   "field.PurchaseOrder.total": "جمع کل",
   "field.POLine.purchase_order_id": "سفارش خرید",
   "field.POLine.item_id": "کالا",
