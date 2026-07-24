@@ -153,7 +153,7 @@
   "field.PurchaseOrder.vendor_id": "Vendor",
   "field.PurchaseOrder.order_date": "Order Date",
   "field.PurchaseOrder.currency_id": "Currency",
-  "field.PurchaseOrder.status": "Status",
+  "field.PurchaseOrder.status_id": "Status",
   "field.PurchaseOrder.total": "Total",
   "field.POLine.purchase_order_id": "Purchase Order",
   "field.POLine.item_id": "Item",

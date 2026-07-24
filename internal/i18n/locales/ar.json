@@ -153,7 +153,7 @@
   "field.PurchaseOrder.vendor_id": "المورّد",
   "field.PurchaseOrder.order_date": "تاريخ الطلب",
   "field.PurchaseOrder.currency_id": "العملة",
-  "field.PurchaseOrder.status": "الحالة",
+  "field.PurchaseOrder.status_id": "الحالة",
   "field.PurchaseOrder.total": "الإجمالي",
   "field.POLine.purchase_order_id": "أمر الشراء",
   "field.POLine.item_id": "الصنف",
