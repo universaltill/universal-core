@@ -81,9 +81,21 @@ type Definition struct {
 	// consulted by a generic engine (crud, formrender) — CLAUDE.md's
 	// kernel boundary rule is about behavior, not about a Definition
 	// carrying data a UI groups by.
-	Module        string         `json:"module,omitempty"`
-	Fields        []Field        `json:"fields"`
-	Relationships []Relationship `json:"relationships,omitempty"`
+	Module string `json:"module,omitempty"`
+	// StatusTypeCode names the foundation StatusType (reference-data-
+	// model.md §0's generic "Status/StatusType" pattern — see
+	// foundation.StatusType/Status/StatusTransition) that governs this
+	// entity's lifecycle, replacing a bespoke per-entity FieldEnum status
+	// field (what Party.status/PurchaseOrder.status still are today — not
+	// migrated by this field's introduction, see foundation.go's doc
+	// comment on StatusType for why). Empty means this entity has no
+	// managed lifecycle; crud.Engine.ValidateStatusTransition is a no-op
+	// for it. When set, Validate below requires a matching "status_id"
+	// FieldReference — the field crud.Engine.ValidateStatusTransition
+	// actually reads/writes.
+	StatusTypeCode string         `json:"status_type_code,omitempty"`
+	Fields         []Field        `json:"fields"`
+	Relationships  []Relationship `json:"relationships,omitempty"`
 }
 
 // FieldByName returns the field with the given name, if present.
@@ -161,6 +173,15 @@ func (d *Definition) Validate() error {
 		}
 		if (r.Kind == RelationComposition || r.Kind == RelationRelatedList) && r.ParentField == "" {
 			return fmt.Errorf("relationship %q (%s) requires parent_field", r.Name, r.Kind)
+		}
+	}
+	if d.StatusTypeCode != "" {
+		sf, ok := d.FieldByName("status_id")
+		if !ok {
+			return fmt.Errorf("%s declares status_type_code %q but has no status_id field", d.EntityType, d.StatusTypeCode)
+		}
+		if sf.Type != FieldReference || sf.Target != "Status" {
+			return fmt.Errorf("%s: status_id must be a reference field targeting Status, got type %q target %q", d.EntityType, sf.Type, sf.Target)
 		}
 	}
 	return nil

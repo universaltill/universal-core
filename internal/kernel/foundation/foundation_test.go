@@ -239,3 +239,48 @@ func TestAttachment_HasNoFixedTargetField(t *testing.T) {
 		t.Fatalf("expected entity_type to be a plain string field, not %s (a fixed Target would defeat genericity)", f.Type)
 	}
 }
+
+// TestStatus_ValidatesAgainstItsStatusType exercises the shape of the
+// three new Definitions together: a Status record names the StatusType
+// it belongs to, and a StatusTransition names the StatusType plus the two
+// Status ids it connects — none of this is enforced by entity.ValidateRecord
+// itself (that only checks field shape, not that the referenced ids
+// actually belong to the same StatusType — see
+// crud.Engine.ValidateStatusTransition for the enforcement that does).
+func TestStatus_ValidatesAgainstItsStatusType(t *testing.T) {
+	statusTypeDef, statusDef, transitionDef := StatusType(), Status(), StatusTransition()
+
+	st := map[string]any{"entity_type": "PurchaseOrder", "code": "purchase_order_status", "name": "Purchase Order Status"}
+	if err := entity.ValidateRecord(statusTypeDef, st); err != nil {
+		t.Fatalf("status type should validate: %v", err)
+	}
+
+	draft := map[string]any{"status_type_id": "st-1", "code": "draft", "name": "Draft", "is_initial": true}
+	if err := entity.ValidateRecord(statusDef, draft); err != nil {
+		t.Fatalf("draft status should validate: %v", err)
+	}
+
+	transition := map[string]any{"status_type_id": "st-1", "from_status_id": "status-draft", "to_status_id": "status-submitted"}
+	if err := entity.ValidateRecord(transitionDef, transition); err != nil {
+		t.Fatalf("transition should validate: %v", err)
+	}
+}
+
+func TestStatus_IsInitialDefaultsFalse(t *testing.T) {
+	def := Status()
+	f, ok := def.FieldByName("is_initial")
+	if !ok {
+		t.Fatal("expected an is_initial field")
+	}
+	if f.Default != false {
+		t.Fatalf("expected is_initial to default to false, got %v", f.Default)
+	}
+}
+
+func TestStatusTransition_MissingToStatus(t *testing.T) {
+	def := StatusTransition()
+	data := map[string]any{"status_type_id": "st-1", "from_status_id": "status-draft"}
+	if err := entity.ValidateRecord(def, data); err == nil {
+		t.Fatal("expected error for missing required to_status_id")
+	}
+}
