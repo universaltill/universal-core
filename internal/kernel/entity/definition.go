@@ -183,6 +183,21 @@ func (d *Definition) Validate() error {
 		if sf.Type != FieldReference || sf.Target != "Status" {
 			return fmt.Errorf("%s: status_id must be a reference field targeting Status, got type %q target %q", d.EntityType, sf.Type, sf.Target)
 		}
+		if !sf.Required {
+			// Required, not just present: crud.Engine.Update replaces a
+			// record's data wholesale (data.RecordRepo.UpdateTx), so a
+			// caller that simply omits status_id from an update (or a
+			// form submission that dropped an emptied field, see
+			// internal/api's parseRecordFields) would otherwise pass
+			// entity.ValidateRecord and read as "not touching status" to
+			// crud.Engine.ValidateStatusTransition, silently wiping
+			// status_id off the stored record — the record falls out of
+			// its lifecycle instead of being rejected. Required:true
+			// makes entity.ValidateRecord itself catch that omission on
+			// every update, not just create, before it ever reaches the
+			// transition check.
+			return fmt.Errorf("%s: status_id must be Required — an optional status_id lets an update silently drop the record's status", d.EntityType)
+		}
 	}
 	return nil
 }
