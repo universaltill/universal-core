@@ -221,6 +221,107 @@ func ExchangeRate() *entity.Definition {
 	}
 }
 
+// StatusType is one entity type's lifecycle state machine — reference-
+// data-model.md §0's "Status/StatusType" pattern (OFBiz's StatusType/
+// StatusItem/StatusValidChange), built as a real generic mechanism rather
+// than the bespoke FieldEnum status field every entity that needs one has
+// used so far (Party.status, purchasing.PurchaseOrder.status, the
+// FiscalYear/Period status in reference-data-model.md §1). A FieldEnum
+// validates that a value is one of a fixed set, but nothing stops an
+// update jumping straight from "draft" to "cancelled" bypassing
+// "submitted"/"approved", and nothing declares which value a new record
+// starts in. StatusType/Status/StatusTransition below close that gap
+// once, generically, for any entity that opts in — not by inventing new
+// storage: these are ordinary foundation Definitions, stored as ordinary
+// records via crud.Engine like Party or Address, not a bespoke SQL table.
+//
+// Deliberately not migrating Party/PurchaseOrder/FiscalYear's existing
+// status fields to this pattern here — that's a real per-entity decision
+// (what are that entity's valid states and transitions?) belonging to a
+// session working that entity, not a side effect of introducing the
+// generic mechanism. An entity opts in by declaring
+// entity.Definition.StatusTypeCode and a "status_id" FieldReference
+// targeting Status (entity.Definition.Validate enforces the pairing);
+// until an entity does that, this package's addition is inert for it.
+//
+// No separate StatusHistory entity: crud.Engine.Update already writes an
+// audit_log row with a diff for every update (ADR-0001 §14/§16,
+// Attachment's own doc comment reasons through the same "don't duplicate
+// what audit_log already gives for free" tradeoff for actor identity) —
+// that diff already captures status_id's old/new value, who changed it,
+// and when. A bespoke StatusHistory entity duplicating (entity_type,
+// record_id, from_status, to_status, actor, timestamp) would just be
+// audit_log's diff reshaped, not new information.
+func StatusType() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "StatusType",
+		Version:    1,
+		Module:     "foundation",
+		Fields: []entity.Field{
+			// entity_type names the business entity this state machine
+			// governs (e.g. "PurchaseOrder") — a plain string, not a
+			// FieldReference, for the same reason Attachment.entity_type
+			// is a plain string: it must be able to name any entity type,
+			// including ones that don't exist yet when this Definition is
+			// authored (a FieldReference's Target is fixed at one type).
+			{Name: "entity_type", Type: entity.FieldString, Required: true},
+			{Name: "code", Type: entity.FieldString, Required: true}, // e.g. "purchase_order_status" — what entity.Definition.StatusTypeCode names
+			{Name: "name", Type: entity.FieldString, Required: true},
+		},
+	}
+}
+
+// Status is one allowed state within a StatusType (OFBiz's StatusItem)
+// — e.g. draft/submitted/approved/cancelled. is_initial marks which
+// Status(es) a new record may start in; crud.Engine.ValidateStatusTransition
+// rejects creating a record whose status_id isn't flagged is_initial.
+// is_terminal is descriptive only in this increment (a UI hint that no
+// further transition is expected) — not enforced, since StatusTransition
+// rows already define the actual transition graph and a terminal status
+// with no outgoing StatusTransition rows is already unreachable by
+// construction.
+func Status() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "Status",
+		Version:    1,
+		Module:     "foundation",
+		Fields: []entity.Field{
+			{Name: "status_type_id", Type: entity.FieldReference, Required: true, Target: "StatusType"},
+			{Name: "code", Type: entity.FieldString, Required: true},
+			{Name: "name", Type: entity.FieldString, Required: true},
+			{Name: "sequence", Type: entity.FieldNumber, Default: float64(0)}, // display/ordering hint only
+			{Name: "is_initial", Type: entity.FieldBool, Default: false},
+			{Name: "is_terminal", Type: entity.FieldBool, Default: false},
+		},
+	}
+}
+
+// StatusTransition is one legal edge (OFBiz's StatusValidChange) in a
+// StatusType's state graph: from_status_id -> to_status_id is allowed,
+// absence means it isn't. requires_workflow optionally names an R9
+// workflow.Definition that should gate this transition (e.g. a
+// PurchaseOrder moving to "approved" needing a require_approval step) —
+// declared here as the data a future workflow trigger type (e.g. an
+// on_status_change alongside internal/kernel/workflow's existing
+// on_create/on_update — not added in this increment) would consult;
+// crud.Engine.ValidateStatusTransition itself only checks the transition
+// is graph-legal, it does not look at requires_workflow or block on it.
+// Recording the field now rather than adding it later avoids a migration
+// once a workflow trigger consumes it.
+func StatusTransition() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "StatusTransition",
+		Version:    1,
+		Module:     "foundation",
+		Fields: []entity.Field{
+			{Name: "status_type_id", Type: entity.FieldReference, Required: true, Target: "StatusType"},
+			{Name: "from_status_id", Type: entity.FieldReference, Required: true, Target: "Status"},
+			{Name: "to_status_id", Type: entity.FieldReference, Required: true, Target: "Status"},
+			{Name: "requires_workflow", Type: entity.FieldString}, // optional workflow.Definition Name; not yet consulted, see doc comment above
+		},
+	}
+}
+
 // All returns every foundation Definition — the set that must exist
 // before any operational module is enabled for a tenant.
 func All() []*entity.Definition {
@@ -235,5 +336,8 @@ func All() []*entity.Definition {
 		UomConversion(),
 		Currency(),
 		ExchangeRate(),
+		StatusType(),
+		Status(),
+		StatusTransition(),
 	}
 }

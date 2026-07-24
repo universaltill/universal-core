@@ -118,6 +118,42 @@ func TestDefinitionValidate(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		{
+			name: "status_type_code without a status_id field",
+			def: Definition{
+				EntityType:     "PurchaseOrder",
+				StatusTypeCode: "purchase_order_status",
+				Fields:         []Field{{Name: "vendor_id", Type: FieldReference, Target: "Party"}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "status_type_code with status_id of the wrong field type",
+			def: Definition{
+				EntityType:     "PurchaseOrder",
+				StatusTypeCode: "purchase_order_status",
+				Fields:         []Field{{Name: "status_id", Type: FieldString}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "status_type_code with status_id targeting the wrong entity",
+			def: Definition{
+				EntityType:     "PurchaseOrder",
+				StatusTypeCode: "purchase_order_status",
+				Fields:         []Field{{Name: "status_id", Type: FieldReference, Target: "Party"}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "valid status_type_code with matching status_id reference",
+			def: Definition{
+				EntityType:     "PurchaseOrder",
+				StatusTypeCode: "purchase_order_status",
+				Fields:         []Field{{Name: "status_id", Type: FieldReference, Target: "Status"}},
+			},
+			wantErr: false,
+		},
 	}
 
 	for _, tc := range cases {
