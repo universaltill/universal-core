@@ -62,23 +62,20 @@ func Item() *entity.Definition {
 // tenant needs run once (cmd/provision-tenant) before any PurchaseOrder
 // create/update can pass crud.Engine.ValidateStatusTransition.
 //
-// No backfill for PurchaseOrder rows written before this Version bump
-// (3->4, plain "status" enum -> "status_id" reference): this kernel has
-// no record-data migration mechanism at all (internal/db/migrations only
-// ever touches schema), and this is the first Version bump that replaces
-// an existing Required-bearing field rather than adding one, so that gap
-// is newly load-bearing here. A pre-existing row's old "status" string
-// just sits unread in its JSONB — it drops out of
-// internal/data/reporting.go's status breakdown (status_id is NULL, the
-// join guard excludes it) and crud.Engine.ValidateStatusTransition
-// treats its next edit as a fresh, unversioned "predates opting in"
-// entry that can only move it to an is_initial status (draft) — a
-// silent lifecycle reset, not a crash. Acceptable to ship only because
-// no production tenant exists yet (QUEUE.md); a stale local/demo tenant
-// needs a wipe + full reseed, not just a re-run of cmd/seed-demo-data
-// (its po_number dedup would skip the broken rows rather than repair
-// them). Must be revisited — a real backfill, or at least a documented
-// operational runbook — before this kernel's first real launch.
+// A PurchaseOrder row written before this Version bump (3->4, plain
+// "status" enum -> "status_id" reference) has its old "status" string
+// sitting unread in its JSONB, not automatically fixed: this kernel
+// still has no *generic* record-data migration mechanism (internal/db/
+// migrations only ever touches schema), and this was the first Version
+// bump to replace an existing Required-bearing field rather than only
+// add one. cmd/backfill-purchase-order-status (branch
+// purchase-order-status-backfill) is the targeted, one-off fix for this
+// specific gap — run it once against any tenant provisioned before this
+// change (idempotent, dry-run supported) rather than wiping and
+// re-seeding. A generic migration framework was deliberately not built
+// for this one case (that would be exactly the premature abstraction
+// CLAUDE.md warns against) — if a second entity ever needs the same
+// kind of fix, generalize then, against two real examples.
 func PurchaseOrder() *entity.Definition {
 	return &entity.Definition{
 		EntityType:     "PurchaseOrder",
