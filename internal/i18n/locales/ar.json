@@ -8,6 +8,7 @@
   "import.commit_button": "تنفيذ",
   "import.repreview_button": "معاينة مرة أخرى",
   "import.mapping_heading": "تعيين الأعمدة",
+  "import.ai_suggested_note": "(اقتراح الذكاء الاصطناعي — يرجى التأكيد)",
   "import.rows_heading": "معاينة الصفوف",
   "import.unmapped_option": "— تخطي —",
   "import.row_status_ok": "صحيح",

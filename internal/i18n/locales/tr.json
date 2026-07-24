@@ -8,6 +8,7 @@
   "import.commit_button": "Uygula",
   "import.repreview_button": "Yeniden önizle",
   "import.mapping_heading": "Sütun Eşleme",
+  "import.ai_suggested_note": "(Yapay zeka önerisi — lütfen onaylayın)",
   "import.rows_heading": "Satır Önizlemesi",
   "import.unmapped_option": "— atla —",
   "import.row_status_ok": "Tamam",

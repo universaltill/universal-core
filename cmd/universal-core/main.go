@@ -21,9 +21,32 @@ import (
 	"github.com/universaltill/universal-core/internal/db"
 	"github.com/universaltill/universal-core/internal/httpx"
 	"github.com/universaltill/universal-core/internal/i18n"
+	"github.com/universaltill/universal-core/internal/kernel/aiassist"
 	"github.com/universaltill/universal-core/internal/webauth"
 	"github.com/universaltill/universal-core/internal/worker"
 )
+
+// defaultOllamaModel matches the model already pulled by the reference
+// homelab-k8s Ollama deployment (kubernetes/apps/ollama) — small enough
+// to run on that cluster's 2-node Raspberry Pi hardware. A deployment
+// with a different model available should set OLLAMA_MODEL explicitly.
+const defaultOllamaModel = "llama3.2:3b"
+
+// aiClientFromEnv builds an aiassist.Client from OLLAMA_* environment
+// variables, returning the resolved model alongside it purely so the
+// caller can log what was actually chosen (env unset vs. the default).
+// OLLAMA_URL empty is the expected, safe default — no AI assistance
+// anywhere in the app, same "every caller already treats a disabled
+// client as unavailable, never an error" contract webauthConfigFromEnv's
+// own doc comment describes for auth.
+func aiClientFromEnv() (client *aiassist.Client, url, model string) {
+	url = os.Getenv("OLLAMA_URL")
+	model = os.Getenv("OLLAMA_MODEL")
+	if model == "" {
+		model = defaultOllamaModel
+	}
+	return aiassist.NewClient(url, model), url, model
+}
 
 // workerConfigFromEnv builds a worker.Config from WORKFLOW_* environment
 // variables, falling back to worker.Config's own defaults (loud on a
@@ -142,7 +165,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("load i18n catalog: %v", err)
 	}
-	api.New(sqlDB, catalog, auth).Routes(mux)
+	ai, ollamaURL, ollamaModel := aiClientFromEnv()
+	if ai.Enabled() {
+		log.Printf("AI assistance enabled (OLLAMA_URL=%s, model=%s) — import mapping suggestions", ollamaURL, ollamaModel)
+	}
+	api.New(sqlDB, catalog, auth, ai).Routes(mux)
 
 	// The durable workflow job queue (internal/kernel/workflow.Queue) has
 	// existed since the definition-registry increment, but nothing ever

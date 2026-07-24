@@ -8,6 +8,7 @@
   "import.commit_button": "اجرا",
   "import.repreview_button": "پیش‌نمایش مجدد",
   "import.mapping_heading": "نگاشت ستون‌ها",
+  "import.ai_suggested_note": "(پیشنهاد هوش مصنوعی — لطفاً تأیید کنید)",
   "import.rows_heading": "پیش‌نمایش ردیف‌ها",
   "import.unmapped_option": "— رد شدن —",
   "import.row_status_ok": "درست",
