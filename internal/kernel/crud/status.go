@@ -32,7 +32,26 @@ var ErrInvalidTransition = errors.New("crud: invalid status transition")
 // comment: no existing entity has opted in yet). internal/api's create/
 // updateRecord call this explicitly, the same shape as extractVersion
 // already being a step distinct from Update itself.
-func (e *Engine) ValidateStatusTransition(ctx context.Context, def *entity.Definition, tenantID, id string, fields map[string]any, isCreate bool) error {
+//
+// expectedVersion is that same extractVersion result, passed through
+// (internal/api now extracts it before calling this, not after) — any
+// update that had a prior status (a real transition, or a same-status
+// resubmit) requires it non-nil; create doesn't, since there's no prior
+// state to race against. Without that, this method's own read of the
+// current status_id and the
+// caller's later crud.Engine.Update happen in separate, unsynchronized
+// transactions: two concurrent updates could both read status "draft",
+// both validate against a real "draft"->"submitted"/"draft"->"cancelled"
+// edge, and both succeed, landing the record on whichever edge's target
+// the last unconditional write happened to overwrite with — a state the
+// StatusTransition graph never declared as reachable from the other.
+// Requiring expectedVersion forces the actual write through
+// data.RecordRepo.UpdateTx's compare-and-swap (WHERE version = $5),
+// so only one of the two concurrent updates can win; the loser gets
+// data.ErrVersionConflict (409) and must re-read and re-validate against
+// the state that actually won, closing the race the read-then-write
+// shape of this check would otherwise leave open.
+func (e *Engine) ValidateStatusTransition(ctx context.Context, def *entity.Definition, tenantID, id string, fields map[string]any, isCreate bool, expectedVersion *int) error {
 	if def.StatusTypeCode == "" {
 		return nil
 	}
@@ -63,6 +82,11 @@ func (e *Engine) ValidateStatusTransition(ctx context.Context, def *entity.Defin
 	if !isCreate {
 		rec, err := e.records.Get(ctx, tenantID, def.EntityType, id)
 		if err != nil {
+			// %w preserves data.ErrNotFound through this wrap — callers
+			// (internal/api) check errors.Is(err, data.ErrNotFound)
+			// before checking ErrInvalidTransition, so a bad id still
+			// reports 404, matching what crud.Engine.Update itself would
+			// have said had this check not run first.
 			return fmt.Errorf("look up current %s %s: %w", def.EntityType, id, err)
 		}
 		currentStatusID, _ = rec.Data["status_id"].(string)
@@ -79,6 +103,18 @@ func (e *Engine) ValidateStatusTransition(ctx context.Context, def *entity.Defin
 		return nil
 	}
 	if currentStatusID == newStatusID {
+		// Still demands expectedVersion, even though nothing about the
+		// graph is being checked here: a client resubmitting the status
+		// it last read is exactly the shape of update a concurrent real
+		// transition (draft->submitted, say) could have raced past —
+		// without a version, this "no-op" would wholesale-overwrite that
+		// transition's result back to the stale value the client is
+		// still holding. Same race as the declared-transition branch
+		// below, just with fields["status_id"] holding the old value
+		// instead of a new one.
+		if expectedVersion == nil {
+			return fmt.Errorf("%w: %s status transitions require the record's current version (concurrent-safe update) — see ValidateStatusTransition's doc comment", ErrInvalidTransition, def.EntityType)
+		}
 		return nil // setting to the same status is always a no-op, not a transition
 	}
 
@@ -86,14 +122,22 @@ func (e *Engine) ValidateStatusTransition(ctx context.Context, def *entity.Defin
 	if err != nil {
 		return fmt.Errorf("list transitions for status type %s: %w", def.StatusTypeCode, err)
 	}
+	found := false
 	for _, t := range transitions {
 		from, _ := t.Data["from_status_id"].(string)
 		to, _ := t.Data["to_status_id"].(string)
 		if from == currentStatusID && to == newStatusID {
-			return nil
+			found = true
+			break
 		}
 	}
-	return fmt.Errorf("%w: %s -> %s is not a declared transition for %s", ErrInvalidTransition, currentStatusID, newStatusID, def.StatusTypeCode)
+	if !found {
+		return fmt.Errorf("%w: %s -> %s is not a declared transition for %s", ErrInvalidTransition, currentStatusID, newStatusID, def.StatusTypeCode)
+	}
+	if expectedVersion == nil {
+		return fmt.Errorf("%w: %s status transitions require the record's current version (concurrent-safe update) — see ValidateStatusTransition's doc comment", ErrInvalidTransition, def.EntityType)
+	}
+	return nil
 }
 
 // statusTypeIDByCode resolves the entity.Definition.StatusTypeCode a
