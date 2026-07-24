@@ -146,11 +146,25 @@ func TestDefinitionValidate(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "valid status_type_code with matching status_id reference",
+			// A non-Required status_id would let an update that omits it
+			// pass entity.ValidateRecord and read as "not touching
+			// status" to crud.Engine.ValidateStatusTransition, silently
+			// wiping the field instead of being rejected — see
+			// Validate()'s status_id Required check.
+			name: "status_type_code with status_id not marked Required",
 			def: Definition{
 				EntityType:     "PurchaseOrder",
 				StatusTypeCode: "purchase_order_status",
 				Fields:         []Field{{Name: "status_id", Type: FieldReference, Target: "Status"}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "valid status_type_code with matching required status_id reference",
+			def: Definition{
+				EntityType:     "PurchaseOrder",
+				StatusTypeCode: "purchase_order_status",
+				Fields:         []Field{{Name: "status_id", Type: FieldReference, Required: true, Target: "Status"}},
 			},
 			wantErr: false,
 		},
