@@ -334,27 +334,34 @@ func TestRender_EnumOptionLabelsAreTranslated(t *testing.T) {
 // hard-coded English form.FormField.Label — Arabic is used specifically
 // because "الحالة" can't be mistaken for a coincidental match with the Go-
 // declared "Status" fallback the way an untranslated locale might.
+// Piggybacks on the real "field.PurchaseOrder.status_id" locale key
+// (purchasing.PurchaseOrder's actual field, since it opted into
+// foundation.go's Status/StatusType pattern — see that entity's own doc
+// comment) rather than fabricating a synthetic one; the fixture below is
+// still a hand-built ad hoc Definition, not an import of the real
+// purchasing package, matching every other formrender test's own
+// module-independence.
 func TestRender_FieldLabelIsTranslated(t *testing.T) {
 	r := testRenderer(t)
 	ent := &entity.Definition{
 		EntityType: "PurchaseOrder",
 		Fields: []entity.Field{
-			{Name: "status", Type: entity.FieldEnum, Required: true, EnumValues: []string{"draft"}},
+			{Name: "status_id", Type: entity.FieldReference, Required: true, Target: "Status"},
 		},
 	}
 	def := &form.Definition{
 		EntityType: "PurchaseOrder",
 		Sections: []form.Section{{
 			Title: "Header", Component: form.ComponentFields,
-			Fields: []form.FormField{{Name: "status", Label: "Status"}},
+			Fields: []form.FormField{{Name: "status_id", Label: "Status"}},
 		}},
 	}
-	data := Data{Record: map[string]any{"status": "draft"}}
+	data := Data{Record: map[string]any{"status_id": "draft"}}
 	var buf strings.Builder
 	if err := r.Render(&buf, def, ent, data, "ar"); err != nil {
 		t.Fatalf("render: %v", err)
 	}
-	if !strings.Contains(buf.String(), `<label for="status">الحالة`) {
+	if !strings.Contains(buf.String(), `<label for="status_id">الحالة`) {
 		t.Fatalf("expected the Arabic field label \"الحالة\", got:\n%s", buf.String())
 	}
 }

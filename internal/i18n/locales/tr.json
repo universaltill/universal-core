@@ -153,7 +153,7 @@
   "field.PurchaseOrder.vendor_id": "Tedarikçi",
   "field.PurchaseOrder.order_date": "Sipariş Tarihi",
   "field.PurchaseOrder.currency_id": "Para Birimi",
-  "field.PurchaseOrder.status": "Durum",
+  "field.PurchaseOrder.status_id": "Durum",
   "field.PurchaseOrder.total": "Toplam",
   "field.POLine.purchase_order_id": "Satın Alma Siparişi",
   "field.POLine.item_id": "Ürün",

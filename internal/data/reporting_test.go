@@ -57,17 +57,34 @@ func TestPurchaseOrderStatusBreakdown_GroupsByStatusWithinTenant(t *testing.T) {
 	tenantA := seedTenant(t, db)
 	tenantB := seedTenant(t, db)
 
+	mustCreateStatus := func(tenantID, code string) string {
+		t.Helper()
+		rec, err := records.Create(ctx, tenantID, "Status", map[string]any{"code": code, "name": code})
+		if err != nil {
+			t.Fatalf("create Status: %v", err)
+		}
+		return rec.ID
+	}
+	draftA := mustCreateStatus(tenantA, "draft")
+	approvedA := mustCreateStatus(tenantA, "approved")
+	draftB := mustCreateStatus(tenantB, "draft")
+
 	mustCreate := func(tenantID string, fields map[string]any) {
 		t.Helper()
 		if _, err := records.Create(ctx, tenantID, "PurchaseOrder", fields); err != nil {
 			t.Fatalf("create PurchaseOrder: %v", err)
 		}
 	}
-	mustCreate(tenantA, map[string]any{"po_number": "PO-A1", "status": "draft", "total": 100.0})
-	mustCreate(tenantA, map[string]any{"po_number": "PO-A2", "status": "draft", "total": 50.0})
-	mustCreate(tenantA, map[string]any{"po_number": "PO-A3", "status": "approved", "total": 200.0})
-	// A different tenant's order must never contaminate tenantA's totals.
-	mustCreate(tenantB, map[string]any{"po_number": "PO-B1", "status": "draft", "total": 999.0})
+	mustCreate(tenantA, map[string]any{"po_number": "PO-A1", "status_id": draftA, "total": 100.0})
+	mustCreate(tenantA, map[string]any{"po_number": "PO-A2", "status_id": draftA, "total": 50.0})
+	mustCreate(tenantA, map[string]any{"po_number": "PO-A3", "status_id": approvedA, "total": 200.0})
+	// A different tenant's order must never contaminate tenantA's totals,
+	// even though "draft" resolves to a different Status row per tenant.
+	mustCreate(tenantB, map[string]any{"po_number": "PO-B1", "status_id": draftB, "total": 999.0})
+	// A status_id that isn't even a well-formed UUID (e.g. a bad CSV
+	// import mapping) must be excluded, not abort the whole query — see
+	// reporting.go's uuidPattern doc comment.
+	mustCreate(tenantA, map[string]any{"po_number": "PO-A4", "status_id": "not-a-uuid", "total": 1234.0})
 
 	rows, err := reporting.PurchaseOrderStatusBreakdown(ctx, tenantA)
 	if err != nil {

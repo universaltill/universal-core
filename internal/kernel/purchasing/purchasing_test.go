@@ -67,22 +67,36 @@ func TestPurchaseOrder_VendorReferencesPartyDirectly(t *testing.T) {
 	}
 }
 
-func TestPurchaseOrder_DefaultsToDraftStatus(t *testing.T) {
+// TestPurchaseOrder_StatusIsManagedByStatusType replaces the old plain
+// FieldEnum "status" field's default/enum checks — PurchaseOrder is the
+// first entity to opt into foundation.go's generic Status/StatusType
+// pattern (see this package's doc comment on PurchaseOrder), so "is this
+// a legal status" and "what does a new record start in" are now
+// crud.Engine.ValidateStatusTransition's job against the
+// purchase_order_status graph purchasing.PublishStatuses seeds, not
+// something entity.ValidateRecord can check from the Definition alone —
+// that generic mechanism is exercised in internal/kernel/crud/
+// status_test.go, not duplicated here.
+func TestPurchaseOrder_StatusIsManagedByStatusType(t *testing.T) {
 	def := PurchaseOrder()
-	f, ok := def.FieldByName("status")
-	if !ok {
-		t.Fatal("expected a status field")
+	if def.StatusTypeCode != "purchase_order_status" {
+		t.Fatalf("expected StatusTypeCode %q, got %q", "purchase_order_status", def.StatusTypeCode)
 	}
-	if f.Default != "draft" {
-		t.Fatalf("expected default status of draft, got %v", f.Default)
+	f, ok := def.FieldByName("status_id")
+	if !ok {
+		t.Fatal("expected a status_id field")
+	}
+	if f.Type != entity.FieldReference || f.Target != "Status" || !f.Required {
+		t.Fatalf("expected status_id to be a Required FieldReference targeting Status, got type=%s target=%s required=%v",
+			f.Type, f.Target, f.Required)
 	}
 }
 
-func TestPurchaseOrder_RejectsUnknownStatus(t *testing.T) {
+func TestPurchaseOrder_RequiresStatusID(t *testing.T) {
 	def := PurchaseOrder()
-	data := map[string]any{"vendor_id": "party-1", "order_date": "2026-07-20", "status": "shipped"}
+	data := map[string]any{"po_number": "PO-TEST-1", "vendor_id": "party-1", "order_date": "2026-07-20"}
 	if err := entity.ValidateRecord(def, data); err == nil {
-		t.Fatal("expected error for status not in the declared enum")
+		t.Fatal("expected error for missing required status_id")
 	}
 }
 
