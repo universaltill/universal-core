@@ -34,6 +34,40 @@ func PartyForm() *form.Definition {
 	}
 }
 
+// IssueReportForm is the admin-facing triage view of a submitted
+// IssueReport — not the submission UI itself (that's the bespoke
+// capture page, internal/api/issuereport.go, same "a feature that
+// doesn't fit the generic field-based form model gets its own page"
+// precedent the CSV import wizard already established). This is what
+// GET /forms/IssueReport/{id} and the generic /records/IssueReport list
+// page (reachable from the module menu) actually render — reusing the
+// generic form renderer for the read/triage side is exactly right,
+// since "show a record's fields, let someone edit status" is precisely
+// what that renderer is for.
+func IssueReportForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "IssueReport",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Details",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "title", Label: "Title"},
+					{Name: "description", Label: "Description"},
+					{Name: "transcript", Label: "Voice Transcript"},
+					{Name: "page_url", Label: "Page"},
+					{Name: "user_agent", Label: "Browser"},
+					{Name: "status", Label: "Status"},
+				},
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
+	}
+}
+
 // AllForms returns every Form Definition this package defines — the
 // source of truth seed.go's PublishForms iterates, so a newly added form
 // constructor is published automatically instead of needing a second,
@@ -41,5 +75,5 @@ func PartyForm() *form.Definition {
 // the gap that left every form unpublished in production until
 // PublishForms existed at all).
 func AllForms() []*form.Definition {
-	return []*form.Definition{PartyForm()}
+	return []*form.Definition{PartyForm(), IssueReportForm()}
 }

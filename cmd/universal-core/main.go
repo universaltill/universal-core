@@ -22,6 +22,7 @@ import (
 	"github.com/universaltill/universal-core/internal/httpx"
 	"github.com/universaltill/universal-core/internal/i18n"
 	"github.com/universaltill/universal-core/internal/kernel/aiassist"
+	"github.com/universaltill/universal-core/internal/kernel/speechassist"
 	"github.com/universaltill/universal-core/internal/webauth"
 	"github.com/universaltill/universal-core/internal/worker"
 )
@@ -46,6 +47,16 @@ func aiClientFromEnv() (client *aiassist.Client, url, model string) {
 		model = defaultOllamaModel
 	}
 	return aiassist.NewClient(url, model), url, model
+}
+
+// speechClientFromEnv builds a speechassist.Client from WHISPER_URL —
+// same "empty is the expected, safe default" contract as
+// aiClientFromEnv, matching the reference homelab-k8s Whisper ASR
+// deployment (kubernetes/apps/whisper) this was verified end-to-end
+// against.
+func speechClientFromEnv() (client *speechassist.Client, url string) {
+	url = os.Getenv("WHISPER_URL")
+	return speechassist.NewClient(url), url
 }
 
 // workerConfigFromEnv builds a worker.Config from WORKFLOW_* environment
@@ -169,7 +180,11 @@ func main() {
 	if ai.Enabled() {
 		log.Printf("AI assistance enabled (OLLAMA_URL=%s, model=%s) — import mapping suggestions", ollamaURL, ollamaModel)
 	}
-	api.New(sqlDB, catalog, auth, ai).Routes(mux)
+	speech, whisperURL := speechClientFromEnv()
+	if speech.Enabled() {
+		log.Printf("Voice transcription enabled (WHISPER_URL=%s) — issue logger voice notes", whisperURL)
+	}
+	api.New(sqlDB, catalog, auth, ai, speech).Routes(mux)
 
 	// The durable workflow job queue (internal/kernel/workflow.Queue) has
 	// existed since the definition-registry increment, but nothing ever

@@ -284,3 +284,47 @@ func TestStatusTransition_MissingToStatus(t *testing.T) {
 		t.Fatal("expected error for missing required to_status_id")
 	}
 }
+
+func TestIssueReport_DefaultsToNewStatus(t *testing.T) {
+	def := IssueReport()
+	f, ok := def.FieldByName("status")
+	if !ok {
+		t.Fatal("expected a status field")
+	}
+	if f.Default != "new" {
+		t.Fatalf("expected status to default to \"new\", got %v", f.Default)
+	}
+}
+
+func TestIssueReport_MissingRequiredDescription(t *testing.T) {
+	def := IssueReport()
+	data := map[string]any{"title": "Something's broken"}
+	if err := entity.ValidateRecord(def, data); err == nil {
+		t.Fatal("expected error for missing required description")
+	}
+}
+
+// TestIssueReport_TranscriptIsOptional confirms a typed-only report
+// (no voice note recorded at all) is still a valid submission — voice
+// capture is one input among several the issue logger offers, not a
+// requirement to file a report at all. status is supplied explicitly
+// (Required, and — same as every other Required field in this kernel,
+// see entity.Definition.Validate's own discipline — Default is a
+// form-rendering hint only, entity.ValidateRecord never auto-fills a
+// missing Required field from it) the same way the real submit handler
+// always will.
+func TestIssueReport_TranscriptIsOptional(t *testing.T) {
+	def := IssueReport()
+	data := map[string]any{"title": "Something's broken", "description": "The button does nothing when clicked.", "status": "new"}
+	if err := entity.ValidateRecord(def, data); err != nil {
+		t.Fatalf("expected a typed-only report (no transcript) to be valid, got %v", err)
+	}
+}
+
+func TestIssueReport_RejectsUnknownStatus(t *testing.T) {
+	def := IssueReport()
+	data := map[string]any{"title": "x", "description": "y", "status": "resolved-by-magic"}
+	if err := entity.ValidateRecord(def, data); err == nil {
+		t.Fatal("expected error for a status value outside the declared enum")
+	}
+}
