@@ -20,6 +20,7 @@
   "dashboard.empty": "هنوز ماژولی برای این مستأجر در دسترس نیست.",
   "dashboard.new_link": "جدید",
   "dashboard.import_link": "ورود اطلاعات",
+  "dashboard.export_link": "خروجی گرفتن",
   "welcome.sign_in_prompt": "برای مشاهده ماژول‌های خود وارد شوید.",
   "welcome.sign_in_link": "ورود",
   "welcome.dev_auth_hint": "هنوز نشستی وجود ندارد. احراز هویت توسعه‌دهنده برای این استقرار فعال است — برای ادامه، هدرهای X-Tenant-ID و X-Actor-ID را ارسال کنید.",

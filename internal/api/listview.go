@@ -98,8 +98,10 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 		Code:       entityType,
 		NewHref:    "/forms/" + entityType + "/new",
 		ImportHref: "/import/" + entityType,
+		ExportHref: "/export/" + entityType,
 		NewLabel:   h.catalog.T(locale, "dashboard.new_link"),
 		ImportLink: h.catalog.T(locale, "dashboard.import_link"),
+		ExportLink: h.catalog.T(locale, "dashboard.export_link"),
 		Empty:      h.catalog.T(locale, "list.empty"),
 	}
 	if totalPages > 1 {
@@ -175,8 +177,10 @@ type recordListView struct {
 	Rows       []recordRowView
 	NewHref    string
 	ImportHref string
+	ExportHref string
 	NewLabel   string
 	ImportLink string
+	ExportLink string
 	Empty      string
 	// PageLabel is "" when there's only one page (no pager to show) —
 	// PrevHref/NextHref are independently "" at whichever boundary has
@@ -197,7 +201,7 @@ type recordRowView struct {
 var recordListTmpl = template.Must(template.New("recordList").Parse(`
 <div class="uc-list-toolbar">
 <h1>{{.Name}} <span class="uc-menu-item-code">{{.Code}}</span></h1>
-<div><a href="{{.NewHref}}">{{.NewLabel}}</a> · <a href="{{.ImportHref}}">{{.ImportLink}}</a></div>
+<div><a href="{{.NewHref}}">{{.NewLabel}}</a> · <a href="{{.ImportHref}}">{{.ImportLink}}</a> · <a href="{{.ExportHref}}">{{.ExportLink}}</a></div>
 </div>
 {{if not .Rows}}
 <p class="uc-empty">{{.Empty}}</p>
