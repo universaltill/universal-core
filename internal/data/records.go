@@ -274,8 +274,15 @@ func (r *RecordRepo) UpdateTx(ctx context.Context, q querier, tenantID, entityTy
 	return 0, ErrVersionConflict
 }
 
+// Delete soft-deletes a record using the repo's own connection pool (no
+// caller-supplied transaction). Use DeleteTx when the write must be
+// atomic with another operation, such as an audit entry.
 func (r *RecordRepo) Delete(ctx context.Context, tenantID, entityType, id string) error {
-	res, err := r.db.ExecContext(ctx,
+	return r.DeleteTx(ctx, r.db, tenantID, entityType, id)
+}
+
+func (r *RecordRepo) DeleteTx(ctx context.Context, q querier, tenantID, entityType, id string) error {
+	res, err := q.ExecContext(ctx,
 		`UPDATE records SET deleted_at = now()
 		 WHERE id = $1 AND tenant_id = $2 AND entity_type = $3 AND deleted_at IS NULL`,
 		id, tenantID, entityType,

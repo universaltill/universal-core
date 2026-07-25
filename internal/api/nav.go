@@ -56,6 +56,11 @@ func (h *Handler) renderNav(r *http.Request, rc *httpx.RequestContext, locale st
 		// present (see foundation.go's own doc comment on it).
 		view.ShowIssueReport = true
 		view.IssueReportLabel = h.catalog.T(locale, "nav.report_issue")
+		// Same reasoning: BYOK AI-provider configuration isn't
+		// module-scoped either — AIProviderConnection is a foundation
+		// entity, always present (see aiprovidersettings.go).
+		view.ShowAIProviderSettings = true
+		view.AIProviderSettingsLabel = h.catalog.T(locale, "nav.ai_provider_settings")
 		if h.auth.Enabled() {
 			view.ShowLogout = true
 			view.LogoutLabel = h.catalog.T(locale, "nav.logout")
@@ -71,17 +76,19 @@ func (h *Handler) renderNav(r *http.Request, rc *httpx.RequestContext, locale st
 }
 
 type navView struct {
-	Brand            string
-	Locale           string
-	CurrentPath      string
-	Locales          []string
-	Modules          []moduleGroup
-	ShowApprovals    bool
-	ApprovalsLabel   string
-	ShowIssueReport  bool
-	IssueReportLabel string
-	ShowLogout       bool
-	LogoutLabel      string
+	Brand                   string
+	Locale                  string
+	CurrentPath             string
+	Locales                 []string
+	Modules                 []moduleGroup
+	ShowApprovals           bool
+	ApprovalsLabel          string
+	ShowIssueReport         bool
+	IssueReportLabel        string
+	ShowAIProviderSettings  bool
+	AIProviderSettingsLabel string
+	ShowLogout              bool
+	LogoutLabel             string
 }
 
 var navTmpl = template.Must(template.New("nav").Parse(`
@@ -90,6 +97,7 @@ var navTmpl = template.Must(template.New("nav").Parse(`
 {{range .Modules}}<a class="uc-nav-link" href="/modules/{{.Key}}">{{.Name}}</a>{{end}}
 {{if .ShowApprovals}}<a class="uc-nav-link" href="/workflow-jobs">{{.ApprovalsLabel}}</a>{{end}}
 {{if .ShowIssueReport}}<a class="uc-nav-link" href="/issue-report/new">{{.IssueReportLabel}}</a>{{end}}
+{{if .ShowAIProviderSettings}}<a class="uc-nav-link" href="/settings/ai-provider">{{.AIProviderSettingsLabel}}</a>{{end}}
 <span class="uc-nav-spacer"></span>
 {{if .ShowLogout}}<a class="uc-nav-link" href="/ui/logout">{{.LogoutLabel}}</a>{{end}}
 {{$path := .CurrentPath}}

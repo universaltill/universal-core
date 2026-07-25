@@ -22,6 +22,7 @@ import (
 	"github.com/universaltill/universal-core/internal/httpx"
 	"github.com/universaltill/universal-core/internal/i18n"
 	"github.com/universaltill/universal-core/internal/kernel/aiassist"
+	"github.com/universaltill/universal-core/internal/kernel/secretcrypt"
 	"github.com/universaltill/universal-core/internal/kernel/speechassist"
 	"github.com/universaltill/universal-core/internal/webauth"
 	"github.com/universaltill/universal-core/internal/worker"
@@ -57,6 +58,23 @@ func aiClientFromEnv() (client *aiassist.Client, url, model string) {
 func speechClientFromEnv() (client *speechassist.Client, url string) {
 	url = os.Getenv("WHISPER_URL")
 	return speechassist.NewClient(url), url
+}
+
+// secretCryptorFromEnv builds a secretcrypt.Cryptor from
+// SECRET_ENCRYPTION_KEY — a base64-encoded 32-byte AES-256 key. Empty is
+// the expected, safe default on a deployment that hasn't opted into the
+// AI-provider BYOK settings page (internal/api/aiprovidersettings.go):
+// that page itself refuses to store a tenant's own API key at all while
+// this is disabled, rather than ever falling back to storing one
+// unencrypted. A non-empty but malformed value is a real configuration
+// error and fails startup loudly, same reasoning webauthConfigFromEnv's
+// own doc comment gives for not silently ignoring a bad OIDC_* value.
+func secretCryptorFromEnv() *secretcrypt.Cryptor {
+	cryptor, err := secretcrypt.NewCryptor(os.Getenv("SECRET_ENCRYPTION_KEY"))
+	if err != nil {
+		log.Fatalf("configure secret encryption: %v", err)
+	}
+	return cryptor
 }
 
 // workerConfigFromEnv builds a worker.Config from WORKFLOW_* environment
@@ -184,7 +202,13 @@ func main() {
 	if speech.Enabled() {
 		log.Printf("Voice transcription enabled (WHISPER_URL=%s) — issue logger voice notes", whisperURL)
 	}
-	api.New(sqlDB, catalog, auth, ai, speech).Routes(mux)
+	secretCryptor := secretCryptorFromEnv()
+	if secretCryptor.Enabled() {
+		log.Printf("Secret encryption enabled — tenants may configure their own AI provider API keys")
+	} else {
+		log.Printf("SECRET_ENCRYPTION_KEY not set — the AI-provider settings page will refuse to store a tenant API key")
+	}
+	api.New(sqlDB, catalog, auth, ai, speech, secretCryptor).Routes(mux)
 
 	// The durable workflow job queue (internal/kernel/workflow.Queue) has
 	// existed since the definition-registry increment, but nothing ever

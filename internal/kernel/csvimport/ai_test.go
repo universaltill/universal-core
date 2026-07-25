@@ -64,7 +64,16 @@ func aiServer(t *testing.T, mappings []map[string]string) *httptest.Server {
 
 func TestSuggestMappingAI_DisabledClientReturnsExistingUnchanged(t *testing.T) {
 	existing := ColumnMapping{"PO No": "po_number"}
-	mapping, aiSuggested, err := SuggestMappingAI(context.Background(), nil,
+	// A typed nil, not a bare nil literal: SuggestMappingAI's ai parameter
+	// is the aiprovider.Provider interface (not a concrete *aiassist.
+	// Client) now that a caller may hand it any BYOK provider — a bare
+	// nil there would be a true nil interface (no dynamic type at all),
+	// and calling .Enabled() on that panics, unlike calling it on a
+	// typed-nil pointer whose Enabled() has a nil-safe receiver. Every
+	// real caller (internal/api's aiProviderFor) always returns a typed
+	// value, this test just has to mirror that same discipline.
+	var ai *aiassist.Client
+	mapping, aiSuggested, err := SuggestMappingAI(context.Background(), ai,
 		[]string{"PO No", "Vendor"}, nil, purchaseOrderDefForAI(), existing)
 	if err != nil {
 		t.Fatalf("expected no error from a disabled client, got %v", err)

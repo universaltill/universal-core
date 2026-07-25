@@ -30,6 +30,7 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/form"
 	"github.com/universaltill/universal-core/internal/kernel/formrender"
+	"github.com/universaltill/universal-core/internal/kernel/secretcrypt"
 	"github.com/universaltill/universal-core/internal/kernel/speechassist"
 	"github.com/universaltill/universal-core/internal/kernel/workflow"
 	"github.com/universaltill/universal-core/internal/webauth"
@@ -55,6 +56,12 @@ type Handler struct {
 	speech        *speechassist.Client
 	workflowQueue *workflow.Queue
 	reporting     *data.ReportingRepo
+	// secretCryptor is nil (Enabled() == false) unless
+	// SECRET_ENCRYPTION_KEY is configured — the AI-provider settings page
+	// (aiprovidersettings.go) refuses to store a tenant's own API key at
+	// all while this is disabled, rather than ever writing one to the
+	// database unencrypted (see secretcrypt's own doc comment).
+	secretCryptor *secretcrypt.Cryptor
 }
 
 // New builds a Handler. catalog is the i18n.Catalog forms (and the
@@ -65,8 +72,9 @@ type Handler struct {
 // comments). ai/speech may be nil — every caller of either (the import
 // wizard's mapping suggestion; the issue logger's voice transcription)
 // treats a disabled client as "AI assistance unavailable," never an
-// error.
-func New(db *sql.DB, catalog *i18n.Catalog, auth *webauth.Authenticator, ai *aiassist.Client, speech *speechassist.Client) *Handler {
+// error. secretCryptor may also be nil — see the Handler field's own
+// doc comment.
+func New(db *sql.DB, catalog *i18n.Catalog, auth *webauth.Authenticator, ai *aiassist.Client, speech *speechassist.Client, secretCryptor *secretcrypt.Cryptor) *Handler {
 	// nil handlers: same default no-op notify handler internal/worker's
 	// Runner gets from workflow.NewQueue — this Handler only ever calls
 	// Enqueue/ResumeAfterApproval, never ProcessOne, so no StepHandler of
@@ -92,6 +100,7 @@ func New(db *sql.DB, catalog *i18n.Catalog, auth *webauth.Authenticator, ai *aia
 		speech:        speech,
 		workflowQueue: workflowQueue,
 		reporting:     data.NewReportingRepo(db),
+		secretCryptor: secretCryptor,
 	}
 }
 
@@ -177,6 +186,14 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	// The mgmt reporting workbench (QUEUE.md's Ansar Group opportunity
 	// entry) — see reporting.go's doc comment.
 	mux.Handle("GET /reports/purchasing", auth(h.renderPurchasingReport))
+	// The BYOK AI-provider settings page — see aiprovidersettings.go's own
+	// doc comment. Not entity-scoped in the URL, same reasoning as
+	// /issue-report/*: AIProviderConnection is one fixed foundation
+	// entity a tenant upserts a single row of, not a generic
+	// per-entity-type route.
+	mux.Handle("GET /settings/ai-provider", auth(h.aiProviderSettingsPage))
+	mux.Handle("POST /settings/ai-provider", auth(h.aiProviderSettingsSave))
+	mux.Handle("POST /settings/ai-provider/clear", auth(h.aiProviderSettingsClear))
 }
 
 // requestContext fetches the httpx.RequestContext a preceding DevAuth (or
