@@ -15,6 +15,7 @@ import (
 	"flag"
 	"log"
 	"os"
+	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
@@ -75,6 +76,7 @@ func main() {
 	items := s.seedItems(uoms)
 	s.seedInventory(items)
 	s.seedPurchaseOrders(vendors, currencies, items)
+	s.seedGoodsReceipts()
 
 	log.Printf("demo data seeded for tenant %s (%d currencies, %d units, %d vendors, %d customers, %d items)",
 		*tenantID, len(currencies), len(uoms), len(vendors), len(customers), len(items))
@@ -279,26 +281,29 @@ func (s *seeder) seedInventory(items map[string]string) {
 // directly: creating POLines needs the parent's id first, and total is
 // only known after the lines exist, so each order still needs its own
 // create-then-update sequence — only the dedup check is shared.
+// statusID looks up a Status record by its code — purchasing.
+// PublishStatuses (called in main before any seeding) already seeded
+// these. Only one StatusType exists today (purchase_order_status), so a
+// plain code lookup is unambiguous; see that function's doc comment if a
+// second StatusType ever makes this need scoping by status_type_id too.
+// A seeder method (not a local closure inside seedPurchaseOrders) since
+// seedGoodsReceipts needs the exact same lookup to find already-
+// "received" orders.
+func (s *seeder) statusID(code string) string {
+	statusDef := s.def("Status")
+	recs, err := s.crud.ListByField(s.ctx, statusDef, s.tenantID, "code", code)
+	if err != nil {
+		log.Fatalf("list Status by code %q: %v", code, err)
+	}
+	if len(recs) == 0 {
+		log.Fatalf("no Status record for code %q (was purchasing.PublishStatuses run?)", code)
+	}
+	return recs[0].ID
+}
+
 func (s *seeder) seedPurchaseOrders(vendors, currencies, items map[string]string) {
 	poDef := s.def("PurchaseOrder")
 	lineDef := s.def("POLine")
-	statusDef := s.def("Status")
-
-	// purchasing.PublishStatuses (called in main before this) already
-	// seeded these by code — only one StatusType exists today
-	// (purchase_order_status), so a plain code lookup is unambiguous;
-	// see that function's doc comment if a second StatusType ever makes
-	// this need scoping by status_type_id too.
-	statusID := func(code string) string {
-		recs, err := s.crud.ListByField(s.ctx, statusDef, s.tenantID, "code", code)
-		if err != nil {
-			log.Fatalf("list Status by code %q: %v", code, err)
-		}
-		if len(recs) == 0 {
-			log.Fatalf("no Status record for code %q (was purchasing.PublishStatuses run?)", code)
-		}
-		return recs[0].ID
-	}
 
 	type line struct {
 		sku      string
@@ -338,7 +343,7 @@ func (s *seeder) seedPurchaseOrders(vendors, currencies, items map[string]string
 			"vendor_id":   vendors[o.vendor],
 			"currency_id": currencies[o.currency],
 			"order_date":  o.date,
-			"status_id":   statusID(o.status),
+			"status_id":   s.statusID(o.status),
 		}, s.actor)
 		if err != nil {
 			log.Fatalf("create PurchaseOrder for %s: %v", o.vendor, err)
@@ -364,9 +369,76 @@ func (s *seeder) seedPurchaseOrders(vendors, currencies, items map[string]string
 		expectedVersion := poID.Version
 		if _, err := s.crud.Update(s.ctx, poDef, s.tenantID, poID.ID, map[string]any{
 			"po_number": o.poNumber, "vendor_id": vendors[o.vendor], "currency_id": currencies[o.currency],
-			"order_date": o.date, "status_id": statusID(o.status), "total": total,
+			"order_date": o.date, "status_id": s.statusID(o.status), "total": total,
 		}, &expectedVersion, s.actor); err != nil {
 			log.Fatalf("update PurchaseOrder total: %v", err)
+		}
+	}
+}
+
+// seedGoodsReceipts gives every already-"received" PurchaseOrder
+// (PO-2026-0004, PO-2026-0005 in seedPurchaseOrders' own table above) a
+// real GoodsReceipt + one GoodsReceiptLine per POLine, received in full
+// 5 days after the order date — sample data that actually demonstrates
+// the entity purchasing.GoodsReceipt exists for, the same reasoning
+// seedParties gives for tagging PartyRole rather than leaving it empty.
+// Deliberately driven by querying PurchaseOrder's own status_id (not a
+// second hardcoded po_number list that could silently drift from
+// seedPurchaseOrders' table) — dedups on purchase_order_id, since
+// GoodsReceipt has no natural key of its own to getOrCreate against.
+// That dedup is existence-based, not completeness-based: if this
+// process died partway through a PO's lines (after creating the
+// GoodsReceipt but before all its GoodsReceiptLines), a re-run would
+// see the GoodsReceipt already exists and skip it rather than finishing
+// the missing lines. Accepted for demo-data tooling — no transaction
+// wraps this loop, same as every other seedX method in this file — but
+// worth knowing before assuming a re-run always "heals" a partial state.
+func (s *seeder) seedGoodsReceipts() {
+	poDef := s.def("PurchaseOrder")
+	lineDef := s.def("POLine")
+	grDef := s.def("GoodsReceipt")
+	grLineDef := s.def("GoodsReceiptLine")
+
+	received, err := s.crud.ListByField(s.ctx, poDef, s.tenantID, "status_id", s.statusID("received"))
+	if err != nil {
+		log.Fatalf("list received PurchaseOrders: %v", err)
+	}
+	for _, po := range received {
+		existing, err := s.crud.ListByField(s.ctx, grDef, s.tenantID, "purchase_order_id", po.ID)
+		if err != nil {
+			log.Fatalf("list GoodsReceipt by purchase_order_id: %v", err)
+		}
+		if len(existing) > 0 {
+			continue
+		}
+
+		orderDate, _ := po.Data["order_date"].(string)
+		receivedDate := orderDate
+		if t, err := time.Parse("2006-01-02", orderDate); err == nil {
+			receivedDate = t.AddDate(0, 0, 5).Format("2006-01-02")
+		}
+		gr, err := s.crud.Create(s.ctx, grDef, s.tenantID, map[string]any{
+			"purchase_order_id": po.ID,
+			"received_date":     receivedDate,
+			"notes":             "Received in full",
+		}, s.actor)
+		if err != nil {
+			log.Fatalf("create GoodsReceipt for PO %s: %v", po.ID, err)
+		}
+
+		lines, err := s.crud.ListByField(s.ctx, lineDef, s.tenantID, "purchase_order_id", po.ID)
+		if err != nil {
+			log.Fatalf("list POLine by purchase_order_id: %v", err)
+		}
+		for _, line := range lines {
+			if _, err := s.crud.Create(s.ctx, grLineDef, s.tenantID, map[string]any{
+				"goods_receipt_id": gr.ID,
+				"po_line_id":       line.ID,
+				"item_id":          line.Data["item_id"],
+				"qty_received":     line.Data["qty"],
+			}, s.actor); err != nil {
+				log.Fatalf("create GoodsReceiptLine for POLine %s: %v", line.ID, err)
+			}
 		}
 	}
 }

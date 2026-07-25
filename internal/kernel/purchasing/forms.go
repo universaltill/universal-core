@@ -99,7 +99,62 @@ func POLineForm() *form.Definition {
 // foundation.AllForms's doc comment for why this exists instead of a
 // second, separately-maintained list).
 func AllForms() []*form.Definition {
-	return []*form.Definition{ItemForm(), PurchaseOrderForm(), POLineForm(), InventoryItemForm()}
+	return []*form.Definition{
+		ItemForm(), PurchaseOrderForm(), POLineForm(), InventoryItemForm(),
+		GoodsReceiptForm(), GoodsReceiptLineForm(),
+	}
+}
+
+// GoodsReceiptForm's Lines section is a real master-detail (Target:
+// "GoodsReceiptLine"), same pattern as PurchaseOrderForm's own Lines
+// section — no RollUp here, unlike PurchaseOrder.total: a goods receipt
+// has no header total field of its own to roll a line sum into.
+func GoodsReceiptForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "GoodsReceipt",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Header",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "purchase_order_id", Label: "Purchase Order"},
+					{Name: "received_date", Label: "Received Date"},
+					{Name: "notes", Label: "Notes"},
+				},
+			},
+			{
+				Title:     "Lines",
+				Component: form.ComponentMasterDetail,
+				Target:    "GoodsReceiptLine",
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
+	}
+}
+
+func GoodsReceiptLineForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "GoodsReceiptLine",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Details",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "goods_receipt_id", Label: "Goods Receipt"},
+					{Name: "po_line_id", Label: "PO Line"},
+					{Name: "item_id", Label: "Item"},
+					{Name: "qty_received", Label: "Qty Received"},
+				},
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
+	}
 }
 
 func InventoryItemForm() *form.Definition {
