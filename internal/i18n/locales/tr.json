@@ -188,5 +188,7 @@
   "field.POLine.line_total": "Satır Toplamı",
   "field.InventoryItem.item_id": "Ürün",
   "field.InventoryItem.qty_on_hand": "Eldeki Miktar",
-  "field.InventoryItem.qty_available_to_promise": "Taahhüt Edilebilir Miktar"
+  "field.InventoryItem.qty_available_to_promise": "Taahhüt Edilebilir Miktar",
+  "toast.error_fallback": "Bir şeyler ters gitti. Lütfen tekrar deneyin.",
+  "toast.network_error": "Sunucuya ulaşılamadı. Bağlantınızı kontrol edip tekrar deneyin."
 }

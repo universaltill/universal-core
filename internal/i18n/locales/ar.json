@@ -188,5 +188,7 @@
   "field.POLine.line_total": "إجمالي البند",
   "field.InventoryItem.item_id": "الصنف",
   "field.InventoryItem.qty_on_hand": "الكمية المتوفرة",
-  "field.InventoryItem.qty_available_to_promise": "الكمية المتاحة للوعد"
+  "field.InventoryItem.qty_available_to_promise": "الكمية المتاحة للوعد",
+  "toast.error_fallback": "حدث خطأ ما. يرجى المحاولة مرة أخرى.",
+  "toast.network_error": "تعذر الوصول إلى الخادم. تحقق من اتصالك وحاول مرة أخرى."
 }

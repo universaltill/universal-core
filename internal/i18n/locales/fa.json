@@ -188,5 +188,7 @@
   "field.POLine.line_total": "جمع ردیف",
   "field.InventoryItem.item_id": "کالا",
   "field.InventoryItem.qty_on_hand": "موجودی فعلی",
-  "field.InventoryItem.qty_available_to_promise": "موجودی قابل تخصیص"
+  "field.InventoryItem.qty_available_to_promise": "موجودی قابل تخصیص",
+  "toast.error_fallback": "مشکلی پیش آمد. لطفاً دوباره تلاش کنید.",
+  "toast.network_error": "امکان دسترسی به سرور نبود. اتصال خود را بررسی کرده و دوباره تلاش کنید."
 }
