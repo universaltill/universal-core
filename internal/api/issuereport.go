@@ -230,7 +230,7 @@ type issueReportResultView struct {
 var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
 {{define "page"}}
 <div class="uc-issue-report">
-<form id="uc-issue-report-form" method="post" action="{{.SubmitHref}}">
+<form id="uc-issue-report-form" class="uc-form" method="post" action="{{.SubmitHref}}">
 <label for="uc-issue-title">{{.TitleLabel}}</label>
 <input type="text" id="uc-issue-title" name="title" required>
 
@@ -268,6 +268,26 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
     return;
   }
 
+  // extractErrorMessage reads httpx's own {"data":null,"error":"..."}
+  // envelope (internal/httpx/envelope.go) out of a failed response body
+  // and returns just the human message — the raw envelope text used to
+  // be dumped verbatim into statusEl on any failure (e.g. a disabled
+  // speechassist.Client's 503), showing a user the whole raw JSON
+  // envelope instead of a readable sentence. Falls back to the raw text
+  // only if it isn't the JSON shape this endpoint actually returns
+  // (never expected in practice, but safer than throwing here).
+  function extractErrorMessage(rawText) {
+    try {
+      var body = JSON.parse(rawText);
+      if (body && typeof body.error === "string" && body.error !== "") {
+        return body.error;
+      }
+    } catch (e) {
+      // Not JSON — fall through to the raw text.
+    }
+    return rawText;
+  }
+
   recordBtn.addEventListener("click", function() {
     if (!recording) {
       navigator.mediaDevices.getUserMedia({ audio: true }).then(function(stream) {
@@ -282,7 +302,7 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
           form.append("audio", blob, "note.webm");
           fetch({{.TranscribeHref}}, { method: "POST", body: form })
             .then(function(resp) {
-              if (!resp.ok) { return resp.text().then(function(t) { throw new Error(t); }); }
+              if (!resp.ok) { return resp.text().then(function(t) { throw new Error(extractErrorMessage(t)); }); }
               return resp.text();
             })
             .then(function(text) {
