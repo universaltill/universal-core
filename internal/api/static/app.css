@@ -175,6 +175,16 @@ a:hover {
   line-height: 1;
 }
 
+/* An entity-hub node's technical code sub-label (modulemenu.go) — the
+   module-switcher hub's own nodes never set Code, so this simply never
+   renders there. */
+.uc-hub-node-code {
+  display: block;
+  font-size: 0.7rem;
+  font-weight: 500;
+  opacity: 0.85;
+}
+
 a.uc-hub-node:hover {
   transform: translate(-50%, -50%) scale(1.06);
   text-decoration: none;
@@ -225,42 +235,11 @@ a.uc-hub-node:hover {
   margin: 0.75rem 0 1.25rem;
 }
 
-.uc-menu-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-}
-
-.uc-menu-item {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
-  padding: 0.75rem 1rem;
-  border: 1px solid var(--uc-border);
-  border-radius: 6px;
-  background: #fff;
-}
-
-.uc-menu-item-link {
-  font-weight: 600;
-}
-
 .uc-menu-item-code {
   color: var(--uc-muted);
   font-weight: 400;
   font-size: 0.8rem;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-}
-
-/* Legacy dashboard module tiles — still used by the module menu's
-   New/Import action row. */
-.uc-module-actions {
-  color: var(--uc-muted);
-  font-size: 0.85rem;
 }
 
 /* A module menu's own report link(s), e.g. Purchasing's "Reports"
