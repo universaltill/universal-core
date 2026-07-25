@@ -103,6 +103,39 @@ func (e *Engine) Update(ctx context.Context, def *entity.Definition, tenantID, i
 	return newVersion, nil
 }
 
+// Delete soft-deletes a record and writes an audit entry, atomically in
+// one transaction — same "audit is written from the same transaction as
+// the mutation, never bolted on after" discipline as Create/Update
+// (ADR-0001 §14). Its first real caller is the AI-provider settings
+// page's "revert to platform default" action (internal/api/
+// aiprovidersettings.go), deleting a tenant's own AIProviderConnection
+// override — not a generic per-entity-type route (there's no DELETE
+// exposed on /api/records yet).
+func (e *Engine) Delete(ctx context.Context, def *entity.Definition, tenantID, id string, actor audit.Actor) error {
+	tx, err := e.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // rollback is a no-op after a successful commit
+
+	if err := e.records.DeleteTx(ctx, tx, tenantID, def.EntityType, id); err != nil {
+		return fmt.Errorf("delete record: %w", err)
+	}
+
+	auditEntry, err := audit.New(tenantID, def.EntityType, id, audit.ActionDelete, actor, nil)
+	if err != nil {
+		return fmt.Errorf("build audit entry: %w", err)
+	}
+	if err := e.audit.Insert(ctx, tx, auditEntry); err != nil {
+		return fmt.Errorf("write audit entry: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+	return nil
+}
+
 func (e *Engine) Get(ctx context.Context, def *entity.Definition, tenantID, id string) (data.Record, error) {
 	return e.records.Get(ctx, tenantID, def.EntityType, id)
 }

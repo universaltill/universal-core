@@ -410,7 +410,7 @@ func testHandlerWithAI(t *testing.T, db *sql.DB, ai *aiassist.Client) *Handler {
 	if err != nil {
 		t.Fatalf("load i18n catalog: %v", err)
 	}
-	return New(db, catalog, nil, ai, nil)
+	return New(db, catalog, nil, ai, nil, nil)
 }
 
 // fakeAIServer stands in for Ollama's /api/generate, always returning
@@ -477,6 +477,63 @@ func TestImport_Preview_AIFillsGapsAndMarksSuggestedRows(t *testing.T) {
 	}
 	if strings.Count(body, "uc-ai-suggested") != 2 {
 		t.Fatalf("expected exactly 2 AI-suggested badges (one per AI-filled row), got:\n%s", body)
+	}
+}
+
+// TestImport_Preview_UsesTenantBYOKProviderInsteadOfPlatformDefault is
+// aiProviderFor's own end-to-end proof (import.go): once a tenant has
+// saved an AIProviderConnection override (aiprovidersettings.go), the
+// import wizard's mapping assist must call THAT server, not the
+// platform's own default h.ai — two separate fake Ollama-shaped servers
+// stand in for each, so this fails loud (wrong server called, or the
+// right one never is) if the resolver ever regresses to always using
+// h.ai regardless of what a tenant configured.
+func TestImport_Preview_UsesTenantBYOKProviderInsteadOfPlatformDefault(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+	publishFoundation(t, db, tenantID)
+	publishEntityAndForm(t, db, tenantID, orderEntityDef(), orderFormDef())
+
+	var platformCalled, tenantCalled bool
+	platformSrv := fakeAIServer(t, nil, &platformCalled)
+	defer platformSrv.Close()
+	tenantSrv := fakeAIServer(t, []map[string]string{
+		{"column": "Vendor Nm", "database_field": "vendor_id"},
+		{"column": "Order Dt", "database_field": "order_date"},
+	}, &tenantCalled)
+	defer tenantSrv.Close()
+
+	platformAI := aiassist.NewClient(platformSrv.URL, "llama3.2:3b")
+	mux := http.NewServeMux()
+	testHandlerWithAI(t, db, platformAI).Routes(mux)
+
+	saveForm := "provider=ollama&base_url=" + tenantSrv.URL + "&model=llama3.2:3b"
+	saveReq := newRequest("POST", "/settings/ai-provider", tenantID, "farshid", []byte(saveForm))
+	saveReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	saveRec := httptest.NewRecorder()
+	mux.ServeHTTP(saveRec, saveReq)
+	if saveRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 saving the tenant's AI provider override, got %d: %s", saveRec.Code, saveRec.Body.String())
+	}
+
+	csvContent := []byte("Vendor Nm,Order Dt\nAcme Textiles,2026-07-01\n")
+	req := newMultipartRequest(t, "/import/Order/preview", tenantID, "farshid", "orders.csv", csvContent, nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if platformCalled {
+		t.Fatal("expected the platform default AI server to NOT be called once a tenant override is configured")
+	}
+	if !tenantCalled {
+		t.Fatal("expected the tenant's own configured Ollama server to be called")
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `value="vendor_id" selected`) {
+		t.Fatalf("expected Vendor Nm -> vendor_id pre-selected from the tenant's own AI, got:\n%s", body)
 	}
 }
 

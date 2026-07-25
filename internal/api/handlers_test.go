@@ -201,7 +201,7 @@ func testHandler(t *testing.T, db *sql.DB) *Handler {
 	if err != nil {
 		t.Fatalf("load i18n catalog: %v", err)
 	}
-	return New(db, catalog, nil, nil, nil)
+	return New(db, catalog, nil, nil, nil, nil)
 }
 
 func newRequest(method, target, tenantID, actorID string, body []byte) *http.Request {

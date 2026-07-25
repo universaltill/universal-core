@@ -7,7 +7,7 @@ import (
 	"maps"
 	"strings"
 
-	"github.com/universaltill/universal-core/internal/kernel/aiassist"
+	"github.com/universaltill/universal-core/internal/kernel/aiprovider"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 )
 
@@ -95,6 +95,14 @@ type aiMappingResponse struct {
 // model. headers and sampleRows come from SampleRows/SampleRowsXLSX
 // (same row order, same column order).
 //
+// ai is the aiprovider.Provider interface, not a concrete client: the
+// caller (internal/api/import.go's aiProviderFor) resolves per request
+// to either the platform's own default aiassist.Client or a tenant's own
+// BYOK claudeassist/openaiassist client (internal/kernel/aiprovider's
+// own doc comment covers why this is the one intentionally-generic
+// exception among otherwise single-vendor sibling packages) — this
+// function itself has no idea which one it got, nor does it need to.
+//
 // Returns the augmented mapping plus aiSuggested, the subset of that
 // mapping's keys (CSV headers) whose value came from the AI rather than
 // existing — a caller (internal/api/import.go's mapping-table UI) uses
@@ -107,7 +115,7 @@ type aiMappingResponse struct {
 // or a response that doesn't parse is never fatal to the caller: this
 // always returns a valid, usable mapping (at minimum, existing
 // unchanged) alongside a non-nil err a caller may choose to log.
-func SuggestMappingAI(ctx context.Context, ai *aiassist.Client, headers []string, sampleRows [][]string, def *entity.Definition, existing ColumnMapping) (mapping ColumnMapping, aiSuggested map[string]bool, err error) {
+func SuggestMappingAI(ctx context.Context, ai aiprovider.Provider, headers []string, sampleRows [][]string, def *entity.Definition, existing ColumnMapping) (mapping ColumnMapping, aiSuggested map[string]bool, err error) {
 	mapping = make(ColumnMapping, len(existing))
 	maps.Copy(mapping, existing)
 	aiSuggested = map[string]bool{}

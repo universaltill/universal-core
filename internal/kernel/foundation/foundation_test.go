@@ -328,3 +328,34 @@ func TestIssueReport_RejectsUnknownStatus(t *testing.T) {
 		t.Fatal("expected error for a status value outside the declared enum")
 	}
 }
+
+func TestAIProviderConnection_RequiresProvider(t *testing.T) {
+	def := AIProviderConnection()
+	data := map[string]any{"model": "llama3.2:3b"}
+	if err := entity.ValidateRecord(def, data); err == nil {
+		t.Fatal("expected error for missing required provider")
+	}
+}
+
+func TestAIProviderConnection_RejectsUnknownProvider(t *testing.T) {
+	def := AIProviderConnection()
+	data := map[string]any{"provider": "gemini"}
+	if err := entity.ValidateRecord(def, data); err == nil {
+		t.Fatal("expected error for a provider value outside the declared enum (ollama/anthropic/openai)")
+	}
+}
+
+// TestAIProviderConnection_APIKeyEncryptedIsNotRequiredAtTheEntityLevel
+// confirms an Ollama-only connection (base_url, no api_key_encrypted at
+// all) is a valid record on its own — the "Anthropic/OpenAI need a key,
+// Ollama doesn't" rule is provider-conditional business logic that
+// belongs in internal/api's settings handler, not something
+// entity.Field can express (see AIProviderConnection's own doc comment
+// on why api_key_encrypted is deliberately not Required here).
+func TestAIProviderConnection_APIKeyEncryptedIsNotRequiredAtTheEntityLevel(t *testing.T) {
+	def := AIProviderConnection()
+	data := map[string]any{"provider": "ollama", "base_url": "http://localhost:11434", "model": "llama3.2:3b"}
+	if err := entity.ValidateRecord(def, data); err != nil {
+		t.Fatalf("expected an Ollama connection with no api_key_encrypted to be valid at the entity level, got %v", err)
+	}
+}
