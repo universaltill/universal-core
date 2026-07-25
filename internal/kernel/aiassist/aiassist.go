@@ -1,13 +1,18 @@
 // Package aiassist is a thin, generic client for a self-hosted Ollama
-// instance — the only kind of in-product AI this platform allows (no
-// paid third-party AI APIs in the product itself; Ollama/custom models
-// only, same rule as Universal Till). Nothing in this package knows
-// about any specific feature (import mapping, issue triage, ...) — it
-// only ever does "send a prompt plus a JSON Schema, get back a value
-// matching that schema," the same discipline every generic engine in
-// this kernel already follows (CLAUDE.md's kernel-boundary rule): a
-// feature package (internal/kernel/csvimport, say) builds the prompt
-// and interprets the result, this package never does.
+// instance — the platform's own default in-product AI (no paid third-
+// party AI APIs *required*; Ollama/custom models only, same rule as
+// Universal Till). A tenant may additionally opt into their own
+// Anthropic/OpenAI API key as a BYOK plugin (internal/kernel/
+// claudeassist, internal/kernel/openaiassist — see aiprovider.Provider,
+// the shared interface all three implement) — that's the customer's own
+// account, own cost, own data-sharing consent, never the product itself
+// depending on or paying for a third-party AI vendor. Nothing in this
+// package knows about any specific feature (import mapping, issue
+// triage, ...) — it only ever does "send a prompt plus a JSON Schema,
+// get back a value matching that schema," the same discipline every
+// generic engine in this kernel already follows (CLAUDE.md's kernel-
+// boundary rule): a feature package (internal/kernel/csvimport, say)
+// builds the prompt and interprets the result, this package never does.
 //
 // A *Client is advisory infrastructure, never a source of truth: every
 // caller must treat a nil/disabled Client, a timeout, or a malformed
@@ -24,7 +29,16 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"github.com/universaltill/universal-core/internal/kernel/aiprovider"
 )
+
+// Compile-time proof *Client actually satisfies aiprovider.Provider —
+// nothing else in this package depends on aiprovider at all, this line
+// exists purely so a signature drift here fails the build immediately
+// instead of surfacing as a confusing type error wherever a *Client is
+// first passed somewhere expecting the interface.
+var _ aiprovider.Provider = (*Client)(nil)
 
 // Client talks to one Ollama server. The zero value is unusable —
 // construct via NewClient, which is also where "no AI configured"

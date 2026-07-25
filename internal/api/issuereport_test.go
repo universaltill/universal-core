@@ -27,7 +27,7 @@ func testHandlerWithSpeech(t *testing.T, db *sql.DB, speech *speechassist.Client
 	if err != nil {
 		t.Fatalf("load i18n catalog: %v", err)
 	}
-	return New(db, catalog, nil, nil, speech)
+	return New(db, catalog, nil, nil, speech, nil)
 }
 
 func publishFoundation(t *testing.T, db *sql.DB, tenantID string) {

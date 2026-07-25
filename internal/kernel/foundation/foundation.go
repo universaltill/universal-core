@@ -371,6 +371,63 @@ func IssueReport() *entity.Definition {
 	}
 }
 
+// AIProviderConnection is a tenant's own configured AI backend for
+// text-generation-assisted features (currently: the import wizard's
+// column-mapping suggestion, internal/kernel/csvimport.
+// SuggestMappingAI) — a BYOK plugin, per internal/kernel/aiprovider's
+// own doc comment: the platform's own self-hosted Ollama instance stays
+// the default every tenant already gets for free; this is how a tenant
+// opts into their own Anthropic or OpenAI API key instead (their own
+// account, their own cost, their own explicit consent to that
+// provider's data handling), or into their own self-hosted Ollama
+// server (a laptop, a home server, their own cloud VM — anywhere they
+// control) instead of the platform's shared one.
+//
+// One row per tenant (an upsert, not a list — internal/api's settings
+// handler enforces that; the generic entity/crud layer has no unique-
+// constraint concept, same "application-level convention, not a DB
+// constraint" limitation purchasing.PurchaseOrder.po_number's own doc
+// comment already documents for this kernel).
+//
+// api_key_encrypted is never the plaintext key: internal/kernel/
+// secretcrypt encrypts it before internal/api's handler ever calls
+// crud.Engine.Create/Update, and the settings page never echoes it back
+// in plaintext after saving — see secretcrypt's own doc comment on why
+// this needed a real encrypted-at-rest mechanism instead of just
+// another plain FieldString like every other field in this kernel.
+// Deliberately not Required at the entity level (unlike IssueReport's
+// status field, say): whether it's needed at all depends on `provider`
+// (Ollama doesn't use it, Anthropic/OpenAI do) — conditional-on-another-
+// field validation isn't something entity.Field can express, so that
+// check lives in internal/api's settings handler instead, the same
+// "provider-specific business logic belongs in the feature layer, not
+// the generic entity engine" discipline every other per-provider
+// validation in this feature already follows.
+func AIProviderConnection() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "AIProviderConnection",
+		Version:    1,
+		Module:     "foundation",
+		Fields: []entity.Field{
+			{Name: "provider", Type: entity.FieldEnum, Required: true,
+				EnumValues: []string{"ollama", "anthropic", "openai"}},
+			// base_url: Ollama only (the tenant's own server address).
+			{Name: "base_url", Type: entity.FieldString},
+			// model: required in practice for every provider (enforced
+			// by the handler, not here — same conditional-on-provider
+			// reasoning as api_key_encrypted above) — deliberately no
+			// default for any provider: a tenant configuring their own
+			// Anthropic/OpenAI connection explicitly picks what they're
+			// paying for, this kernel doesn't guess a model name on
+			// their behalf.
+			{Name: "model", Type: entity.FieldString},
+			// api_key_encrypted: Anthropic/OpenAI only. See this
+			// function's own doc comment above.
+			{Name: "api_key_encrypted", Type: entity.FieldString},
+		},
+	}
+}
+
 // All returns every foundation Definition — the set that must exist
 // before any operational module is enabled for a tenant.
 func All() []*entity.Definition {
@@ -389,5 +446,6 @@ func All() []*entity.Definition {
 		Status(),
 		StatusTransition(),
 		IssueReport(),
+		AIProviderConnection(),
 	}
 }

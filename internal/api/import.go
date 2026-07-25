@@ -13,8 +13,11 @@ import (
 
 	"github.com/universaltill/universal-core/internal/httpx"
 	"github.com/universaltill/universal-core/internal/kernel/aiassist"
+	"github.com/universaltill/universal-core/internal/kernel/aiprovider"
+	"github.com/universaltill/universal-core/internal/kernel/claudeassist"
 	"github.com/universaltill/universal-core/internal/kernel/csvimport"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
+	"github.com/universaltill/universal-core/internal/kernel/openaiassist"
 )
 
 // maxUploadBytes bounds the whole multipart request body for an import
@@ -115,7 +118,8 @@ func (h *Handler) importPreview(w http.ResponseWriter, r *http.Request) {
 
 	submitted := mappingFromForm(r)
 
-	headers, mapping, aiSuggested, results, mappingErr, err := previewUpload(r.Context(), h.ai, data, xlsx, def, submitted)
+	ai := h.aiProviderFor(r.Context(), rc.TenantID)
+	headers, mapping, aiSuggested, results, mappingErr, err := previewUpload(r.Context(), ai, data, xlsx, def, submitted)
 	if err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, err.Error())
 		return
@@ -255,7 +259,7 @@ func readUploadedFile(w http.ResponseWriter, r *http.Request) (data []byte, xlsx
 // entries came from the AI pass, purely for the UI to visibly flag
 // those (still fully editable) rows as worth a closer look — see
 // buildMappingRows.
-func previewUpload(ctx context.Context, ai *aiassist.Client, data []byte, xlsx bool, def *entity.Definition, submitted csvimport.ColumnMapping) (headers []string, mapping csvimport.ColumnMapping, aiSuggested map[string]bool, results []csvimport.RowResult, mappingErr error, err error) {
+func previewUpload(ctx context.Context, ai aiprovider.Provider, data []byte, xlsx bool, def *entity.Definition, submitted csvimport.ColumnMapping) (headers []string, mapping csvimport.ColumnMapping, aiSuggested map[string]bool, results []csvimport.RowResult, mappingErr error, err error) {
 	var sampleRows [][]string
 	if xlsx {
 		headers, sampleRows, err = csvimport.SampleRowsXLSX(bytes.NewReader(data))
@@ -308,6 +312,78 @@ func previewUpload(ctx context.Context, ai *aiassist.Client, data []byte, xlsx b
 		return nil, nil, nil, nil, nil, err
 	}
 	return headers, mapping, aiSuggested, results, nil, nil
+}
+
+// aiProviderFor resolves which aiprovider.Provider a request for
+// tenantID should use for AI assistance: the tenant's own
+// AIProviderConnection override if one is configured (BYOK — see
+// aiprovidersettings.go), falling back to h.ai (the platform's own
+// default self-hosted Ollama) otherwise. Never returns nil: a caller can
+// always call .Enabled()/.GenerateJSON() on what comes back exactly like
+// it always could on h.ai alone (every concrete client's nil-safe
+// receiver contract — see aiassist/claudeassist/openaiassist's own doc
+// comments — means even a disabled fallback is safe to call through).
+//
+// Any failure resolving the override (a definition/list lookup error, or
+// a stored ciphertext this deployment's current SECRET_ENCRYPTION_KEY
+// can't decrypt — e.g. the key rotated since the tenant saved it)
+// degrades to the platform default, logged not surfaced: SuggestMappingAI
+// treats AI assistance as advisory-only regardless of which provider
+// backs it, so a tenant's broken BYOK config must never take down AI
+// assistance entirely when a perfectly good platform default is right
+// there.
+func (h *Handler) aiProviderFor(ctx context.Context, tenantID string) aiprovider.Provider {
+	def, err := h.entityDef(ctx, tenantID, "AIProviderConnection")
+	if err != nil {
+		return h.ai
+	}
+	records, err := h.crud.List(ctx, def, tenantID)
+	if err != nil {
+		log.Printf("api: resolve AI provider for tenant %s: list AIProviderConnection: %v", tenantID, err)
+		return h.ai
+	}
+	if len(records) == 0 {
+		return h.ai
+	}
+	fields := records[0].Data
+	provider, _ := fields["provider"].(string)
+	model, _ := fields["model"].(string)
+	switch provider {
+	case "ollama":
+		baseURL, _ := fields["base_url"].(string)
+		return aiassist.NewClient(baseURL, model)
+	case "anthropic":
+		key, ok := h.decryptStoredAPIKey(tenantID, fields)
+		if !ok {
+			return h.ai
+		}
+		return claudeassist.NewClient(key, model)
+	case "openai":
+		key, ok := h.decryptStoredAPIKey(tenantID, fields)
+		if !ok {
+			return h.ai
+		}
+		return openaiassist.NewClient(key, model)
+	default:
+		return h.ai
+	}
+}
+
+// decryptStoredAPIKey decrypts fields' api_key_encrypted for tenantID —
+// ok is false (never a stop-the-request error, see aiProviderFor's own
+// doc comment) when there's nothing to decrypt, this deployment has no
+// SECRET_ENCRYPTION_KEY configured, or decryption itself fails.
+func (h *Handler) decryptStoredAPIKey(tenantID string, fields map[string]any) (key string, ok bool) {
+	encrypted, _ := fields["api_key_encrypted"].(string)
+	if encrypted == "" || !h.secretCryptor.Enabled() {
+		return "", false
+	}
+	key, err := h.secretCryptor.Decrypt(encrypted)
+	if err != nil {
+		log.Printf("api: resolve AI provider for tenant %s: decrypt stored API key: %v", tenantID, err)
+		return "", false
+	}
+	return key, true
 }
 
 // mappingFromForm reconstructs a csvimport.ColumnMapping from the

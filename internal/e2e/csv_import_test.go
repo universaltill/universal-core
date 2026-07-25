@@ -158,7 +158,7 @@ func testServer(t *testing.T, db *sql.DB) (srv *httptest.Server, tenantID string
 		t.Fatalf("load i18n catalog: %v", err)
 	}
 	mux := http.NewServeMux()
-	api.New(db, catalog, nil, nil, nil).Routes(mux)
+	api.New(db, catalog, nil, nil, nil, nil).Routes(mux)
 	srv = httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv, id
