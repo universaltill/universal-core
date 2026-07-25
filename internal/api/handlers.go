@@ -30,6 +30,7 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/form"
 	"github.com/universaltill/universal-core/internal/kernel/formrender"
+	"github.com/universaltill/universal-core/internal/kernel/speechassist"
 	"github.com/universaltill/universal-core/internal/kernel/workflow"
 	"github.com/universaltill/universal-core/internal/webauth"
 )
@@ -47,7 +48,11 @@ type Handler struct {
 	// ai is nil (Enabled() == false) unless OLLAMA_URL is configured —
 	// see aiassist's own doc comment on why every caller can treat that
 	// as "AI assistance unavailable" without a separate nil check.
-	ai            *aiassist.Client
+	ai *aiassist.Client
+	// speech is nil (Enabled() == false) unless WHISPER_URL is
+	// configured — same nil-safe contract as ai, see speechassist's own
+	// doc comment.
+	speech        *speechassist.Client
 	workflowQueue *workflow.Queue
 	reporting     *data.ReportingRepo
 }
@@ -57,10 +62,11 @@ type Handler struct {
 // may be nil or disabled (webauth.Config.Enabled() == false) — Routes
 // wires it unconditionally either way, since Guard/Register are both
 // safe no-ops on a disabled Authenticator (see webauth's own doc
-// comments). ai may be nil — every caller of it (currently just the
-// import wizard's mapping suggestion) treats a disabled client as
-// "AI assistance unavailable," never an error.
-func New(db *sql.DB, catalog *i18n.Catalog, auth *webauth.Authenticator, ai *aiassist.Client) *Handler {
+// comments). ai/speech may be nil — every caller of either (the import
+// wizard's mapping suggestion; the issue logger's voice transcription)
+// treats a disabled client as "AI assistance unavailable," never an
+// error.
+func New(db *sql.DB, catalog *i18n.Catalog, auth *webauth.Authenticator, ai *aiassist.Client, speech *speechassist.Client) *Handler {
 	// nil handlers: same default no-op notify handler internal/worker's
 	// Runner gets from workflow.NewQueue — this Handler only ever calls
 	// Enqueue/ResumeAfterApproval, never ProcessOne, so no StepHandler of
@@ -83,6 +89,7 @@ func New(db *sql.DB, catalog *i18n.Catalog, auth *webauth.Authenticator, ai *aia
 		catalog:       catalog,
 		auth:          auth,
 		ai:            ai,
+		speech:        speech,
 		workflowQueue: workflowQueue,
 		reporting:     data.NewReportingRepo(db),
 	}
@@ -151,6 +158,12 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	mux.Handle("GET /import/{entityType}", auth(h.importUploadPage))
 	mux.Handle("POST /import/{entityType}/preview", auth(h.importPreview))
 	mux.Handle("POST /import/{entityType}/commit", auth(h.importCommit))
+	// The in-app issue logger — see issuereport.go's own doc comment.
+	// Not entity-scoped: IssueReport is one fixed foundation entity, not
+	// a generic-per-entity-type route the way /import is.
+	mux.Handle("GET /issue-report/new", auth(h.issueReportNewPage))
+	mux.Handle("POST /issue-report/transcribe", auth(h.issueReportTranscribe))
+	mux.Handle("POST /issue-report/submit", auth(h.issueReportSubmit))
 	// Resumes a job halted at a require_approval step — see workflow.go's
 	// doc comment. Not entity-scoped in the URL: a workflow_jobs row is
 	// tenant+id addressed, same as workflow_definitions being keyed by
