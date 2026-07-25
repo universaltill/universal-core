@@ -322,6 +322,55 @@ func StatusTransition() *entity.Definition {
 	}
 }
 
+// IssueReport is a user-submitted bug/feedback report from the in-app
+// issue logger — voice-note transcription (internal/kernel/speechassist,
+// a self-hosted Whisper ASR instance) plus typed context, captured and
+// stored as an ordinary record like anything else in this kernel rather
+// than a bespoke table: the generic entity/crud/audit machinery already
+// gives tenant scoping, an audit trail of who submitted what and when,
+// and a browsable list/form for free, for zero extra persistence code.
+//
+// Foundation, not an optional module: reporting a problem shouldn't
+// require a tenant to have licensed anything specific — every tenant
+// gets this the same way every tenant gets Party.
+//
+// Deliberately a plain FieldEnum status, not the Status/StatusType
+// pattern (see StatusType's own doc comment) — new -> triaged/dismissed
+// is a flat, three-state lifecycle with no real transition graph worth
+// declaring, unlike PurchaseOrder's actual multi-step flow. Per that
+// pattern's doc comment, opting in is a real per-entity decision, not
+// automatic just because the mechanism exists.
+//
+// Automatic GitHub issue filing (the original ask: "open an issue for
+// us maybe in the github issue") isn't wired yet — needs a GitHub
+// credential with issue-write access to the target repo, which per
+// this kernel's standing secret-creation discipline needs to be
+// explicitly authorized and provisioned, not created unilaterally. This
+// entity is the interim (and permanent, regardless — an audit trail of
+// every report ever submitted, filed or not) store; filing to GitHub is
+// a later step that would read from here, not replace it.
+func IssueReport() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "IssueReport",
+		Version:    1,
+		Module:     "foundation",
+		Fields: []entity.Field{
+			{Name: "title", Type: entity.FieldString, Required: true},
+			// description is the field a human actually reads: typed text
+			// plus the voice transcript appended, if there was one — see
+			// internal/api/issuereport.go's submit handler. transcript
+			// below keeps the raw, unedited ASR output separately so a
+			// human's own edits to description never lose the original.
+			{Name: "description", Type: entity.FieldString, Required: true},
+			{Name: "transcript", Type: entity.FieldString},
+			{Name: "page_url", Type: entity.FieldString},
+			{Name: "user_agent", Type: entity.FieldString},
+			{Name: "status", Type: entity.FieldEnum, Required: true,
+				EnumValues: []string{"new", "triaged", "dismissed"}, Default: "new"},
+		},
+	}
+}
+
 // All returns every foundation Definition — the set that must exist
 // before any operational module is enabled for a tenant.
 func All() []*entity.Definition {
@@ -339,5 +388,6 @@ func All() []*entity.Definition {
 		StatusType(),
 		Status(),
 		StatusTransition(),
+		IssueReport(),
 	}
 }

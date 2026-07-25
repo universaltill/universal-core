@@ -51,6 +51,11 @@ func (h *Handler) renderNav(r *http.Request, rc *httpx.RequestContext, locale st
 		// against any entity type a tenant has, per triggerWorkflows).
 		view.ShowApprovals = true
 		view.ApprovalsLabel = h.catalog.T(locale, "nav.approvals")
+		// Same reasoning: reporting a problem shouldn't require any
+		// particular module — IssueReport is a foundation entity, always
+		// present (see foundation.go's own doc comment on it).
+		view.ShowIssueReport = true
+		view.IssueReportLabel = h.catalog.T(locale, "nav.report_issue")
 		if h.auth.Enabled() {
 			view.ShowLogout = true
 			view.LogoutLabel = h.catalog.T(locale, "nav.logout")
@@ -66,15 +71,17 @@ func (h *Handler) renderNav(r *http.Request, rc *httpx.RequestContext, locale st
 }
 
 type navView struct {
-	Brand          string
-	Locale         string
-	CurrentPath    string
-	Locales        []string
-	Modules        []moduleGroup
-	ShowApprovals  bool
-	ApprovalsLabel string
-	ShowLogout     bool
-	LogoutLabel    string
+	Brand            string
+	Locale           string
+	CurrentPath      string
+	Locales          []string
+	Modules          []moduleGroup
+	ShowApprovals    bool
+	ApprovalsLabel   string
+	ShowIssueReport  bool
+	IssueReportLabel string
+	ShowLogout       bool
+	LogoutLabel      string
 }
 
 var navTmpl = template.Must(template.New("nav").Parse(`
@@ -82,6 +89,7 @@ var navTmpl = template.Must(template.New("nav").Parse(`
 <a class="uc-nav-brand" href="/">{{.Brand}}</a>
 {{range .Modules}}<a class="uc-nav-link" href="/modules/{{.Key}}">{{.Name}}</a>{{end}}
 {{if .ShowApprovals}}<a class="uc-nav-link" href="/workflow-jobs">{{.ApprovalsLabel}}</a>{{end}}
+{{if .ShowIssueReport}}<a class="uc-nav-link" href="/issue-report/new">{{.IssueReportLabel}}</a>{{end}}
 <span class="uc-nav-spacer"></span>
 {{if .ShowLogout}}<a class="uc-nav-link" href="/ui/logout">{{.LogoutLabel}}</a>{{end}}
 {{$path := .CurrentPath}}

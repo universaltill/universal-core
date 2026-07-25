@@ -410,7 +410,7 @@ func testHandlerWithAI(t *testing.T, db *sql.DB, ai *aiassist.Client) *Handler {
 	if err != nil {
 		t.Fatalf("load i18n catalog: %v", err)
 	}
-	return New(db, catalog, nil, ai)
+	return New(db, catalog, nil, ai, nil)
 }
 
 // fakeAIServer stands in for Ollama's /api/generate, always returning
