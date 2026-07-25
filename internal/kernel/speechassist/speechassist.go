@@ -22,6 +22,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -73,11 +74,26 @@ func (c *Client) Enabled() bool {
 // format the browser's MediaRecorder produced) to the Whisper server's
 // POST /asr endpoint and returns the plain-text transcript.
 //
+// language is an ISO-639-1-ish code (e.g. "en", "ar", "tr", "fa" — the
+// exact same codes this kernel's own i18n locales already use, see
+// internal/api/locale.go's supportedLocales) forwarded as the server's
+// own `language` query parameter; "" omits it entirely, letting the
+// server auto-detect. Found necessary in practice, not just in theory:
+// a short voice note (a few seconds) gives Whisper's language-ID very
+// little signal to work with, and the reference deployment runs the
+// smallest "base" model (see kubernetes/apps/whisper's own README) —
+// auto-detection on short, non-English audio against that model
+// unreliably settled on English rather than the language actually
+// spoken. A caller that already knows the speaker's language (e.g. the
+// issue logger, from the page's own current UI locale) should always
+// pass it — it costs nothing when right and fixes exactly this failure
+// mode when auto-detect would have guessed wrong.
+//
 // Deliberately returns a plain error, no retries — a network failure,
 // context deadline, or server error are all real, expected outcomes a
 // caller must treat as "transcription unavailable," the same contract
 // aiassist.Client.GenerateJSON already holds callers to.
-func (c *Client) Transcribe(ctx context.Context, audio io.Reader, filename string) (string, error) {
+func (c *Client) Transcribe(ctx context.Context, audio io.Reader, filename, language string) (string, error) {
 	if !c.Enabled() {
 		return "", fmt.Errorf("speechassist: client not configured")
 	}
@@ -100,9 +116,18 @@ func (c *Client) Transcribe(ctx context.Context, audio io.Reader, filename strin
 	// choice explicit rather than relying on the server's own default
 	// staying "txt" — task=transcribe (not "translate") since a voice
 	// bug report should stay in whatever language it was spoken, not
-	// get auto-translated to English.
+	// get auto-translated to English. language is only set when the
+	// caller actually supplied one (see this function's own doc comment)
+	// — an empty value would otherwise be sent as a literal
+	// "language=" query parameter, and per the server's own OpenAPI
+	// schema that's not the same as omitting it entirely (the parameter
+	// has no default value at all).
+	query := url.Values{"output": {"text"}, "task": {"transcribe"}}
+	if language != "" {
+		query.Set("language", language)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.baseURL+"/asr?output=text&task=transcribe", &body)
+		c.baseURL+"/asr?"+query.Encode(), &body)
 	if err != nil {
 		return "", fmt.Errorf("speechassist: build request: %w", err)
 	}
