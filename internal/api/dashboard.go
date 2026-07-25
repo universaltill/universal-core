@@ -62,17 +62,14 @@ func (h *Handler) writeDashboard(w http.ResponseWriter, r *http.Request, rc http
 		return
 	}
 
-	nodes, containerPx := hubLayout(modules, locale, h.catalog)
+	title := h.catalog.T(locale, "dashboard.title")
+	hub := hubLayout(modules, locale, h.catalog, title, h.catalog.T(locale, "module.coming_soon"))
 
 	var buf bytes.Buffer
 	err = dashboardTmpl.Execute(&buf, dashboardView{
-		Nodes:        nodes,
-		Title:        h.catalog.T(locale, "dashboard.title"),
-		Empty:        h.catalog.T(locale, "dashboard.empty"),
-		ComingSoon:   h.catalog.T(locale, "module.coming_soon"),
-		ContainerPx:  containerPx,
-		CenterPx:     containerPx / 2,
-		CenterSizePx: hubCenterSizePx,
+		Hub:   hub,
+		Title: title,
+		Empty: h.catalog.T(locale, "dashboard.empty"),
 	})
 	if err != nil {
 		writeInternalError(w, "render dashboard", err)
@@ -276,27 +273,130 @@ func moduleIcon(key string) string {
 // there actually are (2 real modules today, 14 total with placeholders)
 // without nodes overlapping.
 type dashboardView struct {
-	Nodes        []hubNode
-	Title        string
-	Empty        string
-	ComingSoon   string
-	ContainerPx  int
-	CenterPx     int
-	CenterSizePx int
+	Hub   hubView
+	Title string
+	Empty string
 }
 
-// hubNode is one positioned, colored module node — a real clickable
-// module (Href set) or a muted placeholder (Placeholder true, no Href).
+// hubNode is one positioned, colored node in a hub-and-spoke graphic — a
+// real clickable target (Href set) or a muted placeholder (Placeholder
+// true, no Href). Shared by two different hubs: the module switcher
+// (dashboard.go, nodes = modules the tenant has access to) and, since
+// Farshid asked for the same graphical/searchable treatment one level
+// deeper ("purchasing is only a list of menu... put them in a graphical
+// mode"), a module's own menu (modulemenu.go, nodes = entity types
+// inside that module) — one visual language throughout the app instead
+// of two implementations that could drift. Code/SearchKey are unused
+// (zero value) by the module switcher itself; a module's own entity hub
+// sets both (Code shown as a sub-label, SearchKey feeds the same
+// data-search filtering the flat list already had).
 type hubNode struct {
 	Key         string
 	Name        string
+	Code        string
 	Icon        string
 	Href        string
+	SearchKey   string
 	Placeholder bool
 	X, Y        int
 	SizePx      int
 	ColorIndex  int
 }
+
+// hubEntry is one not-yet-positioned candidate for layoutHubNodes —
+// the common shape both hubLayout (dashboard.go) and modulemenu.go's
+// own entity layout build before handing off to the shared geometry
+// engine.
+type hubEntry struct {
+	Key, Name, Code, Icon, Href, SearchKey string
+	Placeholder                            bool
+}
+
+// layoutHubNodes positions entries evenly around a circle sized to fit
+// them all without overlapping (see hubGeometry) — the shared geometry
+// engine behind both hubs described on hubNode's own doc comment.
+func layoutHubNodes(entries []hubEntry) ([]hubNode, int) {
+	n := len(entries)
+	containerPx, radiusPx, nodeSizePx := hubGeometry(n)
+	centerPx := containerPx / 2
+	nodes := make([]hubNode, n)
+	for i, e := range entries {
+		angleDeg := -90.0 + float64(i)*(360.0/float64(n))
+		rad := angleDeg * math.Pi / 180
+		nodes[i] = hubNode{
+			Key:         e.Key,
+			Name:        e.Name,
+			Code:        e.Code,
+			Icon:        e.Icon,
+			Href:        e.Href,
+			SearchKey:   e.SearchKey,
+			Placeholder: e.Placeholder,
+			X:           centerPx + int(float64(radiusPx)*math.Cos(rad)),
+			Y:           centerPx + int(float64(radiusPx)*math.Sin(rad)),
+			SizePx:      nodeSizePx,
+			ColorIndex:  i % hubColorCount,
+		}
+	}
+	return nodes, containerPx
+}
+
+// hubView is the data every hub-graphic page (dashboard.go,
+// modulemenu.go) renders via the shared "hub" template block —
+// see hubNode's own doc comment on why this is factored out rather than
+// duplicated. SearchPlaceholder is "" for the module-switcher hub (no
+// search box there today — few enough real+planned modules that one
+// isn't needed yet) and non-empty for a module's own entity hub.
+type hubView struct {
+	Nodes             []hubNode
+	CenterLabel       string
+	ComingSoon        string
+	SearchPlaceholder string
+	ContainerPx       int
+	CenterPx          int
+	CenterSizePx      int
+}
+
+// hubTmpl holds the one shared "hub" block both dashboardTmpl and
+// modulemenu.go's own template render via {{template "hub" .Hub}} —
+// html/template requires an associated template to already exist by
+// name in the *same* template.Template value a Parse call is attached
+// to, so this is parsed once here and reused as the base every other
+// hub-rendering template.Must(...).Parse(...) call parses its own
+// content into (Go's html/template.Parse *adds* to an existing
+// template set rather than replacing it, which is exactly what makes
+// this composition work).
+var hubTmpl = template.Must(template.New("hub").Parse(`
+{{define "hub"}}
+{{if .SearchPlaceholder}}
+<input type="text" class="uc-menu-search" placeholder="{{.SearchPlaceholder}}"
+  oninput="document.querySelectorAll('[data-search]').forEach(function(el){
+    el.style.display = el.dataset.search.indexOf(this.value.toLowerCase()) === -1 ? 'none' : '';
+  }, this)">
+{{end}}
+<div class="uc-hub-wrap">
+<div class="uc-hub" style="width:{{.ContainerPx}}px;height:{{.ContainerPx}}px;">
+<svg class="uc-hub-lines" width="{{.ContainerPx}}" height="{{.ContainerPx}}">
+{{$center := .CenterPx}}
+{{range .Nodes}}<line data-search="{{.SearchKey}}" x1="{{$center}}" y1="{{$center}}" x2="{{.X}}" y2="{{.Y}}"></line>{{end}}
+</svg>
+<div class="uc-hub-center" style="left:{{.CenterPx}}px;top:{{.CenterPx}}px;width:{{.CenterSizePx}}px;height:{{.CenterSizePx}}px;">{{.CenterLabel}}</div>
+{{$comingSoon := .ComingSoon}}
+{{range .Nodes}}
+{{if .Placeholder}}
+<div class="uc-hub-node uc-hub-node-placeholder" data-search="{{.SearchKey}}" style="left:{{.X}}px;top:{{.Y}}px;width:{{.SizePx}}px;height:{{.SizePx}}px;">
+<span class="uc-hub-node-icon">{{.Icon}}</span>{{.Name}}
+<span class="uc-hub-node-badge">{{$comingSoon}}</span>
+</div>
+{{else}}
+<a class="uc-hub-node uc-hub-node-{{.ColorIndex}}" data-search="{{.SearchKey}}" href="{{.Href}}" style="left:{{.X}}px;top:{{.Y}}px;width:{{.SizePx}}px;height:{{.SizePx}}px;">
+<span class="uc-hub-node-icon">{{.Icon}}</span>{{.Name}}{{if .Code}}<span class="uc-hub-node-code">{{.Code}}</span>{{end}}
+</a>
+{{end}}
+{{end}}
+</div>
+</div>
+{{end}}
+`))
 
 // hubColorCount is how many distinct node colors static/app.css
 // defines (.uc-hub-node-0 .. .uc-hub-node-9) — cycled by index,
@@ -335,82 +435,46 @@ func hubGeometry(n int) (containerPx, radiusPx, nodeSizePx int) {
 // hubLayout combines real modules with plannedModuleKeys (skipping any
 // planned key a real module already owns — a real module always wins
 // its slot, never duplicated as also-a-placeholder) and lays every node
-// out evenly spaced around a circle starting at 12 o'clock.
-func hubLayout(modules []moduleGroup, locale string, catalog *i18n.Catalog) ([]hubNode, int) {
+// out evenly spaced around a circle starting at 12 o'clock, via the
+// shared layoutHubNodes engine (see hubNode's own doc comment).
+func hubLayout(modules []moduleGroup, locale string, catalog *i18n.Catalog, centerLabel, comingSoon string) hubView {
 	real := make(map[string]bool, len(modules))
 	for _, m := range modules {
 		real[m.Key] = true
 	}
 
-	type entry struct {
-		key, name, icon string
-		href            string
-		placeholder     bool
-	}
-	entries := make([]entry, 0, len(modules)+len(plannedModuleKeys))
+	entries := make([]hubEntry, 0, len(modules)+len(plannedModuleKeys))
 	for _, m := range modules {
-		entries = append(entries, entry{key: m.Key, name: m.Name, icon: m.Icon, href: "/modules/" + m.Key})
+		entries = append(entries, hubEntry{Key: m.Key, Name: m.Name, Icon: m.Icon, Href: "/modules/" + m.Key})
 	}
 	for _, key := range plannedModuleKeys {
 		if real[key] {
 			continue
 		}
-		entries = append(entries, entry{
-			key:         key,
-			name:        catalog.T(locale, "module."+key+".name"),
-			icon:        moduleIcon(key),
-			placeholder: true,
+		entries = append(entries, hubEntry{
+			Key:         key,
+			Name:        catalog.T(locale, "module."+key+".name"),
+			Icon:        moduleIcon(key),
+			Placeholder: true,
 		})
 	}
 
-	n := len(entries)
-	containerPx, radiusPx, nodeSizePx := hubGeometry(n)
-	centerPx := containerPx / 2
-	nodes := make([]hubNode, n)
-	for i, e := range entries {
-		angleDeg := -90.0 + float64(i)*(360.0/float64(n))
-		rad := angleDeg * math.Pi / 180
-		nodes[i] = hubNode{
-			Key:         e.key,
-			Name:        e.name,
-			Icon:        e.icon,
-			Href:        e.href,
-			Placeholder: e.placeholder,
-			X:           centerPx + int(float64(radiusPx)*math.Cos(rad)),
-			Y:           centerPx + int(float64(radiusPx)*math.Sin(rad)),
-			SizePx:      nodeSizePx,
-			ColorIndex:  i % hubColorCount,
-		}
+	nodes, containerPx := layoutHubNodes(entries)
+	return hubView{
+		Nodes:        nodes,
+		CenterLabel:  centerLabel,
+		ComingSoon:   comingSoon,
+		ContainerPx:  containerPx,
+		CenterPx:     containerPx / 2,
+		CenterSizePx: hubCenterSizePx,
 	}
-	return nodes, containerPx
 }
 
-var dashboardTmpl = template.Must(template.New("dashboard").Parse(`
+var dashboardTmpl = template.Must(hubTmpl.New("dashboard").Parse(`
 <h1>{{.Title}}</h1>
-{{if not .Nodes}}
+{{if not .Hub.Nodes}}
 <p>{{.Empty}}</p>
 {{else}}
-<div class="uc-hub-wrap">
-<div class="uc-hub" style="width:{{.ContainerPx}}px;height:{{.ContainerPx}}px;">
-<svg class="uc-hub-lines" width="{{.ContainerPx}}" height="{{.ContainerPx}}">
-{{$center := .CenterPx}}
-{{range .Nodes}}<line x1="{{$center}}" y1="{{$center}}" x2="{{.X}}" y2="{{.Y}}"></line>{{end}}
-</svg>
-<div class="uc-hub-center" style="left:{{.CenterPx}}px;top:{{.CenterPx}}px;width:{{.CenterSizePx}}px;height:{{.CenterSizePx}}px;">{{.Title}}</div>
-{{$comingSoon := .ComingSoon}}
-{{range .Nodes}}
-{{if .Placeholder}}
-<div class="uc-hub-node uc-hub-node-placeholder" style="left:{{.X}}px;top:{{.Y}}px;width:{{.SizePx}}px;height:{{.SizePx}}px;">
-<span class="uc-hub-node-icon">{{.Icon}}</span>{{.Name}}
-<span class="uc-hub-node-badge">{{$comingSoon}}</span>
-</div>
-{{else}}
-<a class="uc-hub-node uc-hub-node-{{.ColorIndex}}" href="{{.Href}}" style="left:{{.X}}px;top:{{.Y}}px;width:{{.SizePx}}px;height:{{.SizePx}}px;">
-<span class="uc-hub-node-icon">{{.Icon}}</span>{{.Name}}
-</a>
-{{end}}
-{{end}}
-</div>
-</div>
+{{template "hub" .Hub}}
 {{end}}
 `))

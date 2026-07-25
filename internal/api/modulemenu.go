@@ -17,16 +17,32 @@ import (
 // or-code box inside a module's own menu (SAP's transaction-code search,
 // Odoo's app search), not just a flat unfiltered list.
 //
-// Each row shows both a translated display name (locale.go's
+// Graphical since 2026-07-26: originally a plain <ul>, changed after
+// Farshid compared it directly to the dashboard's own hub-and-spoke
+// module switcher ("the main page menu is amazing but when I go to
+// purchasing... that is only a list of menu... put them in graphical
+// mode and searchable") — this now renders each entity type as its own
+// node in the exact same hub graphic (dashboard.go's hubNode/hubView/
+// layoutHubNodes/hubTmpl), centered on the module's own name instead of
+// the app's, so "graphical, connected-node menu" reads as one visual
+// language throughout the app rather than the dashboard being a special
+// case. Search still works the same way it always did (data-search
+// substring match, filtering which nodes stay visible) — see hubTmpl's
+// own doc comment for why that JS moved there once two different pages
+// needed the identical behavior.
+//
+// Each node shows both a translated display name (locale.go's
 // entityDisplayName, via "entity.{EntityType}.name") and its technical
-// code (the raw EntityType, e.g. "PurchaseOrder") — search matches
-// either, in any locale, matching "search by name and code" the way a
-// real ERP's quick-search does (SAP's transaction-code search, Odoo's
-// app search) rather than only matching one language's label. Filtering
-// is a few lines of plain JS in the page itself (see moduleMenuTmpl) —
-// no framework, matching this kernel's general dependency-light
-// preference — not a server round trip, since the whole list is already
-// on the page.
+// code (the raw EntityType, e.g. "PurchaseOrder") as a sub-label —
+// search matches either, in any locale, matching "search by name and
+// code" the way a real ERP's quick-search does (SAP's transaction-code
+// search, Odoo's app search) rather than only matching one language's
+// label. A node's own New/Import/Export shortcuts were dropped in this
+// change (the flat list used to show them inline per row) — the entity's
+// own list page (listview.go) already has all three in its toolbar, the
+// same one click further away a module-switcher node's own target page
+// already requires, so nothing this menu previously linked to became
+// unreachable.
 func (h *Handler) renderModuleMenu(w http.ResponseWriter, r *http.Request) {
 	rc, ok := requestContext(w, r)
 	if !ok {
@@ -60,26 +76,13 @@ func (h *Handler) renderModuleMenu(w http.ResponseWriter, r *http.Request) {
 	}
 
 	view := moduleMenuView{
-		Name:              group.Name,
-		SearchPlaceholder: h.catalog.T(locale, "modulemenu.search_placeholder"),
-		NewLabel:          h.catalog.T(locale, "dashboard.new_link"),
-		ImportLink:        h.catalog.T(locale, "dashboard.import_link"),
+		Name: group.Name,
+		Hub:  entityHubLayout(h, locale, group.Name, group.Entities),
 	}
 	for _, link := range moduleReportLinks[key] {
 		view.Reports = append(view.Reports, moduleMenuReport{
 			Label: h.catalog.T(locale, link.LabelKey),
 			Href:  link.Href,
-		})
-	}
-	for _, e := range group.Entities {
-		name := h.entityDisplayName(locale, e.EntityType)
-		view.Entities = append(view.Entities, moduleMenuEntity{
-			Name:       name,
-			Code:       e.EntityType,
-			SearchKey:  strings.ToLower(name + " " + e.EntityType),
-			ListHref:   "/records/" + e.EntityType,
-			NewHref:    "/forms/" + e.EntityType + "/new",
-			ImportHref: "/import/" + e.EntityType,
 		})
 	}
 
@@ -94,6 +97,70 @@ func (h *Handler) renderModuleMenu(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// entityHubLayout builds the hub graphic for one module's entity types —
+// the same layoutHubNodes geometry engine the dashboard's own module
+// switcher uses, centered on the module's own name rather than the
+// app's. No placeholder/"coming soon" nodes here (unlike the dashboard):
+// there's no equivalent "planned but not built yet" concept at the
+// entity-type level, every node is a real, clickable target.
+func entityHubLayout(h *Handler, locale, centerLabel string, entities []moduleEntity) hubView {
+	entries := make([]hubEntry, len(entities))
+	for i, e := range entities {
+		name := h.entityDisplayName(locale, e.EntityType)
+		entries[i] = hubEntry{
+			Key:       e.EntityType,
+			Name:      name,
+			Code:      e.EntityType,
+			Icon:      entityIcon(e.EntityType),
+			Href:      "/records/" + e.EntityType,
+			SearchKey: strings.ToLower(name + " " + e.EntityType),
+		}
+	}
+	nodes, containerPx := layoutHubNodes(entries)
+	return hubView{
+		Nodes:             nodes,
+		CenterLabel:       centerLabel,
+		SearchPlaceholder: h.catalog.T(locale, "modulemenu.search_placeholder"),
+		ContainerPx:       containerPx,
+		CenterPx:          containerPx / 2,
+		CenterSizePx:      hubCenterSizePx,
+	}
+}
+
+// entityIcons is a plain emoji per known entity type — same "zero-
+// dependency, good enough to read as graphical/colorful" reasoning as
+// dashboard.go's moduleIcons, one level deeper. An entity type with no
+// mapping (a module this kernel doesn't have icons picked for yet) falls
+// back to a generic document icon rather than an empty/broken node.
+var entityIcons = map[string]string{
+	"Party":                "👤",
+	"PartyRole":            "🎭",
+	"PartyRelationship":    "🔗",
+	"Address":              "📍",
+	"ContactMechanism":     "☎️",
+	"Attachment":           "📎",
+	"UnitOfMeasure":        "📏",
+	"UomConversion":        "🔁",
+	"Currency":             "💱",
+	"ExchangeRate":         "💹",
+	"StatusType":           "🚦",
+	"Status":               "🏷️",
+	"StatusTransition":     "➡️",
+	"IssueReport":          "🐛",
+	"AIProviderConnection": "🤖",
+	"Item":                 "📦",
+	"PurchaseOrder":        "🧾",
+	"POLine":               "📝",
+	"InventoryItem":        "🗄️",
+}
+
+func entityIcon(entityType string) string {
+	if icon, ok := entityIcons[entityType]; ok {
+		return icon
+	}
+	return "📄"
+}
+
 // moduleReportLinks are hand-declared report pages that live one level
 // inside a module's menu rather than being a browsable/importable entity
 // type of their own (a report is a read-only view over other entities'
@@ -106,12 +173,9 @@ var moduleReportLinks = map[string][]struct{ LabelKey, Href string }{
 }
 
 type moduleMenuView struct {
-	Name              string
-	SearchPlaceholder string
-	NewLabel          string
-	ImportLink        string
-	Reports           []moduleMenuReport
-	Entities          []moduleMenuEntity
+	Name    string
+	Hub     hubView
+	Reports []moduleMenuReport
 }
 
 type moduleMenuReport struct {
@@ -119,32 +183,12 @@ type moduleMenuReport struct {
 	Href  string
 }
 
-type moduleMenuEntity struct {
-	Name       string
-	Code       string
-	SearchKey  string
-	ListHref   string
-	NewHref    string
-	ImportHref string
-}
-
-var moduleMenuTmpl = template.Must(template.New("moduleMenu").Parse(`
+var moduleMenuTmpl = template.Must(hubTmpl.New("moduleMenu").Parse(`
 <h1>{{.Name}}</h1>
 {{if .Reports}}
 <p class="uc-module-reports">
 {{range .Reports}}<a href="{{.Href}}">{{.Label}}</a> {{end}}
 </p>
 {{end}}
-<input type="text" class="uc-menu-search" placeholder="{{.SearchPlaceholder}}"
-  oninput="document.querySelectorAll('.uc-menu-item').forEach(function(el){
-    el.style.display = el.dataset.search.indexOf(this.value.toLowerCase()) === -1 ? 'none' : '';
-  }, this)">
-<ul class="uc-menu-list">
-{{range .Entities}}
-<li class="uc-menu-item" data-search="{{.SearchKey}}">
-<a class="uc-menu-item-link" href="{{.ListHref}}">{{.Name}} <span class="uc-menu-item-code">{{.Code}}</span></a>
-<span class="uc-module-actions"><a href="{{.NewHref}}">{{$.NewLabel}}</a> · <a href="{{.ImportHref}}">{{$.ImportLink}}</a></span>
-</li>
-{{end}}
-</ul>
+{{template "hub" .Hub}}
 `))
