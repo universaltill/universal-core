@@ -149,6 +149,76 @@ func InventoryItem() *entity.Definition {
 	}
 }
 
+// GoodsReceipt is the physical arrival of goods against a PurchaseOrder
+// (reference-data-model.md §2, UBL `ReceiptAdvice`) — the next real step
+// this module's own doc comment already named as future work ("the
+// staged lead-time timestamps... those are laid on top of this base
+// model, not part of it"; this is the base-model piece itself, not the
+// staged-timestamp layer). Deliberately its own document, not just
+// PurchaseOrder.status_id reaching "received": a real PO is routinely
+// received in more than one physical delivery (partial shipments,
+// especially for the import-heavy, multi-country sourcing pattern
+// the design partner's own evidence describes — reference-data-model.md's design-partner
+// cross-check explicitly quotes their Inventory Manager asking for GRN
+// auto-population from a purchase invoice), so "received" needs to be a
+// repeatable event with its own record, not a single header flag.
+//
+// No status field of its own (unlike PurchaseOrder) — a goods receipt
+// records something that already happened (goods physically arrived);
+// there's no draft/approval lifecycle to gate before that fact is true,
+// so a StatusType/StatusTransition seed (PublishStatuses' own pattern)
+// would be pure ceremony with no real transition to enforce.
+//
+// Deliberately NOT built in this pass, a real next step not forgotten
+// (QUEUE.md): actually incrementing InventoryItem.qty_on_hand when a
+// GoodsReceiptLine is created. That's a genuine business-logic side
+// effect (concurrency-safe, idempotent against re-edits) worth its own
+// careful pass, not something to bolt onto a first CRUD slice — this
+// entity is real, tenant-visible, importable/reportable data on its own
+// even before that wiring exists, the same way POLine was useful before
+// PurchaseOrder.total's roll-up existed.
+func GoodsReceipt() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "GoodsReceipt",
+		Version:    1,
+		Module:     "purchasing",
+		Fields: []entity.Field{
+			{Name: "purchase_order_id", Type: entity.FieldReference, Required: true, Target: "PurchaseOrder"},
+			{Name: "received_date", Type: entity.FieldDate, Required: true},
+			{Name: "notes", Type: entity.FieldString},
+		},
+		Relationships: []entity.Relationship{
+			// Same master-detail pattern as PurchaseOrder/POLine — see
+			// that Relationship's own doc comment on why ParentField
+			// exists (internal/api/handlers.go's loadMasterDetailChildren
+			// looks this up by name, not by convention).
+			{Name: "lines", Kind: entity.RelationComposition, Target: "GoodsReceiptLine", ParentField: "goods_receipt_id"},
+		},
+	}
+}
+
+// GoodsReceiptLine is one received item + qty against a specific POLine
+// — the composition child of GoodsReceipt (reference-data-model.md §2).
+// item_id is carried alongside po_line_id (not derived by looking up
+// po_line_id.item_id at read time) for the same reason POLine carries
+// its own item_id rather than only a line-number: every other entity in
+// this kernel that references an Item does so directly, and a report or
+// CSV import over GoodsReceiptLine shouldn't need a join through POLine
+// just to know what was actually received.
+func GoodsReceiptLine() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "GoodsReceiptLine",
+		Version:    1,
+		Module:     "purchasing",
+		Fields: []entity.Field{
+			{Name: "goods_receipt_id", Type: entity.FieldReference, Required: true, Target: "GoodsReceipt"},
+			{Name: "po_line_id", Type: entity.FieldReference, Required: true, Target: "POLine"},
+			{Name: "item_id", Type: entity.FieldReference, Required: true, Target: "Item"},
+			{Name: "qty_received", Type: entity.FieldNumber, Required: true},
+		},
+	}
+}
+
 // All returns every Definition this module adds — the set a tenant gets
 // once Purchasing is one of their licensed modules (seed.go's Publish).
 func All() []*entity.Definition {
@@ -157,5 +227,7 @@ func All() []*entity.Definition {
 		PurchaseOrder(),
 		POLine(),
 		InventoryItem(),
+		GoodsReceipt(),
+		GoodsReceiptLine(),
 	}
 }
