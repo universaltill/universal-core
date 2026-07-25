@@ -709,7 +709,7 @@ func (h *Handler) renderForm(w http.ResponseWriter, r *http.Request, id string) 
 		return
 	}
 	nav := h.renderNav(r, &rc, locale)
-	if err := renderShell(w, locale, nav, template.HTML(buf.String())); err != nil {
+	if err := h.renderShell(w, locale, nav, template.HTML(buf.String())); err != nil {
 		log.Printf("api: render %s form shell (id=%q): %v", entityType, id, err)
 	}
 }

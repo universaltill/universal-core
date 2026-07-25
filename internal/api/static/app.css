@@ -420,3 +420,32 @@ button.uc-btn {
 button.uc-btn:hover {
   opacity: 0.9;
 }
+
+/* Global htmx-error toast (see layout.go's shellTmpl doc comment) —
+   fixed top-right, hidden until .uc-toast-visible is added, so a failed
+   htmx request (a validation 400, a version-conflict 409, a network
+   failure) is always visibly reported somewhere on screen instead of
+   the click just appearing to do nothing. */
+.uc-toast {
+  position: fixed;
+  top: 1rem;
+  inset-inline-end: 1rem;
+  max-width: 24rem;
+  background: #b42318;
+  color: #fff;
+  padding: 0.75rem 1rem;
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+  font-size: 0.92rem;
+  z-index: 1000;
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(-0.5rem);
+  transition: opacity 0.15s ease, transform 0.15s ease, visibility 0.15s;
+}
+
+.uc-toast-visible {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(0);
+}

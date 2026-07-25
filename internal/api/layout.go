@@ -99,6 +99,23 @@ func serveCSS(w http.ResponseWriter, r *http.Request) {
 // strings translated but the surrounding layout still reading the wrong
 // direction is arguably worse than not translating at all. See
 // locale.go's localeDir.
+//
+// The trailing <script> is a global htmx:responseError/htmx:sendError
+// listener — every htmx-driven form submission or button in this kernel
+// (formrender's own <form>, the import wizard, the workflow inbox's
+// Approve button, the AI-provider settings form) used to fail
+// completely silently on a non-2xx response: htmx only swaps a 2xx
+// response into the DOM by default, so a validation 400, a version-
+// conflict 409, or a network failure just... did nothing visible, the
+// user's click appeared to do nothing at all (QUEUE.md flagged this
+// directly: "a visible error/toast on a version conflict or failed
+// approve in the htmx UI"). Wired once, here, rather than per-page:
+// every page already goes through this one shell, so a single
+// body-level listener (htmx:responseError bubbles from whatever element
+// made the failing request up to document.body — see htmx's own event
+// docs) covers every current and future htmx surface in this kernel
+// with no per-page opt-in needed, the same "one shared thing" reasoning
+// appCSS/htmxJS already apply to CSS/JS themselves.
 var shellTmpl = template.Must(template.New("shell").Parse(fmt.Sprintf(`<!doctype html>
 <html lang="{{.Lang}}" dir="{{.Dir}}">
 <head>
@@ -111,6 +128,46 @@ var shellTmpl = template.Must(template.New("shell").Parse(fmt.Sprintf(`<!doctype
 <main class="uc-container">
 {{.Body}}
 </main>
+<script>
+(function() {
+  var toastEl = null;
+  function ensureToast() {
+    if (toastEl) { return toastEl; }
+    toastEl = document.createElement("div");
+    toastEl.id = "uc-toast";
+    toastEl.className = "uc-toast";
+    toastEl.setAttribute("role", "alert");
+    document.body.appendChild(toastEl);
+    return toastEl;
+  }
+  function showToast(message) {
+    var el = ensureToast();
+    el.textContent = message;
+    el.classList.add("uc-toast-visible");
+    window.clearTimeout(el._ucHideTimer);
+    el._ucHideTimer = window.setTimeout(function() {
+      el.classList.remove("uc-toast-visible");
+    }, 6000);
+  }
+  document.body.addEventListener("htmx:responseError", function(evt) {
+    var xhr = evt.detail && evt.detail.xhr;
+    var message = {{.ToastFallback}};
+    if (xhr && xhr.responseText) {
+      try {
+        var body = JSON.parse(xhr.responseText);
+        if (body && body.error) { message = body.error; }
+      } catch (e) {
+        // Not a JSON envelope (e.g. a plain-text 401/413 body) — the
+        // generic fallback message stands.
+      }
+    }
+    showToast(message);
+  });
+  document.body.addEventListener("htmx:sendError", function() {
+    showToast({{.ToastNetworkError}});
+  });
+})();
+</script>
 </body>
 </html>
 `, appCSSPath)))
@@ -120,6 +177,13 @@ type shellView struct {
 	Dir  string
 	Nav  template.HTML
 	Body template.HTML
+	// ToastFallback/ToastNetworkError feed the global error-toast script
+	// above — translated via h.catalog, same as every other user-facing
+	// string in this kernel (CLAUDE.md's "no hardcoded user-facing
+	// strings" rule applies just as much to this JS-embedded text as to
+	// any Go-rendered HTML).
+	ToastFallback     string
+	ToastNetworkError string
 }
 
 // renderShell writes fragment wrapped in shellTmpl, with nav as the
@@ -128,10 +192,22 @@ type shellView struct {
 // renderNav, fragment from formrender/importTmpl/dashboardTmpl, all
 // html/template output), not raw user input — passed as template.HTML
 // deliberately, the same trust boundary formrender's own Render already
-// crossed once for this exact content.
-func renderShell(w http.ResponseWriter, locale string, nav, fragment template.HTML) error {
+// crossed once for this exact content. A Handler method (not a free
+// function) specifically so it can look up the toast strings via
+// h.catalog itself, rather than every one of its ~10 callers needing to
+// pass two more translated strings through their own signature for
+// something that has nothing to do with what each of those pages is
+// actually rendering.
+func (h *Handler) renderShell(w http.ResponseWriter, locale string, nav, fragment template.HTML) error {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	view := shellView{Lang: locale, Dir: localeDir(locale), Nav: nav, Body: fragment}
+	view := shellView{
+		Lang:              locale,
+		Dir:               localeDir(locale),
+		Nav:               nav,
+		Body:              fragment,
+		ToastFallback:     h.catalog.T(locale, "toast.error_fallback"),
+		ToastNetworkError: h.catalog.T(locale, "toast.network_error"),
+	}
 	if err := shellTmpl.Execute(w, view); err != nil {
 		return fmt.Errorf("render page shell: %w", err)
 	}
