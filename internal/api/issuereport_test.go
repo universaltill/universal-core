@@ -193,6 +193,43 @@ func TestIssueReport_Transcribe_ReturnsTranscript(t *testing.T) {
 	}
 }
 
+// TestIssueReport_Transcribe_ForwardsCurrentUILocaleAsLanguageHint is the
+// real-server-request-shape proof for the bug Farshid reported ("it
+// works but only in english"): the page's own current UI locale
+// (Arabic, here) must actually reach speechassist as a language hint,
+// not be silently dropped — see speechassist.Client.Transcribe's own
+// doc comment on why leaving this to the Whisper server's auto-detect
+// was unreliable for a short recording.
+func TestIssueReport_Transcribe_ForwardsCurrentUILocaleAsLanguageHint(t *testing.T) {
+	db := testDB(t)
+	withDevAuthEnabled(t)
+	tenantID := seedTenant(t, db)
+
+	var gotLanguage string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotLanguage = r.URL.Query().Get("language")
+		_ = r.ParseMultipartForm(1 << 20)
+		w.Write([]byte("هذا هو النص"))
+	}))
+	defer srv.Close()
+	speech := speechassist.NewClient(srv.URL)
+
+	mux := http.NewServeMux()
+	testHandlerWithSpeech(t, db, speech).Routes(mux)
+
+	req := newAudioUploadRequest(t, "/issue-report/transcribe", tenantID, "farshid", []byte("fake audio bytes"))
+	req.AddCookie(&http.Cookie{Name: localeCookie, Value: "ar"})
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if gotLanguage != "ar" {
+		t.Fatalf("expected the current UI locale (ar) forwarded as the language hint, got %q", gotLanguage)
+	}
+}
+
 // TestIssueReport_Submit_CreatesRecordAndItsQueryable is the core
 // end-to-end proof: submitting the form actually creates a real
 // IssueReport record (tenant-scoped, audit-tracked, via the exact same

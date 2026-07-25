@@ -120,7 +120,16 @@ func (h *Handler) issueReportTranscribe(w http.ResponseWriter, r *http.Request) 
 	if filename == "" {
 		filename = "note.webm"
 	}
-	transcript, err := h.speech.Transcribe(r.Context(), file, filename)
+	// The page's own current UI locale is the best language hint this
+	// handler has for what the recording is actually spoken in — see
+	// speechassist.Client.Transcribe's own doc comment on why leaving
+	// this to the server's auto-detect was unreliable for a short
+	// recording against the reference deployment's smallest model.
+	// localeFromRequest never mutates anything on a POST with no
+	// "?lang=" query param (this endpoint's URL never carries one) —
+	// it only reads the existing locale cookie the page load already set.
+	locale := localeFromRequest(w, r)
+	transcript, err := h.speech.Transcribe(r.Context(), file, filename, locale)
 	if err != nil {
 		writeInternalError(w, "transcribe voice note", err)
 		return
