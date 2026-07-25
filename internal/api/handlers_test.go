@@ -939,7 +939,7 @@ func TestAPI_Dashboard_ShowsHubNodePerModule(t *testing.T) {
 	if !strings.Contains(body, `<script src="/static/htmx.min.js"></script>`) {
 		t.Fatalf("expected the dashboard to load htmx.js like every other page navigation, got:\n%s", body)
 	}
-	if !strings.Contains(body, `class="uc-hub-node uc-hub-node-0" href="/modules/general"`) {
+	if !strings.Contains(body, `class="uc-hub-node uc-hub-node-0" data-search="" href="/modules/general"`) {
 		t.Fatalf("expected a hub node linking to the general module, got:\n%s", body)
 	}
 	if !strings.Contains(body, `class="uc-hub-lines"`) {
@@ -1047,11 +1047,19 @@ func TestAPI_Dashboard_RealModuleTakesOverPlaceholderSlot(t *testing.T) {
 	}
 }
 
-// TestAPI_ModuleMenu_ShowsEntitiesWithSearchAndActions is the regression
-// test for the page a hub node/nav link actually lands on: a searchable
-// menu of the module's own entity types, each with New/Import links —
-// the level the old flat dashboard used to put directly on "/".
-func TestAPI_ModuleMenu_ShowsEntitiesWithSearchAndActions(t *testing.T) {
+// TestAPI_ModuleMenu_ShowsEntitiesAsSearchableHubNodes confirms the
+// graphical module menu (modulemenu.go, changed 2026-07-26 from a flat
+// <ul> to the same hub-and-spoke graphic the dashboard's own module
+// switcher uses — Farshid: "purchasing is only a list of menu... put
+// them in graphical mode and searchable"): each entity type renders as
+// its own hub node (icon, translated name, technical code sub-label),
+// still filterable by the same search box, still linking to the
+// entity's own list page. New/Import are no longer shown inline here
+// (dropped along with the flat list) — reachable one click further, via
+// that list page's own toolbar (listview.go), same distance the
+// dashboard's own module nodes already put every entity-level action
+// behind.
+func TestAPI_ModuleMenu_ShowsEntitiesAsSearchableHubNodes(t *testing.T) {
 	db := testDB(t)
 	withDevAuthEnabled(t)
 	tenantID := seedTenant(t, db)
@@ -1074,14 +1082,11 @@ func TestAPI_ModuleMenu_ShowsEntitiesWithSearchAndActions(t *testing.T) {
 	if !strings.Contains(body, `data-search="vendor vendor"`) {
 		t.Fatalf("expected a lowercased searchable key combining Vendor's display name and code, got:\n%s", body)
 	}
-	if !strings.Contains(body, `href="/records/Vendor"`) {
-		t.Fatalf("expected a link to Vendor's list page, got:\n%s", body)
+	if !strings.Contains(body, `class="uc-hub-node uc-hub-node-0" data-search="vendor vendor" href="/records/Vendor"`) {
+		t.Fatalf("expected Vendor rendered as its own hub node linking to its list page, got:\n%s", body)
 	}
-	if !strings.Contains(body, `href="/forms/Vendor/new"`) {
-		t.Fatalf("expected a link to the Vendor form, got:\n%s", body)
-	}
-	if !strings.Contains(body, `href="/import/Vendor"`) {
-		t.Fatalf("expected a link to the Vendor import wizard, got:\n%s", body)
+	if !strings.Contains(body, `<span class="uc-hub-node-code">Vendor</span>`) {
+		t.Fatalf("expected Vendor's technical code shown as the node's sub-label, got:\n%s", body)
 	}
 }
 
@@ -2155,7 +2160,7 @@ func TestAPI_ModuleMenu_ShowsTranslatedEntityNames(t *testing.T) {
 	if !strings.Contains(body, "طرف") {
 		t.Fatalf("expected Party's Arabic display name, got:\n%s", body)
 	}
-	if !strings.Contains(body, `<span class="uc-menu-item-code">Party</span>`) {
+	if !strings.Contains(body, `<span class="uc-hub-node-code">Party</span>`) {
 		t.Fatalf("expected Party's technical code shown alongside its name, got:\n%s", body)
 	}
 }
