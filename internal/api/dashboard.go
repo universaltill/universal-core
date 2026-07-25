@@ -79,7 +79,7 @@ func (h *Handler) writeDashboard(w http.ResponseWriter, r *http.Request, rc http
 		return
 	}
 	nav := h.renderNav(r, &rc, locale)
-	if err := renderShell(w, locale, nav, template.HTML(buf.String())); err != nil {
+	if err := h.renderShell(w, locale, nav, template.HTML(buf.String())); err != nil {
 		writeInternalError(w, "render dashboard shell", err)
 	}
 }
@@ -111,7 +111,7 @@ func (h *Handler) renderWelcome(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	nav := h.renderNav(r, nil, locale)
-	if err := renderShell(w, locale, nav, template.HTML(buf.String())); err != nil {
+	if err := h.renderShell(w, locale, nav, template.HTML(buf.String())); err != nil {
 		writeInternalError(w, "render welcome shell", err)
 	}
 }

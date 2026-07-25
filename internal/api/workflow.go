@@ -241,7 +241,7 @@ func (h *Handler) renderWorkflowInbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	nav := h.renderNav(r, &rc, locale)
-	if err := renderShell(w, locale, nav, template.HTML(buf.String())); err != nil {
+	if err := h.renderShell(w, locale, nav, template.HTML(buf.String())); err != nil {
 		writeInternalError(w, "render workflow inbox shell", err)
 	}
 }

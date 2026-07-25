@@ -188,5 +188,7 @@
   "field.POLine.line_total": "Line Total",
   "field.InventoryItem.item_id": "Item",
   "field.InventoryItem.qty_on_hand": "Qty On Hand",
-  "field.InventoryItem.qty_available_to_promise": "Qty Available to Promise"
+  "field.InventoryItem.qty_available_to_promise": "Qty Available to Promise",
+  "toast.error_fallback": "Something went wrong. Please try again.",
+  "toast.network_error": "Couldn't reach the server. Check your connection and try again."
 }
