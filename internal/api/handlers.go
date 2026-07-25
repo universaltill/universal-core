@@ -167,6 +167,9 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	mux.Handle("GET /import/{entityType}", auth(h.importUploadPage))
 	mux.Handle("POST /import/{entityType}/preview", auth(h.importPreview))
 	mux.Handle("POST /import/{entityType}/commit", auth(h.importCommit))
+	// The exporter half of Farshid's original "importer exporter
+	// plugins" ask — see export.go's own doc comment.
+	mux.Handle("GET /export/{entityType}", auth(h.exportRecordsCSV))
 	// The in-app issue logger — see issuereport.go's own doc comment.
 	// Not entity-scoped: IssueReport is one fixed foundation entity, not
 	// a generic-per-entity-type route the way /import is.

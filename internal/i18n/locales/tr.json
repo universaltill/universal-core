@@ -20,6 +20,7 @@
   "dashboard.empty": "Bu kiracı için henüz kullanılabilir modül yok.",
   "dashboard.new_link": "Yeni",
   "dashboard.import_link": "İçe Aktar",
+  "dashboard.export_link": "Dışa Aktar",
   "welcome.sign_in_prompt": "Modüllerinizi görmek için oturum açın.",
   "welcome.sign_in_link": "Oturum aç",
   "welcome.dev_auth_hint": "Henüz oturum yok. Bu dağıtımda geliştirici kimlik doğrulaması etkin — devam etmek için X-Tenant-ID ve X-Actor-ID isteği başlıklarını gönderin.",
