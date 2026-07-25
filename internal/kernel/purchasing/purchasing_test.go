@@ -16,7 +16,10 @@ func TestAllPurchasingDefinitionsAreValid(t *testing.T) {
 }
 
 func TestAllPurchasingFormsAreValid(t *testing.T) {
-	forms := []*form.Definition{ItemForm(), PurchaseOrderForm(), POLineForm(), InventoryItemForm()}
+	forms := []*form.Definition{
+		ItemForm(), PurchaseOrderForm(), POLineForm(), InventoryItemForm(),
+		GoodsReceiptForm(), GoodsReceiptLineForm(),
+	}
 	for _, f := range forms {
 		if err := f.Validate(); err != nil {
 			t.Fatalf("%s: expected valid form definition, got %v", f.EntityType, err)
@@ -175,6 +178,86 @@ func TestInventoryItem_MissingRequiredItemID(t *testing.T) {
 	data := map[string]any{"qty_on_hand": float64(5), "qty_available_to_promise": float64(5)}
 	if err := entity.ValidateRecord(def, data); err == nil {
 		t.Fatal("expected error for missing required item_id")
+	}
+}
+
+// TestGoodsReceipt_ReferencesPurchaseOrder confirms GoodsReceipt links
+// back to the PurchaseOrder it's receiving against — the whole point of
+// this entity existing rather than just a status flag (this package's
+// own doc comment on GoodsReceipt).
+func TestGoodsReceipt_ReferencesPurchaseOrder(t *testing.T) {
+	def := GoodsReceipt()
+	f, ok := def.FieldByName("purchase_order_id")
+	if !ok || f.Type != entity.FieldReference || f.Target != "PurchaseOrder" || !f.Required {
+		t.Fatalf("expected a Required purchase_order_id FieldReference targeting PurchaseOrder, got %+v", f)
+	}
+}
+
+func TestGoodsReceipt_MissingRequiredReceivedDate(t *testing.T) {
+	def := GoodsReceipt()
+	data := map[string]any{"purchase_order_id": "po-1"}
+	if err := entity.ValidateRecord(def, data); err == nil {
+		t.Fatal("expected error for missing required received_date")
+	}
+}
+
+func TestGoodsReceipt_HasCompositionRelationshipToLines(t *testing.T) {
+	def := GoodsReceipt()
+	if len(def.Relationships) != 1 {
+		t.Fatalf("expected exactly one relationship, got %d", len(def.Relationships))
+	}
+	rel := def.Relationships[0]
+	if rel.Kind != entity.RelationComposition || rel.Target != "GoodsReceiptLine" || rel.ParentField != "goods_receipt_id" {
+		t.Fatalf("expected a composition relationship to GoodsReceiptLine via goods_receipt_id, got %+v", rel)
+	}
+}
+
+// TestGoodsReceiptLine_ReferencesParentPOLineAndItem confirms the line
+// carries both its own goods_receipt_id (the master-detail parent) and
+// po_line_id (which specific ordered line this receipt is against) plus
+// item_id directly — see this package's own doc comment on
+// GoodsReceiptLine for why item_id isn't only derivable through po_line_id.
+func TestGoodsReceiptLine_ReferencesParentPOLineAndItem(t *testing.T) {
+	def := GoodsReceiptLine()
+	for _, tc := range []struct {
+		field, target string
+	}{
+		{"goods_receipt_id", "GoodsReceipt"},
+		{"po_line_id", "POLine"},
+		{"item_id", "Item"},
+	} {
+		f, ok := def.FieldByName(tc.field)
+		if !ok || f.Type != entity.FieldReference || f.Target != tc.target || !f.Required {
+			t.Fatalf("expected a Required %s FieldReference targeting %s, got %+v", tc.field, tc.target, f)
+		}
+	}
+}
+
+func TestGoodsReceiptLine_MissingRequiredQtyReceived(t *testing.T) {
+	def := GoodsReceiptLine()
+	data := map[string]any{"goods_receipt_id": "gr-1", "po_line_id": "poline-1", "item_id": "item-1"}
+	if err := entity.ValidateRecord(def, data); err == nil {
+		t.Fatal("expected error for missing required qty_received")
+	}
+}
+
+// TestGoodsReceiptForm_MasterDetailTargetsGoodsReceiptLine mirrors
+// TestPurchaseOrderForm_RollsUpLineTotalsIntoTotal's own reasoning, minus
+// the roll-up check — GoodsReceipt has no header total field for a line
+// sum to roll into (this package's own doc comment on GoodsReceiptForm).
+func TestGoodsReceiptForm_MasterDetailTargetsGoodsReceiptLine(t *testing.T) {
+	f := GoodsReceiptForm()
+	var lines *form.Section
+	for i := range f.Sections {
+		if f.Sections[i].Component == form.ComponentMasterDetail {
+			lines = &f.Sections[i]
+		}
+	}
+	if lines == nil {
+		t.Fatal("expected a master-detail section")
+	}
+	if lines.Target != "GoodsReceiptLine" {
+		t.Fatalf("expected master-detail target GoodsReceiptLine, got %s", lines.Target)
 	}
 }
 
