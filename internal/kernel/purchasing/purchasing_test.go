@@ -27,6 +27,38 @@ func TestAllPurchasingFormsAreValid(t *testing.T) {
 	}
 }
 
+// TestAllPurchasingFormFieldsExistOnTheirEntity closes the same gap
+// foundation's own equivalent test (internal/kernel/foundation/
+// foundation_test.go) does: form.Definition.Validate() never cross-
+// checks a FormField.Name against the target entity's real fields, so a
+// typo'd/stale field name here would pass Validate() cleanly and only
+// fail at real render time (formrender.Render's "form field %q has no
+// matching field on entity %q" error) the first time someone opens that
+// form. Skips ComponentMasterDetail/ComponentRelatedList sections (their
+// Fields is always empty — see form.Section's own doc comment; they're
+// keyed by Target, a different entity type's fields entirely, not
+// something to validate against this form's own EntityType).
+func TestAllPurchasingFormFieldsExistOnTheirEntity(t *testing.T) {
+	entityDefs := map[string]*entity.Definition{}
+	for _, def := range All() {
+		entityDefs[def.EntityType] = def
+	}
+	for _, f := range AllForms() {
+		def, ok := entityDefs[f.EntityType]
+		if !ok {
+			t.Errorf("form %s targets an entity type not in All()", f.EntityType)
+			continue
+		}
+		for _, section := range f.Sections {
+			for _, ff := range section.Fields {
+				if _, ok := def.FieldByName(ff.Name); !ok {
+					t.Errorf("%s form section %q references field %q, which doesn't exist on the %s entity", f.EntityType, section.Title, ff.Name, f.EntityType)
+				}
+			}
+		}
+	}
+}
+
 func TestItem_DefaultsToStockType(t *testing.T) {
 	def := Item()
 	f, ok := def.FieldByName("item_type")
