@@ -2,15 +2,16 @@ package foundation
 
 import "github.com/universaltill/universal-core/internal/kernel/form"
 
-// PartyForm is the first Form Definition for a foundation entity —
+// PartyForm was the first Form Definition for a foundation entity —
 // Party specifically, since every module depends on it (see this
 // package's own doc comment). Deliberately not published by Publish()
 // above: a Form Definition is a presentation-layer choice, not the
 // "always present, every module needs it to exist at all" guarantee
 // ADR-0001 §8 makes for the entities themselves, so it doesn't belong in
-// the same all-foundation-entities lifecycle. Other foundation entities
-// don't have a form yet; add one here as each is actually needed by a
-// real screen, rather than building all of them speculatively now.
+// the same all-foundation-entities lifecycle. Every other foundation
+// entity now has one too (AllForms' own doc comment below covers why
+// that took until 2026-07-26 and what gap it closed) — this file no
+// longer has a "not built yet" foundation entity left.
 func PartyForm() *form.Definition {
 	return &form.Definition{
 		EntityType: "Party",
@@ -74,6 +75,292 @@ func IssueReportForm() *form.Definition {
 // separately-maintained list a caller could forget to update (exactly
 // the gap that left every form unpublished in production until
 // PublishForms existed at all).
+//
+// The remaining 12 foundation entities' forms were added 2026-07-26,
+// closing a real gap this doc comment's own earlier wording ("add one
+// here as each is actually needed") had left open far longer than
+// intended: accessibleModules (internal/api/dashboard.go) only shows an
+// entity in the module hub/menu once BOTH its entity Definition AND its
+// Form Definition are published — every foundation entity without a
+// form here was completely invisible in the UI (no module-menu node, no
+// /forms/{entityType}/new|{id} route reachable) despite being real,
+// already-seeded, already-referenced data (Currency and UnitOfMeasure in
+// particular are actively created by cmd/seed-demo-data and referenced
+// by Item/PurchaseOrder, yet had no way to view or edit a single one
+// through the app itself). AIProviderConnection is the one deliberate,
+// still-standing exception — see its own doc comment in foundation.go:
+// a generic form would render its encrypted API key as a plain text
+// box, so its settings page is bespoke and stays that way.
 func AllForms() []*form.Definition {
-	return []*form.Definition{PartyForm(), IssueReportForm()}
+	return []*form.Definition{
+		PartyForm(), IssueReportForm(),
+		PartyRoleForm(), PartyRelationshipForm(), AddressForm(), ContactMechanismForm(),
+		AttachmentForm(), UnitOfMeasureForm(), UomConversionForm(), CurrencyForm(),
+		ExchangeRateForm(), StatusTypeForm(), StatusForm(), StatusTransitionForm(),
+	}
+}
+
+func PartyRoleForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "PartyRole",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Details",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "party_id", Label: "Party"},
+					{Name: "role_type", Label: "Role"},
+				},
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
+	}
+}
+
+func PartyRelationshipForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "PartyRelationship",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Details",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "party_id_from", Label: "From Party"},
+					{Name: "party_id_to", Label: "To Party"},
+					{Name: "relationship_type", Label: "Relationship"},
+				},
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
+	}
+}
+
+func AddressForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "Address",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Details",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "party_id", Label: "Party"},
+					{Name: "address_type", Label: "Type"},
+					{Name: "line1", Label: "Address Line 1"},
+					{Name: "line2", Label: "Address Line 2"},
+					{Name: "city", Label: "City"},
+					{Name: "region", Label: "Region"},
+					{Name: "postal_code", Label: "Postal Code"},
+					{Name: "country_code", Label: "Country Code"},
+					{Name: "is_primary", Label: "Primary"},
+				},
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
+	}
+}
+
+func ContactMechanismForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "ContactMechanism",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Details",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "party_id", Label: "Party"},
+					{Name: "mechanism_type", Label: "Type"},
+					{Name: "value", Label: "Value"},
+					{Name: "is_primary", Label: "Primary"},
+				},
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
+	}
+}
+
+func AttachmentForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "Attachment",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Details",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "entity_type", Label: "Entity Type"},
+					{Name: "record_id", Label: "Record ID"},
+					{Name: "file_name", Label: "File Name"},
+					{Name: "mime_type", Label: "MIME Type"},
+					{Name: "size_bytes", Label: "Size (bytes)"},
+					{Name: "storage_path", Label: "Storage Path"},
+				},
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
+	}
+}
+
+func UnitOfMeasureForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "UnitOfMeasure",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Details",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "code", Label: "Code"},
+					{Name: "name", Label: "Name"},
+				},
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
+	}
+}
+
+func UomConversionForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "UomConversion",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Details",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "from_uom_id", Label: "From Unit"},
+					{Name: "to_uom_id", Label: "To Unit"},
+					{Name: "factor", Label: "Factor"},
+				},
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
+	}
+}
+
+func CurrencyForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "Currency",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Details",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "code", Label: "Code"},
+					{Name: "name", Label: "Name"},
+					{Name: "minor_unit", Label: "Minor Unit"},
+				},
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
+	}
+}
+
+func ExchangeRateForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "ExchangeRate",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Details",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "from_currency_id", Label: "From Currency"},
+					{Name: "to_currency_id", Label: "To Currency"},
+					{Name: "effective_date", Label: "Effective Date"},
+					{Name: "rate", Label: "Rate"},
+				},
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
+	}
+}
+
+func StatusTypeForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "StatusType",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Details",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "entity_type", Label: "Entity Type"},
+					{Name: "code", Label: "Code"},
+					{Name: "name", Label: "Name"},
+				},
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
+	}
+}
+
+func StatusForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "Status",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Details",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "status_type_id", Label: "Status Type"},
+					{Name: "code", Label: "Code"},
+					{Name: "name", Label: "Name"},
+					{Name: "sequence", Label: "Sequence"},
+					{Name: "is_initial", Label: "Initial"},
+					{Name: "is_terminal", Label: "Terminal"},
+				},
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
+	}
+}
+
+func StatusTransitionForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "StatusTransition",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Details",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "status_type_id", Label: "Status Type"},
+					{Name: "from_status_id", Label: "From Status"},
+					{Name: "to_status_id", Label: "To Status"},
+					{Name: "requires_workflow", Label: "Requires Workflow"},
+				},
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
+	}
 }

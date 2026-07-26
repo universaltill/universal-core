@@ -14,6 +14,75 @@ func TestAllFoundationDefinitionsAreValid(t *testing.T) {
 	}
 }
 
+// TestAllFoundationFormsAreValid confirms every AllForms() entry is a
+// structurally valid Form Definition — no test caught this generically
+// before the 2026-07-26 addition of the 12 previously-missing foundation
+// forms (AllForms' own doc comment), since only PartyForm/IssueReportForm
+// existed and neither had a dedicated validity test either.
+func TestAllFoundationFormsAreValid(t *testing.T) {
+	for _, f := range AllForms() {
+		if err := f.Validate(); err != nil {
+			t.Fatalf("%s: expected valid form definition, got %v", f.EntityType, err)
+		}
+	}
+}
+
+// TestAllFoundationEntitiesHaveAForm is the direct regression test for
+// the gap AllForms' own doc comment describes: accessibleModules
+// (internal/api/dashboard.go) only surfaces an entity in the UI once
+// BOTH its entity Definition AND its Form Definition are published, so
+// an entity Definition with no matching form is invisible — reachable by
+// no module-menu node, no /forms/{entityType}/new|{id} route. Every
+// foundation entity except AIProviderConnection (its own doc comment:
+// deliberately bespoke, a generic form would render its encrypted API
+// key as a plain text box) must have a form.
+func TestAllFoundationEntitiesHaveAForm(t *testing.T) {
+	formTypes := map[string]bool{}
+	for _, f := range AllForms() {
+		formTypes[f.EntityType] = true
+	}
+	for _, def := range All() {
+		if def.EntityType == "AIProviderConnection" {
+			continue
+		}
+		if !formTypes[def.EntityType] {
+			t.Errorf("%s has an entity Definition but no Form Definition — it will be invisible in the UI (see AllForms' own doc comment)", def.EntityType)
+		}
+	}
+}
+
+// TestAllFoundationFormFieldsExistOnTheirEntity closes a real gap found
+// by this feature's own independent review: form.Definition.Validate()
+// only checks a form's own internal shape (a fields section has ≥1
+// field, action ops are known) — it never cross-checks a FormField.Name
+// against the target entity's actual declared fields. A typo'd or
+// stale field name would pass Validate() and TestAllFoundationFormsAreValid
+// cleanly, then only fail at real render time
+// (formrender.Render's own "form field %q has no matching field on
+// entity %q" error) the first time a human actually opens that form —
+// exactly the kind of gap this whole change exists to close, so it
+// needs its own guard, not just "the form is shaped correctly."
+func TestAllFoundationFormFieldsExistOnTheirEntity(t *testing.T) {
+	entityDefs := map[string]*entity.Definition{}
+	for _, def := range All() {
+		entityDefs[def.EntityType] = def
+	}
+	for _, f := range AllForms() {
+		def, ok := entityDefs[f.EntityType]
+		if !ok {
+			t.Errorf("form %s targets an entity type not in All()", f.EntityType)
+			continue
+		}
+		for _, section := range f.Sections {
+			for _, ff := range section.Fields {
+				if _, ok := def.FieldByName(ff.Name); !ok {
+					t.Errorf("%s form section %q references field %q, which doesn't exist on the %s entity", f.EntityType, section.Title, ff.Name, f.EntityType)
+				}
+			}
+		}
+	}
+}
+
 // TestPartyRole_SamePartyCanHoldMultipleRoles is the whole point of the
 // Party-Role pattern (ADR-0001 §8): a single Party record can hold
 // customer AND vendor roles at once, instead of the classic ERP failure
