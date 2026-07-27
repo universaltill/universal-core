@@ -2,7 +2,7 @@
 #
 # Multi-stage build. Pure Go (CGO_ENABLED=0), so cross-compiling for
 # another target platform needs no C toolchain.
-#   docker buildx build --platform linux/arm64 --target production -t <ref> .
+#   docker buildx build --platform linux/arm64,linux/amd64 --target production -t <ref> .
 ARG GO_VERSION=1.26.3
 
 FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-bookworm AS builder
