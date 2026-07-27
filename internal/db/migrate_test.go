@@ -3,13 +3,27 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"io/fs"
+	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
+
+// quoteIdentifier double-quotes a Postgres identifier, escaping any
+// embedded double-quote by doubling it — the standard SQL-identifier
+// quoting rule. freshTestDB's generated names are always
+// prefix_<unixnano> (fixed ASCII alphanumeric/underscore), so this is
+// defense in depth here, not a real injection surface.
+func quoteIdentifier(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
 
 // embeddedMigrationCount reads the count directly off migrationsFS rather
 // than hardcoding a number here — a hardcoded count goes stale the
@@ -117,6 +131,203 @@ func TestApply_FormDefinitionsHasActorTrackingColumns(t *testing.T) {
 		}
 		if !exists {
 			t.Fatalf("expected form_definitions.%s to exist after Apply", col)
+		}
+	}
+}
+
+// freshTestDB opens a connection to a brand-new database on the same
+// server as TEST_DATABASE_URL, named uniquely per call — ApplyControl/
+// ApplyTenant need a genuinely fresh, empty database each (unlike Apply's
+// tests above, which all happily share one already-migrated database
+// across the whole file), since a real deployment only ever runs each
+// one once per tenant/control database. Skips (like testDB) if
+// TEST_DATABASE_URL isn't set.
+func freshTestDB(t *testing.T, namePrefix string) *sql.DB {
+	t.Helper()
+	base := testDB(t)
+
+	name := fmt.Sprintf("%s_%d", namePrefix, time.Now().UnixNano())
+	if _, err := base.Exec(`CREATE DATABASE ` + quoteIdentifier(name)); err != nil {
+		t.Fatalf("create fresh database %s: %v", name, err)
+	}
+	t.Cleanup(func() {
+		// Terminate any lingering backends first — DROP DATABASE fails
+		// outright if this test's own db connection (closed via the
+		// db.Close() below) hasn't fully disconnected yet.
+		_, _ = base.Exec(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()`, name)
+		_, _ = base.Exec(`DROP DATABASE IF EXISTS ` + quoteIdentifier(name))
+	})
+
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("parse TEST_DATABASE_URL: %v", err)
+	}
+	u.Path = "/" + name
+
+	fresh, err := sql.Open("pgx", u.String())
+	if err != nil {
+		t.Fatalf("open fresh database %s: %v", name, err)
+	}
+	t.Cleanup(func() { fresh.Close() })
+	if err := fresh.Ping(); err != nil {
+		t.Fatalf("ping fresh database %s: %v", name, err)
+	}
+	if _, err := fresh.Exec(`CREATE EXTENSION IF NOT EXISTS pgcrypto`); err != nil {
+		t.Fatalf("create pgcrypto extension: %v", err)
+	}
+	return fresh
+}
+
+// TestApplyControl_CreatesTenantsTable confirms the control-plane
+// migration set (ADR-0003) creates exactly the tenants registry, against
+// a genuinely fresh database — not the shared one Apply's own tests use.
+func TestApplyControl_CreatesTenantsTable(t *testing.T) {
+	db := freshTestDB(t, "uc_test_control")
+	ctx := context.Background()
+
+	if err := ApplyControl(ctx, db); err != nil {
+		t.Fatalf("ApplyControl: %v", err)
+	}
+
+	for _, col := range []string{"id", "name", "region", "db_name", "zitadel_org_id", "created_at"} {
+		var exists bool
+		err := db.QueryRowContext(ctx,
+			`SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name = 'tenants' AND column_name = $1)`, col,
+		).Scan(&exists)
+		if err != nil {
+			t.Fatalf("check tenants.%s: %v", col, err)
+		}
+		if !exists {
+			t.Fatalf("expected tenants.%s to exist after ApplyControl", col)
+		}
+	}
+
+	// The control database must never carry any of the per-tenant tables
+	// — that would defeat the whole point of the split.
+	for _, table := range []string{"records", "audit_log", "workflow_jobs", "entity_definitions"} {
+		var exists bool
+		err := db.QueryRowContext(ctx,
+			`SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name = $1)`, table,
+		).Scan(&exists)
+		if err != nil {
+			t.Fatalf("check table %s: %v", table, err)
+		}
+		if exists {
+			t.Fatalf("did not expect tenant table %q in the control-plane database", table)
+		}
+	}
+}
+
+// TestApplyControl_IsIdempotent mirrors TestApply_IsIdempotent for the
+// control-plane migration set.
+func TestApplyControl_IsIdempotent(t *testing.T) {
+	db := freshTestDB(t, "uc_test_control")
+	ctx := context.Background()
+
+	if err := ApplyControl(ctx, db); err != nil {
+		t.Fatalf("first ApplyControl: %v", err)
+	}
+	if err := ApplyControl(ctx, db); err != nil {
+		t.Fatalf("second ApplyControl should be a no-op, got: %v", err)
+	}
+}
+
+// TestApplyTenant_CreatesEverySchemaObjectWithoutTenantID confirms the
+// per-tenant migration set (ADR-0003) creates every tenant-owned table,
+// and — the whole point of this migration — none of them carry a
+// tenant_id column, against a genuinely fresh database.
+func TestApplyTenant_CreatesEverySchemaObjectWithoutTenantID(t *testing.T) {
+	db := freshTestDB(t, "uc_test_tenant")
+	ctx := context.Background()
+
+	if err := ApplyTenant(ctx, db); err != nil {
+		t.Fatalf("ApplyTenant: %v", err)
+	}
+
+	tables := []string{
+		"entity_definitions", "form_definitions", "workflow_definitions",
+		"records", "audit_log", "gl_accounts", "journal_entries",
+		"journal_lines", "workflow_jobs", "schema_migrations",
+	}
+	for _, table := range tables {
+		var exists bool
+		err := db.QueryRowContext(ctx,
+			`SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name = $1)`, table,
+		).Scan(&exists)
+		if err != nil {
+			t.Fatalf("check table %s: %v", table, err)
+		}
+		if !exists {
+			t.Fatalf("expected table %q to exist after ApplyTenant", table)
+		}
+	}
+
+	// No table in a tenant database may carry a tenant_id column —
+	// that's the entire point of database-per-tenant (ADR-0003 §4): a
+	// tenant_id column left over anywhere would be silent dead weight at
+	// best, and a sign the migration split missed something at worst.
+	var leftover string
+	err := db.QueryRowContext(ctx,
+		`SELECT table_name FROM information_schema.columns WHERE column_name = 'tenant_id' LIMIT 1`,
+	).Scan(&leftover)
+	if err == nil {
+		t.Fatalf("expected no tenant_id column anywhere in a tenant database, found one on %q", leftover)
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("check for leftover tenant_id columns: %v", err)
+	}
+
+	// tenants itself must never appear in a tenant database — it's the
+	// control-plane's table only.
+	var tenantsExists bool
+	if err := db.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name = 'tenants')`,
+	).Scan(&tenantsExists); err != nil {
+		t.Fatalf("check tenants table: %v", err)
+	}
+	if tenantsExists {
+		t.Fatal("did not expect the control-plane tenants table in a tenant database")
+	}
+}
+
+// TestApplyTenant_IsIdempotent mirrors TestApply_IsIdempotent for the
+// per-tenant migration set.
+func TestApplyTenant_IsIdempotent(t *testing.T) {
+	db := freshTestDB(t, "uc_test_tenant")
+	ctx := context.Background()
+
+	if err := ApplyTenant(ctx, db); err != nil {
+		t.Fatalf("first ApplyTenant: %v", err)
+	}
+	if err := ApplyTenant(ctx, db); err != nil {
+		t.Fatalf("second ApplyTenant should be a no-op, got: %v", err)
+	}
+}
+
+// TestApplyControl_And_ApplyTenant_LockKeysDoNotCollide is the regression
+// test for the reason migrationLockKeyControl/migrationLockKeyTenant
+// exist as distinct constants from migrationLockKey: pg_advisory_lock's
+// key space is shared across the whole Postgres server, not scoped to
+// the database a session is connected to, so running all three
+// concurrently against three different fresh databases must not
+// serialize or deadlock against each other.
+func TestApplyControl_And_ApplyTenant_LockKeysDoNotCollide(t *testing.T) {
+	controlDB := freshTestDB(t, "uc_test_control")
+	tenantDB := freshTestDB(t, "uc_test_tenant")
+	legacyDB := freshTestDB(t, "uc_test_legacy")
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+	errs := make([]error, 3)
+	wg.Add(3)
+	go func() { defer wg.Done(); errs[0] = ApplyControl(ctx, controlDB) }()
+	go func() { defer wg.Done(); errs[1] = ApplyTenant(ctx, tenantDB) }()
+	go func() { defer wg.Done(); errs[2] = Apply(ctx, legacyDB) }()
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent caller %d failed: %v", i, err)
 		}
 	}
 }
