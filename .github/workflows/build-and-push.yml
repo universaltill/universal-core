@@ -15,7 +15,12 @@ permissions:
 env:
   REGISTRY: unitillacr01.azurecr.io
   IMAGE: unitillacr01.azurecr.io/universal-core
-  PLATFORMS: linux/arm64
+  # arm64 (the Pi nodes) + amd64 (mini-pc-main, added to the homelab
+  # cluster 2026-07-26/27) — a single-platform image can now land on
+  # either node's architecture and crash-loop with "exec format error"
+  # on the wrong one. See QUEUE.md's 2026-07-27 hairpin-NAT incident
+  # entry, which flagged this as a real, not yet triggered, risk.
+  PLATFORMS: linux/arm64,linux/amd64
 
 jobs:
   build-and-push:
