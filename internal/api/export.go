@@ -37,14 +37,19 @@ func (h *Handler) exportRecordsCSV(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	ts, err := h.scope(r.Context(), rc.TenantID)
+	if err != nil {
+		writeInternalError(w, "resolve tenant scope", err)
+		return
+	}
 	entityType := r.PathValue("entityType")
 
-	def, err := h.entityDef(r.Context(), rc.TenantID, entityType)
+	def, err := ts.entityDef(r.Context(), entityType)
 	if err != nil {
 		writeDefinitionLookupError(w, entityType, err)
 		return
 	}
-	records, err := h.crud.List(r.Context(), def, rc.TenantID)
+	records, err := ts.crud.List(r.Context(), def)
 	if err != nil {
 		writeInternalError(w, fmt.Sprintf("list %s records for export", entityType), err)
 		return

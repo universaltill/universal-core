@@ -23,6 +23,11 @@
 // Idempotent: a record that already has status_id is left untouched, so
 // running this against an already-migrated tenant (or re-running after a
 // partial failure) is safe.
+//
+// DATABASE_URL must point directly at the target tenant's own database
+// (ADR-0003, database-per-tenant) — this tool has no router/control-plane
+// wiring of its own yet, so it operates on whichever database the caller
+// connects it to, not a -tenant-id selector.
 package main
 
 import (
@@ -46,13 +51,9 @@ func main() {
 	if dbURL == "" {
 		log.Fatal("DATABASE_URL is required")
 	}
-	tenantID := flag.String("tenant-id", "", "tenant whose PurchaseOrder records to backfill (required)")
 	actorID := flag.String("actor-id", "", "audit actor id for every record this updates (required)")
 	dryRun := flag.Bool("dry-run", false, "report what would change without writing anything")
 	flag.Parse()
-	if *tenantID == "" {
-		log.Fatal("-tenant-id is required")
-	}
 	if *actorID == "" {
 		log.Fatal("-actor-id is required")
 	}
@@ -71,11 +72,11 @@ func main() {
 	entityDefs := data.NewEntityDefinitionRepo(sqlDB)
 	engine := crud.NewEngine(sqlDB)
 
-	poDef, err := publishedDef(ctx, entityDefs, *tenantID, "PurchaseOrder")
+	poDef, err := publishedDef(ctx, entityDefs, "PurchaseOrder")
 	if err != nil {
 		log.Fatalf("look up PurchaseOrder definition: %v", err)
 	}
-	statusDef, err := publishedDef(ctx, entityDefs, *tenantID, "Status")
+	statusDef, err := publishedDef(ctx, entityDefs, "Status")
 	if err != nil {
 		log.Fatalf("look up Status definition: %v", err)
 	}
@@ -90,7 +91,7 @@ func main() {
 	// code lookup is unambiguous.
 	statusIDByCode := map[string]string{}
 	for _, code := range []string{"draft", "submitted", "approved", "received", "cancelled"} {
-		recs, err := engine.ListByField(ctx, statusDef, *tenantID, "code", code)
+		recs, err := engine.ListByField(ctx, statusDef, "code", code)
 		if err != nil {
 			log.Fatalf("list Status by code %q: %v", code, err)
 		}
@@ -100,7 +101,7 @@ func main() {
 		statusIDByCode[code] = recs[0].ID
 	}
 
-	orders, err := engine.List(ctx, poDef, *tenantID)
+	orders, err := engine.List(ctx, poDef)
 	if err != nil {
 		log.Fatalf("list PurchaseOrder records: %v", err)
 	}
@@ -166,7 +167,7 @@ func main() {
 		}
 
 		expectedVersion := po.Version
-		if _, err := engine.Update(ctx, poDef, *tenantID, po.ID, fields, &expectedVersion, actor); err != nil {
+		if _, err := engine.Update(ctx, poDef, po.ID, fields, &expectedVersion, actor); err != nil {
 			log.Fatalf("update PurchaseOrder %s: %v", po.ID, err)
 		}
 		migrated++
@@ -179,8 +180,8 @@ func main() {
 	fmt.Printf("%s %d PurchaseOrder record(s); %d already had status_id; %d skipped for manual review.\n", verb, migrated, alreadyDone, skipped)
 }
 
-func publishedDef(ctx context.Context, repo *data.EntityDefinitionRepo, tenantID, entityType string) (*entity.Definition, error) {
-	v, err := repo.GetPublished(ctx, tenantID, entityType)
+func publishedDef(ctx context.Context, repo *data.EntityDefinitionRepo, entityType string) (*entity.Definition, error) {
+	v, err := repo.GetPublished(ctx, entityType)
 	if err != nil {
 		return nil, fmt.Errorf("get published %s: %w", entityType, err)
 	}

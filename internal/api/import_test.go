@@ -3,7 +3,6 @@ package api
 import (
 	"archive/zip"
 	"bytes"
-	"database/sql"
 	"encoding/json"
 	"mime/multipart"
 	"net/http"
@@ -12,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/universaltill/universal-core/internal/i18n"
+	"github.com/universaltill/universal-core/internal/tenantdb"
 	"github.com/universaltill/universal-core/internal/kernel/aiassist"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/form"
@@ -54,13 +54,13 @@ func newMultipartRequest(t *testing.T, target, tenantID, actorID, filename strin
 }
 
 func TestImport_UploadPage_RendersForm(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
-	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
 
 	mux := http.NewServeMux()
-	testHandler(t, db).Routes(mux)
+	testHandler(t, router).Routes(mux)
 
 	req := newRequest("GET", "/import/Vendor", tenantID, "farshid", nil)
 	rec := httptest.NewRecorder()
@@ -78,12 +78,12 @@ func TestImport_UploadPage_RendersForm(t *testing.T) {
 }
 
 func TestImport_UploadPage_UnknownEntityTypeIs404(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
+	tenantID, _ := newTestTenant(t, router)
 
 	mux := http.NewServeMux()
-	testHandler(t, db).Routes(mux)
+	testHandler(t, router).Routes(mux)
 
 	req := newRequest("GET", "/import/NoSuchEntity", tenantID, "farshid", nil)
 	rec := httptest.NewRecorder()
@@ -99,13 +99,13 @@ func TestImport_UploadPage_UnknownEntityTypeIs404(t *testing.T) {
 // confirm SuggestMapping's guess is pre-selected in the rendered
 // mapping <select>s, and that the preview table shows the row's data.
 func TestImport_Preview_SuggestsMappingAndShowsRows(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
-	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
 
 	mux := http.NewServeMux()
-	testHandler(t, db).Routes(mux)
+	testHandler(t, router).Routes(mux)
 
 	csvContent := []byte("name\nAcme Textiles\n")
 	req := newMultipartRequest(t, "/import/Vendor/preview", tenantID, "farshid", "vendors.csv", csvContent, nil)
@@ -141,13 +141,13 @@ func TestImport_Preview_SuggestsMappingAndShowsRows(t *testing.T) {
 // manually) with the validation error surfaced inline, and no rows or
 // Commit button until the mapping is actually complete.
 func TestImport_Preview_IncompleteMappingShowsEditorNotHardError(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
-	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
 
 	mux := http.NewServeMux()
-	testHandler(t, db).Routes(mux)
+	testHandler(t, router).Routes(mux)
 
 	csvContent := []byte("Vendor Name\nAcme Textiles\n")
 	req := newMultipartRequest(t, "/import/Vendor/preview", tenantID, "farshid", "vendors.csv", csvContent, nil)
@@ -188,13 +188,13 @@ func TestImport_Preview_IncompleteMappingShowsEditorNotHardError(t *testing.T) {
 }
 
 func TestImport_Preview_InvalidRowShowsError(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
-	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
 
 	mux := http.NewServeMux()
-	testHandler(t, db).Routes(mux)
+	testHandler(t, router).Routes(mux)
 
 	// "name" is required; the row has an empty value for it. A second
 	// column with real content keeps this from being a fully blank
@@ -222,13 +222,13 @@ func TestImport_Preview_InvalidRowShowsError(t *testing.T) {
 // a real GET /api/records/Vendor afterward, not just that Commit
 // reported success.
 func TestImport_Commit_WritesRowsAndReportsResult(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
-	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
 
 	mux := http.NewServeMux()
-	testHandler(t, db).Routes(mux)
+	testHandler(t, router).Routes(mux)
 
 	csvContent := []byte("name\nAcme Textiles\nBeta Supplies\n")
 	commitReq := newMultipartRequest(t, "/import/Vendor/commit", tenantID, "farshid", "vendors.csv", csvContent,
@@ -252,13 +252,13 @@ func TestImport_Commit_WritesRowsAndReportsResult(t *testing.T) {
 }
 
 func TestImport_Preview_NoFileIs400(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
-	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
 
 	mux := http.NewServeMux()
-	testHandler(t, db).Routes(mux)
+	testHandler(t, router).Routes(mux)
 
 	req := newMultipartRequest(t, "/import/Vendor/preview", tenantID, "farshid", "", nil, nil)
 	rec := httptest.NewRecorder()
@@ -274,13 +274,13 @@ func TestImport_Preview_NoFileIs400(t *testing.T) {
 // its own (unlike XLSX), so this HTTP-layer cap is the only thing
 // bounding it once an upload endpoint exists.
 func TestImport_Preview_OversizedUploadIs400(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
-	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
 
 	mux := http.NewServeMux()
-	testHandler(t, db).Routes(mux)
+	testHandler(t, router).Routes(mux)
 
 	oversized := bytes.Repeat([]byte("a"), maxUploadBytes+1)
 	req := newMultipartRequest(t, "/import/Vendor/preview", tenantID, "farshid", "huge.csv", oversized, nil)
@@ -324,13 +324,13 @@ func buildTestXLSX(t *testing.T, value string) []byte {
 }
 
 func TestImport_Preview_XLSXFile(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
-	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
 
 	mux := http.NewServeMux()
-	testHandler(t, db).Routes(mux)
+	testHandler(t, router).Routes(mux)
 
 	xlsxContent := buildTestXLSX(t, "Gamma Traders")
 	req := newMultipartRequest(t, "/import/Vendor/preview", tenantID, "farshid", "vendors.xlsx", xlsxContent, nil)
@@ -346,13 +346,13 @@ func TestImport_Preview_XLSXFile(t *testing.T) {
 }
 
 func TestImport_Commit_XLSXFile(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
-	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
 
 	mux := http.NewServeMux()
-	testHandler(t, db).Routes(mux)
+	testHandler(t, router).Routes(mux)
 
 	xlsxContent := buildTestXLSX(t, "Delta Holdings")
 	req := newMultipartRequest(t, "/import/Vendor/commit", tenantID, "farshid", "vendors.xlsx", xlsxContent,
@@ -404,13 +404,13 @@ func orderFormDef() *form.Definition {
 // separate rather than adding an ai parameter to testHandler itself so
 // every other test in this package stays exactly as it was (AI
 // disabled, matching a deployment with no OLLAMA_URL configured).
-func testHandlerWithAI(t *testing.T, db *sql.DB, ai *aiassist.Client) *Handler {
+func testHandlerWithAI(t *testing.T, router *tenantdb.Router, ai *aiassist.Client) *Handler {
 	t.Helper()
 	catalog, err := i18n.Load("en")
 	if err != nil {
 		t.Fatalf("load i18n catalog: %v", err)
 	}
-	return New(db, catalog, nil, ai, nil, nil)
+	return New(router, catalog, nil, ai, nil, nil)
 }
 
 // fakeAIServer stands in for Ollama's /api/generate, always returning
@@ -441,10 +441,10 @@ func fakeAIServer(t *testing.T, mappings []map[string]string, called *bool) *htt
 // flagged in the rendered HTML — still just the same editable <select>
 // every mapping row already had.
 func TestImport_Preview_AIFillsGapsAndMarksSuggestedRows(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
-	publishEntityAndForm(t, db, tenantID, orderEntityDef(), orderFormDef())
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, orderEntityDef(), orderFormDef())
 
 	var called bool
 	srv := fakeAIServer(t, []map[string]string{
@@ -455,7 +455,7 @@ func TestImport_Preview_AIFillsGapsAndMarksSuggestedRows(t *testing.T) {
 	ai := aiassist.NewClient(srv.URL, "llama3.2:3b")
 
 	mux := http.NewServeMux()
-	testHandlerWithAI(t, db, ai).Routes(mux)
+	testHandlerWithAI(t, router, ai).Routes(mux)
 
 	csvContent := []byte("Vendor Nm,Order Dt\nAcme Textiles,2026-07-01\n")
 	req := newMultipartRequest(t, "/import/Order/preview", tenantID, "farshid", "orders.csv", csvContent, nil)
@@ -489,11 +489,11 @@ func TestImport_Preview_AIFillsGapsAndMarksSuggestedRows(t *testing.T) {
 // right one never is) if the resolver ever regresses to always using
 // h.ai regardless of what a tenant configured.
 func TestImport_Preview_UsesTenantBYOKProviderInsteadOfPlatformDefault(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
-	publishFoundation(t, db, tenantID)
-	publishEntityAndForm(t, db, tenantID, orderEntityDef(), orderFormDef())
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
+	publishEntityAndForm(t, db, orderEntityDef(), orderFormDef())
 
 	var platformCalled, tenantCalled bool
 	platformSrv := fakeAIServer(t, nil, &platformCalled)
@@ -506,7 +506,7 @@ func TestImport_Preview_UsesTenantBYOKProviderInsteadOfPlatformDefault(t *testin
 
 	platformAI := aiassist.NewClient(platformSrv.URL, "llama3.2:3b")
 	mux := http.NewServeMux()
-	testHandlerWithAI(t, db, platformAI).Routes(mux)
+	testHandlerWithAI(t, router, platformAI).Routes(mux)
 
 	saveForm := "provider=ollama&base_url=" + tenantSrv.URL + "&model=llama3.2:3b"
 	saveReq := newRequest("POST", "/settings/ai-provider", tenantID, "farshid", []byte(saveForm))
@@ -545,10 +545,10 @@ func TestImport_Preview_UsesTenantBYOKProviderInsteadOfPlatformDefault(t *testin
 // surprise the wizard's whole confirm-before-write design exists to
 // prevent.
 func TestImport_Preview_ResubmissionNeverCallsAI(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
-	publishEntityAndForm(t, db, tenantID, orderEntityDef(), orderFormDef())
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, orderEntityDef(), orderFormDef())
 
 	var called bool
 	srv := fakeAIServer(t, nil, &called)
@@ -556,7 +556,7 @@ func TestImport_Preview_ResubmissionNeverCallsAI(t *testing.T) {
 	ai := aiassist.NewClient(srv.URL, "llama3.2:3b")
 
 	mux := http.NewServeMux()
-	testHandlerWithAI(t, db, ai).Routes(mux)
+	testHandlerWithAI(t, router, ai).Routes(mux)
 
 	csvContent := []byte("Vendor Nm,Order Dt\nAcme Textiles,2026-07-01\n")
 	req := newMultipartRequest(t, "/import/Order/preview", tenantID, "farshid", "orders.csv", csvContent,
@@ -578,10 +578,10 @@ func TestImport_Preview_ResubmissionNeverCallsAI(t *testing.T) {
 // SuggestMapping's exact-match pass alone produced, per
 // SuggestMappingAI's own "err is advisory only" contract.
 func TestImport_Preview_AIServerErrorFallsBackGracefully(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
-	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -590,7 +590,7 @@ func TestImport_Preview_AIServerErrorFallsBackGracefully(t *testing.T) {
 	ai := aiassist.NewClient(srv.URL, "llama3.2:3b")
 
 	mux := http.NewServeMux()
-	testHandlerWithAI(t, db, ai).Routes(mux)
+	testHandlerWithAI(t, router, ai).Routes(mux)
 
 	// "name" exact-matches Vendor's own field, so this must still work
 	// via SuggestMapping alone even though the AI call for it will fail.
@@ -613,13 +613,13 @@ func TestImport_Preview_AIServerErrorFallsBackGracefully(t *testing.T) {
 // must render byte-for-byte the same mapping UI this wizard always had,
 // no stray "AI-suggested" copy appearing when there's no AI involved.
 func TestImport_Preview_AIDisabledShowsNoBadges(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
-	publishEntityAndForm(t, db, tenantID, vendorEntityDef(), vendorFormDef())
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
 
 	mux := http.NewServeMux()
-	testHandler(t, db).Routes(mux)
+	testHandler(t, router).Routes(mux)
 
 	csvContent := []byte("name\nAcme Textiles\n")
 	req := newMultipartRequest(t, "/import/Vendor/preview", tenantID, "farshid", "vendors.csv", csvContent, nil)

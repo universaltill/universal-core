@@ -43,14 +43,14 @@ import (
 // workflow definitions per tenant is exactly the kind of future problem
 // dashboardModules' own N+1 note already named as "revisit if it ever
 // matters," not a reason to add trigger-matching SQL today.
-func (h *Handler) triggerWorkflows(ctx context.Context, tenantID, entityType, recordID string, triggerType workflow.TriggerType, actor audit.Actor) {
-	names, err := h.workflowDefs.ListPublishedNames(ctx, tenantID)
+func (h *Handler) triggerWorkflows(ctx context.Context, ts tenantScope, entityType, recordID string, triggerType workflow.TriggerType, actor audit.Actor) {
+	names, err := ts.workflowDefs.ListPublishedNames(ctx)
 	if err != nil {
 		log.Printf("api: trigger workflows for %s %s: list published workflow names: %v", entityType, recordID, err)
 		return
 	}
 	for _, name := range names {
-		v, err := h.workflowDefs.GetPublished(ctx, tenantID, name)
+		v, err := ts.workflowDefs.GetPublished(ctx, name)
 		if err != nil {
 			log.Printf("api: trigger workflows for %s %s: get published workflow %q: %v", entityType, recordID, name, err)
 			continue
@@ -63,7 +63,7 @@ func (h *Handler) triggerWorkflows(ctx context.Context, tenantID, entityType, re
 		if def.Trigger.Type != triggerType || def.Trigger.EntityType != entityType {
 			continue
 		}
-		if _, err := h.workflowQueue.Enqueue(ctx, def, tenantID, entityType, recordID, actor); err != nil {
+		if _, err := ts.workflowQueue.Enqueue(ctx, def, entityType, recordID, actor); err != nil {
 			log.Printf("api: trigger workflow %q for %s %s: enqueue: %v", name, entityType, recordID, err)
 		}
 	}
@@ -100,13 +100,18 @@ func (h *Handler) approveWorkflowJob(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	ts, err := h.scope(r.Context(), rc.TenantID)
+	if err != nil {
+		writeInternalError(w, "resolve tenant scope", err)
+		return
+	}
 	id := r.PathValue("id")
 	if !isValidID(id) {
 		httpx.WriteError(w, http.StatusBadRequest, "invalid workflow job id")
 		return
 	}
 
-	if err := h.workflowQueue.ResumeAfterApproval(r.Context(), rc.TenantID, id); err != nil {
+	if err := ts.workflowQueue.ResumeAfterApproval(r.Context(), id); err != nil {
 		if errors.Is(err, data.ErrNotFound) {
 			httpx.WriteError(w, http.StatusNotFound, fmt.Sprintf("workflow job %q not found or not waiting for approval", id))
 			return
@@ -166,6 +171,11 @@ func (h *Handler) listWorkflowJobs(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	ts, err := h.scope(r.Context(), rc.TenantID)
+	if err != nil {
+		writeInternalError(w, "resolve tenant scope", err)
+		return
+	}
 	status := r.URL.Query().Get("status")
 	if status == "" {
 		httpx.WriteError(w, http.StatusBadRequest, "status query parameter is required (e.g. ?status=waiting_approval)")
@@ -176,7 +186,7 @@ func (h *Handler) listWorkflowJobs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	jobs, err := h.workflowQueue.ListByStatus(r.Context(), rc.TenantID, status)
+	jobs, err := ts.workflowQueue.ListByStatus(r.Context(), status)
 	if err != nil {
 		writeInternalError(w, fmt.Sprintf("list workflow jobs with status %s", status), err)
 		return
@@ -208,9 +218,14 @@ func (h *Handler) renderWorkflowInbox(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	ts, err := h.scope(r.Context(), rc.TenantID)
+	if err != nil {
+		writeInternalError(w, "resolve tenant scope", err)
+		return
+	}
 	locale := localeFromRequest(w, r)
 
-	jobs, err := h.workflowQueue.ListByStatus(r.Context(), rc.TenantID, "waiting_approval")
+	jobs, err := ts.workflowQueue.ListByStatus(r.Context(), "waiting_approval")
 	if err != nil {
 		writeInternalError(w, "list waiting-approval workflow jobs for inbox", err)
 		return

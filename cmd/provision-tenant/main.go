@@ -18,6 +18,11 @@
 // moduleseed.PublishAll's doc comment), so provisioning an already-
 // provisioned tenant (e.g. to pick up a newly added module) is a no-op
 // for what's already published and only brings the new module online.
+//
+// DATABASE_URL is the control-plane database (ADR-0003) — the tenants
+// registry, not any tenant's own data. A new tenant's own database is
+// created and migrated here via internal/tenantdb.Router.Create; an
+// existing tenant (-tenant-id) is resolved the same way via Router.Get.
 package main
 
 import (
@@ -31,10 +36,11 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
-	"github.com/universaltill/universal-core/internal/data"
+	"github.com/universaltill/universal-core/internal/db"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
 	"github.com/universaltill/universal-core/internal/kernel/purchasing"
+	"github.com/universaltill/universal-core/internal/tenantdb"
 )
 
 // modulePublishers maps a -modules name to its Publish/PublishForms(/
@@ -49,17 +55,17 @@ import (
 // business data) — a future module with no status-managed entity simply
 // has nothing to seed here.
 var modulePublishers = map[string]struct {
-	publish         func(ctx context.Context, db *sql.DB, tenantID string, actor audit.Actor) error
-	publishForms    func(ctx context.Context, db *sql.DB, tenantID string, actor audit.Actor) error
-	publishStatuses func(ctx context.Context, db *sql.DB, tenantID string, actor audit.Actor) error
+	publish         func(ctx context.Context, db *sql.DB, actor audit.Actor) error
+	publishForms    func(ctx context.Context, db *sql.DB, actor audit.Actor) error
+	publishStatuses func(ctx context.Context, db *sql.DB, actor audit.Actor) error
 }{
 	"purchasing": {purchasing.Publish, purchasing.PublishForms, purchasing.PublishStatuses},
 }
 
 func main() {
-	dbURL := os.Getenv("DATABASE_URL")
-	if dbURL == "" {
-		log.Fatal("DATABASE_URL is required")
+	controlDBURL := os.Getenv("DATABASE_URL")
+	if controlDBURL == "" {
+		log.Fatal("DATABASE_URL is required (the control-plane database — see this file's own doc comment)")
 	}
 
 	name := flag.String("name", "", "tenant name (required unless -tenant-id reuses an existing tenant)")
@@ -94,46 +100,60 @@ func main() {
 		}
 	}
 
-	sqlDB, err := sql.Open("pgx", dbURL)
+	controlDB, err := sql.Open("pgx", controlDBURL)
 	if err != nil {
-		log.Fatalf("open database: %v", err)
+		log.Fatalf("open control database: %v", err)
 	}
-	defer sqlDB.Close()
-	if err := sqlDB.Ping(); err != nil {
-		log.Fatalf("ping database: %v", err)
+	defer controlDB.Close()
+	if err := controlDB.Ping(); err != nil {
+		log.Fatalf("ping control database: %v", err)
+	}
+	if err := db.ApplyControl(context.Background(), controlDB); err != nil {
+		log.Fatalf("apply control-plane migrations: %v", err)
+	}
+
+	router, err := tenantdb.NewRouter(controlDB, controlDBURL)
+	if err != nil {
+		log.Fatalf("build tenant router: %v", err)
 	}
 
 	ctx := context.Background()
 	actor := audit.Actor{Type: audit.ActorHuman, ID: *actorID}
 
 	id := *tenantID
+	var tenantDB *sql.DB
 	if id == "" {
-		created, err := data.NewTenantRepo(sqlDB).Create(ctx, *name, *region)
+		id, err = router.Create(ctx, *name, *region)
 		if err != nil {
 			log.Fatalf("create tenant: %v", err)
 		}
-		id = created
 		log.Printf("created tenant %s", id)
+		tenantDB, err = router.Get(ctx, id)
+	} else {
+		tenantDB, err = router.Get(ctx, id)
+	}
+	if err != nil {
+		log.Fatalf("resolve tenant %s database: %v", id, err)
 	}
 
-	if err := foundation.Publish(ctx, sqlDB, id, actor); err != nil {
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
 		log.Fatalf("publish foundation entities: %v", err)
 	}
-	if err := foundation.PublishForms(ctx, sqlDB, id, actor); err != nil {
+	if err := foundation.PublishForms(ctx, tenantDB, actor); err != nil {
 		log.Fatalf("publish foundation forms: %v", err)
 	}
 	log.Println("foundation layer published (entities + forms)")
 
 	for _, m := range modules {
 		p := modulePublishers[m]
-		if err := p.publish(ctx, sqlDB, id, actor); err != nil {
+		if err := p.publish(ctx, tenantDB, actor); err != nil {
 			log.Fatalf("publish %s entities: %v", m, err)
 		}
-		if err := p.publishForms(ctx, sqlDB, id, actor); err != nil {
+		if err := p.publishForms(ctx, tenantDB, actor); err != nil {
 			log.Fatalf("publish %s forms: %v", m, err)
 		}
 		if p.publishStatuses != nil {
-			if err := p.publishStatuses(ctx, sqlDB, id, actor); err != nil {
+			if err := p.publishStatuses(ctx, tenantDB, actor); err != nil {
 				log.Fatalf("publish %s statuses: %v", m, err)
 			}
 		}

@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/universaltill/universal-core/internal/i18n"
+	"github.com/universaltill/universal-core/internal/tenantdb"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
 	"github.com/universaltill/universal-core/internal/kernel/speechassist"
 )
@@ -21,23 +22,23 @@ import (
 // (voice transcription disabled, matching a deployment with no
 // WHISPER_URL configured), same pattern import_test.go's
 // testHandlerWithAI already establishes for aiassist.
-func testHandlerWithSpeech(t *testing.T, db *sql.DB, speech *speechassist.Client) *Handler {
+func testHandlerWithSpeech(t *testing.T, router *tenantdb.Router, speech *speechassist.Client) *Handler {
 	t.Helper()
 	catalog, err := i18n.Load("en")
 	if err != nil {
 		t.Fatalf("load i18n catalog: %v", err)
 	}
-	return New(db, catalog, nil, nil, speech, nil)
+	return New(router, catalog, nil, nil, speech, nil)
 }
 
-func publishFoundation(t *testing.T, db *sql.DB, tenantID string) {
+func publishFoundation(t *testing.T, db *sql.DB) {
 	t.Helper()
 	ctx := context.Background()
 	actor := humanActor()
-	if err := foundation.Publish(ctx, db, tenantID, actor); err != nil {
+	if err := foundation.Publish(ctx, db, actor); err != nil {
 		t.Fatalf("foundation.Publish: %v", err)
 	}
-	if err := foundation.PublishForms(ctx, db, tenantID, actor); err != nil {
+	if err := foundation.PublishForms(ctx, db, actor); err != nil {
 		t.Fatalf("foundation.PublishForms: %v", err)
 	}
 }
@@ -68,12 +69,12 @@ func newAudioUploadRequest(t *testing.T, target, tenantID, actorID string, audio
 }
 
 func TestIssueReport_NewPage_RendersCaptureForm(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
+	tenantID, _ := newTestTenant(t, router)
 
 	mux := http.NewServeMux()
-	testHandler(t, db).Routes(mux)
+	testHandler(t, router).Routes(mux)
 
 	req := newRequest("GET", "/issue-report/new", tenantID, "farshid", nil)
 	rec := httptest.NewRecorder()
@@ -95,10 +96,10 @@ func TestIssueReport_NewPage_RendersCaptureForm(t *testing.T) {
 }
 
 func TestIssueReport_NewPage_RequiresAuth(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
 	mux := http.NewServeMux()
-	testHandler(t, db).Routes(mux)
+	testHandler(t, router).Routes(mux)
 
 	req := httptest.NewRequest("GET", "/issue-report/new", nil) // no auth headers
 	rec := httptest.NewRecorder()
@@ -116,10 +117,10 @@ func TestIssueReport_NewPage_RequiresAuth(t *testing.T) {
 // being required at all is the one thing standing between that gap and
 // letting a fully anonymous caller burn compute for free).
 func TestIssueReport_Transcribe_RequiresAuth(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
 	mux := http.NewServeMux()
-	testHandler(t, db).Routes(mux)
+	testHandler(t, router).Routes(mux)
 
 	req := httptest.NewRequest("POST", "/issue-report/transcribe", nil) // no auth headers
 	rec := httptest.NewRecorder()
@@ -136,12 +137,12 @@ func TestIssueReport_Transcribe_RequiresAuth(t *testing.T) {
 // has no non-AI fallback to silently degrade to — see issuereport.go's
 // own doc comment on issueReportTranscribe).
 func TestIssueReport_Transcribe_DisabledReturns503(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
+	tenantID, _ := newTestTenant(t, router)
 
 	mux := http.NewServeMux()
-	testHandler(t, db).Routes(mux) // no speech client
+	testHandler(t, router).Routes(mux) // no speech client
 
 	req := newAudioUploadRequest(t, "/issue-report/transcribe", tenantID, "farshid", []byte("fake audio"))
 	rec := httptest.NewRecorder()
@@ -156,9 +157,9 @@ func TestIssueReport_Transcribe_DisabledReturns503(t *testing.T) {
 // actually calls through to the configured speechassist.Client and
 // returns its transcript verbatim as the response body.
 func TestIssueReport_Transcribe_ReturnsTranscript(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
+	tenantID, _ := newTestTenant(t, router)
 
 	var gotFilename string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -176,7 +177,7 @@ func TestIssueReport_Transcribe_ReturnsTranscript(t *testing.T) {
 	speech := speechassist.NewClient(srv.URL)
 
 	mux := http.NewServeMux()
-	testHandlerWithSpeech(t, db, speech).Routes(mux)
+	testHandlerWithSpeech(t, router, speech).Routes(mux)
 
 	req := newAudioUploadRequest(t, "/issue-report/transcribe", tenantID, "farshid", []byte("fake audio bytes"))
 	rec := httptest.NewRecorder()
@@ -201,9 +202,9 @@ func TestIssueReport_Transcribe_ReturnsTranscript(t *testing.T) {
 // doc comment on why leaving this to the Whisper server's auto-detect
 // was unreliable for a short recording.
 func TestIssueReport_Transcribe_ForwardsCurrentUILocaleAsLanguageHint(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
+	tenantID, _ := newTestTenant(t, router)
 
 	var gotLanguage string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -215,7 +216,7 @@ func TestIssueReport_Transcribe_ForwardsCurrentUILocaleAsLanguageHint(t *testing
 	speech := speechassist.NewClient(srv.URL)
 
 	mux := http.NewServeMux()
-	testHandlerWithSpeech(t, db, speech).Routes(mux)
+	testHandlerWithSpeech(t, router, speech).Routes(mux)
 
 	req := newAudioUploadRequest(t, "/issue-report/transcribe", tenantID, "farshid", []byte("fake audio bytes"))
 	req.AddCookie(&http.Cookie{Name: localeCookie, Value: "ar"})
@@ -237,13 +238,13 @@ func TestIssueReport_Transcribe_ForwardsCurrentUILocaleAsLanguageHint(t *testing
 // side-channel — and it's genuinely queryable afterward through the
 // generic /api/records route, same as anything else.
 func TestIssueReport_Submit_CreatesRecordAndItsQueryable(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
-	publishFoundation(t, db, tenantID)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
 
 	mux := http.NewServeMux()
-	testHandler(t, db).Routes(mux)
+	testHandler(t, router).Routes(mux)
 
 	form := "title=" + "Button+does+nothing" +
 		"&description=" + "Clicking+the+save+button+has+no+effect." +
@@ -277,13 +278,13 @@ func TestIssueReport_Submit_CreatesRecordAndItsQueryable(t *testing.T) {
 }
 
 func TestIssueReport_Submit_MissingRequiredFieldIs400(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
-	publishFoundation(t, db, tenantID)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
 
 	mux := http.NewServeMux()
-	testHandler(t, db).Routes(mux)
+	testHandler(t, router).Routes(mux)
 
 	// title omitted entirely.
 	req := newRequest("POST", "/issue-report/submit", tenantID, "farshid", []byte("description=Something+is+wrong"))

@@ -43,9 +43,14 @@ func (h *Handler) importUploadPage(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	ts, err := h.scope(r.Context(), rc.TenantID)
+	if err != nil {
+		writeInternalError(w, "resolve tenant scope", err)
+		return
+	}
 	entityType := r.PathValue("entityType")
 
-	if _, err := h.entityDef(r.Context(), rc.TenantID, entityType); err != nil {
+	if _, err := ts.entityDef(r.Context(), entityType); err != nil {
 		writeDefinitionLookupError(w, entityType, err)
 		return
 	}
@@ -59,7 +64,7 @@ func (h *Handler) importUploadPage(w http.ResponseWriter, r *http.Request) {
 	// this page's own htmx swaps into #uc-import-result stay bare —
 	// only the very first page load gets the shell.
 	var buf bytes.Buffer
-	err := importTmpl.ExecuteTemplate(&buf, "page", importPageView{
+	err = importTmpl.ExecuteTemplate(&buf, "page", importPageView{
 		EntityType:   entityType,
 		PreviewHref:  "/import/" + entityType + "/preview",
 		ChooseFile:   h.catalog.T(locale, "import.choose_file"),
@@ -102,10 +107,15 @@ func (h *Handler) importPreview(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	ts, err := h.scope(r.Context(), rc.TenantID)
+	if err != nil {
+		writeInternalError(w, "resolve tenant scope", err)
+		return
+	}
 	entityType := r.PathValue("entityType")
 	locale := localeFromRequest(w, r)
 
-	def, err := h.entityDef(r.Context(), rc.TenantID, entityType)
+	def, err := ts.entityDef(r.Context(), entityType)
 	if err != nil {
 		writeDefinitionLookupError(w, entityType, err)
 		return
@@ -118,7 +128,7 @@ func (h *Handler) importPreview(w http.ResponseWriter, r *http.Request) {
 
 	submitted := mappingFromForm(r)
 
-	ai := h.aiProviderFor(r.Context(), rc.TenantID)
+	ai := h.aiProviderFor(r.Context(), ts)
 	headers, mapping, aiSuggested, results, mappingErr, err := previewUpload(r.Context(), ai, data, xlsx, def, submitted)
 	if err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, err.Error())
@@ -159,10 +169,15 @@ func (h *Handler) importCommit(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	ts, err := h.scope(r.Context(), rc.TenantID)
+	if err != nil {
+		writeInternalError(w, "resolve tenant scope", err)
+		return
+	}
 	entityType := r.PathValue("entityType")
 	locale := localeFromRequest(w, r)
 
-	def, err := h.entityDef(r.Context(), rc.TenantID, entityType)
+	def, err := ts.entityDef(r.Context(), entityType)
 	if err != nil {
 		writeDefinitionLookupError(w, entityType, err)
 		return
@@ -176,9 +191,9 @@ func (h *Handler) importCommit(w http.ResponseWriter, r *http.Request) {
 
 	var results []csvimport.RowResult
 	if xlsx {
-		results, err = csvimport.CommitXLSX(r.Context(), bytes.NewReader(data), def, mapping, h.crud, rc.TenantID, rc.Actor)
+		results, err = csvimport.CommitXLSX(r.Context(), bytes.NewReader(data), def, mapping, ts.crud, rc.Actor)
 	} else {
-		results, err = csvimport.Commit(r.Context(), bytes.NewReader(data), def, mapping, h.crud, rc.TenantID, rc.Actor)
+		results, err = csvimport.Commit(r.Context(), bytes.NewReader(data), def, mapping, ts.crud, rc.Actor)
 	}
 	if err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, err.Error())
@@ -332,14 +347,14 @@ func previewUpload(ctx context.Context, ai aiprovider.Provider, data []byte, xls
 // backs it, so a tenant's broken BYOK config must never take down AI
 // assistance entirely when a perfectly good platform default is right
 // there.
-func (h *Handler) aiProviderFor(ctx context.Context, tenantID string) aiprovider.Provider {
-	def, err := h.entityDef(ctx, tenantID, "AIProviderConnection")
+func (h *Handler) aiProviderFor(ctx context.Context, ts tenantScope) aiprovider.Provider {
+	def, err := ts.entityDef(ctx, "AIProviderConnection")
 	if err != nil {
 		return h.ai
 	}
-	records, err := h.crud.List(ctx, def, tenantID)
+	records, err := ts.crud.List(ctx, def)
 	if err != nil {
-		log.Printf("api: resolve AI provider for tenant %s: list AIProviderConnection: %v", tenantID, err)
+		log.Printf("api: resolve AI provider: list AIProviderConnection: %v", err)
 		return h.ai
 	}
 	if len(records) == 0 {
@@ -353,13 +368,13 @@ func (h *Handler) aiProviderFor(ctx context.Context, tenantID string) aiprovider
 		baseURL, _ := fields["base_url"].(string)
 		return aiassist.NewClient(baseURL, model)
 	case "anthropic":
-		key, ok := h.decryptStoredAPIKey(tenantID, fields)
+		key, ok := h.decryptStoredAPIKey(fields)
 		if !ok {
 			return h.ai
 		}
 		return claudeassist.NewClient(key, model)
 	case "openai":
-		key, ok := h.decryptStoredAPIKey(tenantID, fields)
+		key, ok := h.decryptStoredAPIKey(fields)
 		if !ok {
 			return h.ai
 		}
@@ -369,18 +384,18 @@ func (h *Handler) aiProviderFor(ctx context.Context, tenantID string) aiprovider
 	}
 }
 
-// decryptStoredAPIKey decrypts fields' api_key_encrypted for tenantID —
-// ok is false (never a stop-the-request error, see aiProviderFor's own
-// doc comment) when there's nothing to decrypt, this deployment has no
+// decryptStoredAPIKey decrypts fields' api_key_encrypted — ok is false
+// (never a stop-the-request error, see aiProviderFor's own doc comment)
+// when there's nothing to decrypt, this deployment has no
 // SECRET_ENCRYPTION_KEY configured, or decryption itself fails.
-func (h *Handler) decryptStoredAPIKey(tenantID string, fields map[string]any) (key string, ok bool) {
+func (h *Handler) decryptStoredAPIKey(fields map[string]any) (key string, ok bool) {
 	encrypted, _ := fields["api_key_encrypted"].(string)
 	if encrypted == "" || !h.secretCryptor.Enabled() {
 		return "", false
 	}
 	key, err := h.secretCryptor.Decrypt(encrypted)
 	if err != nil {
-		log.Printf("api: resolve AI provider for tenant %s: decrypt stored API key: %v", tenantID, err)
+		log.Printf("api: resolve AI provider: decrypt stored API key: %v", err)
 		return "", false
 	}
 	return key, true

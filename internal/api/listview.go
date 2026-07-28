@@ -41,16 +41,21 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	ts, err := h.scope(r.Context(), rc.TenantID)
+	if err != nil {
+		writeInternalError(w, "resolve tenant scope", err)
+		return
+	}
 	entityType := r.PathValue("entityType")
 	locale := localeFromRequest(w, r)
 
-	def, err := h.entityDef(r.Context(), rc.TenantID, entityType)
+	def, err := ts.entityDef(r.Context(), entityType)
 	if err != nil {
 		writeDefinitionLookupError(w, entityType, err)
 		return
 	}
 
-	total, err := h.crud.Count(r.Context(), def, rc.TenantID)
+	total, err := ts.crud.Count(r.Context(), def)
 	if err != nil {
 		writeInternalError(w, fmt.Sprintf("count %s records for list page", entityType), err)
 		return
@@ -66,7 +71,7 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 	if page > totalPages {
 		page = totalPages
 	}
-	records, err := h.crud.ListPage(r.Context(), def, rc.TenantID, listPageSize, (page-1)*listPageSize)
+	records, err := ts.crud.ListPage(r.Context(), def, listPageSize, (page-1)*listPageSize)
 	if err != nil {
 		writeInternalError(w, fmt.Sprintf("list %s records for list page", entityType), err)
 		return
@@ -83,7 +88,7 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 	// target record was deleted after this one referenced it) falls
 	// back to showing the raw id — visible-but-broken beats silently
 	// hiding that the reference is dangling.
-	refOptions := h.loadReferenceOptions(r.Context(), rc.TenantID, def)
+	refOptions := h.loadReferenceOptions(r.Context(), ts, def)
 	referenceLabels := make(map[string]map[string]string, len(refOptions))
 	for field, opts := range refOptions {
 		byID := make(map[string]string, len(opts))

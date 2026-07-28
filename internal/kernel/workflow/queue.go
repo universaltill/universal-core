@@ -23,24 +23,21 @@ var ErrNoJobAvailable = data.ErrNoJobAvailable
 type StepHandler func(ctx context.Context, job data.WorkflowJob, step Step) error
 
 // DefinitionLookup resolves the workflow.Definition a queued job was
-// enqueued against, scoped to tenantID — required, not optional: workflow
-// definitions are per-tenant (a tenant can customize/version its own
-// workflows), and ClaimNext is deliberately tenant-global (a background
-// dispatcher polls every tenant's due jobs), so a lookup keyed only on
-// name+version with no tenant scope would resolve one tenant's workflow
-// definition against another tenant's job — exactly the kind of ambient,
-// implicit-tenant-context bug CLAUDE.md's multi-tenancy rule exists to
-// rule out. RegistryDefinitionLookup (registry.go) is the real,
-// registry-backed implementation; tests build their own stub closures.
-type DefinitionLookup func(ctx context.Context, tenantID, name string, version int) (*Definition, error)
+// enqueued against. RegistryDefinitionLookup (registry.go) is the real,
+// registry-backed implementation, built against one tenant's own
+// database (ADR-0003) — every Queue this package constructs already
+// operates against a single tenant's *sql.DB, so a lookup no longer
+// needs its own tenant scope; tests build their own stub closures.
+type DefinitionLookup func(ctx context.Context, name string, version int) (*Definition, error)
 
 // Queue is the durable, Postgres-backed counterpart to the in-memory
 // Execute — the "durable, transactional Postgres job queue (retries,
-// dead-letter, resumable)" ADR-0001 §9 calls for. One Queue serves every
-// tenant and workflow definition; behaviour comes from the Definition a
-// job was enqueued against and the StepHandlers registered, never a
-// per-entity-type branch (CLAUDE.md's kernel/deterministic-core boundary
-// rule).
+// dead-letter, resumable)" ADR-0001 §9 calls for. One Queue serves one
+// tenant's own database (ADR-0003) and every workflow definition within
+// it; behaviour comes from the Definition a job was enqueued against and
+// the StepHandlers registered, never a per-entity-type branch (CLAUDE.md's
+// kernel/deterministic-core boundary rule). internal/worker is
+// responsible for running one Queue per tenant to cover every tenant.
 //
 // Execute (workflow.go) stays as the simple synchronous, no-side-effect,
 // no-persistence executor — useful for validating/previewing a
@@ -97,12 +94,11 @@ func defaultBackoff(attempt int) time.Duration {
 // record, starting at step 0. An invalid Definition is never queued —
 // fail loud before persisting, same discipline as crud.Engine validating
 // before it writes.
-func (q *Queue) Enqueue(ctx context.Context, def *Definition, tenantID, entityType, recordID string, actor audit.Actor) (data.WorkflowJob, error) {
+func (q *Queue) Enqueue(ctx context.Context, def *Definition, entityType, recordID string, actor audit.Actor) (data.WorkflowJob, error) {
 	if err := def.Validate(); err != nil {
 		return data.WorkflowJob{}, fmt.Errorf("invalid workflow: %w", err)
 	}
 	return q.jobs.Enqueue(ctx, data.WorkflowJob{
-		TenantID:        tenantID,
 		WorkflowName:    def.Name,
 		WorkflowVersion: def.Version,
 		EntityType:      entityType,
@@ -130,7 +126,7 @@ func (q *Queue) ProcessOne(ctx context.Context, lookup DefinitionLookup) (job da
 		return data.WorkflowJob{}, err
 	}
 
-	def, err := lookup(ctx, job.TenantID, job.WorkflowName, job.WorkflowVersion)
+	def, err := lookup(ctx, job.WorkflowName, job.WorkflowVersion)
 	if err != nil {
 		return job, q.fail(ctx, job, fmt.Errorf("look up workflow definition: %w", err))
 	}
@@ -142,7 +138,7 @@ func (q *Queue) ProcessOne(ctx context.Context, lookup DefinitionLookup) (job da
 		step := def.Steps[i]
 
 		if step.Kind == StepRequireApproval {
-			if err := q.jobs.MarkWaitingApproval(ctx, job.TenantID, job.ID, i); err != nil {
+			if err := q.jobs.MarkWaitingApproval(ctx, job.ID, i); err != nil {
 				return job, err
 			}
 			return job, nil
@@ -157,7 +153,7 @@ func (q *Queue) ProcessOne(ctx context.Context, lookup DefinitionLookup) (job da
 		}
 	}
 
-	if err := q.jobs.MarkDone(ctx, job.TenantID, job.ID, len(def.Steps)); err != nil {
+	if err := q.jobs.MarkDone(ctx, job.ID, len(def.Steps)); err != nil {
 		return job, err
 	}
 	return job, nil
@@ -180,7 +176,7 @@ func runHandler(ctx context.Context, handler StepHandler, job data.WorkflowJob, 
 // status/last_error, not a caller-facing error from ProcessOne.
 func (q *Queue) fail(ctx context.Context, job data.WorkflowJob, stepErr error) error {
 	runAfter := time.Now().Add(q.backoff(job.Attempts))
-	if _, err := q.jobs.MarkFailed(ctx, job.TenantID, job.ID, stepErr, runAfter); err != nil {
+	if _, err := q.jobs.MarkFailed(ctx, job.ID, stepErr, runAfter); err != nil {
 		return fmt.Errorf("mark job failed (original error: %v): %w", stepErr, err)
 	}
 	return nil
@@ -190,20 +186,20 @@ func (q *Queue) fail(ctx context.Context, job data.WorkflowJob, stepErr error) e
 // its next step and requeues it. Called from internal/api's
 // approveWorkflowJob (POST /api/workflow-jobs/{id}/approve, added
 // 2026-07-21 — see QUEUE.md), the handler for a human's approval action.
-// tenantID must be the caller's authenticated tenant scope — this is the
-// one method in this package a request handler calls directly with a
-// caller-supplied job ID, so the tenant check is load-bearing, not just
-// defense in depth.
-func (q *Queue) ResumeAfterApproval(ctx context.Context, tenantID, jobID string) error {
-	return q.jobs.ResumeAfterApproval(ctx, tenantID, jobID)
+// The caller must have already resolved this Queue against the
+// authenticated caller's own tenant database (internal/tenantdb.Router)
+// — that's what makes a cross-tenant resume impossible now, not a
+// tenantID parameter here.
+func (q *Queue) ResumeAfterApproval(ctx context.Context, jobID string) error {
+	return q.jobs.ResumeAfterApproval(ctx, jobID)
 }
 
-// ListByStatus returns every tenantID job currently in status, oldest
-// first — see data.WorkflowJobRepo.ListByStatus. The read side of the
-// approval loop: ResumeAfterApproval resumes a job by id, this is how a
-// caller finds which ids are actually waiting without direct DB access.
-func (q *Queue) ListByStatus(ctx context.Context, tenantID, status string) ([]data.WorkflowJob, error) {
-	return q.jobs.ListByStatus(ctx, tenantID, status)
+// ListByStatus returns every job currently in status, oldest first — see
+// data.WorkflowJobRepo.ListByStatus. The read side of the approval loop:
+// ResumeAfterApproval resumes a job by id, this is how a caller finds
+// which ids are actually waiting without direct DB access.
+func (q *Queue) ListByStatus(ctx context.Context, status string) ([]data.WorkflowJob, error) {
+	return q.jobs.ListByStatus(ctx, status)
 }
 
 // ReclaimStale requeues jobs stuck in 'running' past leaseTimeout — see

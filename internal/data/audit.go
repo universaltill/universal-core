@@ -45,9 +45,9 @@ func (r *AuditRepo) Insert(ctx context.Context, ex execer, e audit.Entry) error 
 
 	_, err := ex.ExecContext(ctx,
 		`INSERT INTO audit_log
-		 (tenant_id, entity_type, record_id, action, actor_type, actor_id, model_version, input_hash, diff)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-		e.TenantID, e.EntityType, nullableID(e.RecordID), string(e.Action),
+		 (entity_type, record_id, action, actor_type, actor_id, model_version, input_hash, diff)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		e.EntityType, nullableID(e.RecordID), string(e.Action),
 		string(e.Actor.Type), e.Actor.ID, modelVersion, inputHash, raw,
 	)
 	if err != nil {

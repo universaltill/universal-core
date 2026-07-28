@@ -15,7 +15,6 @@ import (
 // resumable across worker restarts via StepIndex.
 type WorkflowJob struct {
 	ID              string
-	TenantID        string
 	WorkflowName    string
 	WorkflowVersion int
 	EntityType      string
@@ -34,6 +33,12 @@ var ErrNoJobAvailable = errors.New("data: no workflow job available to claim")
 
 // WorkflowJobRepo is the repository for the durable workflow job queue —
 // the only place that runs raw SQL against workflow_jobs (CLAUDE.md).
+// Every method operates against one tenant's own database (ADR-0003) —
+// internal/worker is responsible for iterating every tenant's database
+// when it needs to poll across all of them (ClaimNext/ReclaimStale below
+// are each scoped to whichever database this repo was constructed
+// against, not "every tenant" the way they were under the old shared-DB
+// design).
 type WorkflowJobRepo struct {
 	db *sql.DB
 }
@@ -54,11 +59,11 @@ func (r *WorkflowJobRepo) Enqueue(ctx context.Context, job WorkflowJob) (Workflo
 	}
 	err := r.db.QueryRowContext(ctx,
 		`INSERT INTO workflow_jobs
-		 (tenant_id, workflow_name, workflow_version, entity_type, record_id,
+		 (workflow_name, workflow_version, entity_type, record_id,
 		  max_attempts, actor_type, actor_id, model_version)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		 RETURNING id, step_index, status, attempts, run_after`,
-		job.TenantID, job.WorkflowName, job.WorkflowVersion, job.EntityType, job.RecordID,
+		job.WorkflowName, job.WorkflowVersion, job.EntityType, job.RecordID,
 		job.MaxAttempts, string(job.Actor.Type), job.Actor.ID, modelVersion,
 	).Scan(&job.ID, &job.StepIndex, &job.Status, &job.Attempts, &job.RunAfter)
 	if err != nil {
@@ -67,11 +72,11 @@ func (r *WorkflowJobRepo) Enqueue(ctx context.Context, job WorkflowJob) (Workflo
 	return job, nil
 }
 
-// ClaimNext atomically claims the oldest due, queued job and marks it
-// running, using SELECT ... FOR UPDATE SKIP LOCKED so multiple worker
-// processes can poll this table concurrently without claiming the same
-// job or blocking on each other's claims. Returns ErrNoJobAvailable when
-// nothing is due yet.
+// ClaimNext atomically claims the oldest due, queued job in this
+// database and marks it running, using SELECT ... FOR UPDATE SKIP LOCKED
+// so multiple worker processes can poll this table concurrently without
+// claiming the same job or blocking on each other's claims. Returns
+// ErrNoJobAvailable when nothing is due yet.
 func (r *WorkflowJobRepo) ClaimNext(ctx context.Context) (WorkflowJob, error) {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -82,14 +87,14 @@ func (r *WorkflowJobRepo) ClaimNext(ctx context.Context) (WorkflowJob, error) {
 	var j WorkflowJob
 	var modelVersion sql.NullString
 	err = tx.QueryRowContext(ctx,
-		`SELECT id, tenant_id, workflow_name, workflow_version, entity_type, record_id,
+		`SELECT id, workflow_name, workflow_version, entity_type, record_id,
 		        step_index, attempts, max_attempts, actor_type, actor_id, model_version
 		 FROM workflow_jobs
 		 WHERE status = 'queued' AND run_after <= now()
 		 ORDER BY run_after
 		 FOR UPDATE SKIP LOCKED
 		 LIMIT 1`,
-	).Scan(&j.ID, &j.TenantID, &j.WorkflowName, &j.WorkflowVersion, &j.EntityType, &j.RecordID,
+	).Scan(&j.ID, &j.WorkflowName, &j.WorkflowVersion, &j.EntityType, &j.RecordID,
 		&j.StepIndex, &j.Attempts, &j.MaxAttempts, &j.Actor.Type, &j.Actor.ID, &modelVersion)
 	if errors.Is(err, sql.ErrNoRows) {
 		return WorkflowJob{}, ErrNoJobAvailable
@@ -114,17 +119,14 @@ func (r *WorkflowJobRepo) ClaimNext(ctx context.Context) (WorkflowJob, error) {
 }
 
 // MarkDone completes a job at stepIndex (== len(def.Steps) when every
-// step ran). Scoped by tenantID (CLAUDE.md's multi-tenancy rule) even
-// though today's only caller (Queue.ProcessOne) already has the job's own
-// tenant_id from ClaimNext — cheap defense in depth, and consistent with
-// every other by-ID method below. Guarded by status = 'running': see the
-// package-level note above ReclaimStale on why every Mark* method needs
-// this guard, not just a tenant/id match.
-func (r *WorkflowJobRepo) MarkDone(ctx context.Context, tenantID, id string, stepIndex int) error {
+// step ran). Guarded by status = 'running': see the package-level note
+// above ReclaimStale on why every Mark* method needs this guard, not
+// just an id match.
+func (r *WorkflowJobRepo) MarkDone(ctx context.Context, id string, stepIndex int) error {
 	n, err := execRows(ctx, r.db,
-		`UPDATE workflow_jobs SET status = 'done', step_index = $3, updated_at = now()
-		 WHERE id = $1 AND tenant_id = $2 AND status = 'running'`,
-		id, tenantID, stepIndex)
+		`UPDATE workflow_jobs SET status = 'done', step_index = $2, updated_at = now()
+		 WHERE id = $1 AND status = 'running'`,
+		id, stepIndex)
 	if err != nil {
 		return fmt.Errorf("mark workflow job done: %w", err)
 	}
@@ -138,11 +140,11 @@ func (r *WorkflowJobRepo) MarkDone(ctx context.Context, tenantID, id string, ste
 // is the approval step's own index, so ResumeAfterApproval's step_index+1
 // resumes at the step after it. Guarded by status = 'running' — see the
 // package-level note above ReclaimStale.
-func (r *WorkflowJobRepo) MarkWaitingApproval(ctx context.Context, tenantID, id string, stepIndex int) error {
+func (r *WorkflowJobRepo) MarkWaitingApproval(ctx context.Context, id string, stepIndex int) error {
 	n, err := execRows(ctx, r.db,
-		`UPDATE workflow_jobs SET status = 'waiting_approval', step_index = $3, updated_at = now()
-		 WHERE id = $1 AND tenant_id = $2 AND status = 'running'`,
-		id, tenantID, stepIndex)
+		`UPDATE workflow_jobs SET status = 'waiting_approval', step_index = $2, updated_at = now()
+		 WHERE id = $1 AND status = 'running'`,
+		id, stepIndex)
 	if err != nil {
 		return fmt.Errorf("mark workflow job waiting_approval: %w", err)
 	}
@@ -159,17 +161,17 @@ func (r *WorkflowJobRepo) MarkWaitingApproval(ctx context.Context, tenantID, id 
 // UPDATE (not read-attempts-then-write) so two workers can't race past
 // max_attempts. Guarded by status = 'running' — see the package-level
 // note above ReclaimStale.
-func (r *WorkflowJobRepo) MarkFailed(ctx context.Context, tenantID, id string, stepErr error, runAfter time.Time) (status string, err error) {
+func (r *WorkflowJobRepo) MarkFailed(ctx context.Context, id string, stepErr error, runAfter time.Time) (status string, err error) {
 	row := r.db.QueryRowContext(ctx,
 		`UPDATE workflow_jobs
 		 SET attempts = attempts + 1,
-		     last_error = $3,
+		     last_error = $2,
 		     status = CASE WHEN attempts + 1 >= max_attempts THEN 'dead_letter' ELSE 'queued' END,
-		     run_after = CASE WHEN attempts + 1 >= max_attempts THEN run_after ELSE $4 END,
+		     run_after = CASE WHEN attempts + 1 >= max_attempts THEN run_after ELSE $3 END,
 		     updated_at = now()
-		 WHERE id = $1 AND tenant_id = $2 AND status = 'running'
+		 WHERE id = $1 AND status = 'running'
 		 RETURNING status`,
-		id, tenantID, stepErr.Error(), runAfter,
+		id, stepErr.Error(), runAfter,
 	)
 	if err := row.Scan(&status); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -182,18 +184,21 @@ func (r *WorkflowJobRepo) MarkFailed(ctx context.Context, tenantID, id string, s
 
 // ResumeAfterApproval requeues a job halted at a require_approval step,
 // advancing past it — the durable counterpart of a human approving a
-// pending step. Tenant-scoped: this is the method a future HTTP approval
-// endpoint calls directly with a caller-supplied job ID, so the tenant
-// check here is load-bearing, not just defense in depth (a request for
-// tenant A must not be able to resume tenant B's job). Only valid from
-// 'waiting_approval'; returns ErrNotFound if the job isn't in that state
-// (already resumed, never halted, or belongs to a different tenant).
-func (r *WorkflowJobRepo) ResumeAfterApproval(ctx context.Context, tenantID, id string) error {
+// pending step. This is the method a future HTTP approval endpoint calls
+// directly with a caller-supplied job ID — the *sql.DB this repo was
+// constructed against must already be the caller's own tenant's
+// database (resolved via internal/tenantdb.Router before this call),
+// which is what makes a cross-tenant resume impossible now: there is no
+// row belonging to another tenant in this database to accidentally
+// match. Only valid from 'waiting_approval'; returns ErrNotFound if the
+// job isn't in that state (already resumed, never halted, or doesn't
+// exist in this database).
+func (r *WorkflowJobRepo) ResumeAfterApproval(ctx context.Context, id string) error {
 	n, err := execRows(ctx, r.db,
 		`UPDATE workflow_jobs
 		 SET status = 'queued', step_index = step_index + 1, run_after = now(), updated_at = now()
-		 WHERE id = $1 AND tenant_id = $2 AND status = 'waiting_approval'`,
-		id, tenantID)
+		 WHERE id = $1 AND status = 'waiting_approval'`,
+		id)
 	if err != nil {
 		return fmt.Errorf("resume workflow job: %w", err)
 	}
@@ -203,16 +208,16 @@ func (r *WorkflowJobRepo) ResumeAfterApproval(ctx context.Context, tenantID, id 
 	return nil
 }
 
-func (r *WorkflowJobRepo) Get(ctx context.Context, tenantID, id string) (WorkflowJob, error) {
+func (r *WorkflowJobRepo) Get(ctx context.Context, id string) (WorkflowJob, error) {
 	var j WorkflowJob
 	var modelVersion, lastError sql.NullString
 	err := r.db.QueryRowContext(ctx,
-		`SELECT id, tenant_id, workflow_name, workflow_version, entity_type, record_id,
+		`SELECT id, workflow_name, workflow_version, entity_type, record_id,
 		        step_index, status, attempts, max_attempts, last_error, run_after,
 		        actor_type, actor_id, model_version
-		 FROM workflow_jobs WHERE id = $1 AND tenant_id = $2`,
-		id, tenantID,
-	).Scan(&j.ID, &j.TenantID, &j.WorkflowName, &j.WorkflowVersion, &j.EntityType, &j.RecordID,
+		 FROM workflow_jobs WHERE id = $1`,
+		id,
+	).Scan(&j.ID, &j.WorkflowName, &j.WorkflowVersion, &j.EntityType, &j.RecordID,
 		&j.StepIndex, &j.Status, &j.Attempts, &j.MaxAttempts, &lastError, &j.RunAfter,
 		&j.Actor.Type, &j.Actor.ID, &modelVersion)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -230,21 +235,19 @@ func (r *WorkflowJobRepo) Get(ctx context.Context, tenantID, id string) (Workflo
 	return j, nil
 }
 
-// ListByStatus returns every tenantID job currently in status, oldest
-// first — what a task-list/inbox needs to show a human what's actually
-// waiting on them ("waiting_approval") without requiring the caller to
-// already know a job id (approveWorkflowJob's own gap: it resumes a job
-// by id, but nothing before this could tell a caller which ids exist).
-// idx_workflow_jobs_tenant_status (tenant_id, status) backs this
-// directly — the same index the claim/reclaim paths' own tenant-status
-// lookups already benefit from.
-func (r *WorkflowJobRepo) ListByStatus(ctx context.Context, tenantID, status string) ([]WorkflowJob, error) {
+// ListByStatus returns every job currently in status, oldest first —
+// what a task-list/inbox needs to show a human what's actually waiting
+// on them ("waiting_approval") without requiring the caller to already
+// know a job id (approveWorkflowJob's own gap: it resumes a job by id,
+// but nothing before this could tell a caller which ids exist).
+// idx_workflow_jobs_status backs this directly.
+func (r *WorkflowJobRepo) ListByStatus(ctx context.Context, status string) ([]WorkflowJob, error) {
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT id, tenant_id, workflow_name, workflow_version, entity_type, record_id,
+		`SELECT id, workflow_name, workflow_version, entity_type, record_id,
 		        step_index, status, attempts, max_attempts, last_error, run_after,
 		        actor_type, actor_id, model_version
-		 FROM workflow_jobs WHERE tenant_id = $1 AND status = $2 ORDER BY created_at`,
-		tenantID, status,
+		 FROM workflow_jobs WHERE status = $1 ORDER BY created_at`,
+		status,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list workflow jobs by status: %w", err)
@@ -255,7 +258,7 @@ func (r *WorkflowJobRepo) ListByStatus(ctx context.Context, tenantID, status str
 	for rows.Next() {
 		var j WorkflowJob
 		var modelVersion, lastError sql.NullString
-		if err := rows.Scan(&j.ID, &j.TenantID, &j.WorkflowName, &j.WorkflowVersion, &j.EntityType, &j.RecordID,
+		if err := rows.Scan(&j.ID, &j.WorkflowName, &j.WorkflowVersion, &j.EntityType, &j.RecordID,
 			&j.StepIndex, &j.Status, &j.Attempts, &j.MaxAttempts, &lastError, &j.RunAfter,
 			&j.Actor.Type, &j.Actor.ID, &modelVersion); err != nil {
 			return nil, fmt.Errorf("scan workflow job: %w", err)
@@ -280,19 +283,20 @@ func (r *WorkflowJobRepo) ListByStatus(ctx context.Context, tenantID, status str
 // rather than lost" intent. Treated like a failure for attempt-counting —
 // not an unconditional reset to 'queued' — so a job that reliably crashes
 // its worker (a poison pill) still dead-letters instead of being reclaimed
-// forever. Global across tenants, like ClaimNext: this is a background
-// maintenance sweep, not a tenant-scoped request. Returns the reclaimed
-// job IDs so a caller can log/alert; call this periodically (e.g. once
-// per poll loop) from whatever process runs ProcessOne.
+// forever. A sweep over this database only — internal/worker iterates
+// every tenant's own database to cover all of them (ADR-0003), this
+// method itself has no cross-tenant concept anymore. Returns the
+// reclaimed job IDs so a caller can log/alert; call this periodically
+// (e.g. once per poll loop) from whatever process runs ProcessOne.
 //
 // Reclaiming isn't the only case this table's writes need to guard
 // against: a worker isn't always dead just because it's stale — it can
 // simply be slow (a step handler running longer than leaseTimeout while
 // still perfectly alive). If ReclaimStale requeues that job out from
 // under it, and the original worker later finishes and calls MarkDone/
-// MarkFailed/MarkWaitingApproval anyway, an UPDATE keyed only on id+
-// tenant_id would happily resurrect a job ReclaimStale had already
-// requeued or dead-lettered — completed work un-completing itself, or a
+// MarkFailed/MarkWaitingApproval anyway, an UPDATE keyed only on id
+// would happily resurrect a job ReclaimStale had already requeued or
+// dead-lettered — completed work un-completing itself, or a
 // dead-lettered job silently un-dead-lettering. That's why every Mark*
 // method above adds `AND status = 'running'`: once ReclaimStale (or
 // another worker, in principle) has moved a job off 'running', the
@@ -334,7 +338,7 @@ func (r *WorkflowJobRepo) ReclaimStale(ctx context.Context, leaseTimeout time.Du
 }
 
 // execRows runs an UPDATE and returns rows affected, so by-ID methods can
-// distinguish "no such row for this tenant" from a real driver error.
+// distinguish "no such row" from a real driver error.
 func execRows(ctx context.Context, ex execer, query string, args ...any) (int64, error) {
 	res, err := ex.ExecContext(ctx, query, args...)
 	if err != nil {

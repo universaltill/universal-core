@@ -77,7 +77,6 @@ func (a Actor) InputHash() string {
 // package defines the shape and the invariant (Actor.Validate); the SQL
 // lives in internal/data per the repository-pattern rule.
 type Entry struct {
-	TenantID   string
 	EntityType string
 	RecordID   string
 	Action     Action
@@ -88,12 +87,11 @@ type Entry struct {
 
 // New builds an Entry, validating the actor. Every mutation path in the
 // kernel must go through this — there is no direct-insert shortcut.
-func New(tenantID, entityType, recordID string, action Action, actor Actor, diff map[string]any) (Entry, error) {
+func New(entityType, recordID string, action Action, actor Actor, diff map[string]any) (Entry, error) {
 	if err := actor.Validate(); err != nil {
 		return Entry{}, err
 	}
 	return Entry{
-		TenantID:   tenantID,
 		EntityType: entityType,
 		RecordID:   recordID,
 		Action:     action,

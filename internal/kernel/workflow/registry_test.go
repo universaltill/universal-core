@@ -15,9 +15,8 @@ import (
 // 003_definition_registry.sql added it) is wired correctly, keyed by
 // name rather than entity_type.
 func TestWorkflowDefinitionRegistry_FullLifecycle(t *testing.T) {
-	db := testDB(t)
+	db := freshTenantDB(t)
 	ctx := context.Background()
-	tenantID := seedTenant(t, db)
 	repo := data.NewWorkflowDefinitionRepo(db)
 	def := poApprovalWorkflow()
 	actor := humanActor()
@@ -27,17 +26,17 @@ func TestWorkflowDefinitionRegistry_FullLifecycle(t *testing.T) {
 		t.Fatalf("marshal definition: %v", err)
 	}
 
-	if _, err := repo.CreateDraft(ctx, tenantID, def.Name, def.Version, raw, actor); err != nil {
+	if _, err := repo.CreateDraft(ctx, def.Name, def.Version, raw, actor); err != nil {
 		t.Fatalf("CreateDraft: %v", err)
 	}
-	if err := repo.Approve(ctx, tenantID, def.Name, def.Version, actor); err != nil {
+	if err := repo.Approve(ctx, def.Name, def.Version, actor); err != nil {
 		t.Fatalf("Approve: %v", err)
 	}
-	if err := repo.Publish(ctx, tenantID, def.Name, def.Version, actor); err != nil {
+	if err := repo.Publish(ctx, def.Name, def.Version, actor); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 
-	got, err := repo.GetPublished(ctx, tenantID, def.Name)
+	got, err := repo.GetPublished(ctx, def.Name)
 	if err != nil {
 		t.Fatalf("GetPublished: %v", err)
 	}
@@ -59,20 +58,19 @@ func TestWorkflowDefinitionRegistry_FullLifecycle(t *testing.T) {
 // published, because job1 already captured WorkflowVersion=1 at Enqueue
 // time.
 func TestRegistryDefinitionLookup_ResolvesExactVersionEnqueuedAgainst(t *testing.T) {
-	db := testDB(t)
+	db := freshTenantDB(t)
 	ctx := context.Background()
-	tenantID := seedTenant(t, db)
 	defRepo := data.NewWorkflowDefinitionRepo(db)
 	actor := humanActor()
 
 	v1 := &Definition{Name: "onboarding", Version: 1, Trigger: Trigger{Type: TriggerManual}, Steps: []Step{{Kind: StepNotify}}}
-	publish(t, defRepo, tenantID, v1, actor)
+	publish(t, defRepo, v1, actor)
 
 	q, err := NewQueue(db, nil)
 	if err != nil {
 		t.Fatalf("NewQueue: %v", err)
 	}
-	job, err := q.Enqueue(ctx, v1, tenantID, "Employee", "33333333-3333-3333-3333-333333333333", actor)
+	job, err := q.Enqueue(ctx, v1, "Employee", "33333333-3333-3333-3333-333333333333", actor)
 	if err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
@@ -80,7 +78,7 @@ func TestRegistryDefinitionLookup_ResolvesExactVersionEnqueuedAgainst(t *testing
 	// A newer version gets published after the job was already enqueued
 	// against v1 — the running job must still resolve v1, not v2.
 	v2 := &Definition{Name: "onboarding", Version: 2, Trigger: Trigger{Type: TriggerManual}, Steps: []Step{{Kind: StepNotify}, {Kind: StepNotify}}}
-	publish(t, defRepo, tenantID, v2, actor)
+	publish(t, defRepo, v2, actor)
 
 	lookup := RegistryDefinitionLookup(db)
 	processed, err := q.ProcessOne(ctx, lookup)
@@ -92,7 +90,7 @@ func TestRegistryDefinitionLookup_ResolvesExactVersionEnqueuedAgainst(t *testing
 	}
 
 	repo := data.NewWorkflowJobRepo(db)
-	got, err := repo.Get(ctx, tenantID, job.ID)
+	got, err := repo.Get(ctx, job.ID)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -102,45 +100,47 @@ func TestRegistryDefinitionLookup_ResolvesExactVersionEnqueuedAgainst(t *testing
 }
 
 // TestRegistryDefinitionLookup_TenantScoped confirms the lookup can't
-// resolve a definition published under a different tenant — the
-// regression test for the DefinitionLookup signature change (adding
-// tenantID) itself.
+// resolve a definition published under a different tenant's database —
+// proven here via two genuinely separate tenant databases (ADR-0003), a
+// stronger proof than the old shared-DB/tenant_id version: tenant B's
+// RegistryDefinitionLookup is built against a connection that simply has
+// no such row, physically, not a query that happens to filter it out.
 func TestRegistryDefinitionLookup_TenantScoped(t *testing.T) {
-	db := testDB(t)
 	ctx := context.Background()
-	tenantA := seedTenant(t, db)
-	tenantB := seedTenant(t, db)
-	defRepo := data.NewWorkflowDefinitionRepo(db)
+	dbA := freshTenantDB(t)
+	dbB := freshTenantDB(t)
+	defRepoA := data.NewWorkflowDefinitionRepo(dbA)
 	actor := humanActor()
 
 	def := &Definition{Name: "tenant_scoped_wf", Version: 1, Trigger: Trigger{Type: TriggerManual}, Steps: []Step{{Kind: StepNotify}}}
-	publish(t, defRepo, tenantA, def, actor)
+	publish(t, defRepoA, def, actor)
 
-	lookup := RegistryDefinitionLookup(db)
-	if _, err := lookup(ctx, tenantB, def.Name, def.Version); err == nil {
+	lookupA := RegistryDefinitionLookup(dbA)
+	lookupB := RegistryDefinitionLookup(dbB)
+	if _, err := lookupB(ctx, def.Name, def.Version); err == nil {
 		t.Fatal("expected tenant B's lookup of tenant A's workflow definition to fail")
 	}
-	if _, err := lookup(ctx, tenantA, def.Name, def.Version); err != nil {
+	if _, err := lookupA(ctx, def.Name, def.Version); err != nil {
 		t.Fatalf("expected tenant A's own lookup to succeed, got %v", err)
 	}
 }
 
 // publish drives a Definition through CreateDraft -> Approve -> Publish
 // in one call, for tests that only care about the end state.
-func publish(t *testing.T, repo *data.WorkflowDefinitionRepo, tenantID string, def *Definition, actor audit.Actor) {
+func publish(t *testing.T, repo *data.WorkflowDefinitionRepo, def *Definition, actor audit.Actor) {
 	t.Helper()
 	ctx := context.Background()
 	raw, err := json.Marshal(def)
 	if err != nil {
 		t.Fatalf("marshal definition %s: %v", def.Name, err)
 	}
-	if _, err := repo.CreateDraft(ctx, tenantID, def.Name, def.Version, raw, actor); err != nil {
+	if _, err := repo.CreateDraft(ctx, def.Name, def.Version, raw, actor); err != nil {
 		t.Fatalf("CreateDraft %s v%d: %v", def.Name, def.Version, err)
 	}
-	if err := repo.Approve(ctx, tenantID, def.Name, def.Version, actor); err != nil {
+	if err := repo.Approve(ctx, def.Name, def.Version, actor); err != nil {
 		t.Fatalf("Approve %s v%d: %v", def.Name, def.Version, err)
 	}
-	if err := repo.Publish(ctx, tenantID, def.Name, def.Version, actor); err != nil {
+	if err := repo.Publish(ctx, def.Name, def.Version, actor); err != nil {
 		t.Fatalf("Publish %s v%d: %v", def.Name, def.Version, err)
 	}
 }

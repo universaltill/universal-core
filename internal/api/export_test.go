@@ -8,10 +8,10 @@ import (
 )
 
 func TestExport_RequiresAuth(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
 	mux := http.NewServeMux()
-	testHandler(t, db).Routes(mux)
+	testHandler(t, router).Routes(mux)
 
 	req := httptest.NewRequest("GET", "/export/Order", nil) // no auth headers
 	rec := httptest.NewRecorder()
@@ -23,12 +23,12 @@ func TestExport_RequiresAuth(t *testing.T) {
 }
 
 func TestExport_UnknownEntityTypeIs404(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
+	tenantID, _ := newTestTenant(t, router)
 
 	mux := http.NewServeMux()
-	testHandler(t, db).Routes(mux)
+	testHandler(t, router).Routes(mux)
 
 	req := newRequest("GET", "/export/NoSuchEntity", tenantID, "farshid", nil)
 	rec := httptest.NewRecorder()
@@ -44,13 +44,13 @@ func TestExport_UnknownEntityTypeIs404(t *testing.T) {
 // CSV row with the right headers, Content-Type, and a
 // Content-Disposition that names a real, downloadable filename.
 func TestExport_WritesCSVAttachmentWithTenantsOwnRecords(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
-	publishEntityAndForm(t, db, tenantID, orderEntityDef(), orderFormDef())
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, orderEntityDef(), orderFormDef())
 
 	mux := http.NewServeMux()
-	testHandler(t, db).Routes(mux)
+	testHandler(t, router).Routes(mux)
 
 	createReq := newRequest("POST", "/api/records/Order", tenantID, "farshid",
 		[]byte(`{"vendor_id":"Acme Textiles","order_date":"2026-07-01"}`))
@@ -85,17 +85,20 @@ func TestExport_WritesCSVAttachmentWithTenantsOwnRecords(t *testing.T) {
 
 // TestExport_TenantIsolation confirms one tenant's export never includes
 // another tenant's records — the same cross-tenant-leak class of bug
-// every other list/read path in this kernel is held to.
+// every other list/read path in this kernel is held to. Proven here via
+// two genuinely separate tenant databases (ADR-0003), provisioned
+// through the same router the Handler under test resolves requests
+// through — a stronger proof than the old shared-DB/tenant_id version.
 func TestExport_TenantIsolation(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantA := seedTenant(t, db)
-	tenantB := seedTenant(t, db)
-	publishEntityAndForm(t, db, tenantA, orderEntityDef(), orderFormDef())
-	publishEntityAndForm(t, db, tenantB, orderEntityDef(), orderFormDef())
+	tenantA, dbA := newTestTenant(t, router)
+	tenantB, dbB := newTestTenant(t, router)
+	publishEntityAndForm(t, dbA, orderEntityDef(), orderFormDef())
+	publishEntityAndForm(t, dbB, orderEntityDef(), orderFormDef())
 
 	mux := http.NewServeMux()
-	testHandler(t, db).Routes(mux)
+	testHandler(t, router).Routes(mux)
 
 	createReq := newRequest("POST", "/api/records/Order", tenantA, "farshid",
 		[]byte(`{"vendor_id":"Tenant A Only Vendor","order_date":"2026-07-01"}`))

@@ -33,19 +33,19 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/secretcrypt"
 	"github.com/universaltill/universal-core/internal/kernel/speechassist"
 	"github.com/universaltill/universal-core/internal/kernel/workflow"
+	"github.com/universaltill/universal-core/internal/tenantdb"
 	"github.com/universaltill/universal-core/internal/webauth"
 )
 
 // Handler wires the registry, crud.Engine, and formrender.Renderer
-// together behind HTTP. One Handler serves every entity/form type.
+// together behind HTTP. One Handler serves every tenant/entity/form type
+// — router resolves each request's own tenant database (ADR-0003) via
+// scope, rather than this Handler holding a single shared *sql.DB.
 type Handler struct {
-	entityDefs   *data.EntityDefinitionRepo
-	formDefs     *data.FormDefinitionRepo
-	workflowDefs *data.WorkflowDefinitionRepo
-	crud         *crud.Engine
-	renderer     *formrender.Renderer
-	catalog      *i18n.Catalog
-	auth         *webauth.Authenticator
+	router   *tenantdb.Router
+	renderer *formrender.Renderer
+	catalog  *i18n.Catalog
+	auth     *webauth.Authenticator
 	// ai is nil (Enabled() == false) unless OLLAMA_URL is configured —
 	// see aiassist's own doc comment on why every caller can treat that
 	// as "AI assistance unavailable" without a separate nil check.
@@ -53,9 +53,7 @@ type Handler struct {
 	// speech is nil (Enabled() == false) unless WHISPER_URL is
 	// configured — same nil-safe contract as ai, see speechassist's own
 	// doc comment.
-	speech        *speechassist.Client
-	workflowQueue *workflow.Queue
-	reporting     *data.ReportingRepo
+	speech *speechassist.Client
 	// secretCryptor is nil (Enabled() == false) unless
 	// SECRET_ENCRYPTION_KEY is configured — the AI-provider settings page
 	// (aiprovidersettings.go) refuses to store a tenant's own API key at
@@ -74,7 +72,43 @@ type Handler struct {
 // treats a disabled client as "AI assistance unavailable," never an
 // error. secretCryptor may also be nil — see the Handler field's own
 // doc comment.
-func New(db *sql.DB, catalog *i18n.Catalog, auth *webauth.Authenticator, ai *aiassist.Client, speech *speechassist.Client, secretCryptor *secretcrypt.Cryptor) *Handler {
+func New(router *tenantdb.Router, catalog *i18n.Catalog, auth *webauth.Authenticator, ai *aiassist.Client, speech *speechassist.Client, secretCryptor *secretcrypt.Cryptor) *Handler {
+	return &Handler{
+		router:        router,
+		renderer:      formrender.New(catalog),
+		catalog:       catalog,
+		auth:          auth,
+		ai:            ai,
+		speech:        speech,
+		secretCryptor: secretCryptor,
+	}
+}
+
+// tenantScope bundles every per-tenant repo/engine a request handler
+// needs, resolved once per request against that tenant's own database
+// (ADR-0003) — the replacement for Handler holding these long-lived
+// against one shared *sql.DB. Cheap to construct (each wraps the same
+// already-open, router-cached *sql.DB pointer; no I/O here beyond
+// router.Get's own cache lookup), so building one per request is not a
+// performance concern.
+type tenantScope struct {
+	db            *sql.DB
+	entityDefs    *data.EntityDefinitionRepo
+	formDefs      *data.FormDefinitionRepo
+	workflowDefs  *data.WorkflowDefinitionRepo
+	crud          *crud.Engine
+	workflowQueue *workflow.Queue
+	reporting     *data.ReportingRepo
+}
+
+// scope resolves tenantID's own database via h.router and builds a
+// tenantScope against it. Every request handler calls this immediately
+// after requestContext.
+func (h *Handler) scope(ctx context.Context, tenantID string) (tenantScope, error) {
+	db, err := h.router.Get(ctx, tenantID)
+	if err != nil {
+		return tenantScope{}, fmt.Errorf("resolve tenant database: %w", err)
+	}
 	// nil handlers: same default no-op notify handler internal/worker's
 	// Runner gets from workflow.NewQueue — this Handler only ever calls
 	// Enqueue/ResumeAfterApproval, never ProcessOne, so no StepHandler of
@@ -83,25 +117,38 @@ func New(db *sql.DB, catalog *i18n.Catalog, auth *webauth.Authenticator, ai *aia
 	if err != nil {
 		// Only returns an error for a caller-supplied require_approval
 		// handler, which nil (no handlers at all) can never trigger —
-		// unreachable in practice, but New has no error return of its own
-		// to propagate this through, so fail loud instead of silently
+		// unreachable in practice, but fail loud rather than silently
 		// leaving workflowQueue nil for something later to panic on.
-		panic(fmt.Sprintf("api.New: build workflow queue: %v", err))
+		return tenantScope{}, fmt.Errorf("build workflow queue: %w", err)
 	}
-	return &Handler{
+	return tenantScope{
+		db:            db,
 		entityDefs:    data.NewEntityDefinitionRepo(db),
 		formDefs:      data.NewFormDefinitionRepo(db),
 		workflowDefs:  data.NewWorkflowDefinitionRepo(db),
 		crud:          crud.NewEngine(db),
-		renderer:      formrender.New(catalog),
-		catalog:       catalog,
-		auth:          auth,
-		ai:            ai,
-		speech:        speech,
 		workflowQueue: workflowQueue,
 		reporting:     data.NewReportingRepo(db),
-		secretCryptor: secretCryptor,
+	}, nil
+}
+
+// entityDef looks up entityType's published Definition. Every handler
+// calls this first — a request for an entity type with no published
+// Definition 404s here, before touching crud.Engine or formrender at all.
+func (ts tenantScope) entityDef(ctx context.Context, entityType string) (*entity.Definition, error) {
+	v, err := ts.entityDefs.GetPublished(ctx, entityType)
+	if err != nil {
+		return nil, err
 	}
+	return entity.Unmarshal(v.Definition)
+}
+
+func (ts tenantScope) formDef(ctx context.Context, entityType string) (*form.Definition, error) {
+	v, err := ts.formDefs.GetPublished(ctx, entityType)
+	if err != nil {
+		return nil, err
+	}
+	return form.Unmarshal(v.Definition)
 }
 
 // Routes registers every handler onto mux, wrapped in
@@ -236,39 +283,24 @@ var idPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4
 
 func isValidID(s string) bool { return idPattern.MatchString(s) }
 
-// entityDef looks up entityType's published Definition for the
-// requesting tenant. Every handler below calls this first — a request
-// for an entity type with no published Definition 404s here, before
-// touching crud.Engine or formrender at all.
-func (h *Handler) entityDef(ctx context.Context, tenantID, entityType string) (*entity.Definition, error) {
-	v, err := h.entityDefs.GetPublished(ctx, tenantID, entityType)
-	if err != nil {
-		return nil, err
-	}
-	return entity.Unmarshal(v.Definition)
-}
-
-func (h *Handler) formDef(ctx context.Context, tenantID, entityType string) (*form.Definition, error) {
-	v, err := h.formDefs.GetPublished(ctx, tenantID, entityType)
-	if err != nil {
-		return nil, err
-	}
-	return form.Unmarshal(v.Definition)
-}
-
 func (h *Handler) listRecords(w http.ResponseWriter, r *http.Request) {
 	rc, ok := requestContext(w, r)
 	if !ok {
 		return
 	}
+	ts, err := h.scope(r.Context(), rc.TenantID)
+	if err != nil {
+		writeInternalError(w, "resolve tenant scope", err)
+		return
+	}
 	entityType := r.PathValue("entityType")
 
-	def, err := h.entityDef(r.Context(), rc.TenantID, entityType)
+	def, err := ts.entityDef(r.Context(), entityType)
 	if err != nil {
 		writeDefinitionLookupError(w, entityType, err)
 		return
 	}
-	records, err := h.crud.List(r.Context(), def, rc.TenantID)
+	records, err := ts.crud.List(r.Context(), def)
 	if err != nil {
 		writeInternalError(w, fmt.Sprintf("list %s records", entityType), err)
 		return
@@ -285,6 +317,11 @@ func (h *Handler) getRecord(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	ts, err := h.scope(r.Context(), rc.TenantID)
+	if err != nil {
+		writeInternalError(w, "resolve tenant scope", err)
+		return
+	}
 	entityType := r.PathValue("entityType")
 	id := r.PathValue("id")
 	if !isValidID(id) {
@@ -292,12 +329,12 @@ func (h *Handler) getRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	def, err := h.entityDef(r.Context(), rc.TenantID, entityType)
+	def, err := ts.entityDef(r.Context(), entityType)
 	if err != nil {
 		writeDefinitionLookupError(w, entityType, err)
 		return
 	}
-	rec, err := h.crud.Get(r.Context(), def, rc.TenantID, id)
+	rec, err := ts.crud.Get(r.Context(), def, id)
 	if errors.Is(err, data.ErrNotFound) {
 		httpx.WriteError(w, http.StatusNotFound, fmt.Sprintf("%s %q not found", entityType, id))
 		return
@@ -331,9 +368,14 @@ func (h *Handler) createRecord(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	ts, err := h.scope(r.Context(), rc.TenantID)
+	if err != nil {
+		writeInternalError(w, "resolve tenant scope", err)
+		return
+	}
 	entityType := r.PathValue("entityType")
 
-	entDef, err := h.entityDef(r.Context(), rc.TenantID, entityType)
+	entDef, err := ts.entityDef(r.Context(), entityType)
 	if err != nil {
 		writeDefinitionLookupError(w, entityType, err)
 		return
@@ -363,7 +405,7 @@ func (h *Handler) createRecord(w http.ResponseWriter, r *http.Request) {
 	// an is_initial status — there's no prior state to race against, so
 	// no expectedVersion is needed (see ValidateStatusTransition's doc
 	// comment).
-	if err := h.crud.ValidateStatusTransition(r.Context(), entDef, rc.TenantID, "", fields, true, nil); err != nil {
+	if err := ts.crud.ValidateStatusTransition(r.Context(), entDef, "", fields, true, nil); err != nil {
 		if errors.Is(err, crud.ErrInvalidTransition) {
 			httpx.WriteError(w, http.StatusBadRequest, err.Error())
 			return
@@ -372,15 +414,15 @@ func (h *Handler) createRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rec, err := h.crud.Create(r.Context(), entDef, rc.TenantID, fields, rc.Actor)
+	rec, err := ts.crud.Create(r.Context(), entDef, fields, rc.Actor)
 	if err != nil {
 		writeInternalError(w, fmt.Sprintf("create %s record", entityType), err)
 		return
 	}
-	h.triggerWorkflows(r.Context(), rc.TenantID, entityType, rec.ID, workflow.TriggerOnCreate, rc.Actor)
+	h.triggerWorkflows(r.Context(), ts, entityType, rec.ID, workflow.TriggerOnCreate, rc.Actor)
 
 	if isHTMXRequest(r) {
-		h.writeRecordFormFragment(w, r, rc.TenantID, entDef, entityType, rec.ID)
+		h.writeRecordFormFragment(w, r, ts, entDef, entityType, rec.ID)
 		return
 	}
 	httpx.WriteJSON(w, http.StatusCreated, toRecordResponse(rec))
@@ -391,6 +433,11 @@ func (h *Handler) updateRecord(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	ts, err := h.scope(r.Context(), rc.TenantID)
+	if err != nil {
+		writeInternalError(w, "resolve tenant scope", err)
+		return
+	}
 	entityType := r.PathValue("entityType")
 	id := r.PathValue("id")
 	if !isValidID(id) {
@@ -398,7 +445,7 @@ func (h *Handler) updateRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	entDef, err := h.entityDef(r.Context(), rc.TenantID, entityType)
+	entDef, err := ts.entityDef(r.Context(), entityType)
 	if err != nil {
 		writeDefinitionLookupError(w, entityType, err)
 		return
@@ -426,7 +473,7 @@ func (h *Handler) updateRecord(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := h.crud.ValidateStatusTransition(r.Context(), entDef, rc.TenantID, id, fields, false, expectedVersion); err != nil {
+	if err := ts.crud.ValidateStatusTransition(r.Context(), entDef, id, fields, false, expectedVersion); err != nil {
 		if errors.Is(err, data.ErrNotFound) {
 			// Matches the 404 crud.Update itself would have returned for
 			// this id — the status check runs first, so it has to report
@@ -442,7 +489,7 @@ func (h *Handler) updateRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err = h.crud.Update(r.Context(), entDef, rc.TenantID, id, fields, expectedVersion, rc.Actor)
+	_, err = ts.crud.Update(r.Context(), entDef, id, fields, expectedVersion, rc.Actor)
 	if errors.Is(err, data.ErrNotFound) {
 		httpx.WriteError(w, http.StatusNotFound, fmt.Sprintf("%s %q not found", entityType, id))
 		return
@@ -461,13 +508,13 @@ func (h *Handler) updateRecord(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, fmt.Sprintf("update %s %s", entityType, id), err)
 		return
 	}
-	h.triggerWorkflows(r.Context(), rc.TenantID, entityType, id, workflow.TriggerOnUpdate, rc.Actor)
+	h.triggerWorkflows(r.Context(), ts, entityType, id, workflow.TriggerOnUpdate, rc.Actor)
 
 	if isHTMXRequest(r) {
-		h.writeRecordFormFragment(w, r, rc.TenantID, entDef, entityType, id)
+		h.writeRecordFormFragment(w, r, ts, entDef, entityType, id)
 		return
 	}
-	rec, err := h.crud.Get(r.Context(), entDef, rc.TenantID, id)
+	rec, err := ts.crud.Get(r.Context(), entDef, id)
 	if err != nil {
 		writeInternalError(w, fmt.Sprintf("get %s %s after update", entityType, id), err)
 		return
@@ -593,13 +640,13 @@ func extractVersion(r *http.Request, fields map[string]any) (*int, error) {
 // wrapping it in layout.go's full <html> document would break the swap
 // the same way wrapping importPreview's response would) and writes it to
 // w. Called after a successful create/update when isHTMXRequest(r).
-func (h *Handler) writeRecordFormFragment(w http.ResponseWriter, r *http.Request, tenantID string, entDef *entity.Definition, entityType, id string) {
-	formDef, err := h.formDef(r.Context(), tenantID, entityType)
+func (h *Handler) writeRecordFormFragment(w http.ResponseWriter, r *http.Request, ts tenantScope, entDef *entity.Definition, entityType, id string) {
+	formDef, err := ts.formDef(r.Context(), entityType)
 	if err != nil {
 		writeDefinitionLookupError(w, entityType, err)
 		return
 	}
-	renderData, err := h.buildFormRenderData(r.Context(), tenantID, entDef, formDef, id)
+	renderData, err := h.buildFormRenderData(r.Context(), ts, entDef, formDef, id)
 	if err != nil {
 		writeInternalError(w, fmt.Sprintf("build %s form render data (id=%q)", entityType, id), err)
 		return
@@ -664,6 +711,11 @@ func (h *Handler) renderForm(w http.ResponseWriter, r *http.Request, id string) 
 	if !ok {
 		return
 	}
+	ts, err := h.scope(r.Context(), rc.TenantID)
+	if err != nil {
+		writeInternalError(w, "resolve tenant scope", err)
+		return
+	}
 	entityType := r.PathValue("entityType")
 	locale := localeFromRequest(w, r)
 	if id != "" && !isValidID(id) {
@@ -671,18 +723,18 @@ func (h *Handler) renderForm(w http.ResponseWriter, r *http.Request, id string) 
 		return
 	}
 
-	entDef, err := h.entityDef(r.Context(), rc.TenantID, entityType)
+	entDef, err := ts.entityDef(r.Context(), entityType)
 	if err != nil {
 		writeDefinitionLookupError(w, entityType, err)
 		return
 	}
-	formDef, err := h.formDef(r.Context(), rc.TenantID, entityType)
+	formDef, err := ts.formDef(r.Context(), entityType)
 	if err != nil {
 		writeDefinitionLookupError(w, entityType, err)
 		return
 	}
 
-	renderData, err := h.buildFormRenderData(r.Context(), rc.TenantID, entDef, formDef, id)
+	renderData, err := h.buildFormRenderData(r.Context(), ts, entDef, formDef, id)
 	if errors.Is(err, data.ErrNotFound) {
 		httpx.WriteError(w, http.StatusNotFound, fmt.Sprintf("%s %q not found", entityType, id))
 		return
@@ -721,14 +773,14 @@ func (h *Handler) renderForm(w http.ResponseWriter, r *http.Request, id string) 
 // both build the exact same data shape the same way, rather than two
 // copies that could silently drift (e.g. one remembering to populate
 // master-detail children, the other not).
-func (h *Handler) buildFormRenderData(ctx context.Context, tenantID string, entDef *entity.Definition, formDef *form.Definition, id string) (formrender.Data, error) {
+func (h *Handler) buildFormRenderData(ctx context.Context, ts tenantScope, entDef *entity.Definition, formDef *form.Definition, id string) (formrender.Data, error) {
 	renderData := formrender.Data{
-		ReferenceOptions: h.loadReferenceOptions(ctx, tenantID, entDef),
+		ReferenceOptions: h.loadReferenceOptions(ctx, ts, entDef),
 	}
 	if id == "" {
 		return renderData, nil
 	}
-	rec, err := h.crud.Get(ctx, entDef, tenantID, id)
+	rec, err := ts.crud.Get(ctx, entDef, id)
 	if err != nil {
 		return formrender.Data{}, err
 	}
@@ -736,7 +788,7 @@ func (h *Handler) buildFormRenderData(ctx context.Context, tenantID string, entD
 	renderData.Version = rec.Version
 	renderData.Record = rec.Data
 
-	children, err := h.loadMasterDetailChildren(ctx, tenantID, entDef, formDef, id)
+	children, err := h.loadMasterDetailChildren(ctx, ts, entDef, formDef, id)
 	if err != nil {
 		return formrender.Data{}, fmt.Errorf("load master-detail children: %w", err)
 	}
@@ -760,7 +812,7 @@ func (h *Handler) buildFormRenderData(ctx context.Context, tenantID string, entD
 // applies to its own registry lookups: a broken reference target
 // shouldn't block viewing or editing the record that merely points at
 // it, and an empty dropdown is still a usable (if incomplete) form.
-func (h *Handler) loadReferenceOptions(ctx context.Context, tenantID string, entDef *entity.Definition) map[string][]formrender.ReferenceOption {
+func (h *Handler) loadReferenceOptions(ctx context.Context, ts tenantScope, entDef *entity.Definition) map[string][]formrender.ReferenceOption {
 	byTarget := map[string][]formrender.ReferenceOption{}
 	out := map[string][]formrender.ReferenceOption{}
 	for _, f := range entDef.Fields {
@@ -770,7 +822,7 @@ func (h *Handler) loadReferenceOptions(ctx context.Context, tenantID string, ent
 		opts, ok := byTarget[f.Target]
 		if !ok {
 			var err error
-			opts, err = h.referenceOptionsFor(ctx, tenantID, f.Target)
+			opts, err = h.referenceOptionsFor(ctx, ts, f.Target)
 			if err != nil {
 				log.Printf("api: load reference options for %s.%s -> %s: %v", entDef.EntityType, f.Name, f.Target, err)
 				opts = nil
@@ -791,12 +843,12 @@ func (h *Handler) loadReferenceOptions(ctx context.Context, tenantID string, ent
 // names (see locale.go's entityDisplayName, a genuinely different
 // concern: translating "PurchaseOrder" the identifier, not translating
 // one specific vendor's name).
-func (h *Handler) referenceOptionsFor(ctx context.Context, tenantID, targetType string) ([]formrender.ReferenceOption, error) {
-	targetDef, err := h.entityDef(ctx, tenantID, targetType)
+func (h *Handler) referenceOptionsFor(ctx context.Context, ts tenantScope, targetType string) ([]formrender.ReferenceOption, error) {
+	targetDef, err := ts.entityDef(ctx, targetType)
 	if err != nil {
 		return nil, fmt.Errorf("look up target entity %s: %w", targetType, err)
 	}
-	records, err := h.crud.List(ctx, targetDef, tenantID)
+	records, err := ts.crud.List(ctx, targetDef)
 	if err != nil {
 		return nil, fmt.Errorf("list %s records: %w", targetType, err)
 	}
@@ -829,7 +881,7 @@ func (h *Handler) referenceOptionsFor(ctx context.Context, tenantID, targetType 
 // children", the same as an explicitly empty slice) rather than erroring
 // — a Definition mismatch here is a data-modeling bug to fix in the
 // Definition, not something that should 500 every form render for it.
-func (h *Handler) loadMasterDetailChildren(ctx context.Context, tenantID string, entDef *entity.Definition, formDef *form.Definition, recordID string) (map[string][]map[string]any, error) {
+func (h *Handler) loadMasterDetailChildren(ctx context.Context, ts tenantScope, entDef *entity.Definition, formDef *form.Definition, recordID string) (map[string][]map[string]any, error) {
 	children := make(map[string][]map[string]any)
 	for _, section := range formDef.Sections {
 		if section.Component != form.ComponentMasterDetail {
@@ -845,11 +897,11 @@ func (h *Handler) loadMasterDetailChildren(ctx context.Context, tenantID string,
 		if rel == nil || rel.ParentField == "" {
 			continue
 		}
-		childDef, err := h.entityDef(ctx, tenantID, section.Target)
+		childDef, err := ts.entityDef(ctx, section.Target)
 		if err != nil {
 			return nil, fmt.Errorf("look up %s definition for master-detail section: %w", section.Target, err)
 		}
-		records, err := h.crud.ListByField(ctx, childDef, tenantID, rel.ParentField, recordID)
+		records, err := ts.crud.ListByField(ctx, childDef, rel.ParentField, recordID)
 		if err != nil {
 			return nil, fmt.Errorf("list %s children: %w", section.Target, err)
 		}

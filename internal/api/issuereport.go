@@ -152,9 +152,14 @@ func (h *Handler) issueReportSubmit(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	ts, err := h.scope(r.Context(), rc.TenantID)
+	if err != nil {
+		writeInternalError(w, "resolve tenant scope", err)
+		return
+	}
 	locale := localeFromRequest(w, r)
 
-	def, err := h.entityDef(r.Context(), rc.TenantID, "IssueReport")
+	def, err := ts.entityDef(r.Context(), "IssueReport")
 	if err != nil {
 		writeDefinitionLookupError(w, "IssueReport", err)
 		return
@@ -190,7 +195,7 @@ func (h *Handler) issueReportSubmit(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	rec, err := h.crud.Create(r.Context(), def, rc.TenantID, fields, rc.Actor)
+	rec, err := ts.crud.Create(r.Context(), def, fields, rc.Actor)
 	if err != nil {
 		writeInternalError(w, "create issue report", err)
 		return

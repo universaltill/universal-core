@@ -31,9 +31,8 @@ import (
 // record it just created (the standard htmx create->edit pattern), edit
 // a field, click Save again, and confirm the update actually persisted.
 func TestFormSaveButton_RealBrowser(t *testing.T) {
-	db := testDB(t)
 	withDevAuthEnabled(t)
-	srv, tenantID := testServer(t, db)
+	srv, tenantID, _ := testServer(t)
 	ctx := browserCtx(t, tenantID)
 
 	if err := chromedp.Run(ctx,

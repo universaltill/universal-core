@@ -51,7 +51,7 @@ var ErrInvalidTransition = errors.New("crud: invalid status transition")
 // data.ErrVersionConflict (409) and must re-read and re-validate against
 // the state that actually won, closing the race the read-then-write
 // shape of this check would otherwise leave open.
-func (e *Engine) ValidateStatusTransition(ctx context.Context, def *entity.Definition, tenantID, id string, fields map[string]any, isCreate bool, expectedVersion *int) error {
+func (e *Engine) ValidateStatusTransition(ctx context.Context, def *entity.Definition, id string, fields map[string]any, isCreate bool, expectedVersion *int) error {
 	if def.StatusTypeCode == "" {
 		return nil
 	}
@@ -63,11 +63,11 @@ func (e *Engine) ValidateStatusTransition(ctx context.Context, def *entity.Defin
 		return nil
 	}
 
-	statusTypeID, err := e.statusTypeIDByCode(ctx, tenantID, def.StatusTypeCode)
+	statusTypeID, err := e.statusTypeIDByCode(ctx, def.StatusTypeCode)
 	if err != nil {
 		return err
 	}
-	newStatus, err := e.records.Get(ctx, tenantID, "Status", newStatusID)
+	newStatus, err := e.records.Get(ctx, "Status", newStatusID)
 	if err != nil {
 		if errors.Is(err, data.ErrNotFound) {
 			return fmt.Errorf("%w: status_id %q does not exist", ErrInvalidTransition, newStatusID)
@@ -80,7 +80,7 @@ func (e *Engine) ValidateStatusTransition(ctx context.Context, def *entity.Defin
 
 	var currentStatusID string
 	if !isCreate {
-		rec, err := e.records.Get(ctx, tenantID, def.EntityType, id)
+		rec, err := e.records.Get(ctx, def.EntityType, id)
 		if err != nil {
 			// %w preserves data.ErrNotFound through this wrap — callers
 			// (internal/api) check errors.Is(err, data.ErrNotFound)
@@ -118,7 +118,7 @@ func (e *Engine) ValidateStatusTransition(ctx context.Context, def *entity.Defin
 		return nil // setting to the same status is always a no-op, not a transition
 	}
 
-	transitions, err := e.records.ListByField(ctx, tenantID, "StatusTransition", "status_type_id", statusTypeID)
+	transitions, err := e.records.ListByField(ctx, "StatusTransition", "status_type_id", statusTypeID)
 	if err != nil {
 		return fmt.Errorf("list transitions for status type %s: %w", def.StatusTypeCode, err)
 	}
@@ -145,8 +145,8 @@ func (e *Engine) ValidateStatusTransition(ctx context.Context, def *entity.Defin
 // human-authored, stable identifier; the record id is what Status/
 // StatusTransition rows actually reference (foundation.go's StatusType
 // doc comment).
-func (e *Engine) statusTypeIDByCode(ctx context.Context, tenantID, code string) (string, error) {
-	matches, err := e.records.ListByField(ctx, tenantID, "StatusType", "code", code)
+func (e *Engine) statusTypeIDByCode(ctx context.Context, code string) (string, error) {
+	matches, err := e.records.ListByField(ctx, "StatusType", "code", code)
 	if err != nil {
 		return "", fmt.Errorf("look up status type %q: %w", code, err)
 	}
