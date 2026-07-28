@@ -25,7 +25,7 @@ func testHandlerWithSecretCryptor(t *testing.T, router *tenantdb.Router, cryptor
 	if err != nil {
 		t.Fatalf("load i18n catalog: %v", err)
 	}
-	return New(router, catalog, nil, nil, nil, cryptor)
+	return New(router, catalog, nil, nil, nil, nil, cryptor)
 }
 
 func testCryptor(t *testing.T) *secretcrypt.Cryptor {

@@ -33,6 +33,7 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/secretcrypt"
 	"github.com/universaltill/universal-core/internal/kernel/speechassist"
 	"github.com/universaltill/universal-core/internal/kernel/workflow"
+	"github.com/universaltill/universal-core/internal/svcauth"
 	"github.com/universaltill/universal-core/internal/tenantdb"
 	"github.com/universaltill/universal-core/internal/webauth"
 )
@@ -46,6 +47,12 @@ type Handler struct {
 	renderer *formrender.Renderer
 	catalog  *i18n.Catalog
 	auth     *webauth.Authenticator
+	// svc is nil (Enabled() == false) unless machine-to-machine API auth
+	// is configured (SVC_INTROSPECTION_CLIENT_ID/SECRET) — see
+	// internal/svcauth's own doc comment. A connector's Bearer token is
+	// checked ahead of auth (webauth) in Routes, not behind it: see
+	// svcauth.Authenticator.Guard's own doc comment on why.
+	svc *svcauth.Authenticator
 	// ai is nil (Enabled() == false) unless OLLAMA_URL is configured —
 	// see aiassist's own doc comment on why every caller can treat that
 	// as "AI assistance unavailable" without a separate nil check.
@@ -64,20 +71,21 @@ type Handler struct {
 
 // New builds a Handler. catalog is the i18n.Catalog forms (and the
 // import wizard, import.go) render against (internal/i18n.Load). auth
-// may be nil or disabled (webauth.Config.Enabled() == false) — Routes
-// wires it unconditionally either way, since Guard/Register are both
-// safe no-ops on a disabled Authenticator (see webauth's own doc
+// and svc may each be nil or disabled — Routes wires both
+// unconditionally either way, since Guard/Register are safe no-ops on
+// a disabled Authenticator (see webauth's and svcauth's own doc
 // comments). ai/speech may be nil — every caller of either (the import
 // wizard's mapping suggestion; the issue logger's voice transcription)
 // treats a disabled client as "AI assistance unavailable," never an
 // error. secretCryptor may also be nil — see the Handler field's own
 // doc comment.
-func New(router *tenantdb.Router, catalog *i18n.Catalog, auth *webauth.Authenticator, ai *aiassist.Client, speech *speechassist.Client, secretCryptor *secretcrypt.Cryptor) *Handler {
+func New(router *tenantdb.Router, catalog *i18n.Catalog, auth *webauth.Authenticator, svc *svcauth.Authenticator, ai *aiassist.Client, speech *speechassist.Client, secretCryptor *secretcrypt.Cryptor) *Handler {
 	return &Handler{
 		router:        router,
 		renderer:      formrender.New(catalog),
 		catalog:       catalog,
 		auth:          auth,
+		svc:           svc,
 		ai:            ai,
 		speech:        speech,
 		secretCryptor: secretCryptor,
@@ -152,14 +160,18 @@ func (ts tenantScope) formDef(ctx context.Context, entityType string) (*form.Def
 }
 
 // Routes registers every handler onto mux, wrapped in
-// h.auth.Guard(httpx.DevAuth(...)) — real login (webauth) is tried
-// first; DevAuth (the insecure stopgap — see that package's doc
-// comment) only ever runs when webauth is disabled entirely for this
-// deployment, since Guard either populates the request context itself
-// or redirects before DevAuth gets a chance (see DevAuth's own doc
-// comment on why that composition is safe either way main.go always
-// registers Routes, relying on DevAuth's own fail-closed default when
-// neither is configured).
+// h.svc.Guard(h.auth.Guard(httpx.DevAuth(...))) — a connector's Bearer
+// access token (svcauth) is checked FIRST, ahead of real browser login
+// (webauth), ahead of DevAuth (the insecure stopgap — see that
+// package's doc comment): a Bearer-carrying request is unambiguously an
+// API client and must get a clean 401 JSON body on failure, never
+// webauth.Guard's own browser-oriented redirect to /ui/login (see
+// svcauth.Authenticator.Guard's own doc comment). Whichever of the
+// three actually authenticates a given request, all three populate the
+// exact same httpx.RequestContext shape — internal/api's handlers never
+// need to know which one ran (main.go always registers Routes, relying
+// on DevAuth's own fail-closed default when none of the three are
+// configured).
 func (h *Handler) Routes(mux *http.ServeMux) {
 	// Unauthenticated: a static asset with no tenant-specific content —
 	// gating it behind auth would only break the page that needs it
@@ -177,7 +189,7 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	h.auth.Register(mux)
 
 	auth := func(handler http.HandlerFunc) http.Handler {
-		return h.auth.Guard(httpx.DevAuth(handler))
+		return h.svc.Guard(h.auth.Guard(httpx.DevAuth(handler)))
 	}
 	// "/{$}" — the Go 1.22+ ServeMux exact-match wildcard — not plain
 	// "/", which would act as a catch-all subtree match and silently
