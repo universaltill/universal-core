@@ -24,6 +24,7 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/aiassist"
 	"github.com/universaltill/universal-core/internal/kernel/secretcrypt"
 	"github.com/universaltill/universal-core/internal/kernel/speechassist"
+	"github.com/universaltill/universal-core/internal/svcauth"
 	"github.com/universaltill/universal-core/internal/tenantdb"
 	"github.com/universaltill/universal-core/internal/webauth"
 	"github.com/universaltill/universal-core/internal/worker"
@@ -138,6 +139,24 @@ func webauthConfigFromEnv() webauth.Config {
 	}
 }
 
+// svcauthConfigFromEnv builds a svcauth.Config for machine-to-machine
+// API auth (connector plugins — see INTEGRATIONS.md and
+// internal/svcauth's own doc comment). Reuses OIDC_ISSUER_URL — the
+// same Zitadel instance webauth authenticates humans against also
+// introspects a connector's own Bearer token — plus two new
+// credentials for the introspection call itself
+// (uc-infra/infra/terraform/zitadel's zitadel_application_api
+// "Universal Core Introspection"). Every field empty is the expected,
+// safe default (Enabled() is false) until that Terraform is actually
+// applied.
+func svcauthConfigFromEnv() svcauth.Config {
+	return svcauth.Config{
+		IssuerURL:    os.Getenv("OIDC_ISSUER_URL"),
+		ClientID:     os.Getenv("SVC_INTROSPECTION_CLIENT_ID"),
+		ClientSecret: os.Getenv("SVC_INTROSPECTION_CLIENT_SECRET"),
+	}
+}
+
 func main() {
 	// DATABASE_URL is the control-plane database (ADR-0003) — the
 	// tenants registry, not any tenant's own data. Every tenant's own
@@ -203,6 +222,14 @@ func main() {
 	} else {
 		log.Printf("no auth backend configured — /api and /forms routes will 401 every request (see QUEUE.md)")
 	}
+	svcCfg := svcauthConfigFromEnv()
+	svc, err := svcauth.New(context.Background(), svcCfg, data.NewTenantRepo(controlDB))
+	if err != nil {
+		log.Fatalf("configure svcauth: %v", err)
+	}
+	if svc.Enabled() {
+		log.Printf("svcauth: machine-to-machine API auth enabled (issuer=%s) — a connector's Bearer access token authenticates via token introspection, see INTEGRATIONS.md", svcCfg.IssuerURL)
+	}
 	catalog, err := i18n.Load("en")
 	if err != nil {
 		log.Fatalf("load i18n catalog: %v", err)
@@ -221,7 +248,7 @@ func main() {
 	} else {
 		log.Printf("SECRET_ENCRYPTION_KEY not set — the AI-provider settings page will refuse to store a tenant API key")
 	}
-	api.New(router, catalog, auth, ai, speech, secretCryptor).Routes(mux)
+	api.New(router, catalog, auth, svc, ai, speech, secretCryptor).Routes(mux)
 
 	// The durable workflow job queue (internal/kernel/workflow.Queue) has
 	// existed since the definition-registry increment, but nothing ever

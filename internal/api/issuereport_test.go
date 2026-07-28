@@ -28,7 +28,7 @@ func testHandlerWithSpeech(t *testing.T, router *tenantdb.Router, speech *speech
 	if err != nil {
 		t.Fatalf("load i18n catalog: %v", err)
 	}
-	return New(router, catalog, nil, nil, speech, nil)
+	return New(router, catalog, nil, nil, nil, speech, nil)
 }
 
 func publishFoundation(t *testing.T, db *sql.DB) {
