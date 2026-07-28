@@ -240,7 +240,7 @@ func testHandler(t *testing.T, router *tenantdb.Router) *Handler {
 	if err != nil {
 		t.Fatalf("load i18n catalog: %v", err)
 	}
-	return New(router, catalog, nil, nil, nil, nil)
+	return New(router, catalog, nil, nil, nil, nil, nil)
 }
 
 func newRequest(method, target, tenantID, actorID string, body []byte) *http.Request {
