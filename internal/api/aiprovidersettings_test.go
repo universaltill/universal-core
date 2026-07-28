@@ -9,8 +9,8 @@ import (
 	"testing"
 
 	"github.com/universaltill/universal-core/internal/i18n"
-	"github.com/universaltill/universal-core/internal/tenantdb"
 	"github.com/universaltill/universal-core/internal/kernel/secretcrypt"
+	"github.com/universaltill/universal-core/internal/tenantdb"
 )
 
 // testHandlerWithSecretCryptor is testHandler plus a secretcrypt.Cryptor
