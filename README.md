@@ -48,6 +48,13 @@ prediction service, connector plugins, module entitlements, and the base
 domain models (kept in an internal, non-public reference document) are
 all designed in the ADR but not yet built.
 
+## Integrating with Universal Core
+
+Building a connector or plugin against this system (Universal Till's is
+the first)? See [`INTEGRATIONS.md`](INTEGRATIONS.md) for the API surface,
+the multi-tenancy/auth model, and what's still missing before a real
+unattended connector can be built.
+
 ## Running the tests
 
 ```
