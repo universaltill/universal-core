@@ -55,33 +55,45 @@ For a real integration partner, "getting a tenant" today means asking
 whoever operates this deployment to run that command for you, not calling
 an API.
 
-## Authentication — read this before building anything
+## Authentication
 
-**There is no machine-to-machine authentication yet.** This is the
-single biggest gap for any backend connector (Till's included) and
-should be resolved before anything unattended is built against this API.
+Three ways to authenticate, composed in this order (`internal/api/
+handlers.go`'s `Routes`): a connector's Bearer token is checked first,
+then real human login, then the insecure dev stopgap.
 
-What exists today:
+- **Machine-to-machine (`internal/svcauth`) — what a connector uses.**
+  A connector authenticates as its own Zitadel **machine user** (a
+  service credential, distinct from any human — see
+  `uc-infra/infra/terraform/zitadel/main.tf`'s `zitadel_machine_user`/
+  `zitadel_personal_access_token`), presenting a **Personal Access
+  Token** as `Authorization: Bearer <token>`. Universal Core validates
+  it via Zitadel's token-introspection endpoint (RFC 7662) on every
+  request — not local JWT verification — so a revoked credential stops
+  working immediately, not just once a self-contained token's own
+  expiry passes. The token must carry the `tenant_integration` project
+  role (granted to the machine user, never to a human) — a human's
+  `tenant_member`-only credential is deliberately rejected by this path.
+  Ask whoever operates this deployment for a machine user + PAT scoped
+  to your tenant; see `INTEGRATIONS.md`'s "Getting a tenant provisioned"
+  section above for the same "ask the operator" pattern.
+
+  An optional `X-On-Behalf-Of: <id>` header lets the connector assert
+  which specific human actually initiated a given mutation (see "Every
+  write needs a real actor" below) — the service credential vouches for
+  this identity; Universal Core trusts the assertion once the
+  credential itself is verified, the same trust boundary a till already
+  extends to its own logged-in cashier.
+
+- **Real human login** (`internal/webauth`): Zitadel/OIDC, for a person
+  logging into the Universal Core UI in a browser and getting a session
+  cookie. What a human user at an integration partner uses to look at
+  their own tenant directly — not what a backend connector uses.
 
 - **`INSECURE_DEV_AUTH`** (`internal/httpx/devauth.go`): trusts
   `X-Tenant-ID`/`X-Actor-ID` headers verbatim, zero verification. Fails
-  **closed** (401) unless explicitly enabled. This is a dev/test stopgap
-  only — it is not a security boundary, and it must never be enabled on
-  anything reachable from outside a trusted dev environment.
-- **Real human login** (`internal/webauth`): Zitadel/OIDC, for a person
-  logging into the Universal Core UI in a browser and getting a session
-  cookie. This is what a human user at an integration partner would use
-  to look at their own Universal Core tenant directly — not what a
-  backend service calling the API programmatically would use.
-
-Neither is right for a connector plugin running unattended in the
-background (e.g. syncing catalog data on a schedule, or forwarding a
-completed sale with no human present to log in). That needs a real
-service-account / client-credentials style mechanism against the same
-Zitadel instance (`id.universaltill.com`) already used for human login —
-**not yet built.** Don't design around headers or cookies for a
-production connector; treat this as a blocking prerequisite and check
-`QUEUE.md` for its status before starting.
+  **closed** (401) unless explicitly enabled. Dev/test only — never a
+  security boundary, never enabled anywhere reachable from outside a
+  trusted dev environment, and never what a real connector should use.
 
 ## Every write needs a real actor — there is no "system" bucket
 
@@ -92,25 +104,26 @@ two actually authored the change (see `internal/kernel/audit/audit.go`'s
 own doc comment — this is a hard rule in this codebase, not a
 convention). An AI actor also requires a `model_version`.
 
-**What this means for a connector:** when Universal Till's connector
-creates a record in Universal Core on behalf of a sale, it needs a real
-answer to "who is the actor" — most likely the human cashier/operator
-who actually completed the sale on the till, carried through as the
+**Resolved for machine-to-machine auth**: a connector-authenticated
+request is always attributed as a **human** actor — never a new bucket
+— because there's always a real, named, accountable party behind it.
+By default that's the service credential's own stable identity
+(`svc:<zitadel-subject>`) — the right default for a genuinely unattended
+call (a nightly catalog sync, no human in the loop). When a connector
+knows exactly which person triggered a mutation (Universal Till's
+connector creating a record for a completed sale, say), it should send
+`X-On-Behalf-Of: <that person's id>` instead — carried through as the
 actor id, not a synthetic "till-connector" identity pretending to be a
-person. If a fully unattended sync (e.g. a nightly catalog pull with no
-human in the loop) needs to write something, how that gets attributed
-honestly under this two-bucket model is an open question — flag it
-rather than inventing a workaround; it may need its own small ADR before
-being decided.
+person. See `internal/svcauth`'s own doc comment for the full reasoning.
 
 ## The API surface
 
 All JSON responses use the same envelope:
 `{"data": ..., "error": null}` on success, `{"data": null, "error":
-"message"}` on failure. Every route below requires auth (see above) via
-`X-Tenant-ID`/`X-Actor-ID` today; the tenant is always implicit in the
-URL scope, never a query parameter — an entity type or record only ever
-resolves within the caller's own tenant.
+"message"}` on failure. Every route below requires auth (see above) —
+for a connector, a `Bearer` access token; the tenant is always resolved
+from that token (or session), never a query parameter — an entity type
+or record only ever resolves within the caller's own tenant.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
@@ -209,10 +222,15 @@ inbound catalog/stock sync reads through `GET /api/records/{entityType}`
    `purchasing`'s `PurchaseOrder`/`POLine`/`GoodsReceipt` set is the
    closest existing precedent for what this looks like once built).
    Doesn't exist yet — this repo only has the purchase side today.
-2. **Machine-to-machine auth**, as above — a connector runs unattended,
-   which today's auth options don't support.
-3. **A decision on actor attribution for automated writes**, as above.
-4. The connector plugin itself, built on Till's own plugin platform per
+2. **The Zitadel side actually applied.** Machine-to-machine auth
+   (`internal/svcauth`) and its Terraform (`uc-infra/infra/terraform/
+   zitadel`) are built and tested, but that Terraform hasn't been
+   applied against the live, shared Zitadel instance yet — an operator
+   needs to run `terraform apply` (creating a real IAM identity + PAT
+   needs explicit go-ahead, same as any other secret/identity creation)
+   and set `SVC_INTROSPECTION_CLIENT_ID`/`SVC_INTROSPECTION_CLIENT_SECRET`
+   on the running deployment before a real connector can authenticate.
+3. The connector plugin itself, built on Till's own plugin platform per
    ADR-0014 — that work lives in `../unitill`, not here.
 
-Track progress on all four in `QUEUE.md`.
+Track progress on all three in `QUEUE.md`.
