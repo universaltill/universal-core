@@ -11,9 +11,9 @@ import (
 	"testing"
 
 	"github.com/universaltill/universal-core/internal/i18n"
-	"github.com/universaltill/universal-core/internal/tenantdb"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
 	"github.com/universaltill/universal-core/internal/kernel/speechassist"
+	"github.com/universaltill/universal-core/internal/tenantdb"
 )
 
 // testHandlerWithSpeech is testHandler plus a speechassist.Client —

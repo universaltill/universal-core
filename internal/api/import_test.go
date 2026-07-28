@@ -11,10 +11,10 @@ import (
 	"testing"
 
 	"github.com/universaltill/universal-core/internal/i18n"
-	"github.com/universaltill/universal-core/internal/tenantdb"
 	"github.com/universaltill/universal-core/internal/kernel/aiassist"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/form"
+	"github.com/universaltill/universal-core/internal/tenantdb"
 )
 
 // newMultipartRequest builds a POST request with a multipart/form-data
