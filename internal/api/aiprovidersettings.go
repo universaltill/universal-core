@@ -43,13 +43,13 @@ import (
 // order) is treated as authoritative rather than erroring — a settings
 // page must always be able to render something to fix the situation from,
 // not 500.
-func (h *Handler) aiProviderConnectionRecord(w http.ResponseWriter, r *http.Request, tenantID string) (def *entity.Definition, id string, fields map[string]any, version int, ok bool) {
-	def, err := h.entityDef(r.Context(), tenantID, "AIProviderConnection")
+func (h *Handler) aiProviderConnectionRecord(w http.ResponseWriter, r *http.Request, ts tenantScope) (def *entity.Definition, id string, fields map[string]any, version int, ok bool) {
+	def, err := ts.entityDef(r.Context(), "AIProviderConnection")
 	if err != nil {
 		writeDefinitionLookupError(w, "AIProviderConnection", err)
 		return nil, "", nil, 0, false
 	}
-	records, err := h.crud.List(r.Context(), def, tenantID)
+	records, err := ts.crud.List(r.Context(), def)
 	if err != nil {
 		writeInternalError(w, "list AIProviderConnection records", err)
 		return nil, "", nil, 0, false
@@ -69,15 +69,20 @@ func (h *Handler) aiProviderSettingsPage(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
+	ts, err := h.scope(r.Context(), rc.TenantID)
+	if err != nil {
+		writeInternalError(w, "resolve tenant scope", err)
+		return
+	}
 	locale := localeFromRequest(w, r)
 
-	_, id, fields, _, ok := h.aiProviderConnectionRecord(w, r, rc.TenantID)
+	_, id, fields, _, ok := h.aiProviderConnectionRecord(w, r, ts)
 	if !ok {
 		return
 	}
 
 	var buf bytes.Buffer
-	err := aiProviderSettingsTmpl.ExecuteTemplate(&buf, "page", h.aiProviderSettingsPageView(locale, id, fields))
+	err = aiProviderSettingsTmpl.ExecuteTemplate(&buf, "page", h.aiProviderSettingsPageView(locale, id, fields))
 	if err != nil {
 		writeInternalError(w, "render AI provider settings page", err)
 		return
@@ -145,9 +150,14 @@ func (h *Handler) aiProviderSettingsSave(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
+	ts, err := h.scope(r.Context(), rc.TenantID)
+	if err != nil {
+		writeInternalError(w, "resolve tenant scope", err)
+		return
+	}
 	locale := localeFromRequest(w, r)
 
-	def, id, existing, version, ok := h.aiProviderConnectionRecord(w, r, rc.TenantID)
+	def, id, existing, version, ok := h.aiProviderConnectionRecord(w, r, ts)
 	if !ok {
 		return
 	}
@@ -168,7 +178,7 @@ func (h *Handler) aiProviderSettingsSave(w http.ResponseWriter, r *http.Request)
 	}
 
 	if id == "" {
-		rec, err := h.crud.Create(r.Context(), def, rc.TenantID, fields, rc.Actor)
+		rec, err := ts.crud.Create(r.Context(), def, fields, rc.Actor)
 		if err != nil {
 			writeInternalError(w, "create AIProviderConnection", err)
 			return
@@ -176,7 +186,7 @@ func (h *Handler) aiProviderSettingsSave(w http.ResponseWriter, r *http.Request)
 		id = rec.ID
 	} else {
 		v := version
-		if _, err := h.crud.Update(r.Context(), def, rc.TenantID, id, fields, &v, rc.Actor); err != nil {
+		if _, err := ts.crud.Update(r.Context(), def, id, fields, &v, rc.Actor); err != nil {
 			writeInternalError(w, "update AIProviderConnection", err)
 			return
 		}
@@ -301,14 +311,19 @@ func (h *Handler) aiProviderSettingsClear(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
+	ts, err := h.scope(r.Context(), rc.TenantID)
+	if err != nil {
+		writeInternalError(w, "resolve tenant scope", err)
+		return
+	}
 	locale := localeFromRequest(w, r)
 
-	def, id, _, _, ok := h.aiProviderConnectionRecord(w, r, rc.TenantID)
+	def, id, _, _, ok := h.aiProviderConnectionRecord(w, r, ts)
 	if !ok {
 		return
 	}
 	if id != "" {
-		if err := h.crud.Delete(r.Context(), def, rc.TenantID, id, rc.Actor); err != nil {
+		if err := ts.crud.Delete(r.Context(), def, id, rc.Actor); err != nil {
 			writeInternalError(w, "delete AIProviderConnection", err)
 			return
 		}

@@ -48,10 +48,15 @@ func (h *Handler) renderModuleMenu(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	ts, err := h.scope(r.Context(), rc.TenantID)
+	if err != nil {
+		writeInternalError(w, "resolve tenant scope", err)
+		return
+	}
 	key := r.PathValue("key")
 	locale := localeFromRequest(w, r)
 
-	modules, err := h.accessibleModules(r.Context(), rc.TenantID, locale)
+	modules, err := h.accessibleModules(r.Context(), ts, locale)
 	if err != nil {
 		writeInternalError(w, "build accessible modules", err)
 		return

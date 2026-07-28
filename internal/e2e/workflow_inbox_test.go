@@ -22,9 +22,8 @@ import (
 // gap the earlier htmx.js-missing-script-tag bug (found by
 // TestCSVImportWizard_RealBrowser) exists to catch.
 func TestWorkflowInbox_ApproveButton_RealBrowser(t *testing.T) {
-	db := testDB(t)
 	withDevAuthEnabled(t)
-	srv, tenantID := testServer(t, db)
+	srv, tenantID, db := testServer(t)
 	actor := humanActor()
 
 	def := &workflow.Definition{
@@ -38,13 +37,13 @@ func TestWorkflowInbox_ApproveButton_RealBrowser(t *testing.T) {
 	}
 	wfRepo := data.NewWorkflowDefinitionRepo(db)
 	ctx := context.Background()
-	if _, err := wfRepo.CreateDraft(ctx, tenantID, def.Name, def.Version, raw, actor); err != nil {
+	if _, err := wfRepo.CreateDraft(ctx, def.Name, def.Version, raw, actor); err != nil {
 		t.Fatalf("CreateDraft: %v", err)
 	}
-	if err := wfRepo.Approve(ctx, tenantID, def.Name, def.Version, actor); err != nil {
+	if err := wfRepo.Approve(ctx, def.Name, def.Version, actor); err != nil {
 		t.Fatalf("Approve: %v", err)
 	}
-	if err := wfRepo.Publish(ctx, tenantID, def.Name, def.Version, actor); err != nil {
+	if err := wfRepo.Publish(ctx, def.Name, def.Version, actor); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 
@@ -52,7 +51,7 @@ func TestWorkflowInbox_ApproveButton_RealBrowser(t *testing.T) {
 	// via the same mechanism internal/worker uses — setup, not what this
 	// test is actually proving (the browser interaction below is).
 	recordRepo := data.NewRecordRepo(db)
-	rec, err := recordRepo.Create(ctx, tenantID, "Party", map[string]any{"party_type": "organization", "name": "Globex Corp"})
+	rec, err := recordRepo.Create(ctx, "Party", map[string]any{"party_type": "organization", "name": "Globex Corp"})
 	if err != nil {
 		t.Fatalf("create Party record: %v", err)
 	}
@@ -60,7 +59,7 @@ func TestWorkflowInbox_ApproveButton_RealBrowser(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewQueue: %v", err)
 	}
-	if _, err := q.Enqueue(ctx, def, tenantID, "Party", rec.ID, actor); err != nil {
+	if _, err := q.Enqueue(ctx, def, "Party", rec.ID, actor); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if _, err := q.ProcessOne(ctx, workflow.RegistryDefinitionLookup(db)); err != nil {
@@ -68,7 +67,7 @@ func TestWorkflowInbox_ApproveButton_RealBrowser(t *testing.T) {
 	}
 
 	var jobID string
-	if err := db.QueryRow(`SELECT id FROM workflow_jobs WHERE tenant_id = $1 AND workflow_name = $2`, tenantID, def.Name).Scan(&jobID); err != nil {
+	if err := db.QueryRow(`SELECT id FROM workflow_jobs WHERE workflow_name = $1`, def.Name).Scan(&jobID); err != nil {
 		t.Fatalf("find enqueued job: %v", err)
 	}
 
@@ -97,7 +96,7 @@ func TestWorkflowInbox_ApproveButton_RealBrowser(t *testing.T) {
 	}
 
 	jobRepo := data.NewWorkflowJobRepo(db)
-	got, err := jobRepo.Get(ctx, tenantID, jobID)
+	got, err := jobRepo.Get(ctx, jobID)
 	if err != nil {
 		t.Fatalf("Get after browser approve: %v", err)
 	}

@@ -21,9 +21,8 @@ import (
 // "..."} envelope httpx.WriteError produces, not just reacting to the
 // failure at all.
 func TestErrorToast_RealBrowser(t *testing.T) {
-	db := testDB(t)
 	withDevAuthEnabled(t)
-	srv, tenantID := testServer(t, db)
+	srv, tenantID, _ := testServer(t)
 	ctx := browserCtx(t, tenantID)
 
 	// Item requires both sku and name (purchasing.go) — submitting the

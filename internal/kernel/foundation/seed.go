@@ -11,17 +11,19 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/moduleseed"
 )
 
-// Publish brings tenantID's foundation layer online: every All()
-// Definition, published into the entity_definitions registry via the
-// normal draft -> approve -> publish lifecycle (moduleseed.PublishAll),
-// the same path any Definition takes — not a bypass or a direct INSERT.
-// This is the "Foundation entities used by every module are always
-// present" requirement (ADR-0001 §8) actually happening for a given
-// tenant, rather than just existing as Go values only tests construct.
+// Publish brings a tenant's foundation layer online (the *sql.DB passed
+// in is already resolved to that tenant's own database — ADR-0003):
+// every All() Definition, published into the entity_definitions registry
+// via the normal draft -> approve -> publish lifecycle
+// (moduleseed.PublishAll), the same path any Definition takes — not a
+// bypass or a direct INSERT. This is the "Foundation entities used by
+// every module are always present" requirement (ADR-0001 §8) actually
+// happening for a given tenant, rather than just existing as Go values
+// only tests construct.
 //
 // See moduleseed.PublishAll's doc comment for the idempotency/resume/
 // concurrency contract this inherits unchanged.
-func Publish(ctx context.Context, db *sql.DB, tenantID string, actor audit.Actor) error {
+func Publish(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 	repo := data.NewEntityDefinitionRepo(db)
 	items := make([]moduleseed.Item, 0, len(All()))
 	for _, def := range All() {
@@ -34,7 +36,7 @@ func Publish(ctx context.Context, db *sql.DB, tenantID string, actor audit.Actor
 		}
 		items = append(items, moduleseed.Item{Key: def.EntityType, Version: def.Version, Raw: raw})
 	}
-	return moduleseed.PublishAll(ctx, repo, tenantID, items, actor)
+	return moduleseed.PublishAll(ctx, repo, items, actor)
 }
 
 // PublishForms brings tenantID's foundation Form Definitions online —
@@ -46,7 +48,7 @@ func Publish(ctx context.Context, db *sql.DB, tenantID string, actor audit.Actor
 // there was no code path that called it in production until
 // cmd/provision-tenant wired one up (found by dogfooding the purchasing
 // module: nothing had ever needed a real, non-test form publish before).
-func PublishForms(ctx context.Context, db *sql.DB, tenantID string, actor audit.Actor) error {
+func PublishForms(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 	repo := data.NewFormDefinitionRepo(db)
 	forms := AllForms()
 	items := make([]moduleseed.Item, 0, len(forms))
@@ -60,5 +62,5 @@ func PublishForms(ctx context.Context, db *sql.DB, tenantID string, actor audit.
 		}
 		items = append(items, moduleseed.Item{Key: f.EntityType, Version: f.Version, Raw: raw})
 	}
-	return moduleseed.PublishAll(ctx, repo, tenantID, items, actor)
+	return moduleseed.PublishAll(ctx, repo, items, actor)
 }

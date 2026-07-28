@@ -5,43 +5,60 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/url"
 	"os"
 	"testing"
+	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/universaltill/universal-core/internal/data"
+	"github.com/universaltill/universal-core/internal/db"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
 )
 
-func testDB(t *testing.T) *sql.DB {
+func freshTenantDB(t *testing.T) *sql.DB {
 	t.Helper()
-	url := os.Getenv("TEST_DATABASE_URL")
-	if url == "" {
+	base := os.Getenv("TEST_DATABASE_URL")
+	if base == "" {
 		t.Skip("TEST_DATABASE_URL not set; skipping integration test")
 	}
-	db, err := sql.Open("pgx", url)
+	admin, err := sql.Open("pgx", base)
 	if err != nil {
-		t.Fatalf("open db: %v", err)
+		t.Fatalf("open admin connection: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
-	if err := db.Ping(); err != nil {
-		t.Fatalf("ping db: %v", err)
-	}
-	return db
-}
+	t.Cleanup(func() { admin.Close() })
 
-func seedTenant(t *testing.T, db *sql.DB) string {
-	t.Helper()
-	var id string
-	err := db.QueryRow(
-		`INSERT INTO tenants (name, region) VALUES ($1, $2) RETURNING id`,
-		"Test Tenant", "eu-west",
-	).Scan(&id)
-	if err != nil {
-		t.Fatalf("seed tenant: %v", err)
+	name := fmt.Sprintf("uc_test_foundation_%d", time.Now().UnixNano())
+	if _, err := admin.Exec(`CREATE DATABASE "` + name + `"`); err != nil {
+		t.Fatalf("create database %s: %v", name, err)
 	}
-	return id
+	t.Cleanup(func() {
+		_, _ = admin.Exec(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()`, name)
+		_, _ = admin.Exec(`DROP DATABASE IF EXISTS "` + name + `"`)
+	})
+
+	u, err := url.Parse(base)
+	if err != nil {
+		t.Fatalf("parse TEST_DATABASE_URL: %v", err)
+	}
+	u.Path = "/" + name
+	tenantDB, err := sql.Open("pgx", u.String())
+	if err != nil {
+		t.Fatalf("open tenant database %s: %v", name, err)
+	}
+	t.Cleanup(func() { tenantDB.Close() })
+	if err := tenantDB.Ping(); err != nil {
+		t.Fatalf("ping tenant database %s: %v", name, err)
+	}
+	if _, err := tenantDB.Exec(`CREATE EXTENSION IF NOT EXISTS pgcrypto`); err != nil {
+		t.Fatalf("create pgcrypto extension: %v", err)
+	}
+	if err := db.ApplyTenant(context.Background(), tenantDB); err != nil {
+		t.Fatalf("ApplyTenant: %v", err)
+	}
+	return tenantDB
 }
 
 func humanActor() audit.Actor {
@@ -52,12 +69,11 @@ func humanActor() audit.Actor {
 // Definition actually lands in the registry as 'published' for the
 // tenant, not just that Publish returns nil.
 func TestPublish_PublishesEveryFoundationDefinition(t *testing.T) {
-	db := testDB(t)
+	db := freshTenantDB(t)
 	ctx := context.Background()
-	tenantID := seedTenant(t, db)
 	repo := data.NewEntityDefinitionRepo(db)
 
-	if err := Publish(ctx, db, tenantID, humanActor()); err != nil {
+	if err := Publish(ctx, db, humanActor()); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 
@@ -66,7 +82,7 @@ func TestPublish_PublishesEveryFoundationDefinition(t *testing.T) {
 		t.Fatal("All() returned no Definitions — test would pass vacuously")
 	}
 	for _, def := range all {
-		v, err := repo.GetPublished(ctx, tenantID, def.EntityType)
+		v, err := repo.GetPublished(ctx, def.EntityType)
 		if err != nil {
 			t.Fatalf("GetPublished(%s): %v", def.EntityType, err)
 		}
@@ -79,14 +95,13 @@ func TestPublish_PublishesEveryFoundationDefinition(t *testing.T) {
 // TestPublish_IsIdempotent confirms a second call is a safe no-op —
 // no duplicate-version errors, nothing changes.
 func TestPublish_IsIdempotent(t *testing.T) {
-	db := testDB(t)
+	db := freshTenantDB(t)
 	ctx := context.Background()
-	tenantID := seedTenant(t, db)
 
-	if err := Publish(ctx, db, tenantID, humanActor()); err != nil {
+	if err := Publish(ctx, db, humanActor()); err != nil {
 		t.Fatalf("first Publish: %v", err)
 	}
-	if err := Publish(ctx, db, tenantID, humanActor()); err != nil {
+	if err := Publish(ctx, db, humanActor()); err != nil {
 		t.Fatalf("second Publish should be a no-op, got: %v", err)
 	}
 }
@@ -99,9 +114,8 @@ func TestPublish_IsIdempotent(t *testing.T) {
 // (bypassing Publish), then confirm a Publish call still drives it all
 // the way to published, not skip it because a row already exists.
 func TestPublish_ResumesFromPartiallyDraftedState(t *testing.T) {
-	db := testDB(t)
+	db := freshTenantDB(t)
 	ctx := context.Background()
-	tenantID := seedTenant(t, db)
 	repo := data.NewEntityDefinitionRepo(db)
 	actor := humanActor()
 
@@ -110,16 +124,16 @@ func TestPublish_ResumesFromPartiallyDraftedState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	if _, err := repo.CreateDraft(ctx, tenantID, partyDef.EntityType, partyDef.Version, raw, actor); err != nil {
+	if _, err := repo.CreateDraft(ctx, partyDef.EntityType, partyDef.Version, raw, actor); err != nil {
 		t.Fatalf("CreateDraft: %v", err)
 	}
 	// Deliberately do NOT approve/publish — simulating a crash right here.
 
-	if err := Publish(ctx, db, tenantID, actor); err != nil {
+	if err := Publish(ctx, db, actor); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 
-	v, err := repo.GetPublished(ctx, tenantID, "Party")
+	v, err := repo.GetPublished(ctx, "Party")
 	if err != nil {
 		t.Fatalf("expected Party to be published after resuming from a draft-only state, got: %v", err)
 	}
@@ -134,9 +148,8 @@ func TestPublish_ResumesFromPartiallyDraftedState(t *testing.T) {
 // row (that would hit definitionRepo.transition's atomic status guard
 // and error) — it must go straight to Publish.
 func TestPublish_ResumesFromApprovedState(t *testing.T) {
-	db := testDB(t)
+	db := freshTenantDB(t)
 	ctx := context.Background()
-	tenantID := seedTenant(t, db)
 	repo := data.NewEntityDefinitionRepo(db)
 	actor := humanActor()
 
@@ -145,19 +158,19 @@ func TestPublish_ResumesFromApprovedState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	if _, err := repo.CreateDraft(ctx, tenantID, partyDef.EntityType, partyDef.Version, raw, actor); err != nil {
+	if _, err := repo.CreateDraft(ctx, partyDef.EntityType, partyDef.Version, raw, actor); err != nil {
 		t.Fatalf("CreateDraft: %v", err)
 	}
-	if err := repo.Approve(ctx, tenantID, partyDef.EntityType, partyDef.Version, actor); err != nil {
+	if err := repo.Approve(ctx, partyDef.EntityType, partyDef.Version, actor); err != nil {
 		t.Fatalf("Approve: %v", err)
 	}
 	// Deliberately do NOT publish — simulating a crash right here.
 
-	if err := Publish(ctx, db, tenantID, actor); err != nil {
+	if err := Publish(ctx, db, actor); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 
-	v, err := repo.GetPublished(ctx, tenantID, "Party")
+	v, err := repo.GetPublished(ctx, "Party")
 	if err != nil {
 		t.Fatalf("expected Party to be published after resuming from an approved-only state, got: %v", err)
 	}
@@ -170,24 +183,23 @@ func TestPublish_ResumesFromApprovedState(t *testing.T) {
 // rolled-back version is never silently re-published by a later
 // Publish call.
 func TestPublish_LeavesRolledBackVersionAlone(t *testing.T) {
-	db := testDB(t)
+	db := freshTenantDB(t)
 	ctx := context.Background()
-	tenantID := seedTenant(t, db)
 	repo := data.NewEntityDefinitionRepo(db)
 	actor := humanActor()
 
-	if err := Publish(ctx, db, tenantID, actor); err != nil {
+	if err := Publish(ctx, db, actor); err != nil {
 		t.Fatalf("first Publish: %v", err)
 	}
-	if err := repo.Rollback(ctx, tenantID, "Party", 2, actor); err != nil {
+	if err := repo.Rollback(ctx, "Party", 2, actor); err != nil {
 		t.Fatalf("Rollback: %v", err)
 	}
 
-	if err := Publish(ctx, db, tenantID, actor); err != nil {
+	if err := Publish(ctx, db, actor); err != nil {
 		t.Fatalf("second Publish: %v", err)
 	}
 
-	if _, err := repo.GetPublished(ctx, tenantID, "Party"); !errors.Is(err, data.ErrNotFound) {
+	if _, err := repo.GetPublished(ctx, "Party"); !errors.Is(err, data.ErrNotFound) {
 		t.Fatalf("expected Party to stay rolled back (no published version), got: %v", err)
 	}
 }
@@ -199,16 +211,15 @@ func TestPublish_LeavesRolledBackVersionAlone(t *testing.T) {
 // regardless of whether Publish (entities only) has run, since no code
 // path ever published the form itself outside a test.
 func TestPublishForms_PublishesEveryFoundationForm(t *testing.T) {
-	db := testDB(t)
+	db := freshTenantDB(t)
 	ctx := context.Background()
-	tenantID := seedTenant(t, db)
 	formRepo := data.NewFormDefinitionRepo(db)
 
-	if err := PublishForms(ctx, db, tenantID, humanActor()); err != nil {
+	if err := PublishForms(ctx, db, humanActor()); err != nil {
 		t.Fatalf("PublishForms: %v", err)
 	}
 
-	v, err := formRepo.GetPublished(ctx, tenantID, "Party")
+	v, err := formRepo.GetPublished(ctx, "Party")
 	if err != nil {
 		t.Fatalf("GetPublished(Party form): %v", err)
 	}
@@ -218,14 +229,13 @@ func TestPublishForms_PublishesEveryFoundationForm(t *testing.T) {
 }
 
 func TestPublishForms_IsIdempotent(t *testing.T) {
-	db := testDB(t)
+	db := freshTenantDB(t)
 	ctx := context.Background()
-	tenantID := seedTenant(t, db)
 
-	if err := PublishForms(ctx, db, tenantID, humanActor()); err != nil {
+	if err := PublishForms(ctx, db, humanActor()); err != nil {
 		t.Fatalf("first PublishForms: %v", err)
 	}
-	if err := PublishForms(ctx, db, tenantID, humanActor()); err != nil {
+	if err := PublishForms(ctx, db, humanActor()); err != nil {
 		t.Fatalf("second PublishForms should be a no-op, got: %v", err)
 	}
 }

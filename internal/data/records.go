@@ -26,7 +26,6 @@ var ErrVersionConflict = errors.New("data: record version conflict")
 // successful update) — see 005_record_version.sql's doc comment.
 type Record struct {
 	ID         string
-	TenantID   string
 	EntityType string
 	Data       map[string]any
 	Version    int
@@ -42,8 +41,10 @@ type querier interface {
 }
 
 // RecordRepo is the repository for the generic entity-storage table.
-// Every method takes tenantID explicitly — no query relies on an implicit
-// tenant context (CLAUDE.md's multi-tenancy rule).
+// Every method takes a *sql.DB/querier already resolved to one tenant's
+// own database (internal/tenantdb.Router) — tenant isolation is physical
+// (ADR-0003), not a query-level filter, so no method here takes a
+// tenantID.
 type RecordRepo struct {
 	db *sql.DB
 }
@@ -55,11 +56,11 @@ func NewRecordRepo(db *sql.DB) *RecordRepo {
 // Create inserts a record using the repo's own connection pool (no
 // caller-supplied transaction). Use CreateTx when the write must be
 // atomic with another operation, such as an audit entry.
-func (r *RecordRepo) Create(ctx context.Context, tenantID, entityType string, data map[string]any) (Record, error) {
-	return r.CreateTx(ctx, r.db, tenantID, entityType, data)
+func (r *RecordRepo) Create(ctx context.Context, entityType string, data map[string]any) (Record, error) {
+	return r.CreateTx(ctx, r.db, entityType, data)
 }
 
-func (r *RecordRepo) CreateTx(ctx context.Context, q querier, tenantID, entityType string, data map[string]any) (Record, error) {
+func (r *RecordRepo) CreateTx(ctx context.Context, q querier, entityType string, data map[string]any) (Record, error) {
 	raw, err := json.Marshal(data)
 	if err != nil {
 		return Record{}, fmt.Errorf("marshal record data: %w", err)
@@ -67,28 +68,28 @@ func (r *RecordRepo) CreateTx(ctx context.Context, q querier, tenantID, entityTy
 	var id string
 	var version int
 	err = q.QueryRowContext(ctx,
-		`INSERT INTO records (tenant_id, entity_type, data)
-		 VALUES ($1, $2, $3)
+		`INSERT INTO records (entity_type, data)
+		 VALUES ($1, $2)
 		 RETURNING id, version`,
-		tenantID, entityType, raw,
+		entityType, raw,
 	).Scan(&id, &version)
 	if err != nil {
 		return Record{}, fmt.Errorf("insert record: %w", err)
 	}
-	return Record{ID: id, TenantID: tenantID, EntityType: entityType, Data: data, Version: version}, nil
+	return Record{ID: id, EntityType: entityType, Data: data, Version: version}, nil
 }
 
-func (r *RecordRepo) Get(ctx context.Context, tenantID, entityType, id string) (Record, error) {
-	return r.get(ctx, r.db, tenantID, entityType, id)
+func (r *RecordRepo) Get(ctx context.Context, entityType, id string) (Record, error) {
+	return r.get(ctx, r.db, entityType, id)
 }
 
-func (r *RecordRepo) get(ctx context.Context, q querier, tenantID, entityType, id string) (Record, error) {
+func (r *RecordRepo) get(ctx context.Context, q querier, entityType, id string) (Record, error) {
 	var raw []byte
 	var version int
 	err := q.QueryRowContext(ctx,
 		`SELECT data, version FROM records
-		 WHERE id = $1 AND tenant_id = $2 AND entity_type = $3 AND deleted_at IS NULL`,
-		id, tenantID, entityType,
+		 WHERE id = $1 AND entity_type = $2 AND deleted_at IS NULL`,
+		id, entityType,
 	).Scan(&raw, &version)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Record{}, ErrNotFound
@@ -100,15 +101,15 @@ func (r *RecordRepo) get(ctx context.Context, q querier, tenantID, entityType, i
 	if err := json.Unmarshal(raw, &data); err != nil {
 		return Record{}, fmt.Errorf("unmarshal record data: %w", err)
 	}
-	return Record{ID: id, TenantID: tenantID, EntityType: entityType, Data: data, Version: version}, nil
+	return Record{ID: id, EntityType: entityType, Data: data, Version: version}, nil
 }
 
-func (r *RecordRepo) List(ctx context.Context, tenantID, entityType string) ([]Record, error) {
+func (r *RecordRepo) List(ctx context.Context, entityType string) ([]Record, error) {
 	rows, err := r.db.QueryContext(ctx,
 		`SELECT id, data, version FROM records
-		 WHERE tenant_id = $1 AND entity_type = $2 AND deleted_at IS NULL
+		 WHERE entity_type = $1 AND deleted_at IS NULL
 		 ORDER BY created_at`,
-		tenantID, entityType,
+		entityType,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list records: %w", err)
@@ -127,22 +128,22 @@ func (r *RecordRepo) List(ctx context.Context, tenantID, entityType string) ([]R
 		if err := json.Unmarshal(raw, &data); err != nil {
 			return nil, fmt.Errorf("unmarshal record data: %w", err)
 		}
-		out = append(out, Record{ID: id, TenantID: tenantID, EntityType: entityType, Data: data, Version: version})
+		out = append(out, Record{ID: id, EntityType: entityType, Data: data, Version: version})
 	}
 	return out, rows.Err()
 }
 
 // CountByEntityType returns how many non-deleted records of entityType
-// tenantID has — the total a pager needs to compute page count, kept as
-// its own query rather than folded into ListPage via a window function
+// exist — the total a pager needs to compute page count, kept as its own
+// query rather than folded into ListPage via a window function
 // (count(*) OVER()) so the common "page beyond the last one" case (an
 // empty LIMIT/OFFSET result set) doesn't lose the total along with the
 // rows; two simple queries over one query with an edge case.
-func (r *RecordRepo) CountByEntityType(ctx context.Context, tenantID, entityType string) (int, error) {
+func (r *RecordRepo) CountByEntityType(ctx context.Context, entityType string) (int, error) {
 	var n int
 	err := r.db.QueryRowContext(ctx,
-		`SELECT count(*) FROM records WHERE tenant_id = $1 AND entity_type = $2 AND deleted_at IS NULL`,
-		tenantID, entityType,
+		`SELECT count(*) FROM records WHERE entity_type = $1 AND deleted_at IS NULL`,
+		entityType,
 	).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("count records: %w", err)
@@ -150,21 +151,21 @@ func (r *RecordRepo) CountByEntityType(ctx context.Context, tenantID, entityType
 	return n, nil
 }
 
-// ListPage returns one page of tenantID's entityType records — the same
-// ordering as List (created_at, with id as a tiebreaker so pagination
-// stays deterministic even when two records share a created_at). Kept
-// distinct from List rather than adding limit/offset params there: every
-// existing List caller (the JSON API, reference-option dropdowns,
-// master-detail child loading) genuinely wants every matching row, not
-// a page of them — this is additive for the one caller that doesn't
-// (the HTML list page).
-func (r *RecordRepo) ListPage(ctx context.Context, tenantID, entityType string, limit, offset int) ([]Record, error) {
+// ListPage returns one page of entityType records — the same ordering as
+// List (created_at, with id as a tiebreaker so pagination stays
+// deterministic even when two records share a created_at). Kept distinct
+// from List rather than adding limit/offset params there: every existing
+// List caller (the JSON API, reference-option dropdowns, master-detail
+// child loading) genuinely wants every matching row, not a page of them
+// — this is additive for the one caller that doesn't (the HTML list
+// page).
+func (r *RecordRepo) ListPage(ctx context.Context, entityType string, limit, offset int) ([]Record, error) {
 	rows, err := r.db.QueryContext(ctx,
 		`SELECT id, data, version FROM records
-		 WHERE tenant_id = $1 AND entity_type = $2 AND deleted_at IS NULL
+		 WHERE entity_type = $1 AND deleted_at IS NULL
 		 ORDER BY created_at, id
-		 LIMIT $3 OFFSET $4`,
-		tenantID, entityType, limit, offset,
+		 LIMIT $2 OFFSET $3`,
+		entityType, limit, offset,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list records page: %w", err)
@@ -183,7 +184,7 @@ func (r *RecordRepo) ListPage(ctx context.Context, tenantID, entityType string, 
 		if err := json.Unmarshal(raw, &data); err != nil {
 			return nil, fmt.Errorf("unmarshal record data: %w", err)
 		}
-		out = append(out, Record{ID: id, TenantID: tenantID, EntityType: entityType, Data: data, Version: version})
+		out = append(out, Record{ID: id, EntityType: entityType, Data: data, Version: version})
 	}
 	return out, rows.Err()
 }
@@ -194,12 +195,12 @@ func (r *RecordRepo) ListPage(ctx context.Context, tenantID, entityType string, 
 // the parent PurchaseOrder's id). fieldName is passed as a bind
 // parameter to the ->> operator, never concatenated into the query text,
 // so a caller-controlled field name can't alter the query's structure.
-func (r *RecordRepo) ListByField(ctx context.Context, tenantID, entityType, fieldName, value string) ([]Record, error) {
+func (r *RecordRepo) ListByField(ctx context.Context, entityType, fieldName, value string) ([]Record, error) {
 	rows, err := r.db.QueryContext(ctx,
 		`SELECT id, data, version FROM records
-		 WHERE tenant_id = $1 AND entity_type = $2 AND data->>$3 = $4 AND deleted_at IS NULL
+		 WHERE entity_type = $1 AND data->>$2 = $3 AND deleted_at IS NULL
 		 ORDER BY created_at`,
-		tenantID, entityType, fieldName, value,
+		entityType, fieldName, value,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list records by field: %w", err)
@@ -218,7 +219,7 @@ func (r *RecordRepo) ListByField(ctx context.Context, tenantID, entityType, fiel
 		if err := json.Unmarshal(raw, &data); err != nil {
 			return nil, fmt.Errorf("unmarshal record data: %w", err)
 		}
-		out = append(out, Record{ID: id, TenantID: tenantID, EntityType: entityType, Data: data, Version: version})
+		out = append(out, Record{ID: id, EntityType: entityType, Data: data, Version: version})
 	}
 	return out, rows.Err()
 }
@@ -231,11 +232,11 @@ func (r *RecordRepo) ListByField(ctx context.Context, tenantID, entityType, fiel
 // must match the record's current version or the update is rejected with
 // ErrVersionConflict instead of silently clobbering a concurrent edit.
 // Returns the record's new version on success.
-func (r *RecordRepo) Update(ctx context.Context, tenantID, entityType, id string, data map[string]any, expectedVersion *int) (int, error) {
-	return r.UpdateTx(ctx, r.db, tenantID, entityType, id, data, expectedVersion)
+func (r *RecordRepo) Update(ctx context.Context, entityType, id string, data map[string]any, expectedVersion *int) (int, error) {
+	return r.UpdateTx(ctx, r.db, entityType, id, data, expectedVersion)
 }
 
-func (r *RecordRepo) UpdateTx(ctx context.Context, q querier, tenantID, entityType, id string, data map[string]any, expectedVersion *int) (int, error) {
+func (r *RecordRepo) UpdateTx(ctx context.Context, q querier, entityType, id string, data map[string]any, expectedVersion *int) (int, error) {
 	raw, err := json.Marshal(data)
 	if err != nil {
 		return 0, fmt.Errorf("marshal record data: %w", err)
@@ -243,10 +244,10 @@ func (r *RecordRepo) UpdateTx(ctx context.Context, q querier, tenantID, entityTy
 	var newVersion int
 	err = q.QueryRowContext(ctx,
 		`UPDATE records SET data = $1, version = version + 1, updated_at = now()
-		 WHERE id = $2 AND tenant_id = $3 AND entity_type = $4 AND deleted_at IS NULL
-		   AND ($5::int IS NULL OR version = $5)
+		 WHERE id = $2 AND entity_type = $3 AND deleted_at IS NULL
+		   AND ($4::int IS NULL OR version = $4)
 		 RETURNING version`,
-		raw, id, tenantID, entityType, expectedVersion,
+		raw, id, entityType, expectedVersion,
 	).Scan(&newVersion)
 	if err == nil {
 		return newVersion, nil
@@ -255,16 +256,16 @@ func (r *RecordRepo) UpdateTx(ctx context.Context, q querier, tenantID, entityTy
 		return 0, fmt.Errorf("update record: %w", err)
 	}
 	// Zero rows updated — either the record doesn't exist (deleted, wrong
-	// tenant, wrong id) or it exists but expectedVersion didn't match. The
-	// single UPDATE above can't distinguish those (its WHERE clause ANDs
-	// both conditions together), so a follow-up existence check resolves
+	// id) or it exists but expectedVersion didn't match. The single
+	// UPDATE above can't distinguish those (its WHERE clause ANDs both
+	// conditions together), so a follow-up existence check resolves
 	// which error the caller actually needs: 404 vs. 409 are different
 	// user-facing outcomes ("this record is gone" vs. "someone else just
 	// changed it, reload and retry").
 	var exists bool
 	if checkErr := q.QueryRowContext(ctx,
-		`SELECT true FROM records WHERE id = $1 AND tenant_id = $2 AND entity_type = $3 AND deleted_at IS NULL`,
-		id, tenantID, entityType,
+		`SELECT true FROM records WHERE id = $1 AND entity_type = $2 AND deleted_at IS NULL`,
+		id, entityType,
 	).Scan(&exists); checkErr != nil {
 		if errors.Is(checkErr, sql.ErrNoRows) {
 			return 0, ErrNotFound
@@ -277,15 +278,15 @@ func (r *RecordRepo) UpdateTx(ctx context.Context, q querier, tenantID, entityTy
 // Delete soft-deletes a record using the repo's own connection pool (no
 // caller-supplied transaction). Use DeleteTx when the write must be
 // atomic with another operation, such as an audit entry.
-func (r *RecordRepo) Delete(ctx context.Context, tenantID, entityType, id string) error {
-	return r.DeleteTx(ctx, r.db, tenantID, entityType, id)
+func (r *RecordRepo) Delete(ctx context.Context, entityType, id string) error {
+	return r.DeleteTx(ctx, r.db, entityType, id)
 }
 
-func (r *RecordRepo) DeleteTx(ctx context.Context, q querier, tenantID, entityType, id string) error {
+func (r *RecordRepo) DeleteTx(ctx context.Context, q querier, entityType, id string) error {
 	res, err := q.ExecContext(ctx,
 		`UPDATE records SET deleted_at = now()
-		 WHERE id = $1 AND tenant_id = $2 AND entity_type = $3 AND deleted_at IS NULL`,
-		id, tenantID, entityType,
+		 WHERE id = $1 AND entity_type = $2 AND deleted_at IS NULL`,
+		id, entityType,
 	)
 	if err != nil {
 		return fmt.Errorf("delete record: %w", err)

@@ -43,11 +43,11 @@ type PurchaseOrderStatusCount struct {
 	Value  float64
 }
 
-// PurchaseOrderStatusBreakdown groups every one of tenantID's
-// PurchaseOrder records by status. Callers that want a fixed display
-// order (draft, submitted, approved, received, cancelled) should
-// reorder the result themselves — this returns whatever combination of
-// statuses actually has at least one order, in no particular order.
+// PurchaseOrderStatusBreakdown groups every PurchaseOrder record by
+// status. Callers that want a fixed display order (draft, submitted,
+// approved, received, cancelled) should reorder the result themselves —
+// this returns whatever combination of statuses actually has at least
+// one order, in no particular order.
 //
 // Joins to Status for its code rather than reading a plain enum value
 // off PurchaseOrder directly — status_id/StatusTypeCode
@@ -59,21 +59,19 @@ type PurchaseOrderStatusCount struct {
 // Same uuidPattern guard as TopVendorsBySpend/StockoutRiskItems below:
 // a malformed status_id (bad CSV import, say) is excluded from the
 // breakdown rather than aborting the whole aggregate with a cast error.
-func (r *ReportingRepo) PurchaseOrderStatusBreakdown(ctx context.Context, tenantID string) ([]PurchaseOrderStatusCount, error) {
+func (r *ReportingRepo) PurchaseOrderStatusBreakdown(ctx context.Context) ([]PurchaseOrderStatusCount, error) {
 	rows, err := r.db.QueryContext(ctx,
 		`SELECT st.data->>'code' AS status, count(*), coalesce(sum((po.data->>'total')::numeric), 0)
 		 FROM records po
 		 JOIN records st
-		   ON st.tenant_id = po.tenant_id
-		  AND st.entity_type = 'Status'
+		   ON st.entity_type = 'Status'
 		  AND st.deleted_at IS NULL
 		  AND st.id = (po.data->>'status_id')::uuid
-		 WHERE po.tenant_id = $1
-		   AND po.entity_type = 'PurchaseOrder'
+		 WHERE po.entity_type = 'PurchaseOrder'
 		   AND po.deleted_at IS NULL
-		   AND po.data->>'status_id' ~ $2
+		   AND po.data->>'status_id' ~ $1
 		 GROUP BY st.data->>'code'`,
-		tenantID, uuidPattern,
+		uuidPattern,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("purchase order status breakdown: %w", err)
@@ -102,28 +100,25 @@ type VendorSpend struct {
 	Total      float64
 }
 
-// TopVendorsBySpend returns tenantID's vendors ranked by total
-// PurchaseOrder value, highest first, capped at limit. A vendor_id that
-// doesn't resolve to a live Party row (deleted, or simply malformed —
-// see uuidPattern's doc comment) is excluded rather than aborting the
-// whole query.
-func (r *ReportingRepo) TopVendorsBySpend(ctx context.Context, tenantID string, limit int) ([]VendorSpend, error) {
+// TopVendorsBySpend returns vendors ranked by total PurchaseOrder value,
+// highest first, capped at limit. A vendor_id that doesn't resolve to a
+// live Party row (deleted, or simply malformed — see uuidPattern's doc
+// comment) is excluded rather than aborting the whole query.
+func (r *ReportingRepo) TopVendorsBySpend(ctx context.Context, limit int) ([]VendorSpend, error) {
 	rows, err := r.db.QueryContext(ctx,
 		`SELECT v.id, coalesce(v.data->>'name', v.id::text), count(po.id), coalesce(sum((po.data->>'total')::numeric), 0) AS spend
 		 FROM records po
 		 JOIN records v
-		   ON v.tenant_id = po.tenant_id
-		  AND v.entity_type = 'Party'
+		   ON v.entity_type = 'Party'
 		  AND v.deleted_at IS NULL
 		  AND v.id = (po.data->>'vendor_id')::uuid
-		 WHERE po.tenant_id = $1
-		   AND po.entity_type = 'PurchaseOrder'
+		 WHERE po.entity_type = 'PurchaseOrder'
 		   AND po.deleted_at IS NULL
-		   AND po.data->>'vendor_id' ~ $3
+		   AND po.data->>'vendor_id' ~ $2
 		 GROUP BY v.id, v.data->>'name'
 		 ORDER BY spend DESC, v.id
-		 LIMIT $2`,
-		tenantID, limit, uuidPattern,
+		 LIMIT $1`,
+		limit, uuidPattern,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("top vendors by spend: %w", err)
@@ -141,7 +136,7 @@ func (r *ReportingRepo) TopVendorsBySpend(ctx context.Context, tenantID string, 
 	return out, rows.Err()
 }
 
-// StockSummary is the tenant-wide roll-up over every InventoryItem row.
+// StockSummary is the roll-up over every InventoryItem row.
 type StockSummary struct {
 	ItemCount     int
 	TotalOnHand   float64
@@ -149,7 +144,7 @@ type StockSummary struct {
 	StockoutCount int // items with qty_available_to_promise <= 0
 }
 
-func (r *ReportingRepo) StockSummary(ctx context.Context, tenantID string) (StockSummary, error) {
+func (r *ReportingRepo) StockSummary(ctx context.Context) (StockSummary, error) {
 	var s StockSummary
 	err := r.db.QueryRowContext(ctx,
 		`SELECT
@@ -158,8 +153,7 @@ func (r *ReportingRepo) StockSummary(ctx context.Context, tenantID string) (Stoc
 		   coalesce(sum((data->>'qty_available_to_promise')::numeric), 0),
 		   count(*) FILTER (WHERE (data->>'qty_available_to_promise')::numeric <= 0)
 		 FROM records
-		 WHERE tenant_id = $1 AND entity_type = 'InventoryItem' AND deleted_at IS NULL`,
-		tenantID,
+		 WHERE entity_type = 'InventoryItem' AND deleted_at IS NULL`,
 	).Scan(&s.ItemCount, &s.TotalOnHand, &s.TotalATP, &s.StockoutCount)
 	if err != nil {
 		return StockSummary{}, fmt.Errorf("stock summary: %w", err)
@@ -183,28 +177,26 @@ type StockoutRiskItem struct {
 	QtyATP    float64
 }
 
-// StockoutRiskItems returns tenantID's Items with qty_available_to_promise
-// <= 0, most-negative first, capped at limit. Same malformed-reference
-// guard as TopVendorsBySpend.
-func (r *ReportingRepo) StockoutRiskItems(ctx context.Context, tenantID string, limit int) ([]StockoutRiskItem, error) {
+// StockoutRiskItems returns Items with qty_available_to_promise <= 0,
+// most-negative first, capped at limit. Same malformed-reference guard
+// as TopVendorsBySpend.
+func (r *ReportingRepo) StockoutRiskItems(ctx context.Context, limit int) ([]StockoutRiskItem, error) {
 	rows, err := r.db.QueryContext(ctx,
 		`SELECT i.id, coalesce(i.data->>'sku', ''), coalesce(i.data->>'name', i.id::text),
 		        coalesce((inv.data->>'qty_on_hand')::numeric, 0),
 		        coalesce((inv.data->>'qty_available_to_promise')::numeric, 0)
 		 FROM records inv
 		 JOIN records i
-		   ON i.tenant_id = inv.tenant_id
-		  AND i.entity_type = 'Item'
+		   ON i.entity_type = 'Item'
 		  AND i.deleted_at IS NULL
 		  AND i.id = (inv.data->>'item_id')::uuid
-		 WHERE inv.tenant_id = $1
-		   AND inv.entity_type = 'InventoryItem'
+		 WHERE inv.entity_type = 'InventoryItem'
 		   AND inv.deleted_at IS NULL
-		   AND inv.data->>'item_id' ~ $3
+		   AND inv.data->>'item_id' ~ $2
 		   AND (inv.data->>'qty_available_to_promise')::numeric <= 0
 		 ORDER BY (inv.data->>'qty_available_to_promise')::numeric, i.id
-		 LIMIT $2`,
-		tenantID, limit, uuidPattern,
+		 LIMIT $1`,
+		limit, uuidPattern,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("stockout risk items: %w", err)

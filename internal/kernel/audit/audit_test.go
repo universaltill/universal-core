@@ -52,19 +52,19 @@ func TestInputHash(t *testing.T) {
 }
 
 func TestNew_RejectsInvalidActor(t *testing.T) {
-	_, err := New("tenant-1", "Vendor", "rec-1", ActionCreate, Actor{Type: ActorAgent, ID: "a"}, nil)
+	_, err := New("Vendor", "rec-1", ActionCreate, Actor{Type: ActorAgent, ID: "a"}, nil)
 	if err != ErrMissingModelVersion {
 		t.Fatalf("expected ErrMissingModelVersion, got %v", err)
 	}
 }
 
 func TestNew_Succeeds(t *testing.T) {
-	e, err := New("tenant-1", "Vendor", "rec-1", ActionCreate,
+	e, err := New("Vendor", "rec-1", ActionCreate,
 		Actor{Type: ActorHuman, ID: "farshid"}, map[string]any{"name": "Acme"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if e.TenantID != "tenant-1" || e.Action != ActionCreate {
+	if e.EntityType != "Vendor" || e.Action != ActionCreate {
 		t.Fatalf("unexpected entry: %+v", e)
 	}
 }

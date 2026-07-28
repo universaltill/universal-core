@@ -18,6 +18,7 @@ import (
 
 	"golang.org/x/sync/singleflight"
 
+	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/db"
 )
 
@@ -56,6 +57,7 @@ func quoteIdentifier(name string) string {
 // control-plane connection (see NewRouter).
 type Router struct {
 	control *sql.DB
+	tenants *data.TenantRepo
 	baseURL *url.URL
 
 	mu    sync.RWMutex
@@ -77,6 +79,7 @@ func NewRouter(controlDB *sql.DB, controlDSN string) (*Router, error) {
 	}
 	return &Router{
 		control: controlDB,
+		tenants: data.NewTenantRepo(controlDB),
 		baseURL: u,
 		pools:   make(map[string]*sql.DB),
 	}, nil
@@ -124,11 +127,8 @@ func (r *Router) cached(tenantID string) (*sql.DB, bool) {
 }
 
 func (r *Router) dbNameFor(ctx context.Context, tenantID string) (string, error) {
-	var dbName string
-	err := r.control.QueryRowContext(ctx,
-		`SELECT db_name FROM tenants WHERE id = $1`, tenantID,
-	).Scan(&dbName)
-	if errors.Is(err, sql.ErrNoRows) {
+	dbName, err := r.tenants.DBName(ctx, tenantID)
+	if errors.Is(err, data.ErrNotFound) {
 		return "", ErrTenantNotFound
 	}
 	if err != nil {
@@ -169,18 +169,13 @@ func (r *Router) open(ctx context.Context, dbName string) (*sql.DB, error) {
 // insert and that cleanup could still leave one — an inherent limit of
 // spanning two databases, not something a transaction can fix here.
 func (r *Router) Create(ctx context.Context, name, region string) (tenantID string, err error) {
-	var dbName string
-	err = r.control.QueryRowContext(ctx, `
-		INSERT INTO tenants (name, region, db_name)
-		VALUES ($1, $2, 'uc_tenant_' || replace(gen_random_uuid()::text, '-', ''))
-		RETURNING id, db_name`, name, region,
-	).Scan(&tenantID, &dbName)
+	tenantID, dbName, err := r.tenants.CreateWithDatabase(ctx, name, region)
 	if err != nil {
 		return "", fmt.Errorf("tenantdb: insert tenant row: %w", err)
 	}
 
 	if err := r.provision(ctx, tenantID, dbName); err != nil {
-		_, _ = r.control.ExecContext(context.Background(), `DELETE FROM tenants WHERE id = $1`, tenantID)
+		_ = r.tenants.Delete(context.Background(), tenantID)
 		return "", err
 	}
 	return tenantID, nil

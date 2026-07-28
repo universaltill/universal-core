@@ -23,9 +23,8 @@ import (
 // them. This test actually asks a real browser what an input's computed
 // style is, the only way to catch this class of bug at all.
 func TestIssueReportPage_FormIsStyled(t *testing.T) {
-	db := testDB(t)
 	withDevAuthEnabled(t)
-	srv, tenantID := testServer(t, db)
+	srv, tenantID, _ := testServer(t)
 	ctx := browserCtx(t, tenantID)
 
 	if err := chromedp.Run(ctx,
@@ -91,9 +90,8 @@ func TestIssueReportPage_FormIsStyled(t *testing.T) {
 // itself is stubbed out, which is the one part no CI/dev machine can be
 // relied on to have a working microphone for regardless.
 func TestIssueReportPage_VoiceRecordShowsCleanErrorNotRawJSON(t *testing.T) {
-	db := testDB(t)
 	withDevAuthEnabled(t)
-	srv, tenantID := testServer(t, db) // no speech client wired — transcribe always 503s
+	srv, tenantID, _ := testServer(t) // no speech client wired — transcribe always 503s
 	ctx := browserCtx(t, tenantID)
 
 	const fakeMediaScript = `

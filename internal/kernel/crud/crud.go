@@ -15,8 +15,12 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 )
 
-// Engine is the generic CRUD engine. One Engine serves every entity type;
-// the Definition supplied per call is what makes each entity distinct.
+// Engine is the generic CRUD engine, operating against one tenant's own
+// database (ADR-0003 — the *sql.DB passed to NewEngine is already
+// resolved to a specific tenant via internal/tenantdb.Router, not shared
+// across tenants). One Engine serves every entity type within that
+// tenant; the Definition supplied per call is what makes each entity
+// distinct.
 type Engine struct {
 	db      *sql.DB
 	records *data.RecordRepo
@@ -35,7 +39,7 @@ func NewEngine(db *sql.DB) *Engine {
 // writes an audit entry — atomically in one transaction, so a record can
 // never exist without its audit trail (ADR-0017 §14/§16: audit is written
 // from the same transaction as the mutation, never bolted on after).
-func (e *Engine) Create(ctx context.Context, def *entity.Definition, tenantID string, fields map[string]any, actor audit.Actor) (data.Record, error) {
+func (e *Engine) Create(ctx context.Context, def *entity.Definition, fields map[string]any, actor audit.Actor) (data.Record, error) {
 	if err := entity.ValidateRecord(def, fields); err != nil {
 		return data.Record{}, fmt.Errorf("validation failed: %w", err)
 	}
@@ -46,12 +50,12 @@ func (e *Engine) Create(ctx context.Context, def *entity.Definition, tenantID st
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback is a no-op after a successful commit
 
-	rec, err := e.records.CreateTx(ctx, tx, tenantID, def.EntityType, fields)
+	rec, err := e.records.CreateTx(ctx, tx, def.EntityType, fields)
 	if err != nil {
 		return data.Record{}, fmt.Errorf("create record: %w", err)
 	}
 
-	auditEntry, err := audit.New(tenantID, def.EntityType, rec.ID, audit.ActionCreate, actor, fields)
+	auditEntry, err := audit.New(def.EntityType, rec.ID, audit.ActionCreate, actor, fields)
 	if err != nil {
 		return data.Record{}, fmt.Errorf("build audit entry: %w", err)
 	}
@@ -73,7 +77,7 @@ func (e *Engine) Create(ctx context.Context, def *entity.Definition, tenantID st
 // record's new version on success, so a caller re-rendering the record
 // (a form, an API response) can embed the version it should check against
 // next time.
-func (e *Engine) Update(ctx context.Context, def *entity.Definition, tenantID, id string, fields map[string]any, expectedVersion *int, actor audit.Actor) (int, error) {
+func (e *Engine) Update(ctx context.Context, def *entity.Definition, id string, fields map[string]any, expectedVersion *int, actor audit.Actor) (int, error) {
 	if err := entity.ValidateRecord(def, fields); err != nil {
 		return 0, fmt.Errorf("validation failed: %w", err)
 	}
@@ -84,12 +88,12 @@ func (e *Engine) Update(ctx context.Context, def *entity.Definition, tenantID, i
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	newVersion, err := e.records.UpdateTx(ctx, tx, tenantID, def.EntityType, id, fields, expectedVersion)
+	newVersion, err := e.records.UpdateTx(ctx, tx, def.EntityType, id, fields, expectedVersion)
 	if err != nil {
 		return 0, fmt.Errorf("update record: %w", err)
 	}
 
-	auditEntry, err := audit.New(tenantID, def.EntityType, id, audit.ActionUpdate, actor, fields)
+	auditEntry, err := audit.New(def.EntityType, id, audit.ActionUpdate, actor, fields)
 	if err != nil {
 		return 0, fmt.Errorf("build audit entry: %w", err)
 	}
@@ -111,18 +115,18 @@ func (e *Engine) Update(ctx context.Context, def *entity.Definition, tenantID, i
 // aiprovidersettings.go), deleting a tenant's own AIProviderConnection
 // override — not a generic per-entity-type route (there's no DELETE
 // exposed on /api/records yet).
-func (e *Engine) Delete(ctx context.Context, def *entity.Definition, tenantID, id string, actor audit.Actor) error {
+func (e *Engine) Delete(ctx context.Context, def *entity.Definition, id string, actor audit.Actor) error {
 	tx, err := e.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback is a no-op after a successful commit
 
-	if err := e.records.DeleteTx(ctx, tx, tenantID, def.EntityType, id); err != nil {
+	if err := e.records.DeleteTx(ctx, tx, def.EntityType, id); err != nil {
 		return fmt.Errorf("delete record: %w", err)
 	}
 
-	auditEntry, err := audit.New(tenantID, def.EntityType, id, audit.ActionDelete, actor, nil)
+	auditEntry, err := audit.New(def.EntityType, id, audit.ActionDelete, actor, nil)
 	if err != nil {
 		return fmt.Errorf("build audit entry: %w", err)
 	}
@@ -136,28 +140,28 @@ func (e *Engine) Delete(ctx context.Context, def *entity.Definition, tenantID, i
 	return nil
 }
 
-func (e *Engine) Get(ctx context.Context, def *entity.Definition, tenantID, id string) (data.Record, error) {
-	return e.records.Get(ctx, tenantID, def.EntityType, id)
+func (e *Engine) Get(ctx context.Context, def *entity.Definition, id string) (data.Record, error) {
+	return e.records.Get(ctx, def.EntityType, id)
 }
 
-func (e *Engine) List(ctx context.Context, def *entity.Definition, tenantID string) ([]data.Record, error) {
-	return e.records.List(ctx, tenantID, def.EntityType)
+func (e *Engine) List(ctx context.Context, def *entity.Definition) ([]data.Record, error) {
+	return e.records.List(ctx, def.EntityType)
 }
 
-// Count returns how many def records tenantID has — see
+// Count returns how many def records exist — see
 // data.RecordRepo.CountByEntityType.
-func (e *Engine) Count(ctx context.Context, def *entity.Definition, tenantID string) (int, error) {
-	return e.records.CountByEntityType(ctx, tenantID, def.EntityType)
+func (e *Engine) Count(ctx context.Context, def *entity.Definition) (int, error) {
+	return e.records.CountByEntityType(ctx, def.EntityType)
 }
 
 // ListPage returns one page of def records — see data.RecordRepo.ListPage.
-func (e *Engine) ListPage(ctx context.Context, def *entity.Definition, tenantID string, limit, offset int) ([]data.Record, error) {
-	return e.records.ListPage(ctx, tenantID, def.EntityType, limit, offset)
+func (e *Engine) ListPage(ctx context.Context, def *entity.Definition, limit, offset int) ([]data.Record, error) {
+	return e.records.ListPage(ctx, def.EntityType, limit, offset)
 }
 
 // ListByField returns every def record whose fieldName == value — used
 // to fetch a master-detail section's child rows (see
 // data.RecordRepo.ListByField).
-func (e *Engine) ListByField(ctx context.Context, def *entity.Definition, tenantID, fieldName, value string) ([]data.Record, error) {
-	return e.records.ListByField(ctx, tenantID, def.EntityType, fieldName, value)
+func (e *Engine) ListByField(ctx context.Context, def *entity.Definition, fieldName, value string) ([]data.Record, error) {
+	return e.records.ListByField(ctx, def.EntityType, fieldName, value)
 }
