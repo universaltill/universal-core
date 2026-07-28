@@ -222,14 +222,14 @@ inbound catalog/stock sync reads through `GET /api/records/{entityType}`
    `purchasing`'s `PurchaseOrder`/`POLine`/`GoodsReceipt` set is the
    closest existing precedent for what this looks like once built).
    Doesn't exist yet — this repo only has the purchase side today.
-2. **The Zitadel side actually applied.** Machine-to-machine auth
-   (`internal/svcauth`) and its Terraform (`uc-infra/infra/terraform/
-   zitadel`) are built and tested, but that Terraform hasn't been
-   applied against the live, shared Zitadel instance yet — an operator
-   needs to run `terraform apply` (creating a real IAM identity + PAT
-   needs explicit go-ahead, same as any other secret/identity creation)
-   and set `SVC_INTROSPECTION_CLIENT_ID`/`SVC_INTROSPECTION_CLIENT_SECRET`
-   on the running deployment before a real connector can authenticate.
+2. ~~The Zitadel side actually applied~~ — **done 2026-07-28**.
+   Machine-to-machine auth is live on the running deployment
+   (`erp.universaltill.com`): the Zitadel Terraform is applied,
+   `SVC_INTROSPECTION_CLIENT_ID`/`SECRET` are wired in, and the demo
+   tenant has its own machine user + PAT (retrieve via `terraform
+   output -raw demo_tenant_integration_pat` in `uc-infra/infra/
+   terraform/zitadel` — hand it to whoever configures a connector
+   against this tenant). A connector can authenticate for real today.
 3. The connector plugin itself, built on Till's own plugin platform per
    ADR-0014 — that work lives in `../unitill`, not here.
 
