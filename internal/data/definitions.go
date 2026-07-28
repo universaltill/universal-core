@@ -39,7 +39,6 @@ var ErrInvalidStatusTransition = errors.New("data: definition is not in the requ
 // Callers decode via the matching kernel package's Unmarshal function.
 type DefinitionVersion struct {
 	ID            string
-	TenantID      string
 	Key           string // entity_type for entity/form definitions, name for workflow definitions
 	Version       int
 	Status        string
@@ -85,7 +84,7 @@ func newDefinitionRepo(db *sql.DB, table, keyColumn, auditPrefix string) *defini
 // createDraft inserts a new draft version and its audit entry atomically
 // — a definition version can never exist without an audit trail (same
 // discipline as crud.Engine.Create for records).
-func (r *definitionRepo) createDraft(ctx context.Context, tenantID, key string, version int, definition []byte, actor audit.Actor) (DefinitionVersion, error) {
+func (r *definitionRepo) createDraft(ctx context.Context, key string, version int, definition []byte, actor audit.Actor) (DefinitionVersion, error) {
 	if err := actor.Validate(); err != nil {
 		return DefinitionVersion{}, fmt.Errorf("create %s draft: %w", r.table, err)
 	}
@@ -98,10 +97,10 @@ func (r *definitionRepo) createDraft(ctx context.Context, tenantID, key string, 
 
 	var id string
 	err = tx.QueryRowContext(ctx,
-		fmt.Sprintf(`INSERT INTO %s (tenant_id, %s, version, definition, created_by_type, created_by)
-		 VALUES ($1, $2, $3, $4, $5, $6)
+		fmt.Sprintf(`INSERT INTO %s (%s, version, definition, created_by_type, created_by)
+		 VALUES ($1, $2, $3, $4, $5)
 		 RETURNING id`, r.table, r.keyColumn),
-		tenantID, key, version, definition, string(actor.Type), actor.ID,
+		key, version, definition, string(actor.Type), actor.ID,
 	).Scan(&id)
 	if err != nil {
 		return DefinitionVersion{}, fmt.Errorf("insert %s: %w", r.table, err)
@@ -111,7 +110,7 @@ func (r *definitionRepo) createDraft(ctx context.Context, tenantID, key string, 
 	if err := json.Unmarshal(definition, &diff); err != nil {
 		return DefinitionVersion{}, fmt.Errorf("unmarshal definition for audit diff: %w", err)
 	}
-	auditEntry, err := audit.New(tenantID, r.auditEntityType(key), id, audit.ActionCreate, actor, diff)
+	auditEntry, err := audit.New(r.auditEntityType(key), id, audit.ActionCreate, actor, diff)
 	if err != nil {
 		return DefinitionVersion{}, fmt.Errorf("build audit entry: %w", err)
 	}
@@ -123,7 +122,7 @@ func (r *definitionRepo) createDraft(ctx context.Context, tenantID, key string, 
 		return DefinitionVersion{}, fmt.Errorf("commit tx: %w", err)
 	}
 	return DefinitionVersion{
-		ID: id, TenantID: tenantID, Key: key, Version: version, Status: StatusDraft,
+		ID: id, Key: key, Version: version, Status: StatusDraft,
 		Definition: definition, CreatedByType: string(actor.Type), CreatedBy: actor.ID,
 	}, nil
 }
@@ -135,7 +134,7 @@ func (r *definitionRepo) createDraft(ctx context.Context, tenantID, key string, 
 // passes it as nil (a no-op UPDATE `approved_by = COALESCE($x, approved_by)`
 // would also work, but an explicit nil is clearer about which transitions
 // actually touch that column).
-func (r *definitionRepo) transition(ctx context.Context, tenantID, key string, version int, fromStatus, toStatus string, approvedBy string, actor audit.Actor, action audit.Action) error {
+func (r *definitionRepo) transition(ctx context.Context, key string, version int, fromStatus, toStatus string, approvedBy string, actor audit.Actor, action audit.Action) error {
 	if err := actor.Validate(); err != nil {
 		return fmt.Errorf("transition %s: %w", r.table, err)
 	}
@@ -150,15 +149,15 @@ func (r *definitionRepo) transition(ctx context.Context, tenantID, key string, v
 	setApprovedBy := ""
 	if approvedBy != "" {
 		approvedByArg = approvedBy
-		setApprovedBy = ", approved_by = $6"
+		setApprovedBy = ", approved_by = $5"
 	}
 
 	query := fmt.Sprintf(
 		`UPDATE %s SET status = $1%s
-		 WHERE tenant_id = $2 AND %s = $3 AND version = $4 AND status = $5`,
+		 WHERE %s = $2 AND version = $3 AND status = $4`,
 		r.table, setApprovedBy, r.keyColumn,
 	)
-	args := []any{toStatus, tenantID, key, version, fromStatus}
+	args := []any{toStatus, key, version, fromStatus}
 	if approvedByArg != nil {
 		args = append(args, approvedByArg)
 	}
@@ -177,13 +176,13 @@ func (r *definitionRepo) transition(ctx context.Context, tenantID, key string, v
 
 	var id string
 	if err := tx.QueryRowContext(ctx,
-		fmt.Sprintf(`SELECT id FROM %s WHERE tenant_id = $1 AND %s = $2 AND version = $3`, r.table, r.keyColumn),
-		tenantID, key, version,
+		fmt.Sprintf(`SELECT id FROM %s WHERE %s = $1 AND version = $2`, r.table, r.keyColumn),
+		key, version,
 	).Scan(&id); err != nil {
 		return fmt.Errorf("look up %s id for audit: %w", r.table, err)
 	}
 
-	auditEntry, err := audit.New(tenantID, r.auditEntityType(key), id, action, actor, map[string]any{"status": toStatus})
+	auditEntry, err := audit.New(r.auditEntityType(key), id, action, actor, map[string]any{"status": toStatus})
 	if err != nil {
 		return fmt.Errorf("build audit entry: %w", err)
 	}
@@ -198,31 +197,30 @@ func (r *definitionRepo) transition(ctx context.Context, tenantID, key string, v
 // new version never has to touch older published rows (they simply stop
 // being "current" once a higher version exists), and rolling back the
 // current version naturally falls back to the next-highest published one.
-func (r *definitionRepo) getPublished(ctx context.Context, tenantID, key string) (DefinitionVersion, error) {
+func (r *definitionRepo) getPublished(ctx context.Context, key string) (DefinitionVersion, error) {
 	return r.getOne(ctx,
 		fmt.Sprintf(
 			`SELECT id, version, status, definition, created_by_type, created_by, approved_by
 			 FROM %s
-			 WHERE tenant_id = $1 AND %s = $2 AND status = 'published'
+			 WHERE %s = $1 AND status = 'published'
 			 ORDER BY version DESC LIMIT 1`, r.table, r.keyColumn),
-		tenantID, key,
+		key,
 	)
 }
 
 // listPublishedKeys returns every distinct key (entity_type, for
-// EntityDefinitionRepo) with at least one published version for
-// tenantID — what a landing page needs to say "here's what you can
-// actually open", without hardcoding any entity type into the generic
-// engine (CLAUDE.md's kernel/deterministic-core boundary rule). DISTINCT
-// because a key can have more than one published row at once (an older
-// version stays 'published' even after a newer one is; see
-// getPublished's own doc comment on "current" meaning highest version,
-// not "only" version) — this only needs the type names, not versions.
-func (r *definitionRepo) listPublishedKeys(ctx context.Context, tenantID string) ([]string, error) {
+// EntityDefinitionRepo) with at least one published version — what a
+// landing page needs to say "here's what you can actually open", without
+// hardcoding any entity type into the generic engine (CLAUDE.md's
+// kernel/deterministic-core boundary rule). DISTINCT because a key can
+// have more than one published row at once (an older version stays
+// 'published' even after a newer one is; see getPublished's own doc
+// comment on "current" meaning highest version, not "only" version) —
+// this only needs the type names, not versions.
+func (r *definitionRepo) listPublishedKeys(ctx context.Context) ([]string, error) {
 	rows, err := r.db.QueryContext(ctx,
-		fmt.Sprintf(`SELECT DISTINCT %s FROM %s WHERE tenant_id = $1 AND status = 'published' ORDER BY %s`,
+		fmt.Sprintf(`SELECT DISTINCT %s FROM %s WHERE status = 'published' ORDER BY %s`,
 			r.keyColumn, r.table, r.keyColumn),
-		tenantID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list published %s: %w", r.table, err)
@@ -240,13 +238,13 @@ func (r *definitionRepo) listPublishedKeys(ctx context.Context, tenantID string)
 	return keys, rows.Err()
 }
 
-func (r *definitionRepo) getVersion(ctx context.Context, tenantID, key string, version int) (DefinitionVersion, error) {
+func (r *definitionRepo) getVersion(ctx context.Context, key string, version int) (DefinitionVersion, error) {
 	return r.getOne(ctx,
 		fmt.Sprintf(
 			`SELECT id, version, status, definition, created_by_type, created_by, approved_by
 			 FROM %s
-			 WHERE tenant_id = $1 AND %s = $2 AND version = $3`, r.table, r.keyColumn),
-		tenantID, key, version,
+			 WHERE %s = $1 AND version = $2`, r.table, r.keyColumn),
+		key, version,
 	)
 }
 
@@ -275,36 +273,36 @@ func NewEntityDefinitionRepo(db *sql.DB) *EntityDefinitionRepo {
 	return &EntityDefinitionRepo{r: newDefinitionRepo(db, "entity_definitions", "entity_type", "entity_definition")}
 }
 
-func (e *EntityDefinitionRepo) CreateDraft(ctx context.Context, tenantID, entityType string, version int, definition []byte, actor audit.Actor) (DefinitionVersion, error) {
-	return e.r.createDraft(ctx, tenantID, entityType, version, definition, actor)
+func (e *EntityDefinitionRepo) CreateDraft(ctx context.Context, entityType string, version int, definition []byte, actor audit.Actor) (DefinitionVersion, error) {
+	return e.r.createDraft(ctx, entityType, version, definition, actor)
 }
 
-func (e *EntityDefinitionRepo) Approve(ctx context.Context, tenantID, entityType string, version int, actor audit.Actor) error {
-	return e.r.transition(ctx, tenantID, entityType, version, StatusDraft, StatusApproved, actor.ID, actor, audit.ActionUpdate)
+func (e *EntityDefinitionRepo) Approve(ctx context.Context, entityType string, version int, actor audit.Actor) error {
+	return e.r.transition(ctx, entityType, version, StatusDraft, StatusApproved, actor.ID, actor, audit.ActionUpdate)
 }
 
-func (e *EntityDefinitionRepo) Publish(ctx context.Context, tenantID, entityType string, version int, actor audit.Actor) error {
-	return e.r.transition(ctx, tenantID, entityType, version, StatusApproved, StatusPublished, "", actor, audit.ActionUpdate)
+func (e *EntityDefinitionRepo) Publish(ctx context.Context, entityType string, version int, actor audit.Actor) error {
+	return e.r.transition(ctx, entityType, version, StatusApproved, StatusPublished, "", actor, audit.ActionUpdate)
 }
 
-func (e *EntityDefinitionRepo) Rollback(ctx context.Context, tenantID, entityType string, version int, actor audit.Actor) error {
-	return e.r.transition(ctx, tenantID, entityType, version, StatusPublished, StatusRolledBack, "", actor, audit.ActionUpdate)
+func (e *EntityDefinitionRepo) Rollback(ctx context.Context, entityType string, version int, actor audit.Actor) error {
+	return e.r.transition(ctx, entityType, version, StatusPublished, StatusRolledBack, "", actor, audit.ActionUpdate)
 }
 
-func (e *EntityDefinitionRepo) GetPublished(ctx context.Context, tenantID, entityType string) (DefinitionVersion, error) {
-	return e.r.getPublished(ctx, tenantID, entityType)
+func (e *EntityDefinitionRepo) GetPublished(ctx context.Context, entityType string) (DefinitionVersion, error) {
+	return e.r.getPublished(ctx, entityType)
 }
 
-func (e *EntityDefinitionRepo) GetVersion(ctx context.Context, tenantID, entityType string, version int) (DefinitionVersion, error) {
-	return e.r.getVersion(ctx, tenantID, entityType, version)
+func (e *EntityDefinitionRepo) GetVersion(ctx context.Context, entityType string, version int) (DefinitionVersion, error) {
+	return e.r.getVersion(ctx, entityType, version)
 }
 
-// ListPublishedEntityTypes returns every entity type tenantID currently
-// has at least one published Definition for — the landing page's data
-// source (internal/api's dashboard handler), reading the registry
-// instead of hardcoding a module list.
-func (e *EntityDefinitionRepo) ListPublishedEntityTypes(ctx context.Context, tenantID string) ([]string, error) {
-	return e.r.listPublishedKeys(ctx, tenantID)
+// ListPublishedEntityTypes returns every entity type with at least one
+// published Definition — the landing page's data source (internal/api's
+// dashboard handler), reading the registry instead of hardcoding a
+// module list.
+func (e *EntityDefinitionRepo) ListPublishedEntityTypes(ctx context.Context) ([]string, error) {
+	return e.r.listPublishedKeys(ctx)
 }
 
 // FormDefinitionRepo is the repository for form_definitions.
@@ -314,28 +312,28 @@ func NewFormDefinitionRepo(db *sql.DB) *FormDefinitionRepo {
 	return &FormDefinitionRepo{r: newDefinitionRepo(db, "form_definitions", "entity_type", "form_definition")}
 }
 
-func (f *FormDefinitionRepo) CreateDraft(ctx context.Context, tenantID, entityType string, version int, definition []byte, actor audit.Actor) (DefinitionVersion, error) {
-	return f.r.createDraft(ctx, tenantID, entityType, version, definition, actor)
+func (f *FormDefinitionRepo) CreateDraft(ctx context.Context, entityType string, version int, definition []byte, actor audit.Actor) (DefinitionVersion, error) {
+	return f.r.createDraft(ctx, entityType, version, definition, actor)
 }
 
-func (f *FormDefinitionRepo) Approve(ctx context.Context, tenantID, entityType string, version int, actor audit.Actor) error {
-	return f.r.transition(ctx, tenantID, entityType, version, StatusDraft, StatusApproved, actor.ID, actor, audit.ActionUpdate)
+func (f *FormDefinitionRepo) Approve(ctx context.Context, entityType string, version int, actor audit.Actor) error {
+	return f.r.transition(ctx, entityType, version, StatusDraft, StatusApproved, actor.ID, actor, audit.ActionUpdate)
 }
 
-func (f *FormDefinitionRepo) Publish(ctx context.Context, tenantID, entityType string, version int, actor audit.Actor) error {
-	return f.r.transition(ctx, tenantID, entityType, version, StatusApproved, StatusPublished, "", actor, audit.ActionUpdate)
+func (f *FormDefinitionRepo) Publish(ctx context.Context, entityType string, version int, actor audit.Actor) error {
+	return f.r.transition(ctx, entityType, version, StatusApproved, StatusPublished, "", actor, audit.ActionUpdate)
 }
 
-func (f *FormDefinitionRepo) Rollback(ctx context.Context, tenantID, entityType string, version int, actor audit.Actor) error {
-	return f.r.transition(ctx, tenantID, entityType, version, StatusPublished, StatusRolledBack, "", actor, audit.ActionUpdate)
+func (f *FormDefinitionRepo) Rollback(ctx context.Context, entityType string, version int, actor audit.Actor) error {
+	return f.r.transition(ctx, entityType, version, StatusPublished, StatusRolledBack, "", actor, audit.ActionUpdate)
 }
 
-func (f *FormDefinitionRepo) GetPublished(ctx context.Context, tenantID, entityType string) (DefinitionVersion, error) {
-	return f.r.getPublished(ctx, tenantID, entityType)
+func (f *FormDefinitionRepo) GetPublished(ctx context.Context, entityType string) (DefinitionVersion, error) {
+	return f.r.getPublished(ctx, entityType)
 }
 
-func (f *FormDefinitionRepo) GetVersion(ctx context.Context, tenantID, entityType string, version int) (DefinitionVersion, error) {
-	return f.r.getVersion(ctx, tenantID, entityType, version)
+func (f *FormDefinitionRepo) GetVersion(ctx context.Context, entityType string, version int) (DefinitionVersion, error) {
+	return f.r.getVersion(ctx, entityType, version)
 }
 
 // WorkflowDefinitionRepo is the repository for workflow_definitions.
@@ -347,35 +345,35 @@ func NewWorkflowDefinitionRepo(db *sql.DB) *WorkflowDefinitionRepo {
 	return &WorkflowDefinitionRepo{r: newDefinitionRepo(db, "workflow_definitions", "name", "workflow_definition")}
 }
 
-func (w *WorkflowDefinitionRepo) CreateDraft(ctx context.Context, tenantID, name string, version int, definition []byte, actor audit.Actor) (DefinitionVersion, error) {
-	return w.r.createDraft(ctx, tenantID, name, version, definition, actor)
+func (w *WorkflowDefinitionRepo) CreateDraft(ctx context.Context, name string, version int, definition []byte, actor audit.Actor) (DefinitionVersion, error) {
+	return w.r.createDraft(ctx, name, version, definition, actor)
 }
 
-func (w *WorkflowDefinitionRepo) Approve(ctx context.Context, tenantID, name string, version int, actor audit.Actor) error {
-	return w.r.transition(ctx, tenantID, name, version, StatusDraft, StatusApproved, actor.ID, actor, audit.ActionUpdate)
+func (w *WorkflowDefinitionRepo) Approve(ctx context.Context, name string, version int, actor audit.Actor) error {
+	return w.r.transition(ctx, name, version, StatusDraft, StatusApproved, actor.ID, actor, audit.ActionUpdate)
 }
 
-func (w *WorkflowDefinitionRepo) Publish(ctx context.Context, tenantID, name string, version int, actor audit.Actor) error {
-	return w.r.transition(ctx, tenantID, name, version, StatusApproved, StatusPublished, "", actor, audit.ActionUpdate)
+func (w *WorkflowDefinitionRepo) Publish(ctx context.Context, name string, version int, actor audit.Actor) error {
+	return w.r.transition(ctx, name, version, StatusApproved, StatusPublished, "", actor, audit.ActionUpdate)
 }
 
-func (w *WorkflowDefinitionRepo) Rollback(ctx context.Context, tenantID, name string, version int, actor audit.Actor) error {
-	return w.r.transition(ctx, tenantID, name, version, StatusPublished, StatusRolledBack, "", actor, audit.ActionUpdate)
+func (w *WorkflowDefinitionRepo) Rollback(ctx context.Context, name string, version int, actor audit.Actor) error {
+	return w.r.transition(ctx, name, version, StatusPublished, StatusRolledBack, "", actor, audit.ActionUpdate)
 }
 
-func (w *WorkflowDefinitionRepo) GetPublished(ctx context.Context, tenantID, name string) (DefinitionVersion, error) {
-	return w.r.getPublished(ctx, tenantID, name)
+func (w *WorkflowDefinitionRepo) GetPublished(ctx context.Context, name string) (DefinitionVersion, error) {
+	return w.r.getPublished(ctx, name)
 }
 
-func (w *WorkflowDefinitionRepo) GetVersion(ctx context.Context, tenantID, name string, version int) (DefinitionVersion, error) {
-	return w.r.getVersion(ctx, tenantID, name, version)
+func (w *WorkflowDefinitionRepo) GetVersion(ctx context.Context, name string, version int) (DefinitionVersion, error) {
+	return w.r.getVersion(ctx, name, version)
 }
 
-// ListPublishedNames returns every workflow name tenantID currently has
-// at least one published Definition for — what internal/api's trigger
-// wiring needs to find which workflows might fire for a given entity
-// type + trigger, without hardcoding a workflow name anywhere (same
-// registry-driven pattern as EntityDefinitionRepo.ListPublishedEntityTypes).
-func (w *WorkflowDefinitionRepo) ListPublishedNames(ctx context.Context, tenantID string) ([]string, error) {
-	return w.r.listPublishedKeys(ctx, tenantID)
+// ListPublishedNames returns every workflow name with at least one
+// published Definition — what internal/api's trigger wiring needs to
+// find which workflows might fire for a given entity type + trigger,
+// without hardcoding a workflow name anywhere (same registry-driven
+// pattern as EntityDefinitionRepo.ListPublishedEntityTypes).
+func (w *WorkflowDefinitionRepo) ListPublishedNames(ctx context.Context) ([]string, error) {
+	return w.r.listPublishedKeys(ctx)
 }

@@ -17,10 +17,10 @@ import (
 // publishEntityAndForm/the CRUD API first.
 
 func TestAPI_PurchasingReport_RequiresAuth(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
 	mux := http.NewServeMux()
-	testHandler(t, db).Routes(mux)
+	testHandler(t, router).Routes(mux)
 
 	req := httptest.NewRequest("GET", "/reports/purchasing", nil) // no X-Tenant-ID/X-Actor-ID
 	rec := httptest.NewRecorder()
@@ -37,46 +37,47 @@ func TestAPI_PurchasingReport_RequiresAuth(t *testing.T) {
 // (plausible — Party.name is free-text, reachable via CSV import) must
 // render escaped, not executable.
 func TestAPI_PurchasingReport_TenantScopedAndEscapesRecordData(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantA := seedTenant(t, db)
-	tenantB := seedTenant(t, db)
-	records := data.NewRecordRepo(db)
+	tenantA, dbA := newTestTenant(t, router)
+	_, dbB := newTestTenant(t, router)
+	recordsA := data.NewRecordRepo(dbA)
+	recordsB := data.NewRecordRepo(dbB)
 	ctx := context.Background()
 
-	statusA, err := records.Create(ctx, tenantA, "Status", map[string]any{"code": "approved", "name": "Approved"})
+	statusA, err := recordsA.Create(ctx, "Status", map[string]any{"code": "approved", "name": "Approved"})
 	if err != nil {
 		t.Fatalf("create Status for tenant A: %v", err)
 	}
-	statusB, err := records.Create(ctx, tenantB, "Status", map[string]any{"code": "approved", "name": "Approved"})
+	statusB, err := recordsB.Create(ctx, "Status", map[string]any{"code": "approved", "name": "Approved"})
 	if err != nil {
 		t.Fatalf("create Status for tenant B: %v", err)
 	}
 
-	vendorA, err := records.Create(ctx, tenantA, "Party", map[string]any{
+	vendorA, err := recordsA.Create(ctx, "Party", map[string]any{
 		"name": `Acme" onmouseover="alert(1)<script>alert(2)</script>`, "party_type": "organization",
 	})
 	if err != nil {
 		t.Fatalf("create Party for tenant A: %v", err)
 	}
-	if _, err := records.Create(ctx, tenantA, "PurchaseOrder", map[string]any{
+	if _, err := recordsA.Create(ctx, "PurchaseOrder", map[string]any{
 		"po_number": "PO-A1", "vendor_id": vendorA.ID, "status_id": statusA.ID, "total": 1234.5,
 	}); err != nil {
 		t.Fatalf("create PurchaseOrder for tenant A: %v", err)
 	}
 
-	vendorB, err := records.Create(ctx, tenantB, "Party", map[string]any{"name": "Tenant B Vendor", "party_type": "organization"})
+	vendorB, err := recordsB.Create(ctx, "Party", map[string]any{"name": "Tenant B Vendor", "party_type": "organization"})
 	if err != nil {
 		t.Fatalf("create Party for tenant B: %v", err)
 	}
-	if _, err := records.Create(ctx, tenantB, "PurchaseOrder", map[string]any{
+	if _, err := recordsB.Create(ctx, "PurchaseOrder", map[string]any{
 		"po_number": "PO-B1", "vendor_id": vendorB.ID, "status_id": statusB.ID, "total": 999999.0,
 	}); err != nil {
 		t.Fatalf("create PurchaseOrder for tenant B: %v", err)
 	}
 
 	mux := http.NewServeMux()
-	testHandler(t, db).Routes(mux)
+	testHandler(t, router).Routes(mux)
 	req := newRequest("GET", "/reports/purchasing", tenantA, "farshid", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
@@ -105,24 +106,24 @@ func TestAPI_PurchasingReport_TenantScopedAndEscapesRecordData(t *testing.T) {
 // (no vendors, no stockouts) render their own message instead of an
 // empty table.
 func TestAPI_PurchasingReport_StockoutRiskAndEmptyStates(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
+	tenantID, db := newTestTenant(t, router)
 	records := data.NewRecordRepo(db)
 	ctx := context.Background()
 
-	item, err := records.Create(ctx, tenantID, "Item", map[string]any{"sku": "SKU-EMPTY", "name": "Out of Stock Widget", "item_type": "stock"})
+	item, err := records.Create(ctx, "Item", map[string]any{"sku": "SKU-EMPTY", "name": "Out of Stock Widget", "item_type": "stock"})
 	if err != nil {
 		t.Fatalf("create Item: %v", err)
 	}
-	if _, err := records.Create(ctx, tenantID, "InventoryItem", map[string]any{
+	if _, err := records.Create(ctx, "InventoryItem", map[string]any{
 		"item_id": item.ID, "qty_on_hand": 0, "qty_available_to_promise": 0,
 	}); err != nil {
 		t.Fatalf("create InventoryItem: %v", err)
 	}
 
 	mux := http.NewServeMux()
-	testHandler(t, db).Routes(mux)
+	testHandler(t, router).Routes(mux)
 	req := newRequest("GET", "/reports/purchasing", tenantID, "farshid", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)

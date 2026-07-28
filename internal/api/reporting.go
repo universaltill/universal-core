@@ -48,10 +48,15 @@ func (h *Handler) renderPurchasingReport(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
+	ts, err := h.scope(r.Context(), rc.TenantID)
+	if err != nil {
+		writeInternalError(w, "resolve tenant scope", err)
+		return
+	}
 	locale := localeFromRequest(w, r)
 	ctx := r.Context()
 
-	statusRows, err := h.reporting.PurchaseOrderStatusBreakdown(ctx, rc.TenantID)
+	statusRows, err := ts.reporting.PurchaseOrderStatusBreakdown(ctx)
 	if err != nil {
 		writeInternalError(w, "purchase order status breakdown", err)
 		return
@@ -67,19 +72,19 @@ func (h *Handler) renderPurchasingReport(w http.ResponseWriter, r *http.Request)
 		}{row.Count, row.Value}
 	}
 
-	vendors, err := h.reporting.TopVendorsBySpend(ctx, rc.TenantID, reportTopVendorLimit)
+	vendors, err := ts.reporting.TopVendorsBySpend(ctx, reportTopVendorLimit)
 	if err != nil {
 		writeInternalError(w, "top vendors by spend", err)
 		return
 	}
 
-	stock, err := h.reporting.StockSummary(ctx, rc.TenantID)
+	stock, err := ts.reporting.StockSummary(ctx)
 	if err != nil {
 		writeInternalError(w, "stock summary", err)
 		return
 	}
 
-	stockouts, err := h.reporting.StockoutRiskItems(ctx, rc.TenantID, reportStockoutLimit)
+	stockouts, err := ts.reporting.StockoutRiskItems(ctx, reportStockoutLimit)
 	if err != nil {
 		writeInternalError(w, "stockout risk items", err)
 		return

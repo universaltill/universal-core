@@ -2,7 +2,6 @@ package api
 
 import (
 	"crypto/rand"
-	"database/sql"
 	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/universaltill/universal-core/internal/i18n"
+	"github.com/universaltill/universal-core/internal/tenantdb"
 	"github.com/universaltill/universal-core/internal/kernel/secretcrypt"
 )
 
@@ -19,13 +19,13 @@ import (
 // establish (every other test in this package stays exactly as it was:
 // secret encryption disabled, matching a deployment with no
 // SECRET_ENCRYPTION_KEY configured).
-func testHandlerWithSecretCryptor(t *testing.T, db *sql.DB, cryptor *secretcrypt.Cryptor) *Handler {
+func testHandlerWithSecretCryptor(t *testing.T, router *tenantdb.Router, cryptor *secretcrypt.Cryptor) *Handler {
 	t.Helper()
 	catalog, err := i18n.Load("en")
 	if err != nil {
 		t.Fatalf("load i18n catalog: %v", err)
 	}
-	return New(db, catalog, nil, nil, nil, cryptor)
+	return New(router, catalog, nil, nil, nil, cryptor)
 }
 
 func testCryptor(t *testing.T) *secretcrypt.Cryptor {
@@ -55,10 +55,10 @@ func postAIProviderSave(mux *http.ServeMux, tenantID, provider, baseURL, model, 
 }
 
 func TestAIProviderSettings_Page_RequiresAuth(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
 	mux := http.NewServeMux()
-	testHandler(t, db).Routes(mux)
+	testHandler(t, router).Routes(mux)
 
 	req := httptest.NewRequest("GET", "/settings/ai-provider", nil) // no auth headers
 	rec := httptest.NewRecorder()
@@ -74,13 +74,13 @@ func TestAIProviderSettings_Page_RequiresAuth(t *testing.T) {
 // note, not an error — this is the expected, common state for every
 // tenant until they explicitly opt into BYOK.
 func TestAIProviderSettings_Page_DefaultsToPlatformAI(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
-	publishFoundation(t, db, tenantID)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
 
 	mux := http.NewServeMux()
-	testHandler(t, db).Routes(mux)
+	testHandler(t, router).Routes(mux)
 
 	req := newRequest("GET", "/settings/ai-provider", tenantID, "farshid", nil)
 	rec := httptest.NewRecorder()
@@ -102,13 +102,13 @@ func TestAIProviderSettings_Page_DefaultsToPlatformAI(t *testing.T) {
 // buildAIProviderFields' Ollama branch is actually enforced end-to-end,
 // not just at the unit level.
 func TestAIProviderSettings_Save_OllamaRequiresBaseURL(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
-	publishFoundation(t, db, tenantID)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
 
 	mux := http.NewServeMux()
-	testHandler(t, db).Routes(mux)
+	testHandler(t, router).Routes(mux)
 
 	rec := postAIProviderSave(mux, tenantID, "ollama", "", "llama3.2:3b", "")
 	if rec.Code != http.StatusOK {
@@ -124,13 +124,13 @@ func TestAIProviderSettings_Save_OllamaRequiresBaseURL(t *testing.T) {
 // (not the platform default) round-trips through Save and back onto the
 // page correctly, with no API key ever in play.
 func TestAIProviderSettings_Save_OllamaSucceeds(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
-	publishFoundation(t, db, tenantID)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
 
 	mux := http.NewServeMux()
-	testHandler(t, db).Routes(mux)
+	testHandler(t, router).Routes(mux)
 
 	rec := postAIProviderSave(mux, tenantID, "ollama", "http://my-own-ollama.example.com:11434", "llama3.2:3b", "")
 	if rec.Code != http.StatusOK {
@@ -165,13 +165,13 @@ func TestAIProviderSettings_Save_OllamaSucceeds(t *testing.T) {
 // not silently accepted and later fetched server-side on every import
 // preview.
 func TestAIProviderSettings_Save_OllamaRejectsLinkLocalBaseURL(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
-	publishFoundation(t, db, tenantID)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
 
 	mux := http.NewServeMux()
-	testHandler(t, db).Routes(mux)
+	testHandler(t, router).Routes(mux)
 
 	rec := postAIProviderSave(mux, tenantID, "ollama", "http://169.254.169.254/latest/meta-data/", "llama3.2:3b", "")
 	if rec.Code != http.StatusOK {
@@ -183,13 +183,13 @@ func TestAIProviderSettings_Save_OllamaRejectsLinkLocalBaseURL(t *testing.T) {
 }
 
 func TestAIProviderSettings_Save_AnthropicWithoutCryptorConfiguredFails(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
-	publishFoundation(t, db, tenantID)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
 
 	mux := http.NewServeMux()
-	testHandler(t, db).Routes(mux) // no secret cryptor
+	testHandler(t, router).Routes(mux) // no secret cryptor
 
 	rec := postAIProviderSave(mux, tenantID, "anthropic", "", "claude-sonnet-5", "sk-ant-fake-key")
 	if rec.Code != http.StatusOK {
@@ -206,13 +206,13 @@ func TestAIProviderSettings_Save_AnthropicWithoutCryptorConfiguredFails(t *testi
 // the ciphertext-equals-plaintext no-op either), and the settings page
 // never renders it back out, only whether one is set.
 func TestAIProviderSettings_Save_AnthropicEncryptsKeyAndNeverEchoesIt(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
-	publishFoundation(t, db, tenantID)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
 
 	mux := http.NewServeMux()
-	testHandlerWithSecretCryptor(t, db, testCryptor(t)).Routes(mux)
+	testHandlerWithSecretCryptor(t, router, testCryptor(t)).Routes(mux)
 
 	const plainKey = "sk-ant-api03-super-secret-value-should-never-appear"
 	rec := postAIProviderSave(mux, tenantID, "anthropic", "", "claude-sonnet-5", plainKey)
@@ -242,13 +242,13 @@ func TestAIProviderSettings_Save_AnthropicEncryptsKeyAndNeverEchoesIt(t *testing
 // own hint text promises actually holds: resubmitting with a new model
 // but no api_key must not silently drop the previously stored key.
 func TestAIProviderSettings_Save_BlankAPIKeyKeepsExistingForSameProvider(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
-	publishFoundation(t, db, tenantID)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
 
 	mux := http.NewServeMux()
-	testHandlerWithSecretCryptor(t, db, testCryptor(t)).Routes(mux)
+	testHandlerWithSecretCryptor(t, router, testCryptor(t)).Routes(mux)
 
 	if rec := postAIProviderSave(mux, tenantID, "anthropic", "", "claude-sonnet-5", "sk-ant-fake-key"); rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 on first save, got %d: %s", rec.Code, rec.Body.String())
@@ -272,13 +272,13 @@ func TestAIProviderSettings_Save_BlankAPIKeyKeepsExistingForSameProvider(t *test
 // a different one — buildAIProviderFields' own doc comment on why that
 // would be a confusing, silent bug.
 func TestAIProviderSettings_Save_BlankAPIKeySwitchingProviderFails(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
-	publishFoundation(t, db, tenantID)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
 
 	mux := http.NewServeMux()
-	testHandlerWithSecretCryptor(t, db, testCryptor(t)).Routes(mux)
+	testHandlerWithSecretCryptor(t, router, testCryptor(t)).Routes(mux)
 
 	if rec := postAIProviderSave(mux, tenantID, "anthropic", "", "claude-sonnet-5", "sk-ant-fake-key"); rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 on first save, got %d: %s", rec.Code, rec.Body.String())
@@ -294,13 +294,13 @@ func TestAIProviderSettings_Save_BlankAPIKeySwitchingProviderFails(t *testing.T)
 }
 
 func TestAIProviderSettings_Save_UnknownProviderIsRejected(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
-	publishFoundation(t, db, tenantID)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
 
 	mux := http.NewServeMux()
-	testHandler(t, db).Routes(mux)
+	testHandler(t, router).Routes(mux)
 
 	rec := postAIProviderSave(mux, tenantID, "gemini", "", "gemini-pro", "")
 	if rec.Code != http.StatusOK {
@@ -316,13 +316,13 @@ func TestAIProviderSettings_Save_UnknownProviderIsRejected(t *testing.T) {
 // and the underlying record must actually be gone (not just hidden),
 // confirmed via the generic /api/records listing.
 func TestAIProviderSettings_Clear_RemovesOverride(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
-	publishFoundation(t, db, tenantID)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
 
 	mux := http.NewServeMux()
-	testHandler(t, db).Routes(mux)
+	testHandler(t, router).Routes(mux)
 
 	if rec := postAIProviderSave(mux, tenantID, "ollama", "http://my-own-ollama.example.com:11434", "llama3.2:3b", ""); rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 on save, got %d: %s", rec.Code, rec.Body.String())
@@ -351,13 +351,13 @@ func TestAIProviderSettings_Clear_RemovesOverride(t *testing.T) {
 // ("no override on file") is identical either way, per
 // aiProviderSettingsClear's own doc comment.
 func TestAIProviderSettings_Clear_WithNoOverrideIsHarmlessNoOp(t *testing.T) {
-	db := testDB(t)
+	router := newTestRouter(t)
 	withDevAuthEnabled(t)
-	tenantID := seedTenant(t, db)
-	publishFoundation(t, db, tenantID)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
 
 	mux := http.NewServeMux()
-	testHandler(t, db).Routes(mux)
+	testHandler(t, router).Routes(mux)
 
 	req := newRequest("POST", "/settings/ai-provider/clear", tenantID, "farshid", nil)
 	rec := httptest.NewRecorder()

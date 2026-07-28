@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -40,27 +41,76 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/universaltill/universal-core/internal/api"
+	"github.com/universaltill/universal-core/internal/db"
 	"github.com/universaltill/universal-core/internal/i18n"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
 	"github.com/universaltill/universal-core/internal/kernel/purchasing"
+	"github.com/universaltill/universal-core/internal/tenantdb"
 )
 
-func testDB(t *testing.T) *sql.DB {
+// freshControlDB returns a connection to a brand-new, uniquely-named
+// control-plane database (ADR-0003) with the control migration set
+// applied — same pattern internal/api/handlers_test.go's own
+// freshControlDB establishes. Skips (not fails) if TEST_DATABASE_URL
+// isn't set, same convention as every other integration test in this
+// repo.
+func freshControlDB(t *testing.T) (controlDB *sql.DB, controlDSN string) {
 	t.Helper()
-	url := os.Getenv("TEST_DATABASE_URL")
-	if url == "" {
+	base := os.Getenv("TEST_DATABASE_URL")
+	if base == "" {
 		t.Skip("TEST_DATABASE_URL not set; skipping integration test")
 	}
-	db, err := sql.Open("pgx", url)
+	admin, err := sql.Open("pgx", base)
 	if err != nil {
-		t.Fatalf("open db: %v", err)
+		t.Fatalf("open admin connection: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
-	if err := db.Ping(); err != nil {
-		t.Fatalf("ping db: %v", err)
+	t.Cleanup(func() { admin.Close() })
+
+	name := fmt.Sprintf("uc_test_e2e_control_%d", time.Now().UnixNano())
+	if _, err := admin.Exec(`CREATE DATABASE "` + name + `"`); err != nil {
+		t.Fatalf("create database %s: %v", name, err)
 	}
-	return db
+	t.Cleanup(func() {
+		_, _ = admin.Exec(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()`, name)
+		_, _ = admin.Exec(`DROP DATABASE IF EXISTS "` + name + `"`)
+	})
+
+	u, err := url.Parse(base)
+	if err != nil {
+		t.Fatalf("parse TEST_DATABASE_URL: %v", err)
+	}
+	u.Path = "/" + name
+	dsn := u.String()
+	control, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open control database %s: %v", name, err)
+	}
+	t.Cleanup(func() { control.Close() })
+	if err := control.Ping(); err != nil {
+		t.Fatalf("ping control database %s: %v", name, err)
+	}
+	if _, err := control.Exec(`CREATE EXTENSION IF NOT EXISTS pgcrypto`); err != nil {
+		t.Fatalf("create pgcrypto extension: %v", err)
+	}
+	if err := db.ApplyControl(context.Background(), control); err != nil {
+		t.Fatalf("ApplyControl: %v", err)
+	}
+	return control, dsn
+}
+
+// newTestRouter builds a Router against a fresh control database — every
+// e2e server in this package is wired against this, exactly as
+// cmd/universal-core wires it in production.
+func newTestRouter(t *testing.T) *tenantdb.Router {
+	t.Helper()
+	control, dsn := freshControlDB(t)
+	router, err := tenantdb.NewRouter(control, dsn)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+	t.Cleanup(func() { router.Close() })
+	return router
 }
 
 func humanActor() audit.Actor {
@@ -110,46 +160,36 @@ func findBrowser(t *testing.T) string {
 	return ""
 }
 
-// testServer provisions a tenant (foundation + purchasing, entities and
-// forms, via cmd/provision-tenant's own underlying calls — not a
-// throwaway script, the real production path) and starts a real HTTP
-// server backed by api.Routes, the same wiring cmd/universal-core uses.
-func testServer(t *testing.T, db *sql.DB) (srv *httptest.Server, tenantID string) {
+// testServer provisions a brand-new tenant (via router.Create — the real
+// production provisioning path, same as cmd/provision-tenant) with
+// foundation + purchasing published (entities and forms), and starts a
+// real HTTP server backed by api.Routes, the same wiring
+// cmd/universal-core uses. Each tenant is its own physical database
+// (ADR-0003), so — unlike the old shared-database version of this helper
+// — there's no cross-test workflow_jobs cleanup needed: a job left behind
+// by one test can never be claimed by another test's ProcessOne call.
+func testServer(t *testing.T) (srv *httptest.Server, tenantID string, tenantDB *sql.DB) {
 	t.Helper()
+	router := newTestRouter(t)
 	ctx := context.Background()
 	actor := humanActor()
 
-	var id string
-	if err := db.QueryRowContext(ctx,
-		`INSERT INTO tenants (name, region) VALUES ($1, $2) RETURNING id`,
-		"E2E Tenant", "eu-west",
-	).Scan(&id); err != nil {
-		t.Fatalf("seed tenant: %v", err)
+	id, err := router.Create(ctx, "E2E Tenant", "eu-west")
+	if err != nil {
+		t.Fatalf("router.Create: %v", err)
 	}
-	// workflow_jobs cleanup: ClaimNext/ProcessOne are deliberately
-	// tenant-global (one shared dispatcher servicing every tenant — see
-	// internal/kernel/workflow/queue.go), so a job an e2e test enqueues
-	// and leaves 'queued' (e.g. TestWorkflowInbox_ApproveButton_
-	// RealBrowser, approved but never run to completion since no worker
-	// runs inside this httptest.Server) is fair game for a LATER
-	// package's ProcessOne call once go test ./... -p 1 moves on — found
-	// exactly this way, the same class of cross-package race already
-	// fixed twice this session (internal/api/handlers_test.go's own
-	// seedTenant, ci.yml's -p 1 itself). Fixed at the shared helper, not
-	// just the one test that happened to trigger it, so any future e2e
-	// test that enqueues a workflow job is covered automatically.
-	t.Cleanup(func() {
-		if _, err := db.Exec(`DELETE FROM workflow_jobs WHERE tenant_id = $1`, id); err != nil {
-			t.Errorf("cleanup workflow_jobs for tenant %s: %v", id, err)
-		}
-	})
-	if err := foundation.Publish(ctx, db, id, actor); err != nil {
+	tenantDB, err = router.Get(ctx, id)
+	if err != nil {
+		t.Fatalf("router.Get: %v", err)
+	}
+
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
 		t.Fatalf("foundation.Publish: %v", err)
 	}
-	if err := purchasing.Publish(ctx, db, id, actor); err != nil {
+	if err := purchasing.Publish(ctx, tenantDB, actor); err != nil {
 		t.Fatalf("purchasing.Publish: %v", err)
 	}
-	if err := purchasing.PublishForms(ctx, db, id, actor); err != nil {
+	if err := purchasing.PublishForms(ctx, tenantDB, actor); err != nil {
 		t.Fatalf("purchasing.PublishForms: %v", err)
 	}
 
@@ -158,10 +198,10 @@ func testServer(t *testing.T, db *sql.DB) (srv *httptest.Server, tenantID string
 		t.Fatalf("load i18n catalog: %v", err)
 	}
 	mux := http.NewServeMux()
-	api.New(db, catalog, nil, nil, nil, nil).Routes(mux)
+	api.New(router, catalog, nil, nil, nil, nil).Routes(mux)
 	srv = httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	return srv, id
+	return srv, id, tenantDB
 }
 
 // browserCtx starts a real headless Chrome instance and configures every
@@ -262,9 +302,8 @@ func clickAndSettle(selector string) chromedp.Action {
 // fix the mapping via real <select> elements, click through to a real
 // commit, and see the real result — end to end, no protocol shortcuts.
 func TestCSVImportWizard_RealBrowser(t *testing.T) {
-	db := testDB(t)
 	withDevAuthEnabled(t)
-	srv, tenantID := testServer(t, db)
+	srv, tenantID, _ := testServer(t)
 	ctx := browserCtx(t, tenantID)
 
 	csvPath := filepath.Join(t.TempDir(), "items.csv")

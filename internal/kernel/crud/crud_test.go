@@ -5,48 +5,66 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"testing"
+	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/universaltill/universal-core/internal/data"
+	"github.com/universaltill/universal-core/internal/db"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 )
 
-// testDB opens the integration-test database. Skips (not fails) if
-// TEST_DATABASE_URL isn't set, so `go test ./...` stays runnable without a
-// database for anyone who hasn't set one up yet — the ledger/entity/audit
-// unit tests still cover the pure logic without it.
-func testDB(t *testing.T) *sql.DB {
+// freshTenantDB returns a connection to a brand-new, uniquely-named
+// tenant database (ADR-0003) with the tenant migration set applied.
+// Skips (not fails) if TEST_DATABASE_URL isn't set, so `go test ./...`
+// stays runnable without a database for anyone who hasn't set one up yet
+// — the ledger/entity/audit unit tests still cover the pure logic
+// without it.
+func freshTenantDB(t *testing.T) *sql.DB {
 	t.Helper()
-	url := os.Getenv("TEST_DATABASE_URL")
-	if url == "" {
+	base := os.Getenv("TEST_DATABASE_URL")
+	if base == "" {
 		t.Skip("TEST_DATABASE_URL not set; skipping integration test")
 	}
-	db, err := sql.Open("pgx", url)
+	admin, err := sql.Open("pgx", base)
 	if err != nil {
-		t.Fatalf("open db: %v", err)
+		t.Fatalf("open admin connection: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
-	if err := db.Ping(); err != nil {
-		t.Fatalf("ping db: %v", err)
-	}
-	return db
-}
+	t.Cleanup(func() { admin.Close() })
 
-func seedTenant(t *testing.T, db *sql.DB) string {
-	t.Helper()
-	var id string
-	err := db.QueryRow(
-		`INSERT INTO tenants (name, region) VALUES ($1, $2) RETURNING id`,
-		"Test Tenant", "eu-west",
-	).Scan(&id)
-	if err != nil {
-		t.Fatalf("seed tenant: %v", err)
+	name := fmt.Sprintf("uc_test_crud_%d", time.Now().UnixNano())
+	if _, err := admin.Exec(`CREATE DATABASE "` + name + `"`); err != nil {
+		t.Fatalf("create database %s: %v", name, err)
 	}
-	return id
+	t.Cleanup(func() {
+		_, _ = admin.Exec(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()`, name)
+		_, _ = admin.Exec(`DROP DATABASE IF EXISTS "` + name + `"`)
+	})
+
+	u, err := url.Parse(base)
+	if err != nil {
+		t.Fatalf("parse TEST_DATABASE_URL: %v", err)
+	}
+	u.Path = "/" + name
+	tenantDB, err := sql.Open("pgx", u.String())
+	if err != nil {
+		t.Fatalf("open tenant database %s: %v", name, err)
+	}
+	t.Cleanup(func() { tenantDB.Close() })
+	if err := tenantDB.Ping(); err != nil {
+		t.Fatalf("ping tenant database %s: %v", name, err)
+	}
+	if _, err := tenantDB.Exec(`CREATE EXTENSION IF NOT EXISTS pgcrypto`); err != nil {
+		t.Fatalf("create pgcrypto extension: %v", err)
+	}
+	if err := db.ApplyTenant(context.Background(), tenantDB); err != nil {
+		t.Fatalf("ApplyTenant: %v", err)
+	}
+	return tenantDB
 }
 
 func vendorDef() *entity.Definition {
@@ -61,14 +79,13 @@ func vendorDef() *entity.Definition {
 }
 
 func TestEngine_Create_WritesRecordAndAuditAtomically(t *testing.T) {
-	db := testDB(t)
+	db := freshTenantDB(t)
 	ctx := context.Background()
-	tenantID := seedTenant(t, db)
 	engine := NewEngine(db)
 	def := vendorDef()
 
 	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
-	rec, err := engine.Create(ctx, def, tenantID, map[string]any{
+	rec, err := engine.Create(ctx, def, map[string]any{
 		"name":           "Acme Textiles",
 		"lead_time_days": float64(60),
 	}, actor)
@@ -80,7 +97,7 @@ func TestEngine_Create_WritesRecordAndAuditAtomically(t *testing.T) {
 	}
 
 	// The record is readable back.
-	got, err := engine.Get(ctx, def, tenantID, rec.ID)
+	got, err := engine.Get(ctx, def, rec.ID)
 	if err != nil {
 		t.Fatalf("Get failed: %v", err)
 	}
@@ -94,8 +111,8 @@ func TestEngine_Create_WritesRecordAndAuditAtomically(t *testing.T) {
 	var modelVersion sql.NullString
 	err = db.QueryRow(
 		`SELECT actor_type, actor_id, model_version FROM audit_log
-		 WHERE tenant_id = $1 AND entity_type = 'Vendor' AND record_id = $2 AND action = 'create'`,
-		tenantID, rec.ID,
+		 WHERE entity_type = 'Vendor' AND record_id = $1 AND action = 'create'`,
+		rec.ID,
 	).Scan(&actorType, &actorID, &modelVersion)
 	if err != nil {
 		t.Fatalf("query audit_log: %v", err)
@@ -109,9 +126,8 @@ func TestEngine_Create_WritesRecordAndAuditAtomically(t *testing.T) {
 }
 
 func TestEngine_Create_RecordsAIActorIdentity(t *testing.T) {
-	db := testDB(t)
+	db := freshTenantDB(t)
 	ctx := context.Background()
-	tenantID := seedTenant(t, db)
 	engine := NewEngine(db)
 	def := vendorDef()
 
@@ -121,7 +137,7 @@ func TestEngine_Create_RecordsAIActorIdentity(t *testing.T) {
 		ModelVersion: "claude-fable-5",
 		Input:        "create a vendor named Acme with 60 day lead time",
 	}
-	rec, err := engine.Create(ctx, def, tenantID, map[string]any{"name": "Acme"}, actor)
+	rec, err := engine.Create(ctx, def, map[string]any{"name": "Acme"}, actor)
 	if err != nil {
 		t.Fatalf("Create failed: %v", err)
 	}
@@ -129,8 +145,8 @@ func TestEngine_Create_RecordsAIActorIdentity(t *testing.T) {
 	var actorType, modelVersion, inputHash string
 	err = db.QueryRow(
 		`SELECT actor_type, model_version, input_hash FROM audit_log
-		 WHERE tenant_id = $1 AND record_id = $2`,
-		tenantID, rec.ID,
+		 WHERE record_id = $1`,
+		rec.ID,
 	).Scan(&actorType, &modelVersion, &inputHash)
 	if err != nil {
 		t.Fatalf("query audit_log: %v", err)
@@ -144,21 +160,20 @@ func TestEngine_Create_RecordsAIActorIdentity(t *testing.T) {
 }
 
 func TestEngine_Create_ValidationFailure_WritesNothing(t *testing.T) {
-	db := testDB(t)
+	db := freshTenantDB(t)
 	ctx := context.Background()
-	tenantID := seedTenant(t, db)
 	engine := NewEngine(db)
 	def := vendorDef()
 
 	// Missing required "name" field.
-	_, err := engine.Create(ctx, def, tenantID, map[string]any{"lead_time_days": float64(10)},
+	_, err := engine.Create(ctx, def, map[string]any{"lead_time_days": float64(10)},
 		audit.Actor{Type: audit.ActorHuman, ID: "farshid"})
 	if err == nil {
 		t.Fatal("expected validation error")
 	}
 
 	var count int
-	if err := db.QueryRow(`SELECT count(*) FROM records WHERE tenant_id = $1`, tenantID).Scan(&count); err != nil {
+	if err := db.QueryRow(`SELECT count(*) FROM records`).Scan(&count); err != nil {
 		t.Fatalf("count records: %v", err)
 	}
 	if count != 0 {
@@ -167,19 +182,18 @@ func TestEngine_Create_ValidationFailure_WritesNothing(t *testing.T) {
 }
 
 func TestEngine_Update_ChangesDataAndAppendsAudit(t *testing.T) {
-	db := testDB(t)
+	db := freshTenantDB(t)
 	ctx := context.Background()
-	tenantID := seedTenant(t, db)
 	engine := NewEngine(db)
 	def := vendorDef()
 	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
 
-	rec, err := engine.Create(ctx, def, tenantID, map[string]any{"name": "Acme"}, actor)
+	rec, err := engine.Create(ctx, def, map[string]any{"name": "Acme"}, actor)
 	if err != nil {
 		t.Fatalf("Create failed: %v", err)
 	}
 
-	_, err = engine.Update(ctx, def, tenantID, rec.ID, map[string]any{
+	_, err = engine.Update(ctx, def, rec.ID, map[string]any{
 		"name":           "Acme Textiles Ltd",
 		"lead_time_days": float64(45),
 	}, nil, actor)
@@ -187,7 +201,7 @@ func TestEngine_Update_ChangesDataAndAppendsAudit(t *testing.T) {
 		t.Fatalf("Update failed: %v", err)
 	}
 
-	got, err := engine.Get(ctx, def, tenantID, rec.ID)
+	got, err := engine.Get(ctx, def, rec.ID)
 	if err != nil {
 		t.Fatalf("Get failed: %v", err)
 	}
@@ -197,8 +211,8 @@ func TestEngine_Update_ChangesDataAndAppendsAudit(t *testing.T) {
 
 	var auditCount int
 	if err := db.QueryRow(
-		`SELECT count(*) FROM audit_log WHERE tenant_id = $1 AND record_id = $2`,
-		tenantID, rec.ID,
+		`SELECT count(*) FROM audit_log WHERE record_id = $1`,
+		rec.ID,
 	).Scan(&auditCount); err != nil {
 		t.Fatalf("count audit_log: %v", err)
 	}
@@ -212,14 +226,13 @@ func TestEngine_Update_ChangesDataAndAppendsAudit(t *testing.T) {
 // to mean "never checked" in the pointer-based expectedVersion API, so a
 // real record must never legitimately have version 0.
 func TestEngine_Create_StartsAtVersion1(t *testing.T) {
-	db := testDB(t)
+	db := freshTenantDB(t)
 	ctx := context.Background()
-	tenantID := seedTenant(t, db)
 	engine := NewEngine(db)
 	def := vendorDef()
 	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
 
-	rec, err := engine.Create(ctx, def, tenantID, map[string]any{"name": "Acme"}, actor)
+	rec, err := engine.Create(ctx, def, map[string]any{"name": "Acme"}, actor)
 	if err != nil {
 		t.Fatalf("Create failed: %v", err)
 	}
@@ -234,14 +247,13 @@ func TestEngine_Create_StartsAtVersion1(t *testing.T) {
 // unconditionally, exactly as before — the version field increments as a
 // side effect, but nothing rejects the write.
 func TestEngine_Update_NilExpectedVersionSkipsCheck(t *testing.T) {
-	db := testDB(t)
+	db := freshTenantDB(t)
 	ctx := context.Background()
-	tenantID := seedTenant(t, db)
 	engine := NewEngine(db)
 	def := vendorDef()
 	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
 
-	rec, err := engine.Create(ctx, def, tenantID, map[string]any{"name": "Acme"}, actor)
+	rec, err := engine.Create(ctx, def, map[string]any{"name": "Acme"}, actor)
 	if err != nil {
 		t.Fatalf("Create failed: %v", err)
 	}
@@ -249,10 +261,10 @@ func TestEngine_Update_NilExpectedVersionSkipsCheck(t *testing.T) {
 	// Two consecutive unconditional updates, neither checking a version —
 	// the second must not fail just because the first already moved the
 	// record's version on from what it was at Create time.
-	if _, err := engine.Update(ctx, def, tenantID, rec.ID, map[string]any{"name": "First Edit"}, nil, actor); err != nil {
+	if _, err := engine.Update(ctx, def, rec.ID, map[string]any{"name": "First Edit"}, nil, actor); err != nil {
 		t.Fatalf("first unconditional Update failed: %v", err)
 	}
-	newVersion, err := engine.Update(ctx, def, tenantID, rec.ID, map[string]any{"name": "Second Edit"}, nil, actor)
+	newVersion, err := engine.Update(ctx, def, rec.ID, map[string]any{"name": "Second Edit"}, nil, actor)
 	if err != nil {
 		t.Fatalf("second unconditional Update failed: %v", err)
 	}
@@ -267,31 +279,30 @@ func TestEngine_Update_NilExpectedVersionSkipsCheck(t *testing.T) {
 // so it must be rejected with data.ErrVersionConflict instead of silently
 // overwriting the first edit.
 func TestEngine_Update_StaleExpectedVersionRejected(t *testing.T) {
-	db := testDB(t)
+	db := freshTenantDB(t)
 	ctx := context.Background()
-	tenantID := seedTenant(t, db)
 	engine := NewEngine(db)
 	def := vendorDef()
 	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
 
-	rec, err := engine.Create(ctx, def, tenantID, map[string]any{"name": "Acme"}, actor)
+	rec, err := engine.Create(ctx, def, map[string]any{"name": "Acme"}, actor)
 	if err != nil {
 		t.Fatalf("Create failed: %v", err)
 	}
 	staleVersion := rec.Version // both "concurrent" edits read the record at this version
 
-	if _, err := engine.Update(ctx, def, tenantID, rec.ID, map[string]any{"name": "Editor A's change"}, &staleVersion, actor); err != nil {
+	if _, err := engine.Update(ctx, def, rec.ID, map[string]any{"name": "Editor A's change"}, &staleVersion, actor); err != nil {
 		t.Fatalf("first Update (the one that actually wins the race) failed: %v", err)
 	}
 
-	_, err = engine.Update(ctx, def, tenantID, rec.ID, map[string]any{"name": "Editor B's change"}, &staleVersion, actor)
+	_, err = engine.Update(ctx, def, rec.ID, map[string]any{"name": "Editor B's change"}, &staleVersion, actor)
 	if !errors.Is(err, data.ErrVersionConflict) {
 		t.Fatalf("expected ErrVersionConflict for a stale expectedVersion, got %v", err)
 	}
 
 	// Editor A's change survived; Editor B's was correctly rejected, not
 	// silently applied on top.
-	got, err := engine.Get(ctx, def, tenantID, rec.ID)
+	got, err := engine.Get(ctx, def, rec.ID)
 	if err != nil {
 		t.Fatalf("Get failed: %v", err)
 	}
@@ -306,40 +317,39 @@ func TestEngine_Update_StaleExpectedVersionRejected(t *testing.T) {
 // since a caller needs to tell "reload and retry" (409) apart from "this
 // is gone" (404).
 func TestEngine_Update_NonexistentRecordReturnsNotFoundNotConflict(t *testing.T) {
-	db := testDB(t)
+	db := freshTenantDB(t)
 	ctx := context.Background()
-	tenantID := seedTenant(t, db)
 	engine := NewEngine(db)
 	def := vendorDef()
 	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
 
 	v := 1
-	_, err := engine.Update(ctx, def, tenantID, "00000000-0000-0000-0000-000000000000", map[string]any{"name": "Ghost"}, &v, actor)
+	_, err := engine.Update(ctx, def, "00000000-0000-0000-0000-000000000000", map[string]any{"name": "Ghost"}, &v, actor)
 	if !errors.Is(err, data.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound for a nonexistent record, got %v", err)
 	}
 }
 
-func TestEngine_List_ScopesToTenantAndEntityType(t *testing.T) {
-	db := testDB(t)
+func TestEngine_List_ScopesToOwnTenantDatabase(t *testing.T) {
 	ctx := context.Background()
-	tenantA := seedTenant(t, db)
-	tenantB := seedTenant(t, db)
-	engine := NewEngine(db)
+	dbA := freshTenantDB(t)
+	dbB := freshTenantDB(t)
+	engineA := NewEngine(dbA)
+	engineB := NewEngine(dbB)
 	def := vendorDef()
 	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
 
-	if _, err := engine.Create(ctx, def, tenantA, map[string]any{"name": "A-Vendor-1"}, actor); err != nil {
+	if _, err := engineA.Create(ctx, def, map[string]any{"name": "A-Vendor-1"}, actor); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if _, err := engine.Create(ctx, def, tenantA, map[string]any{"name": "A-Vendor-2"}, actor); err != nil {
+	if _, err := engineA.Create(ctx, def, map[string]any{"name": "A-Vendor-2"}, actor); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if _, err := engine.Create(ctx, def, tenantB, map[string]any{"name": "B-Vendor-1"}, actor); err != nil {
+	if _, err := engineB.Create(ctx, def, map[string]any{"name": "B-Vendor-1"}, actor); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 
-	listA, err := engine.List(ctx, def, tenantA)
+	listA, err := engineA.List(ctx, def)
 	if err != nil {
 		t.Fatalf("List failed: %v", err)
 	}
@@ -348,30 +358,30 @@ func TestEngine_List_ScopesToTenantAndEntityType(t *testing.T) {
 	}
 	for _, r := range listA {
 		if r.Data["name"] == "B-Vendor-1" {
-			t.Fatal("tenant A's list leaked a record belonging to tenant B")
+			t.Fatal("tenant A's list leaked a record belonging to tenant B's own database")
 		}
 	}
 }
 
-func TestEngine_Count_ScopesToTenantAndEntityType(t *testing.T) {
-	db := testDB(t)
+func TestEngine_Count_ScopesToOwnTenantDatabase(t *testing.T) {
 	ctx := context.Background()
-	tenantA := seedTenant(t, db)
-	tenantB := seedTenant(t, db)
-	engine := NewEngine(db)
+	dbA := freshTenantDB(t)
+	dbB := freshTenantDB(t)
+	engineA := NewEngine(dbA)
+	engineB := NewEngine(dbB)
 	def := vendorDef()
 	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
 
 	for _, name := range []string{"A-Vendor-1", "A-Vendor-2", "A-Vendor-3"} {
-		if _, err := engine.Create(ctx, def, tenantA, map[string]any{"name": name}, actor); err != nil {
+		if _, err := engineA.Create(ctx, def, map[string]any{"name": name}, actor); err != nil {
 			t.Fatalf("create: %v", err)
 		}
 	}
-	if _, err := engine.Create(ctx, def, tenantB, map[string]any{"name": "B-Vendor-1"}, actor); err != nil {
+	if _, err := engineB.Create(ctx, def, map[string]any{"name": "B-Vendor-1"}, actor); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 
-	count, err := engine.Count(ctx, def, tenantA)
+	count, err := engineA.Count(ctx, def)
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
@@ -386,9 +396,8 @@ func TestEngine_Count_ScopesToTenantAndEntityType(t *testing.T) {
 // the property a "Page N of M" UI depends on being true every time, not
 // just on average.
 func TestEngine_ListPage_ReturnsPagesInStableCreationOrder(t *testing.T) {
-	db := testDB(t)
+	db := freshTenantDB(t)
 	ctx := context.Background()
-	tenantID := seedTenant(t, db)
 	engine := NewEngine(db)
 	def := vendorDef()
 	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
@@ -396,22 +405,22 @@ func TestEngine_ListPage_ReturnsPagesInStableCreationOrder(t *testing.T) {
 	const total = 5
 	var created []string
 	for i := range total {
-		rec, err := engine.Create(ctx, def, tenantID, map[string]any{"name": fmt.Sprintf("Vendor-%d", i)}, actor)
+		rec, err := engine.Create(ctx, def, map[string]any{"name": fmt.Sprintf("Vendor-%d", i)}, actor)
 		if err != nil {
 			t.Fatalf("create %d: %v", i, err)
 		}
 		created = append(created, rec.ID)
 	}
 
-	page1, err := engine.ListPage(ctx, def, tenantID, 2, 0)
+	page1, err := engine.ListPage(ctx, def, 2, 0)
 	if err != nil {
 		t.Fatalf("ListPage page 1: %v", err)
 	}
-	page2, err := engine.ListPage(ctx, def, tenantID, 2, 2)
+	page2, err := engine.ListPage(ctx, def, 2, 2)
 	if err != nil {
 		t.Fatalf("ListPage page 2: %v", err)
 	}
-	page3, err := engine.ListPage(ctx, def, tenantID, 2, 4)
+	page3, err := engine.ListPage(ctx, def, 2, 4)
 	if err != nil {
 		t.Fatalf("ListPage page 3: %v", err)
 	}
@@ -436,7 +445,7 @@ func TestEngine_ListPage_ReturnsPagesInStableCreationOrder(t *testing.T) {
 	}
 
 	// A page past the end returns no records, not an error.
-	emptyPage, err := engine.ListPage(ctx, def, tenantID, 2, 10)
+	emptyPage, err := engine.ListPage(ctx, def, 2, 10)
 	if err != nil {
 		t.Fatalf("ListPage past the end: %v", err)
 	}

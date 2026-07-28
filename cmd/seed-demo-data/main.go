@@ -24,12 +24,16 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/purchasing"
+	"github.com/universaltill/universal-core/internal/tenantdb"
 )
 
+// DATABASE_URL is the control-plane database (ADR-0003) — -tenant-id is
+// resolved to that tenant's own database via internal/tenantdb.Router,
+// the same pattern cmd/provision-tenant uses.
 func main() {
-	dbURL := os.Getenv("DATABASE_URL")
-	if dbURL == "" {
-		log.Fatal("DATABASE_URL is required")
+	controlDBURL := os.Getenv("DATABASE_URL")
+	if controlDBURL == "" {
+		log.Fatal("DATABASE_URL is required (the control-plane database — see this file's own doc comment)")
 	}
 	tenantID := flag.String("tenant-id", "", "tenant to seed sample data into (required)")
 	actorID := flag.String("actor-id", "", "audit actor id for every record this creates (required)")
@@ -41,18 +45,26 @@ func main() {
 		log.Fatal("-actor-id is required")
 	}
 
-	sqlDB, err := sql.Open("pgx", dbURL)
+	controlDB, err := sql.Open("pgx", controlDBURL)
 	if err != nil {
-		log.Fatalf("open database: %v", err)
+		log.Fatalf("open control database: %v", err)
 	}
-	defer sqlDB.Close()
-	if err := sqlDB.Ping(); err != nil {
-		log.Fatalf("ping database: %v", err)
+	defer controlDB.Close()
+	if err := controlDB.Ping(); err != nil {
+		log.Fatalf("ping control database: %v", err)
+	}
+
+	router, err := tenantdb.NewRouter(controlDB, controlDBURL)
+	if err != nil {
+		log.Fatalf("build tenant router: %v", err)
+	}
+	sqlDB, err := router.Get(context.Background(), *tenantID)
+	if err != nil {
+		log.Fatalf("resolve tenant %s database: %v", *tenantID, err)
 	}
 
 	s := &seeder{
 		ctx:        context.Background(),
-		tenantID:   *tenantID,
 		actor:      audit.Actor{Type: audit.ActorHuman, ID: *actorID},
 		entityDefs: data.NewEntityDefinitionRepo(sqlDB),
 		crud:       crud.NewEngine(sqlDB),
@@ -66,7 +78,7 @@ func main() {
 	// idempotent and cheap enough to also run here so this command stays
 	// self-sufficient against a tenant provisioned before this seeder
 	// grew a PurchaseOrder step that depends on it.
-	if err := purchasing.PublishStatuses(context.Background(), sqlDB, *tenantID, s.actor); err != nil {
+	if err := purchasing.PublishStatuses(context.Background(), sqlDB, s.actor); err != nil {
 		log.Fatalf("publish purchase_order_status: %v", err)
 	}
 
@@ -84,7 +96,6 @@ func main() {
 
 type seeder struct {
 	ctx        context.Context
-	tenantID   string
 	actor      audit.Actor
 	entityDefs *data.EntityDefinitionRepo
 	crud       *crud.Engine
@@ -95,7 +106,7 @@ func (s *seeder) def(entityType string) *entity.Definition {
 	if d, ok := s.defs[entityType]; ok {
 		return d
 	}
-	v, err := s.entityDefs.GetPublished(s.ctx, s.tenantID, entityType)
+	v, err := s.entityDefs.GetPublished(s.ctx, entityType)
 	if err != nil {
 		log.Fatalf("look up published %s: %v (has this module been provisioned for this tenant? see cmd/provision-tenant)", entityType, err)
 	}
@@ -117,14 +128,14 @@ func (s *seeder) def(entityType string) *entity.Definition {
 // narrower dedup logic (see seedPurchaseOrders' doc comment).
 func (s *seeder) getOrCreate(entityType, keyField, keyValue string, fields map[string]any) string {
 	def := s.def(entityType)
-	existing, err := s.crud.ListByField(s.ctx, def, s.tenantID, keyField, keyValue)
+	existing, err := s.crud.ListByField(s.ctx, def, keyField, keyValue)
 	if err != nil {
 		log.Fatalf("list %s by %s: %v", entityType, keyField, err)
 	}
 	if len(existing) > 0 {
 		return existing[0].ID
 	}
-	rec, err := s.crud.Create(s.ctx, def, s.tenantID, fields, s.actor)
+	rec, err := s.crud.Create(s.ctx, def, fields, s.actor)
 	if err != nil {
 		log.Fatalf("create %s %v: %v", entityType, fields, err)
 	}
@@ -165,7 +176,7 @@ func (s *seeder) seedParties() (vendors, customers map[string]string) {
 	roleDef := s.def("PartyRole")
 
 	seedRole := func(partyID, roleType string) {
-		existing, err := s.crud.ListByField(s.ctx, roleDef, s.tenantID, "party_id", partyID)
+		existing, err := s.crud.ListByField(s.ctx, roleDef, "party_id", partyID)
 		if err != nil {
 			log.Fatalf("list PartyRole by party_id: %v", err)
 		}
@@ -174,7 +185,7 @@ func (s *seeder) seedParties() (vendors, customers map[string]string) {
 				return
 			}
 		}
-		if _, err := s.crud.Create(s.ctx, roleDef, s.tenantID, map[string]any{
+		if _, err := s.crud.Create(s.ctx, roleDef, map[string]any{
 			"party_id": partyID, "role_type": roleType,
 		}, s.actor); err != nil {
 			log.Fatalf("create PartyRole: %v", err)
@@ -257,14 +268,14 @@ func (s *seeder) seedInventory(items map[string]string) {
 		if !ok {
 			continue
 		}
-		existing, err := s.crud.ListByField(s.ctx, def, s.tenantID, "item_id", itemID)
+		existing, err := s.crud.ListByField(s.ctx, def, "item_id", itemID)
 		if err != nil {
 			log.Fatalf("list InventoryItem by item_id: %v", err)
 		}
 		if len(existing) > 0 {
 			continue
 		}
-		if _, err := s.crud.Create(s.ctx, def, s.tenantID, map[string]any{
+		if _, err := s.crud.Create(s.ctx, def, map[string]any{
 			"item_id": itemID, "qty_on_hand": level.onHand, "qty_available_to_promise": level.atp,
 		}, s.actor); err != nil {
 			log.Fatalf("create InventoryItem: %v", err)
@@ -291,7 +302,7 @@ func (s *seeder) seedInventory(items map[string]string) {
 // "received" orders.
 func (s *seeder) statusID(code string) string {
 	statusDef := s.def("Status")
-	recs, err := s.crud.ListByField(s.ctx, statusDef, s.tenantID, "code", code)
+	recs, err := s.crud.ListByField(s.ctx, statusDef, "code", code)
 	if err != nil {
 		log.Fatalf("list Status by code %q: %v", code, err)
 	}
@@ -330,7 +341,7 @@ func (s *seeder) seedPurchaseOrders(vendors, currencies, items map[string]string
 		{"PO-2026-0010", "Doha Fasteners LLC", "QAR", "2026-07-21", "approved", []line{{"SKU-1009", 8000, 0.08}}},
 	}
 	for _, o := range orders {
-		existing, err := s.crud.ListByField(s.ctx, poDef, s.tenantID, "po_number", o.poNumber)
+		existing, err := s.crud.ListByField(s.ctx, poDef, "po_number", o.poNumber)
 		if err != nil {
 			log.Fatalf("list PurchaseOrder by po_number: %v", err)
 		}
@@ -338,7 +349,7 @@ func (s *seeder) seedPurchaseOrders(vendors, currencies, items map[string]string
 			continue
 		}
 
-		poID, err := s.crud.Create(s.ctx, poDef, s.tenantID, map[string]any{
+		poID, err := s.crud.Create(s.ctx, poDef, map[string]any{
 			"po_number":   o.poNumber,
 			"vendor_id":   vendors[o.vendor],
 			"currency_id": currencies[o.currency],
@@ -352,7 +363,7 @@ func (s *seeder) seedPurchaseOrders(vendors, currencies, items map[string]string
 		for _, l := range o.lines {
 			lineTotal := l.qty * l.unitCost
 			total += lineTotal
-			if _, err := s.crud.Create(s.ctx, lineDef, s.tenantID, map[string]any{
+			if _, err := s.crud.Create(s.ctx, lineDef, map[string]any{
 				"purchase_order_id": poID.ID,
 				"item_id":           items[l.sku],
 				"qty":               l.qty,
@@ -367,7 +378,7 @@ func (s *seeder) seedPurchaseOrders(vendors, currencies, items map[string]string
 		// passed here) — po_number has to be repeated even though it's
 		// unchanged, same as every other field already was.
 		expectedVersion := poID.Version
-		if _, err := s.crud.Update(s.ctx, poDef, s.tenantID, poID.ID, map[string]any{
+		if _, err := s.crud.Update(s.ctx, poDef, poID.ID, map[string]any{
 			"po_number": o.poNumber, "vendor_id": vendors[o.vendor], "currency_id": currencies[o.currency],
 			"order_date": o.date, "status_id": s.statusID(o.status), "total": total,
 		}, &expectedVersion, s.actor); err != nil {
@@ -399,12 +410,12 @@ func (s *seeder) seedGoodsReceipts() {
 	grDef := s.def("GoodsReceipt")
 	grLineDef := s.def("GoodsReceiptLine")
 
-	received, err := s.crud.ListByField(s.ctx, poDef, s.tenantID, "status_id", s.statusID("received"))
+	received, err := s.crud.ListByField(s.ctx, poDef, "status_id", s.statusID("received"))
 	if err != nil {
 		log.Fatalf("list received PurchaseOrders: %v", err)
 	}
 	for _, po := range received {
-		existing, err := s.crud.ListByField(s.ctx, grDef, s.tenantID, "purchase_order_id", po.ID)
+		existing, err := s.crud.ListByField(s.ctx, grDef, "purchase_order_id", po.ID)
 		if err != nil {
 			log.Fatalf("list GoodsReceipt by purchase_order_id: %v", err)
 		}
@@ -417,7 +428,7 @@ func (s *seeder) seedGoodsReceipts() {
 		if t, err := time.Parse("2006-01-02", orderDate); err == nil {
 			receivedDate = t.AddDate(0, 0, 5).Format("2006-01-02")
 		}
-		gr, err := s.crud.Create(s.ctx, grDef, s.tenantID, map[string]any{
+		gr, err := s.crud.Create(s.ctx, grDef, map[string]any{
 			"purchase_order_id": po.ID,
 			"received_date":     receivedDate,
 			"notes":             "Received in full",
@@ -426,12 +437,12 @@ func (s *seeder) seedGoodsReceipts() {
 			log.Fatalf("create GoodsReceipt for PO %s: %v", po.ID, err)
 		}
 
-		lines, err := s.crud.ListByField(s.ctx, lineDef, s.tenantID, "purchase_order_id", po.ID)
+		lines, err := s.crud.ListByField(s.ctx, lineDef, "purchase_order_id", po.ID)
 		if err != nil {
 			log.Fatalf("list POLine by purchase_order_id: %v", err)
 		}
 		for _, line := range lines {
-			if _, err := s.crud.Create(s.ctx, grLineDef, s.tenantID, map[string]any{
+			if _, err := s.crud.Create(s.ctx, grLineDef, map[string]any{
 				"goods_receipt_id": gr.ID,
 				"po_line_id":       line.ID,
 				"item_id":          line.Data["item_id"],

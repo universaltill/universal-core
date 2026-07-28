@@ -18,11 +18,10 @@ import (
 // the search box genuinely hides/shows real DOM nodes as a user types,
 // not just that the right JS text is embedded in the page.
 func TestModuleMenu_RendersAsSearchableHubGraphic(t *testing.T) {
-	db := testDB(t)
 	withDevAuthEnabled(t)
 	// testServer already publishes purchasing: Item, PurchaseOrder,
 	// POLine, InventoryItem, GoodsReceipt, GoodsReceiptLine (6 entities).
-	srv, tenantID := testServer(t, db)
+	srv, tenantID, _ := testServer(t)
 	ctx := browserCtx(t, tenantID)
 
 	if err := chromedp.Run(ctx,

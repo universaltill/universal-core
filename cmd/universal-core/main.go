@@ -24,6 +24,7 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/aiassist"
 	"github.com/universaltill/universal-core/internal/kernel/secretcrypt"
 	"github.com/universaltill/universal-core/internal/kernel/speechassist"
+	"github.com/universaltill/universal-core/internal/tenantdb"
 	"github.com/universaltill/universal-core/internal/webauth"
 	"github.com/universaltill/universal-core/internal/worker"
 )
@@ -138,28 +139,40 @@ func webauthConfigFromEnv() webauth.Config {
 }
 
 func main() {
-	dbURL := os.Getenv("DATABASE_URL")
-	if dbURL == "" {
-		log.Fatal("DATABASE_URL is required")
+	// DATABASE_URL is the control-plane database (ADR-0003) — the
+	// tenants registry, not any tenant's own data. Every tenant's own
+	// database lives on the same Postgres server (only dbname differs;
+	// host/user/password/sslmode carry over unchanged — see
+	// internal/tenantdb.Router), resolved per request/job through
+	// router below, never held as a single shared *sql.DB the way this
+	// process's own database connection used to be.
+	controlDBURL := os.Getenv("DATABASE_URL")
+	if controlDBURL == "" {
+		log.Fatal("DATABASE_URL is required (the control-plane database — see this file's own doc comment)")
 	}
 
-	sqlDB, err := sql.Open("pgx", dbURL)
+	controlDB, err := sql.Open("pgx", controlDBURL)
 	if err != nil {
-		log.Fatalf("open database: %v", err)
+		log.Fatalf("open control database: %v", err)
 	}
-	defer sqlDB.Close()
+	defer controlDB.Close()
 
-	if err := sqlDB.Ping(); err != nil {
-		log.Fatalf("ping database: %v", err)
+	if err := controlDB.Ping(); err != nil {
+		log.Fatalf("ping control database: %v", err)
 	}
 
-	if err := db.Apply(context.Background(), sqlDB); err != nil {
-		log.Fatalf("apply migrations: %v", err)
+	if err := db.ApplyControl(context.Background(), controlDB); err != nil {
+		log.Fatalf("apply control-plane migrations: %v", err)
+	}
+
+	router, err := tenantdb.NewRouter(controlDB, controlDBURL)
+	if err != nil {
+		log.Fatalf("build tenant router: %v", err)
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		if err := sqlDB.PingContext(r.Context()); err != nil {
+		if err := controlDB.PingContext(r.Context()); err != nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			w.Write([]byte(`{"data":null,"error":"database unreachable"}`))
 			return
@@ -175,7 +188,7 @@ func main() {
 	// consistent response either way, not a plain-text 404 when auth
 	// happens to be off.
 	webauthCfg := webauthConfigFromEnv()
-	auth, err := webauth.New(context.Background(), webauthCfg, data.NewTenantRepo(sqlDB))
+	auth, err := webauth.New(context.Background(), webauthCfg, data.NewTenantRepo(controlDB))
 	if err != nil {
 		log.Fatalf("configure webauth: %v", err)
 	}
@@ -208,7 +221,7 @@ func main() {
 	} else {
 		log.Printf("SECRET_ENCRYPTION_KEY not set — the AI-provider settings page will refuse to store a tenant API key")
 	}
-	api.New(sqlDB, catalog, auth, ai, speech, secretCryptor).Routes(mux)
+	api.New(router, catalog, auth, ai, speech, secretCryptor).Routes(mux)
 
 	// The durable workflow job queue (internal/kernel/workflow.Queue) has
 	// existed since the definition-registry increment, but nothing ever
@@ -219,11 +232,10 @@ func main() {
 	// which doesn't have any either — ctx here is process lifetime, not a
 	// signal-driven one, on purpose, so this doesn't silently change how
 	// the process responds to SIGINT/SIGTERM while that's still unhandled
-	// everywhere else in this binary).
-	workerRunner, err := worker.New(sqlDB, nil, workerConfigFromEnv())
-	if err != nil {
-		log.Fatalf("configure workflow worker: %v", err)
-	}
+	// everywhere else in this binary). Fans out across every tenant's own
+	// database each tick (ADR-0003) — see internal/worker's own doc
+	// comment.
+	workerRunner := worker.New(router, controlDB, nil, workerConfigFromEnv())
 	workerRunner.RunConcurrent(context.Background())
 	log.Printf("workflow worker started")
 

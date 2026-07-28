@@ -3,12 +3,16 @@ package data_test
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"net/url"
 	"os"
 	"testing"
+	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/universaltill/universal-core/internal/data"
+	"github.com/universaltill/universal-core/internal/db"
 )
 
 // This package's own tests (unlike every other repo, which is only ever
@@ -18,75 +22,97 @@ import (
 // own doc comment on why that's fine here, unlike the generic engines),
 // so there's no kernel package positioned to test them instead.
 
-func testDB(t *testing.T) *sql.DB {
+// freshTenantDB returns a connection to a brand-new, uniquely-named
+// database with the tenant migration set applied (ADR-0003) — the
+// per-tenant database every test in this file now runs against, in
+// place of the old single shared database + tenant_id column. Two calls
+// in the same test give two physically separate databases, which is how
+// the former "within tenant"/"ignores other tenants" tests below now
+// prove isolation — a stronger proof than a WHERE clause, since there is
+// no shared table for a bug to accidentally query across.
+func freshTenantDB(t *testing.T) *sql.DB {
 	t.Helper()
-	url := os.Getenv("TEST_DATABASE_URL")
-	if url == "" {
+	base := os.Getenv("TEST_DATABASE_URL")
+	if base == "" {
 		t.Skip("TEST_DATABASE_URL not set; skipping integration test")
 	}
-	db, err := sql.Open("pgx", url)
+	admin, err := sql.Open("pgx", base)
 	if err != nil {
-		t.Fatalf("open db: %v", err)
+		t.Fatalf("open admin connection: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
-	if err := db.Ping(); err != nil {
-		t.Fatalf("ping db: %v", err)
+	t.Cleanup(func() { admin.Close() })
+
+	name := fmt.Sprintf("uc_test_reporting_%d", time.Now().UnixNano())
+	if _, err := admin.Exec(`CREATE DATABASE "` + name + `"`); err != nil {
+		t.Fatalf("create database %s: %v", name, err)
 	}
-	return db
+	t.Cleanup(func() {
+		_, _ = admin.Exec(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()`, name)
+		_, _ = admin.Exec(`DROP DATABASE IF EXISTS "` + name + `"`)
+	})
+
+	u, err := url.Parse(base)
+	if err != nil {
+		t.Fatalf("parse TEST_DATABASE_URL: %v", err)
+	}
+	u.Path = "/" + name
+	tenantDB, err := sql.Open("pgx", u.String())
+	if err != nil {
+		t.Fatalf("open tenant database %s: %v", name, err)
+	}
+	t.Cleanup(func() { tenantDB.Close() })
+	if err := tenantDB.Ping(); err != nil {
+		t.Fatalf("ping tenant database %s: %v", name, err)
+	}
+	if _, err := tenantDB.Exec(`CREATE EXTENSION IF NOT EXISTS pgcrypto`); err != nil {
+		t.Fatalf("create pgcrypto extension: %v", err)
+	}
+	if err := db.ApplyTenant(context.Background(), tenantDB); err != nil {
+		t.Fatalf("ApplyTenant: %v", err)
+	}
+	return tenantDB
 }
 
-func seedTenant(t *testing.T, db *sql.DB) string {
-	t.Helper()
-	var id string
-	err := db.QueryRow(
-		`INSERT INTO tenants (name, region) VALUES ($1, $2) RETURNING id`,
-		"Test Tenant", "eu-west",
-	).Scan(&id)
-	if err != nil {
-		t.Fatalf("seed tenant: %v", err)
-	}
-	return id
-}
-
-func TestPurchaseOrderStatusBreakdown_GroupsByStatusWithinTenant(t *testing.T) {
-	db := testDB(t)
+func TestPurchaseOrderStatusBreakdown_GroupsByStatusAndIsolatedPerTenantDatabase(t *testing.T) {
 	ctx := context.Background()
-	records := data.NewRecordRepo(db)
-	reporting := data.NewReportingRepo(db)
+	dbA := freshTenantDB(t)
+	dbB := freshTenantDB(t)
+	recordsA := data.NewRecordRepo(dbA)
+	recordsB := data.NewRecordRepo(dbB)
+	reportingA := data.NewReportingRepo(dbA)
 
-	tenantA := seedTenant(t, db)
-	tenantB := seedTenant(t, db)
-
-	mustCreateStatus := func(tenantID, code string) string {
+	mustCreateStatus := func(records *data.RecordRepo, code string) string {
 		t.Helper()
-		rec, err := records.Create(ctx, tenantID, "Status", map[string]any{"code": code, "name": code})
+		rec, err := records.Create(ctx, "Status", map[string]any{"code": code, "name": code})
 		if err != nil {
 			t.Fatalf("create Status: %v", err)
 		}
 		return rec.ID
 	}
-	draftA := mustCreateStatus(tenantA, "draft")
-	approvedA := mustCreateStatus(tenantA, "approved")
-	draftB := mustCreateStatus(tenantB, "draft")
+	draftA := mustCreateStatus(recordsA, "draft")
+	approvedA := mustCreateStatus(recordsA, "approved")
+	draftB := mustCreateStatus(recordsB, "draft")
 
-	mustCreate := func(tenantID string, fields map[string]any) {
+	mustCreate := func(records *data.RecordRepo, fields map[string]any) {
 		t.Helper()
-		if _, err := records.Create(ctx, tenantID, "PurchaseOrder", fields); err != nil {
+		if _, err := records.Create(ctx, "PurchaseOrder", fields); err != nil {
 			t.Fatalf("create PurchaseOrder: %v", err)
 		}
 	}
-	mustCreate(tenantA, map[string]any{"po_number": "PO-A1", "status_id": draftA, "total": 100.0})
-	mustCreate(tenantA, map[string]any{"po_number": "PO-A2", "status_id": draftA, "total": 50.0})
-	mustCreate(tenantA, map[string]any{"po_number": "PO-A3", "status_id": approvedA, "total": 200.0})
-	// A different tenant's order must never contaminate tenantA's totals,
-	// even though "draft" resolves to a different Status row per tenant.
-	mustCreate(tenantB, map[string]any{"po_number": "PO-B1", "status_id": draftB, "total": 999.0})
+	mustCreate(recordsA, map[string]any{"po_number": "PO-A1", "status_id": draftA, "total": 100.0})
+	mustCreate(recordsA, map[string]any{"po_number": "PO-A2", "status_id": draftA, "total": 50.0})
+	mustCreate(recordsA, map[string]any{"po_number": "PO-A3", "status_id": approvedA, "total": 200.0})
+	// A different tenant's order, in a genuinely different database, must
+	// never contaminate tenantA's totals — even though "draft" resolves to
+	// a different Status row per tenant and this order's own row id space
+	// otherwise overlaps freely with tenantA's.
+	mustCreate(recordsB, map[string]any{"po_number": "PO-B1", "status_id": draftB, "total": 999.0})
 	// A status_id that isn't even a well-formed UUID (e.g. a bad CSV
 	// import mapping) must be excluded, not abort the whole query — see
 	// reporting.go's uuidPattern doc comment.
-	mustCreate(tenantA, map[string]any{"po_number": "PO-A4", "status_id": "not-a-uuid", "total": 1234.0})
+	mustCreate(recordsA, map[string]any{"po_number": "PO-A4", "status_id": "not-a-uuid", "total": 1234.0})
 
-	rows, err := reporting.PurchaseOrderStatusBreakdown(ctx, tenantA)
+	rows, err := reportingA.PurchaseOrderStatusBreakdown(ctx)
 	if err != nil {
 		t.Fatalf("PurchaseOrderStatusBreakdown: %v", err)
 	}
@@ -105,54 +131,47 @@ func TestPurchaseOrderStatusBreakdown_GroupsByStatusWithinTenant(t *testing.T) {
 	}
 }
 
-func TestTopVendorsBySpend_RanksDescendingAndIgnoresOtherTenantsAndMalformedRefs(t *testing.T) {
-	db := testDB(t)
+func TestTopVendorsBySpend_RanksDescendingAndExcludesMalformedRefs(t *testing.T) {
 	ctx := context.Background()
-	records := data.NewRecordRepo(db)
-	reporting := data.NewReportingRepo(db)
+	dbA := freshTenantDB(t)
+	records := data.NewRecordRepo(dbA)
+	reporting := data.NewReportingRepo(dbA)
 
-	tenantA := seedTenant(t, db)
-	tenantB := seedTenant(t, db)
-
-	bigVendor, err := records.Create(ctx, tenantA, "Party", map[string]any{"name": "Big Vendor", "party_type": "organization"})
+	bigVendor, err := records.Create(ctx, "Party", map[string]any{"name": "Big Vendor", "party_type": "organization"})
 	if err != nil {
 		t.Fatalf("create Party: %v", err)
 	}
-	smallVendor, err := records.Create(ctx, tenantA, "Party", map[string]any{"name": "Small Vendor", "party_type": "organization"})
-	if err != nil {
-		t.Fatalf("create Party: %v", err)
-	}
-	otherTenantVendor, err := records.Create(ctx, tenantB, "Party", map[string]any{"name": "Other Tenant Vendor", "party_type": "organization"})
+	smallVendor, err := records.Create(ctx, "Party", map[string]any{"name": "Small Vendor", "party_type": "organization"})
 	if err != nil {
 		t.Fatalf("create Party: %v", err)
 	}
 
-	mustCreatePO := func(tenantID, vendorID string, total float64) {
+	mustCreatePO := func(vendorID string, total float64) {
 		t.Helper()
-		if _, err := records.Create(ctx, tenantID, "PurchaseOrder", map[string]any{
+		if _, err := records.Create(ctx, "PurchaseOrder", map[string]any{
 			"po_number": "PO-" + vendorID, "vendor_id": vendorID, "total": total,
 		}); err != nil {
 			t.Fatalf("create PurchaseOrder: %v", err)
 		}
 	}
-	mustCreatePO(tenantA, bigVendor.ID, 1000.0)
-	mustCreatePO(tenantA, bigVendor.ID, 500.0)
-	mustCreatePO(tenantA, smallVendor.ID, 10.0)
+	mustCreatePO(bigVendor.ID, 1000.0)
+	mustCreatePO(bigVendor.ID, 500.0)
+	mustCreatePO(smallVendor.ID, 10.0)
 	// A vendor_id that isn't even a well-formed UUID (e.g. a bad CSV
 	// import mapping) must be excluded, not abort the whole query — see
 	// reporting.go's uuidPattern doc comment.
-	mustCreatePO(tenantA, "not-a-uuid", 50000.0)
-	// A vendor_id pointing at a real Party row, but one belonging to a
-	// different tenant, must not resolve either (the join is tenant-
-	// scoped on both sides).
-	mustCreatePO(tenantA, otherTenantVendor.ID, 999.0)
+	mustCreatePO("not-a-uuid", 50000.0)
+	// A well-formed but dangling vendor_id (no matching Party in this
+	// database — deleted, or, under the old shared-DB design, belonging
+	// to a different tenant) must not resolve either.
+	mustCreatePO("00000000-0000-0000-0000-000000000000", 999.0)
 
-	got, err := reporting.TopVendorsBySpend(ctx, tenantA, 10)
+	got, err := reporting.TopVendorsBySpend(ctx, 10)
 	if err != nil {
 		t.Fatalf("TopVendorsBySpend: %v", err)
 	}
 	if len(got) != 2 {
-		t.Fatalf("got %d vendors, want 2 (malformed/cross-tenant refs excluded): %+v", len(got), got)
+		t.Fatalf("got %d vendors, want 2 (malformed/dangling refs excluded): %+v", len(got), got)
 	}
 	if got[0].VendorName != "Big Vendor" || got[0].Total != 1500.0 || got[0].OrderCount != 2 {
 		t.Errorf("rank 0 = %+v, want Big Vendor/1500/2", got[0])
@@ -163,29 +182,27 @@ func TestTopVendorsBySpend_RanksDescendingAndIgnoresOtherTenantsAndMalformedRefs
 }
 
 func TestStockSummaryAndStockoutRiskItems(t *testing.T) {
-	db := testDB(t)
 	ctx := context.Background()
-	records := data.NewRecordRepo(db)
-	reporting := data.NewReportingRepo(db)
+	tenantDB := freshTenantDB(t)
+	records := data.NewRecordRepo(tenantDB)
+	reporting := data.NewReportingRepo(tenantDB)
 
-	tenantA := seedTenant(t, db)
-
-	healthy, err := records.Create(ctx, tenantA, "Item", map[string]any{"sku": "SKU-OK", "name": "Healthy Item", "item_type": "stock"})
+	healthy, err := records.Create(ctx, "Item", map[string]any{"sku": "SKU-OK", "name": "Healthy Item", "item_type": "stock"})
 	if err != nil {
 		t.Fatalf("create Item: %v", err)
 	}
-	lowStock, err := records.Create(ctx, tenantA, "Item", map[string]any{"sku": "SKU-LOW", "name": "Low Item", "item_type": "stock"})
+	lowStock, err := records.Create(ctx, "Item", map[string]any{"sku": "SKU-LOW", "name": "Low Item", "item_type": "stock"})
 	if err != nil {
 		t.Fatalf("create Item: %v", err)
 	}
-	worseStock, err := records.Create(ctx, tenantA, "Item", map[string]any{"sku": "SKU-WORSE", "name": "Worse Item", "item_type": "stock"})
+	worseStock, err := records.Create(ctx, "Item", map[string]any{"sku": "SKU-WORSE", "name": "Worse Item", "item_type": "stock"})
 	if err != nil {
 		t.Fatalf("create Item: %v", err)
 	}
 
 	mustCreateInv := func(itemID string, onHand, atp float64) {
 		t.Helper()
-		if _, err := records.Create(ctx, tenantA, "InventoryItem", map[string]any{
+		if _, err := records.Create(ctx, "InventoryItem", map[string]any{
 			"item_id": itemID, "qty_on_hand": onHand, "qty_available_to_promise": atp,
 		}); err != nil {
 			t.Fatalf("create InventoryItem: %v", err)
@@ -196,13 +213,13 @@ func TestStockSummaryAndStockoutRiskItems(t *testing.T) {
 	mustCreateInv(worseStock.ID, 5, -20)
 	// A malformed item_id must be excluded from the stockout list, not
 	// error the whole query.
-	if _, err := records.Create(ctx, tenantA, "InventoryItem", map[string]any{
+	if _, err := records.Create(ctx, "InventoryItem", map[string]any{
 		"item_id": "not-a-uuid", "qty_on_hand": 0, "qty_available_to_promise": -5,
 	}); err != nil {
 		t.Fatalf("create InventoryItem: %v", err)
 	}
 
-	summary, err := reporting.StockSummary(ctx, tenantA)
+	summary, err := reporting.StockSummary(ctx)
 	if err != nil {
 		t.Fatalf("StockSummary: %v", err)
 	}
@@ -216,7 +233,7 @@ func TestStockSummaryAndStockoutRiskItems(t *testing.T) {
 		t.Errorf("StockoutCount = %d, want 3 (low, worse, and the malformed-ref row all have ATP <= 0)", summary.StockoutCount)
 	}
 
-	risk, err := reporting.StockoutRiskItems(ctx, tenantA, 10)
+	risk, err := reporting.StockoutRiskItems(ctx, 10)
 	if err != nil {
 		t.Fatalf("StockoutRiskItems: %v", err)
 	}

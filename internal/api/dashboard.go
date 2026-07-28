@@ -56,7 +56,12 @@ func (h *Handler) sessionContext(r *http.Request) (httpx.RequestContext, bool) {
 func (h *Handler) writeDashboard(w http.ResponseWriter, r *http.Request, rc httpx.RequestContext) {
 	locale := localeFromRequest(w, r)
 
-	modules, err := h.accessibleModules(r.Context(), rc.TenantID, locale)
+	ts, err := h.scope(r.Context(), rc.TenantID)
+	if err != nil {
+		writeInternalError(w, "resolve tenant scope", err)
+		return
+	}
+	modules, err := h.accessibleModules(r.Context(), ts, locale)
 	if err != nil {
 		writeInternalError(w, "build accessible modules", err)
 		return
@@ -162,21 +167,21 @@ type moduleGroup struct {
 // An entity type whose Definition never set Module (shouldn't happen
 // for anything in this repo today, but degrades safely rather than
 // panicking or dropping the entity) falls into a "general" bucket.
-func (h *Handler) accessibleModules(ctx context.Context, tenantID, locale string) ([]moduleGroup, error) {
-	entityTypes, err := h.entityDefs.ListPublishedEntityTypes(ctx, tenantID)
+func (h *Handler) accessibleModules(ctx context.Context, ts tenantScope, locale string) ([]moduleGroup, error) {
+	entityTypes, err := ts.entityDefs.ListPublishedEntityTypes(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list published entity types: %w", err)
 	}
 
 	byKey := map[string][]moduleEntity{}
 	for _, entityType := range entityTypes {
-		if _, err := h.formDefs.GetPublished(ctx, tenantID, entityType); err != nil {
+		if _, err := ts.formDefs.GetPublished(ctx, entityType); err != nil {
 			if errors.Is(err, data.ErrNotFound) {
 				continue // no published form for this entity type — nothing to link to yet
 			}
 			return nil, fmt.Errorf("look up form for %s: %w", entityType, err)
 		}
-		def, err := h.entityDef(ctx, tenantID, entityType)
+		def, err := ts.entityDef(ctx, entityType)
 		if err != nil {
 			if errors.Is(err, data.ErrNotFound) {
 				// entityType came from ListPublishedEntityTypes moments

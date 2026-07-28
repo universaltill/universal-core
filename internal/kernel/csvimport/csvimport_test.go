@@ -3,12 +3,16 @@ package csvimport
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"github.com/universaltill/universal-core/internal/db"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
 	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
@@ -245,36 +249,50 @@ func TestPreview_StripsUTF8BOMFromFirstHeader(t *testing.T) {
 	}
 }
 
-// testDB opens the integration-test database, skipping (not failing) if
-// TEST_DATABASE_URL isn't set — same convention as crud_test.go.
-func testDB(t *testing.T) *sql.DB {
+// freshTenantDB opens a connection to a brand-new tenant database
+// (ADR-0003), skipping (not failing) if TEST_DATABASE_URL isn't set —
+// same convention as crud_test.go.
+func freshTenantDB(t *testing.T) *sql.DB {
 	t.Helper()
-	url := os.Getenv("TEST_DATABASE_URL")
-	if url == "" {
+	base := os.Getenv("TEST_DATABASE_URL")
+	if base == "" {
 		t.Skip("TEST_DATABASE_URL not set; skipping integration test")
 	}
-	db, err := sql.Open("pgx", url)
+	admin, err := sql.Open("pgx", base)
 	if err != nil {
-		t.Fatalf("open db: %v", err)
+		t.Fatalf("open admin connection: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
-	if err := db.Ping(); err != nil {
-		t.Fatalf("ping db: %v", err)
-	}
-	return db
-}
+	t.Cleanup(func() { admin.Close() })
 
-func seedTenant(t *testing.T, db *sql.DB) string {
-	t.Helper()
-	var id string
-	err := db.QueryRow(
-		`INSERT INTO tenants (name, region) VALUES ($1, $2) RETURNING id`,
-		"Test Tenant", "eu-west",
-	).Scan(&id)
-	if err != nil {
-		t.Fatalf("seed tenant: %v", err)
+	name := fmt.Sprintf("uc_test_csvimport_%d", time.Now().UnixNano())
+	if _, err := admin.Exec(`CREATE DATABASE "` + name + `"`); err != nil {
+		t.Fatalf("create database %s: %v", name, err)
 	}
-	return id
+	t.Cleanup(func() {
+		_, _ = admin.Exec(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()`, name)
+		_, _ = admin.Exec(`DROP DATABASE IF EXISTS "` + name + `"`)
+	})
+
+	u, err := url.Parse(base)
+	if err != nil {
+		t.Fatalf("parse TEST_DATABASE_URL: %v", err)
+	}
+	u.Path = "/" + name
+	tenantDB, err := sql.Open("pgx", u.String())
+	if err != nil {
+		t.Fatalf("open tenant database %s: %v", name, err)
+	}
+	t.Cleanup(func() { tenantDB.Close() })
+	if err := tenantDB.Ping(); err != nil {
+		t.Fatalf("ping tenant database %s: %v", name, err)
+	}
+	if _, err := tenantDB.Exec(`CREATE EXTENSION IF NOT EXISTS pgcrypto`); err != nil {
+		t.Fatalf("create pgcrypto extension: %v", err)
+	}
+	if err := db.ApplyTenant(context.Background(), tenantDB); err != nil {
+		t.Fatalf("ApplyTenant: %v", err)
+	}
+	return tenantDB
 }
 
 func humanActor() audit.Actor {
@@ -282,9 +300,8 @@ func humanActor() audit.Actor {
 }
 
 func TestCommit_WritesOnlyRowsThatPassValidation(t *testing.T) {
-	db := testDB(t)
+	db := freshTenantDB(t)
 	ctx := context.Background()
-	tenantID := seedTenant(t, db)
 	engine := crud.NewEngine(db)
 	def := vendorDef()
 
@@ -294,7 +311,7 @@ func TestCommit_WritesOnlyRowsThatPassValidation(t *testing.T) {
 		"Beta,not-a-number\n" + // bad number — should be skipped
 		"Gamma,45\n"
 
-	results, err := Commit(ctx, strings.NewReader(csvData), def, ColumnMapping{"Vendor Name": "name", "Lead Time": "lead_time_days"}, engine, tenantID, humanActor())
+	results, err := Commit(ctx, strings.NewReader(csvData), def, ColumnMapping{"Vendor Name": "name", "Lead Time": "lead_time_days"}, engine, humanActor())
 	if err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
@@ -316,7 +333,7 @@ func TestCommit_WritesOnlyRowsThatPassValidation(t *testing.T) {
 	}
 
 	// Exactly the 2 good rows actually landed in the database.
-	got, err := engine.List(ctx, def, tenantID)
+	got, err := engine.List(ctx, def)
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -329,23 +346,21 @@ func TestCommit_WritesOnlyRowsThatPassValidation(t *testing.T) {
 // through crud.Engine.Create — meaning it gets an audit_log row with
 // actor identity — not a bulk bypass around the normal write path.
 func TestCommit_WritesAuditRowsPerRecord(t *testing.T) {
-	db := testDB(t)
+	db := freshTenantDB(t)
 	ctx := context.Background()
-	tenantID := seedTenant(t, db)
 	engine := crud.NewEngine(db)
 	def := vendorDef()
 	actor := audit.Actor{Type: audit.ActorAgent, ID: "csv-import-agent", ModelVersion: "claude-fable-5"}
 
 	csvData := "Vendor Name\nAcme\nBeta\n"
-	results, err := Commit(ctx, strings.NewReader(csvData), def, ColumnMapping{"Vendor Name": "name"}, engine, tenantID, actor)
+	results, err := Commit(ctx, strings.NewReader(csvData), def, ColumnMapping{"Vendor Name": "name"}, engine, actor)
 	if err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
 
 	var auditCount int
 	if err := db.QueryRowContext(ctx,
-		`SELECT count(*) FROM audit_log WHERE tenant_id = $1 AND entity_type = 'Vendor' AND actor_type = 'ai_agent'`,
-		tenantID,
+		`SELECT count(*) FROM audit_log WHERE entity_type = 'Vendor' AND actor_type = 'ai_agent'`,
 	).Scan(&auditCount); err != nil {
 		t.Fatalf("count audit_log: %v", err)
 	}
