@@ -116,7 +116,21 @@ func (r *RecordRepo) get(ctx context.Context, q querier, entityType, id string) 
 }
 
 func (r *RecordRepo) List(ctx context.Context, entityType string) ([]Record, error) {
-	rows, err := r.db.QueryContext(ctx,
+	return r.list(ctx, r.db, entityType)
+}
+
+// ListTx is List against a caller-supplied querier/tx instead of r.db —
+// same "same shape as the Tx write methods, now needed for a read too"
+// reasoning GetTx's own doc comment gives. First real caller:
+// internal/kernel/ledger.PostTx's period-close check, which needs to
+// read every Period record from within the same transaction as the
+// journal entry it's about to write (or refuse to write).
+func (r *RecordRepo) ListTx(ctx context.Context, q querier, entityType string) ([]Record, error) {
+	return r.list(ctx, q, entityType)
+}
+
+func (r *RecordRepo) list(ctx context.Context, q querier, entityType string) ([]Record, error) {
+	rows, err := q.QueryContext(ctx,
 		`SELECT id, data, version FROM records
 		 WHERE entity_type = $1 AND deleted_at IS NULL
 		 ORDER BY created_at`,

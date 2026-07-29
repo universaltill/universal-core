@@ -157,3 +157,67 @@ func TestRecordRepo_DeleteNotFound(t *testing.T) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 }
+
+func TestRecordRepo_ListTx_ParticipatesInCallerTransaction(t *testing.T) {
+	tdb := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(tdb)
+
+	if _, err := repo.Create(ctx, "Widget", map[string]any{"name": "a"}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	tx, err := tdb.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	got, err := repo.ListTx(ctx, tx, "Widget")
+	if err != nil {
+		t.Fatalf("ListTx: %v", err)
+	}
+	if len(got) != 1 || got[0].Data["name"] != "a" {
+		t.Fatalf("expected 1 Widget record visible within the tx, got %+v", got)
+	}
+}
+
+// TestRecordRepo_ListTx_SeesUncommittedWritesInSameTx confirms ListTx
+// reads within the *same* transaction, not a separate connection —
+// what internal/kernel/ledger's period check actually needs (seeing a
+// Period this same transaction may have just touched, not only
+// already-committed state a fresh connection would see).
+func TestRecordRepo_ListTx_SeesUncommittedWritesInSameTx(t *testing.T) {
+	tdb := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(tdb)
+
+	tx, err := tdb.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	if _, err := repo.CreateTx(ctx, tx, "Widget", map[string]any{"name": "uncommitted"}); err != nil {
+		t.Fatalf("CreateTx: %v", err)
+	}
+
+	got, err := repo.ListTx(ctx, tx, "Widget")
+	if err != nil {
+		t.Fatalf("ListTx: %v", err)
+	}
+	if len(got) != 1 || got[0].Data["name"] != "uncommitted" {
+		t.Fatalf("expected ListTx to see the uncommitted write within the same tx, got %+v", got)
+	}
+
+	// A separate connection must NOT see it (not committed yet) —
+	// confirms this really is transaction-scoped visibility, not a
+	// coincidence of List also happening to return the same row.
+	outside, err := repo.List(ctx, "Widget")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(outside) != 0 {
+		t.Fatalf("expected the uncommitted write to be invisible outside the tx, got %+v", outside)
+	}
+}
