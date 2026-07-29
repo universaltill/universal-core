@@ -13,6 +13,7 @@ import (
 
 	"github.com/universaltill/universal-core/internal/db"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
+	"github.com/universaltill/universal-core/internal/kernel/finance"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
 	"github.com/universaltill/universal-core/internal/kernel/purchasing"
 	"github.com/universaltill/universal-core/internal/kernel/sales"
@@ -46,6 +47,7 @@ type moduleSeed struct {
 var moduleSeeds = map[string]moduleSeed{
 	"purchasing": {purchasing.Publish, purchasing.PublishForms, purchasing.PublishStatuses},
 	"sales":      {sales.Publish, sales.PublishForms, sales.PublishStatuses},
+	"finance":    {finance.Publish, finance.PublishForms, nil},
 }
 
 // provisionedTenant creates a fresh control database plus a new tenant
@@ -97,8 +99,10 @@ func provisionedTenant(t *testing.T, modules ...string) (controlDSN, tenantID st
 		if err := seed.publishForms(ctx, tenantDB, actor); err != nil {
 			t.Fatalf("%s PublishForms: %v", m, err)
 		}
-		if err := seed.publishStatuses(ctx, tenantDB, actor); err != nil {
-			t.Fatalf("%s PublishStatuses: %v", m, err)
+		if seed.publishStatuses != nil {
+			if err := seed.publishStatuses(ctx, tenantDB, actor); err != nil {
+				t.Fatalf("%s PublishStatuses: %v", m, err)
+			}
 		}
 	}
 	return controlDSN, tenantID
@@ -115,7 +119,7 @@ func TestSeedDemoData_MissingDatabaseURL_FailsFast(t *testing.T) {
 }
 
 func TestSeedDemoData_MissingTenantID_FailsFast(t *testing.T) {
-	controlDSN, _ := provisionedTenant(t, "purchasing", "sales")
+	controlDSN, _ := provisionedTenant(t, "purchasing", "sales", "finance")
 	_, stderr, code := run(t, []string{"DATABASE_URL=" + controlDSN}, "-actor-id=a")
 	if code == 0 {
 		t.Fatal("expected non-zero exit with -tenant-id unset")
@@ -126,7 +130,7 @@ func TestSeedDemoData_MissingTenantID_FailsFast(t *testing.T) {
 }
 
 func TestSeedDemoData_MissingActorID_FailsFast(t *testing.T) {
-	controlDSN, id := provisionedTenant(t, "purchasing", "sales")
+	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance")
 	_, stderr, code := run(t, []string{"DATABASE_URL=" + controlDSN}, "-tenant-id="+id)
 	if code == 0 {
 		t.Fatal("expected non-zero exit with -actor-id unset")
@@ -138,8 +142,9 @@ func TestSeedDemoData_MissingActorID_FailsFast(t *testing.T) {
 
 func TestSeedDemoData_UnprovisionedModule_FailsCleanly(t *testing.T) {
 	// Foundation-only tenant: seed-demo-data unconditionally seeds
-	// PurchaseOrders/SalesOrders, so it must fail loudly (not panic, not
-	// silently skip) when purchasing/sales were never published.
+	// Accounts/PurchaseOrders/SalesOrders, so it must fail loudly (not
+	// panic, not silently skip) when finance/purchasing/sales were never
+	// published.
 	controlDSN, id := provisionedTenant(t) // no modules
 	_, stderr, code := run(t, []string{"DATABASE_URL=" + controlDSN}, "-tenant-id="+id, "-actor-id=smoke-test")
 	if code == 0 {
@@ -151,7 +156,7 @@ func TestSeedDemoData_UnprovisionedModule_FailsCleanly(t *testing.T) {
 }
 
 func TestSeedDemoData_SeedsSampleRecordsAndIsIdempotent(t *testing.T) {
-	controlDSN, id := provisionedTenant(t, "purchasing", "sales")
+	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance")
 
 	_, stderr, code := run(t, []string{"DATABASE_URL=" + controlDSN}, "-tenant-id="+id, "-actor-id=smoke-test")
 	if code != 0 {
@@ -170,7 +175,10 @@ func TestSeedDemoData_SeedsSampleRecordsAndIsIdempotent(t *testing.T) {
 	}
 
 	counts := map[string]int{}
-	for _, entityType := range []string{"Party", "Item", "PurchaseOrder", "SalesOrder", "CustomerInvoice"} {
+	for _, entityType := range []string{
+		"Party", "Item", "PurchaseOrder", "SalesOrder", "CustomerInvoice",
+		"Account", "FiscalYear", "Period", "TaxCode", "CostCenter",
+	} {
 		counts[entityType] = countRecords(t, tenantDB, entityType)
 		if counts[entityType] == 0 {
 			t.Fatalf("expected at least one %s record after seeding, got 0", entityType)
