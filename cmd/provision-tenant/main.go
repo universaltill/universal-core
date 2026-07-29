@@ -40,6 +40,7 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/audit"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
 	"github.com/universaltill/universal-core/internal/kernel/purchasing"
+	"github.com/universaltill/universal-core/internal/kernel/sales"
 	"github.com/universaltill/universal-core/internal/tenantdb"
 )
 
@@ -60,6 +61,7 @@ var modulePublishers = map[string]struct {
 	publishStatuses func(ctx context.Context, db *sql.DB, actor audit.Actor) error
 }{
 	"purchasing": {purchasing.Publish, purchasing.PublishForms, purchasing.PublishStatuses},
+	"sales":      {sales.Publish, sales.PublishForms, sales.PublishStatuses},
 }
 
 func main() {
@@ -72,7 +74,7 @@ func main() {
 	region := flag.String("region", "eu-west", "tenant region, only used when creating a new tenant")
 	tenantID := flag.String("tenant-id", "", "reuse an existing tenant id instead of creating a new one")
 	actorID := flag.String("actor-id", "", "audit actor id for every Definition this provisions (required)")
-	modulesFlag := flag.String("modules", "", "comma-separated modules to publish besides foundation (available: purchasing)")
+	modulesFlag := flag.String("modules", "", "comma-separated modules to publish besides foundation (available: purchasing, sales)")
 	flag.Parse()
 
 	if *actorID == "" {
@@ -91,7 +93,7 @@ func main() {
 		seen := make(map[string]bool)
 		for m := range strings.SplitSeq(*modulesFlag, ",") {
 			if _, ok := modulePublishers[m]; !ok {
-				log.Fatalf("unknown module %q (available: purchasing)", m)
+				log.Fatalf("unknown module %q (available: purchasing, sales)", m)
 			}
 			if !seen[m] {
 				seen[m] = true

@@ -162,16 +162,42 @@ func PublishStatuses(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 		{"received", "Received", 4, false, true},
 		{"cancelled", "Cancelled", 5, false, true},
 	}
+	// Scoped by status_type_id, not just code: sales.PublishStatuses
+	// (internal/kernel/sales/seed.go) now seeds sales_order_status and
+	// customer_invoice_status, both of which declare their own "draft"
+	// and (sales_order_status) "cancelled" Status rows — a plain
+	// code-only getOrCreate here could find one of *their* rows first
+	// (RecordRepo.ListByField orders by created_at, not by
+	// status_type_id) and silently reuse its id instead of creating
+	// purchase_order_status's own, corrupting this graph. Found by
+	// independent review while adding the sales module, which hit the
+	// identical bug in its own seedStatusGraph first — see that
+	// function's own doc comment for the full explanation this mirrors.
+	existingByCode := map[string]string{}
+	existingStatuses, err := engine.ListByField(ctx, statusDef, "status_type_id", statusTypeID)
+	if err != nil {
+		return fmt.Errorf("list existing Status for purchase_order_status: %w", err)
+	}
+	for _, s := range existingStatuses {
+		if c, _ := s.Data["code"].(string); c != "" {
+			existingByCode[c] = s.ID
+		}
+	}
+
 	statusIDs := make(map[string]string, len(statuses))
 	for _, s := range statuses {
-		id, err := getOrCreate(statusDef, "code", s.code, map[string]any{
+		if id, ok := existingByCode[s.code]; ok {
+			statusIDs[s.code] = id
+			continue
+		}
+		rec, err := engine.Create(ctx, statusDef, map[string]any{
 			"status_type_id": statusTypeID, "code": s.code, "name": s.name,
 			"sequence": s.sequence, "is_initial": s.isInitial, "is_terminal": s.isTerminal,
-		})
+		}, actor)
 		if err != nil {
 			return fmt.Errorf("seed %s Status: %w", s.code, err)
 		}
-		statusIDs[s.code] = id
+		statusIDs[s.code] = rec.ID
 	}
 
 	for _, edge := range [][2]string{

@@ -80,25 +80,44 @@ func main() {
 	if err != nil {
 		log.Fatalf("look up Status definition: %v", err)
 	}
+	statusTypeDef, err := publishedDef(ctx, entityDefs, "StatusType")
+	if err != nil {
+		log.Fatalf("look up StatusType definition: %v", err)
+	}
 
 	// statusIDByCode resolves purchase_order_status's Status records —
 	// requires purchasing.PublishStatuses to have already been run for
 	// this tenant (cmd/provision-tenant does this automatically for any
 	// tenant provisioned after the purchasing-order-status increment;
-	// an older tenant needs it run once by hand first). Not scoped by
-	// status_type_id: same reasoning as cmd/seed-demo-data's own
-	// statusID lookup — only one StatusType exists today, so a plain
-	// code lookup is unambiguous.
+	// an older tenant needs it run once by hand first). Scoped by
+	// status_type_id, not just code: the sales module
+	// (internal/kernel/sales) added sales_order_status and
+	// customer_invoice_status, which declare their own colliding
+	// "draft"/"cancelled" codes — a plain code-only lookup here would be
+	// ambiguous on any tenant that also has Sales published (this
+	// comment used to claim "only one StatusType exists today," which
+	// stopped being true the moment that module shipped).
+	statusTypes, err := engine.ListByField(ctx, statusTypeDef, "code", "purchase_order_status")
+	if err != nil {
+		log.Fatalf("list StatusType by code: %v", err)
+	}
+	if len(statusTypes) == 0 {
+		log.Fatalf("no purchase_order_status StatusType — run purchasing.PublishStatuses for this tenant first")
+	}
+	existingStatuses, err := engine.ListByField(ctx, statusDef, "status_type_id", statusTypes[0].ID)
+	if err != nil {
+		log.Fatalf("list Status by status_type_id: %v", err)
+	}
 	statusIDByCode := map[string]string{}
+	for _, r := range existingStatuses {
+		if c, _ := r.Data["code"].(string); c != "" {
+			statusIDByCode[c] = r.ID
+		}
+	}
 	for _, code := range []string{"draft", "submitted", "approved", "received", "cancelled"} {
-		recs, err := engine.ListByField(ctx, statusDef, "code", code)
-		if err != nil {
-			log.Fatalf("list Status by code %q: %v", code, err)
+		if _, ok := statusIDByCode[code]; !ok {
+			log.Fatalf("no purchase_order_status Status record for code %q — run purchasing.PublishStatuses for this tenant first (cmd/provision-tenant does this for any tenant provisioned after the purchasing-order-status increment)", code)
 		}
-		if len(recs) == 0 {
-			log.Fatalf("no Status record for code %q — run purchasing.PublishStatuses for this tenant first (cmd/provision-tenant does this for any tenant provisioned after the purchasing-order-status increment)", code)
-		}
-		statusIDByCode[code] = recs[0].ID
 	}
 
 	orders, err := engine.List(ctx, poDef)

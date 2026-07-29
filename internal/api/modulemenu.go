@@ -159,6 +159,9 @@ var entityIcons = map[string]string{
 	"InventoryItem":        "🗄️",
 	"GoodsReceipt":         "🚚",
 	"GoodsReceiptLine":     "📥",
+	"SalesOrder":           "🧮",
+	"SOLine":               "📃",
+	"CustomerInvoice":      "💳",
 }
 
 func entityIcon(entityType string) string {
