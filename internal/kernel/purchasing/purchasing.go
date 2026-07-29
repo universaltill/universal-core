@@ -219,6 +219,52 @@ func GoodsReceiptLine() *entity.Definition {
 	}
 }
 
+// VendorInvoice is a bill received from a vendor against a PurchaseOrder
+// (reference-data-model.md §2, UBL `Invoice`) — the buy-side mirror of
+// sales.CustomerInvoice, "3-way matched against PO + GoodsReceipt" per
+// that same reference. vendor_id is carried directly alongside
+// purchase_order_id (not derived by looking it up at read time), same
+// reasoning as every other entity in this kernel that carries its
+// "obviously derivable" reference directly (GoodsReceiptLine.item_id,
+// CustomerInvoice.customer_id).
+//
+// Deliberately NOT built in this pass, matching CustomerInvoice's own
+// "no line breakdown" scope-down: a VendorInvoiceLine itemization. The
+// 3-way match this task implements (ledger.go's
+// MatchVendorInvoiceOnUpdate) is therefore header-level — it compares
+// this invoice's total against the sum of everything actually received
+// against this PurchaseOrder (GoodsReceiptLine.qty_received × the
+// matching POLine.unit_price), not a line-by-line reconciliation. A real
+// match-exception workflow (what happens when they disagree beyond
+// "reject the transition") is Phase 3's own scoped task
+// (erp/BACKLOG-TASKS.md), not this one — this task's match either
+// passes (transition allowed) or fails closed (transition rejected,
+// nothing written), no partial/flagged state in between yet.
+//
+// status_id follows the same StatusType/Status pattern as PurchaseOrder
+// and CustomerInvoice (purchasing.PublishStatuses seeds
+// "vendor_invoice_status": draft is the only is_initial status,
+// draft->matched->paid is the happy path, void is reachable from draft
+// or matched but not paid — money has already moved by then, same
+// reasoning as CustomerInvoice's own graph).
+func VendorInvoice() *entity.Definition {
+	return &entity.Definition{
+		EntityType:     "VendorInvoice",
+		Version:        1,
+		Module:         "purchasing",
+		StatusTypeCode: "vendor_invoice_status",
+		Fields: []entity.Field{
+			{Name: "invoice_number", Type: entity.FieldString, Required: true},
+			{Name: "purchase_order_id", Type: entity.FieldReference, Required: true, Target: "PurchaseOrder"},
+			{Name: "vendor_id", Type: entity.FieldReference, Required: true, Target: "Party"},
+			{Name: "invoice_date", Type: entity.FieldDate, Required: true},
+			{Name: "currency_id", Type: entity.FieldReference, Target: "Currency"},
+			{Name: "status_id", Type: entity.FieldReference, Required: true, Target: "Status"},
+			{Name: "total", Type: entity.FieldNumber, Default: float64(0)},
+		},
+	}
+}
+
 // All returns every Definition this module adds — the set a tenant gets
 // once Purchasing is one of their licensed modules (seed.go's Publish).
 func All() []*entity.Definition {
@@ -229,5 +275,6 @@ func All() []*entity.Definition {
 		InventoryItem(),
 		GoodsReceipt(),
 		GoodsReceiptLine(),
+		VendorInvoice(),
 	}
 }

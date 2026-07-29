@@ -73,6 +73,7 @@ func main() {
 	// end against real seed data, not just unit tests.
 	engine.SetHook("GoodsReceiptLine", purchasing.PostGoodsReceiptLineToLedger)
 	engine.SetHook("CustomerInvoice", sales.PostCustomerInvoiceToLedger)
+	engine.SetHook("VendorInvoice", purchasing.MatchVendorInvoiceOnUpdate)
 
 	s := &seeder{
 		ctx:        context.Background(),
@@ -116,6 +117,7 @@ func main() {
 	s.seedInventory(items)
 	s.seedPurchaseOrders(vendors, currencies, items)
 	s.seedGoodsReceipts()
+	s.seedVendorInvoices(vendors, currencies)
 	soIDs := s.seedSalesOrders(customers, currencies, items)
 	s.seedCustomerInvoices(customers, currencies, soIDs)
 
@@ -572,6 +574,79 @@ func (s *seeder) seedGoodsReceipts() {
 			}, s.actor); err != nil {
 				log.Fatalf("create GoodsReceiptLine for POLine %s: %v", line.ID, err)
 			}
+		}
+	}
+}
+
+// seedVendorInvoices gives PO-2026-0004 and PO-2026-0005 (the two
+// "received" PurchaseOrders seedGoodsReceipts already gave a real
+// GoodsReceipt+GoodsReceiptLines to) a real VendorInvoice each — sample
+// data that actually exercises purchasing.MatchVendorInvoiceOnUpdate
+// end to end against real received data, the same reasoning
+// seedCustomerInvoices gives for driving CustomerInvoice through real
+// draft->issued transitions rather than creating pre-set final state.
+// Both PurchaseOrders were received in full (seedGoodsReceipts), so
+// each invoice's total is set to exactly its PurchaseOrder's own total
+// — the received value the match hook computes will equal that exactly,
+// so both invoices match cleanly (a seeder demonstrating its own hook
+// rejecting sample data would be a bug, not a feature — a genuine
+// mismatch case belongs in a unit test, not here). VINV-2026-0001 goes
+// draft->matched->paid, VINV-2026-0002 stops at draft->matched — same
+// "show more than one live lifecycle state" reasoning as
+// seedCustomerInvoices' own issued/paid split. Looks the PurchaseOrder
+// up by po_number (ListByField) rather than needing seedPurchaseOrders
+// to return a po_number->id map — smaller, more isolated change than
+// growing that function's signature for one new caller.
+func (s *seeder) seedVendorInvoices(vendors, currencies map[string]string) {
+	invDef := s.def("VendorInvoice")
+	poDef := s.def("PurchaseOrder")
+
+	invoices := []struct {
+		invoiceNumber, poNumber, vendor, currency, date string
+		// statusPath is every status this invoice moves through after
+		// draft, in order — same shape as seedCustomerInvoices' own.
+		statusPath []string
+	}{
+		{"VINV-2026-0001", "PO-2026-0004", "Acme Textiles", "USD", "2026-07-24", []string{"matched", "paid"}},
+		{"VINV-2026-0002", "PO-2026-0005", "Doha Fasteners LLC", "QAR", "2026-07-25", []string{"matched"}},
+	}
+	for _, inv := range invoices {
+		existing, err := s.crud.ListByField(s.ctx, invDef, "invoice_number", inv.invoiceNumber)
+		if err != nil {
+			log.Fatalf("list VendorInvoice by invoice_number: %v", err)
+		}
+		if len(existing) > 0 {
+			continue
+		}
+		pos, err := s.crud.ListByField(s.ctx, poDef, "po_number", inv.poNumber)
+		if err != nil {
+			log.Fatalf("list PurchaseOrder by po_number: %v", err)
+		}
+		if len(pos) == 0 {
+			log.Fatalf("no PurchaseOrder found for po_number %s (was seedPurchaseOrders run first?)", inv.poNumber)
+		}
+		total, _ := pos[0].Data["total"].(float64)
+		fields := map[string]any{
+			"invoice_number":    inv.invoiceNumber,
+			"purchase_order_id": pos[0].ID,
+			"vendor_id":         vendors[inv.vendor],
+			"currency_id":       currencies[inv.currency],
+			"invoice_date":      inv.date,
+			"status_id":         s.statusID("vendor_invoice_status", "draft"),
+			"total":             total,
+		}
+		rec, err := s.crud.Create(s.ctx, invDef, fields, s.actor)
+		if err != nil {
+			log.Fatalf("create VendorInvoice %s: %v", inv.invoiceNumber, err)
+		}
+		version := rec.Version
+		for _, status := range inv.statusPath {
+			fields["status_id"] = s.statusID("vendor_invoice_status", status)
+			newVersion, err := s.crud.Update(s.ctx, invDef, rec.ID, fields, &version, s.actor)
+			if err != nil {
+				log.Fatalf("update VendorInvoice %s to %s: %v", inv.invoiceNumber, status, err)
+			}
+			version = newVersion
 		}
 	}
 }

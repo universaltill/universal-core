@@ -20,7 +20,8 @@ import (
 func TestModuleMenu_RendersAsSearchableHubGraphic(t *testing.T) {
 	withDevAuthEnabled(t)
 	// testServer already publishes purchasing: Item, PurchaseOrder,
-	// POLine, InventoryItem, GoodsReceipt, GoodsReceiptLine (6 entities).
+	// POLine, InventoryItem, GoodsReceipt, GoodsReceiptLine, VendorInvoice
+	// (7 entities).
 	srv, tenantID, _ := testServer(t)
 	ctx := browserCtx(t, tenantID)
 
@@ -37,8 +38,8 @@ func TestModuleMenu_RendersAsSearchableHubGraphic(t *testing.T) {
 	)); err != nil {
 		t.Fatalf("count hub nodes: %v", err)
 	}
-	if nodeCount != 6 {
-		t.Fatalf("expected 6 entity hub nodes (Item, PurchaseOrder, POLine, InventoryItem, GoodsReceipt, GoodsReceiptLine), got %d", nodeCount)
+	if nodeCount != 7 {
+		t.Fatalf("expected 7 entity hub nodes (Item, PurchaseOrder, POLine, InventoryItem, GoodsReceipt, GoodsReceiptLine, VendorInvoice), got %d", nodeCount)
 	}
 
 	// Real, non-overlapping graphical positioning — not just that a
@@ -55,8 +56,8 @@ func TestModuleMenu_RendersAsSearchableHubGraphic(t *testing.T) {
 	)); err != nil {
 		t.Fatalf("read hub node bounding boxes: %v", err)
 	}
-	if len(centers) != 6 {
-		t.Fatalf("expected 6 node centers, got %d", len(centers))
+	if len(centers) != 7 {
+		t.Fatalf("expected 7 node centers, got %d", len(centers))
 	}
 	for i := range centers {
 		for j := i + 1; j < len(centers); j++ {
@@ -105,7 +106,7 @@ func TestModuleMenu_RendersAsSearchableHubGraphic(t *testing.T) {
 	)); err != nil {
 		t.Fatalf("count hidden spoke lines: %v", err)
 	}
-	if hiddenLines != 4 {
-		t.Fatalf("expected exactly 4 spoke lines hidden (matching the 4 filtered-out nodes: PurchaseOrder, POLine, GoodsReceipt, GoodsReceiptLine), got %d", hiddenLines)
+	if hiddenLines != 5 {
+		t.Fatalf("expected exactly 5 spoke lines hidden (matching the 5 filtered-out nodes: PurchaseOrder, POLine, GoodsReceipt, GoodsReceiptLine, VendorInvoice — none of their SearchKeys contain \"item\"), got %d", hiddenLines)
 	}
 }

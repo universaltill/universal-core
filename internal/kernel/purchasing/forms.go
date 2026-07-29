@@ -101,7 +101,36 @@ func POLineForm() *form.Definition {
 func AllForms() []*form.Definition {
 	return []*form.Definition{
 		ItemForm(), PurchaseOrderForm(), POLineForm(), InventoryItemForm(),
-		GoodsReceiptForm(), GoodsReceiptLineForm(),
+		GoodsReceiptForm(), GoodsReceiptLineForm(), VendorInvoiceForm(),
+	}
+}
+
+// VendorInvoiceForm is a plain single-section form, same shape as
+// CustomerInvoice's own (sales/forms.go) — no master-detail Lines
+// section, matching VendorInvoice's own doc comment on why this task
+// stayed header-only (no VendorInvoiceLine breakdown).
+func VendorInvoiceForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "VendorInvoice",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Details",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "invoice_number", Label: "Invoice Number"},
+					{Name: "purchase_order_id", Label: "Purchase Order"},
+					{Name: "vendor_id", Label: "Vendor"},
+					{Name: "invoice_date", Label: "Invoice Date"},
+					{Name: "currency_id", Label: "Currency"},
+					{Name: "status_id", Label: "Status"},
+					{Name: "total", Label: "Total"},
+				},
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
 	}
 }
 

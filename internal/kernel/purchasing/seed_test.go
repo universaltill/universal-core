@@ -352,6 +352,117 @@ func TestPublishStatuses_SeedsGraph(t *testing.T) {
 	}
 }
 
+// TestPublishStatuses_SeedsVendorInvoiceGraph is
+// TestPublishStatuses_SeedsGraph's counterpart for the second StatusType
+// this package now seeds (vendor_invoice_status) — also confirms its
+// "draft" Status gets a different id than purchase_order_status's own
+// "draft", the exact status_type_id-scoping regression seedStatusGraph's
+// own doc comment (and sales.seedStatusGraph's, which this mirrors) warns
+// a plain code-only lookup would silently get wrong.
+func TestPublishStatuses_SeedsVendorInvoiceGraph(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	if err := foundation.Publish(ctx, db, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := PublishStatuses(ctx, db, actor); err != nil {
+		t.Fatalf("PublishStatuses: %v", err)
+	}
+
+	entityDefs := data.NewEntityDefinitionRepo(db)
+	engine := crud.NewEngine(db)
+	def := func(entityType string) *entity.Definition {
+		v, err := entityDefs.GetPublished(ctx, entityType)
+		if err != nil {
+			t.Fatalf("GetPublished(%s): %v", entityType, err)
+		}
+		d, err := entity.Unmarshal(v.Definition)
+		if err != nil {
+			t.Fatalf("unmarshal %s: %v", entityType, err)
+		}
+		return d
+	}
+
+	poStatusTypes, err := engine.ListByField(ctx, def("StatusType"), "code", "purchase_order_status")
+	if err != nil || len(poStatusTypes) != 1 {
+		t.Fatalf("list purchase_order_status StatusType: %v (count %d)", err, len(poStatusTypes))
+	}
+	viStatusTypes, err := engine.ListByField(ctx, def("StatusType"), "code", "vendor_invoice_status")
+	if err != nil {
+		t.Fatalf("list vendor_invoice_status StatusType: %v", err)
+	}
+	if len(viStatusTypes) != 1 {
+		t.Fatalf("expected exactly 1 vendor_invoice_status StatusType, got %d", len(viStatusTypes))
+	}
+
+	poStatuses, err := engine.ListByField(ctx, def("Status"), "status_type_id", poStatusTypes[0].ID)
+	if err != nil {
+		t.Fatalf("list purchase_order_status Status: %v", err)
+	}
+	viStatuses, err := engine.ListByField(ctx, def("Status"), "status_type_id", viStatusTypes[0].ID)
+	if err != nil {
+		t.Fatalf("list vendor_invoice_status Status: %v", err)
+	}
+	wantStatuses := map[string]struct{ isInitial, isTerminal bool }{
+		"draft":   {true, false},
+		"matched": {false, false},
+		"paid":    {false, true},
+		"void":    {false, true},
+	}
+	if len(viStatuses) != len(wantStatuses) {
+		t.Fatalf("expected %d vendor_invoice_status Status records, got %d", len(wantStatuses), len(viStatuses))
+	}
+	statusIDs := map[string]string{}
+	for _, s := range viStatuses {
+		code, _ := s.Data["code"].(string)
+		want, ok := wantStatuses[code]
+		if !ok {
+			t.Fatalf("unexpected Status code %q", code)
+		}
+		if got := s.Data["is_initial"]; got != want.isInitial {
+			t.Errorf("Status %q: expected is_initial=%v, got %v", code, want.isInitial, got)
+		}
+		if got := s.Data["is_terminal"]; got != want.isTerminal {
+			t.Errorf("Status %q: expected is_terminal=%v, got %v", code, want.isTerminal, got)
+		}
+		statusIDs[code] = s.ID
+	}
+
+	// The scoping regression check: purchase_order_status and
+	// vendor_invoice_status both declare a "draft" Status — they must be
+	// two different records, not the same one reused across StatusTypes.
+	for _, s := range poStatuses {
+		if code, _ := s.Data["code"].(string); code == "draft" {
+			if s.ID == statusIDs["draft"] {
+				t.Fatalf("purchase_order_status and vendor_invoice_status share the same 'draft' Status id %s — status_type_id scoping is broken", s.ID)
+			}
+		}
+	}
+
+	transitionDef := def("StatusTransition")
+	wantEdges := [][2]string{
+		{"draft", "matched"}, {"matched", "paid"}, {"draft", "void"}, {"matched", "void"},
+	}
+	for _, edge := range wantEdges {
+		rows, err := engine.ListByField(ctx, transitionDef, "from_status_id", statusIDs[edge[0]])
+		if err != nil {
+			t.Fatalf("list StatusTransition from %s: %v", edge[0], err)
+		}
+		found := false
+		for _, r := range rows {
+			if to, _ := r.Data["to_status_id"].(string); to == statusIDs[edge[1]] {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected a declared %s->%s StatusTransition", edge[0], edge[1])
+		}
+	}
+}
+
 // TestPublishStatuses_IsIdempotent confirms a second call doesn't
 // duplicate the StatusType/Status/StatusTransition rows — same
 // getOrCreate-by-natural-key discipline as cmd/seed-demo-data.
@@ -384,7 +495,11 @@ func TestPublishStatuses_IsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list Status: %v", err)
 	}
-	if len(all) != 5 {
-		t.Fatalf("expected exactly 5 Status records after two PublishStatuses calls, got %d", len(all))
+	// 5 purchase_order_status + 4 vendor_invoice_status — this package now
+	// seeds two StatusTypes (seedStatusGraph's own doc comment), not just
+	// purchase_order_status's original 5.
+	const wantTotal = 5 + 4
+	if len(all) != wantTotal {
+		t.Fatalf("expected exactly %d Status records after two PublishStatuses calls, got %d", wantTotal, len(all))
 	}
 }
