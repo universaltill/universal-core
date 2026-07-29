@@ -9,7 +9,12 @@
 // these are dedicated typed tables, not generic Entity Definitions: a
 // generic Definition is itself a form of metadata configuration, which
 // would contradict this package's own "never configured by metadata"
-// exception.
+// exception. Post/PostTx also refuse to post into a closed/locked
+// finance.Period (period.go) — a deliberately scoped, documented
+// exception to reading the generic entity engine directly, not the same
+// pattern as gl_accounts: see period.go's own doc comment and this
+// ADR's addendum for why Period didn't get the same dedicated-
+// projection treatment Account did.
 package ledger
 
 import (
@@ -135,6 +140,9 @@ func Post(ctx context.Context, db *sql.DB, e Entry, actor audit.Actor) (journalE
 // itself never calls either.
 func PostTx(ctx context.Context, tx *sql.Tx, e Entry, actor audit.Actor) (journalEntryID string, err error) {
 	if err := e.Validate(); err != nil {
+		return "", err
+	}
+	if err := checkPeriodOpen(ctx, tx, e.Date); err != nil {
 		return "", err
 	}
 
