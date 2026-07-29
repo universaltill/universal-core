@@ -428,6 +428,64 @@ func AIProviderConnection() *entity.Definition {
 	}
 }
 
+// Role is a tenant-defined, tenant-customizable access-control role —
+// "Warehouse Supervisor," "Finance Manager," whatever a given tenant
+// actually needs (Farshid, 2026-07-29: "we need lots of role in the
+// tenant"), not a fixed global list. Deliberately Core-owned rather than
+// modeled in Zitadel (ADR-0005, `uc-infra/docs/adr/0005-role-permission-
+// model-core-owned.md`) — Zitadel's own single `tenant_member` grant
+// stays the coarse "is this user in this tenant at all" boundary; Role
+// is the finer "what can they do once they're in" layer, living in the
+// same per-tenant database as everything else this kernel already
+// authorizes against (no per-request external API call).
+//
+// Not to be confused with `PartyRole` (above) — that's a business
+// relationship a Party holds (customer/vendor/employee), unrelated to
+// system access control. A person can be both: an "employee" PartyRole
+// and, separately, hold a "Finance Manager" access-control Role.
+//
+// Deliberately NOT built in this pass (ADR-0005's own scoping note):
+// any actual permission *enforcement* — this is the data model and
+// assignment mechanism only. A `Permission` model wiring this into
+// `internal/kernel/entity`/`crud`'s read/write paths is real, separate,
+// future work (`erp/BACKLOG-TASKS.md` Phase 2, directly below the task
+// this entity ships as part of).
+func Role() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "Role",
+		Version:    1,
+		Module:     "foundation",
+		Fields: []entity.Field{
+			{Name: "code", Type: entity.FieldString, Required: true},
+			{Name: "name", Type: entity.FieldString, Required: true},
+			{Name: "description", Type: entity.FieldString},
+		},
+	}
+}
+
+// UserRole grants one Role to one authenticated user — many-to-many
+// (a user can hold more than one Role; a Role can be held by more than
+// one user), the same shape PartyRole already uses for Party<->role_type.
+//
+// user_id is a plain FieldString carrying the Zitadel OIDC "sub" claim
+// (`internal/webauth.Session.Subject`), not a FieldReference — there is
+// no Core-side User/Person-as-login-identity entity to reference (see
+// ADR-0005's own explanation): this kernel already uses that same
+// identifier as `audit.Actor.ID` on every authenticated request
+// (`internal/webauth/bridge.go`), so UserRole reuses it directly rather
+// than inventing a second identity concept.
+func UserRole() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "UserRole",
+		Version:    1,
+		Module:     "foundation",
+		Fields: []entity.Field{
+			{Name: "user_id", Type: entity.FieldString, Required: true},
+			{Name: "role_id", Type: entity.FieldReference, Required: true, Target: "Role"},
+		},
+	}
+}
+
 // All returns every foundation Definition — the set that must exist
 // before any operational module is enabled for a tenant.
 func All() []*entity.Definition {
@@ -447,5 +505,7 @@ func All() []*entity.Definition {
 		StatusTransition(),
 		IssueReport(),
 		AIProviderConnection(),
+		Role(),
+		UserRole(),
 	}
 }
