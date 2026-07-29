@@ -633,3 +633,40 @@ func TestImport_Preview_AIDisabledShowsNoBadges(t *testing.T) {
 		t.Fatalf("expected no AI-suggested badge with no AI client configured, got:\n%s", rec.Body.String())
 	}
 }
+
+// TestDecryptStoredAPIKey exercises every branch directly (no HTTP): no
+// encrypted value present, encryption disabled (no SECRET_ENCRYPTION_KEY
+// configured — the common case in most deployments today), a genuine
+// round-trip, and a value that fails to decrypt (wrong key/corrupted
+// ciphertext) — decryptStoredAPIKey's own doc comment is explicit that
+// none of these should ever stop the request, only fall back silently.
+func TestDecryptStoredAPIKey(t *testing.T) {
+	router := newTestRouter(t)
+	cryptor := testCryptor(t)
+	h := testHandlerWithSecretCryptor(t, router, cryptor)
+
+	if _, ok := h.decryptStoredAPIKey(map[string]any{}); ok {
+		t.Fatal("expected ok=false when there's no api_key_encrypted field at all")
+	}
+
+	disabled := testHandler(t, router) // no cryptor — mirrors New() with SECRET_ENCRYPTION_KEY unset
+	encrypted, err := cryptor.Encrypt("sk-real-secret")
+	if err != nil {
+		t.Fatalf("Encrypt: %v", err)
+	}
+	if _, ok := disabled.decryptStoredAPIKey(map[string]any{"api_key_encrypted": encrypted}); ok {
+		t.Fatal("expected ok=false when this deployment has no secret encryption configured")
+	}
+
+	key, ok := h.decryptStoredAPIKey(map[string]any{"api_key_encrypted": encrypted})
+	if !ok {
+		t.Fatal("expected ok=true for a genuinely encrypted value")
+	}
+	if key != "sk-real-secret" {
+		t.Fatalf("expected the decrypted key back, got %q", key)
+	}
+
+	if _, ok := h.decryptStoredAPIKey(map[string]any{"api_key_encrypted": "not-valid-ciphertext"}); ok {
+		t.Fatal("expected ok=false for a value that fails to decrypt")
+	}
+}

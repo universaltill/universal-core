@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -480,5 +481,65 @@ func TestRunner_ProcessesMultipleTenantsIndependentlyInOneTick(t *testing.T) {
 	}
 	if crossCount != 0 {
 		t.Fatal("tenant A's own database contains tenant B's job row")
+	}
+}
+
+// TestRunner_RunConcurrent_ReturnsImmediatelyAndSpawnsPollers exercises
+// RunConcurrent directly (unlike TestRunner_RunConcurrent_ProcessesAllJobsExactlyOnce,
+// which deliberately calls r.Run manually in its own goroutines instead —
+// see that test's own comment on why). Confirms RunConcurrent's own
+// documented contract: it returns immediately without waiting for any
+// poller, and the goroutines it spawned are real and actually tick (an
+// atomic counter incremented inside a StepHandler proves at least one
+// poller genuinely ran, not just that the function returned).
+func TestRunner_RunConcurrent_ReturnsImmediatelyAndSpawnsPollers(t *testing.T) {
+	router, control := newTestRouter(t)
+	_, tenantDB := newTestTenant(t, router)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	def := &workflow.Definition{
+		Name: "run_concurrent_test", Version: 1,
+		Trigger: workflow.Trigger{Type: workflow.TriggerManual},
+		Steps:   []workflow.Step{{Kind: workflow.StepNotify}},
+	}
+	actor := humanActor()
+	publish(t, tenantDB, def, actor)
+
+	q, err := workflow.NewQueue(tenantDB, nil)
+	if err != nil {
+		t.Fatalf("NewQueue: %v", err)
+	}
+	if _, err := q.Enqueue(ctx, def, "PurchaseOrder", "44444444-4444-4444-4444-444444444444", actor); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	var ticked atomic.Bool
+	cfg := fastTestConfig()
+	cfg.Concurrency = 3
+	r := New(router, control, map[workflow.StepKind]workflow.StepHandler{
+		workflow.StepNotify: func(_ context.Context, job data.WorkflowJob, _ workflow.Step) error {
+			ticked.Store(true)
+			return nil
+		},
+	}, cfg)
+
+	done := make(chan struct{})
+	go func() {
+		r.RunConcurrent(ctx)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("RunConcurrent must return immediately, without waiting for its pollers")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !ticked.Load() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !ticked.Load() {
+		t.Fatal("expected at least one spawned poller to actually process the enqueued job")
 	}
 }
