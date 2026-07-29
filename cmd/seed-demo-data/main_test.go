@@ -185,6 +185,15 @@ func TestSeedDemoData_SeedsSampleRecordsAndIsIdempotent(t *testing.T) {
 		}
 	}
 
+	// gl_accounts (the ledger core's own typed chart, ADR-0004) is a
+	// separate table, not a generic `records` row — confirmed the
+	// finance.SyncGLAccounts call wired into seed-demo-data actually ran,
+	// not just that Account records exist.
+	glAccountCount := countGLAccounts(t, tenantDB)
+	if glAccountCount != counts["Account"] {
+		t.Fatalf("expected gl_accounts to be synced 1:1 with Account records (%d), got %d", counts["Account"], glAccountCount)
+	}
+
 	// Re-run: must be idempotent (getOrCreate, per this binary's own
 	// doc comment) — record counts must not double.
 	_, stderr, code = run(t, []string{"DATABASE_URL=" + controlDSN}, "-tenant-id="+id, "-actor-id=smoke-test")
@@ -196,6 +205,9 @@ func TestSeedDemoData_SeedsSampleRecordsAndIsIdempotent(t *testing.T) {
 			t.Fatalf("%s count changed after re-running seed-demo-data: had %d, now %d (not idempotent)", entityType, want, got)
 		}
 	}
+	if got := countGLAccounts(t, tenantDB); got != glAccountCount {
+		t.Fatalf("gl_accounts count changed after re-running seed-demo-data: had %d, now %d (not idempotent)", glAccountCount, got)
+	}
 }
 
 func countRecords(t *testing.T, tenantDB *sql.DB, entityType string) int {
@@ -205,6 +217,15 @@ func countRecords(t *testing.T, tenantDB *sql.DB, entityType string) int {
 		`SELECT count(*) FROM records WHERE entity_type = $1 AND deleted_at IS NULL`, entityType,
 	).Scan(&n); err != nil {
 		t.Fatalf("count %s records: %v", entityType, err)
+	}
+	return n
+}
+
+func countGLAccounts(t *testing.T, tenantDB *sql.DB) int {
+	t.Helper()
+	var n int
+	if err := tenantDB.QueryRowContext(context.Background(), `SELECT count(*) FROM gl_accounts`).Scan(&n); err != nil {
+		t.Fatalf("count gl_accounts: %v", err)
 	}
 	return n
 }
