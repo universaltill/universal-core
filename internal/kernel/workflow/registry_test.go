@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/universaltill/universal-core/internal/data"
@@ -46,6 +47,40 @@ func TestWorkflowDefinitionRegistry_FullLifecycle(t *testing.T) {
 	}
 	if gotDef.Name != def.Name || len(gotDef.Steps) != len(def.Steps) {
 		t.Fatalf("round-tripped definition doesn't match: got %+v want %+v", gotDef, def)
+	}
+}
+
+// TestWorkflowDefinitionRegistry_RollbackLeavesNoPublishedVersion mirrors
+// purchasing/seed_test.go's TestPublish_LeavesRolledBackVersionAlone for
+// WorkflowDefinitionRepo specifically — the one Definition kind (of the
+// three: Entity/Form/Workflow) with no existing Rollback coverage
+// anywhere in this repo before this test.
+func TestWorkflowDefinitionRegistry_RollbackLeavesNoPublishedVersion(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := data.NewWorkflowDefinitionRepo(db)
+	def := poApprovalWorkflow()
+	actor := humanActor()
+
+	raw, err := json.Marshal(def)
+	if err != nil {
+		t.Fatalf("marshal definition: %v", err)
+	}
+	if _, err := repo.CreateDraft(ctx, def.Name, def.Version, raw, actor); err != nil {
+		t.Fatalf("CreateDraft: %v", err)
+	}
+	if err := repo.Approve(ctx, def.Name, def.Version, actor); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	if err := repo.Publish(ctx, def.Name, def.Version, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if err := repo.Rollback(ctx, def.Name, def.Version, actor); err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+
+	if _, err := repo.GetPublished(ctx, def.Name); !errors.Is(err, data.ErrNotFound) {
+		t.Fatalf("expected data.ErrNotFound after rollback, got %v", err)
 	}
 }
 

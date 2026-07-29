@@ -540,3 +540,40 @@ func TestPreviewXLSX_DecompressionBombIsBoundedDuringRead(t *testing.T) {
 		t.Fatal("expected decompression to be bounded during Read even when the zip header lies about uncompressed size")
 	}
 }
+
+// TestHeadersXLSX confirms the standalone header-only entry point (what
+// the column-mapping UI calls before any mapping exists yet — see this
+// function's own doc comment) returns just the header row, reusing
+// readXLSX exactly like PreviewXLSX does underneath, not a second
+// divergent reading path.
+func TestHeadersXLSX(t *testing.T) {
+	sst := `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<sst ` + xlsxNS + `>
+<si><t>Vendor Name</t></si>
+<si><t>Lead Time</t></si>
+</sst>`
+	sheet := `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet ` + xlsxNS + `>
+<sheetData>
+<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row>
+</sheetData>
+</worksheet>`
+	data := buildXLSX(t, map[string]string{
+		"xl/sharedStrings.xml":     sst,
+		"xl/worksheets/sheet1.xml": sheet,
+	})
+
+	headers, err := HeadersXLSX(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("HeadersXLSX: %v", err)
+	}
+	if len(headers) != 2 || headers[0] != "Vendor Name" || headers[1] != "Lead Time" {
+		t.Fatalf("unexpected headers: %+v", headers)
+	}
+}
+
+func TestHeadersXLSX_NotAZipFileIsAnError(t *testing.T) {
+	if _, err := HeadersXLSX(bytes.NewReader([]byte("not a zip file"))); err == nil {
+		t.Fatal("expected an error for a non-zip input")
+	}
+}
