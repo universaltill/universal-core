@@ -24,6 +24,7 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/purchasing"
+	"github.com/universaltill/universal-core/internal/kernel/sales"
 	"github.com/universaltill/universal-core/internal/tenantdb"
 )
 
@@ -81,6 +82,13 @@ func main() {
 	if err := purchasing.PublishStatuses(context.Background(), sqlDB, s.actor); err != nil {
 		log.Fatalf("publish purchase_order_status: %v", err)
 	}
+	// Same reasoning as the purchasing.PublishStatuses call above, now
+	// covering sales_order_status/customer_invoice_status — cheap and
+	// idempotent enough to also run here so this command stays
+	// self-sufficient against a tenant provisioned before Sales existed.
+	if err := sales.PublishStatuses(context.Background(), sqlDB, s.actor); err != nil {
+		log.Fatalf("publish sales statuses: %v", err)
+	}
 
 	currencies := s.seedCurrencies()
 	uoms := s.seedUnitsOfMeasure()
@@ -89,6 +97,8 @@ func main() {
 	s.seedInventory(items)
 	s.seedPurchaseOrders(vendors, currencies, items)
 	s.seedGoodsReceipts()
+	soIDs := s.seedSalesOrders(customers, currencies, items)
+	s.seedCustomerInvoices(customers, currencies, soIDs)
 
 	log.Printf("demo data seeded for tenant %s (%d currencies, %d units, %d vendors, %d customers, %d items)",
 		*tenantID, len(currencies), len(uoms), len(vendors), len(customers), len(items))
@@ -292,24 +302,40 @@ func (s *seeder) seedInventory(items map[string]string) {
 // directly: creating POLines needs the parent's id first, and total is
 // only known after the lines exist, so each order still needs its own
 // create-then-update sequence — only the dedup check is shared.
-// statusID looks up a Status record by its code — purchasing.
-// PublishStatuses (called in main before any seeding) already seeded
-// these. Only one StatusType exists today (purchase_order_status), so a
-// plain code lookup is unambiguous; see that function's doc comment if a
-// second StatusType ever makes this need scoping by status_type_id too.
+// statusID looks up a Status record by its code, scoped to a specific
+// StatusType code — required now that a second module (sales) exists:
+// "draft" alone is ambiguous once purchase_order_status,
+// sales_order_status, and customer_invoice_status all declare their own
+// "draft" Status row with a different status_type_id. This used to be a
+// plain code-only lookup when purchase_order_status was the only
+// StatusType in the system (see git history) — that comment predicted
+// exactly this generalization would be needed "if a second StatusType
+// ever" existed, which sales.PublishStatuses' two StatusTypes now do.
 // A seeder method (not a local closure inside seedPurchaseOrders) since
-// seedGoodsReceipts needs the exact same lookup to find already-
-// "received" orders.
-func (s *seeder) statusID(code string) string {
-	statusDef := s.def("Status")
-	recs, err := s.crud.ListByField(s.ctx, statusDef, "code", code)
+// seedGoodsReceipts/seedSalesOrders/seedCustomerInvoices all need the
+// same lookup.
+func (s *seeder) statusID(statusTypeCode, code string) string {
+	statusTypeDef := s.def("StatusType")
+	types, err := s.crud.ListByField(s.ctx, statusTypeDef, "code", statusTypeCode)
 	if err != nil {
-		log.Fatalf("list Status by code %q: %v", code, err)
+		log.Fatalf("list StatusType by code %q: %v", statusTypeCode, err)
 	}
-	if len(recs) == 0 {
-		log.Fatalf("no Status record for code %q (was purchasing.PublishStatuses run?)", code)
+	if len(types) == 0 {
+		log.Fatalf("no StatusType record for code %q (was its module's PublishStatuses run?)", statusTypeCode)
 	}
-	return recs[0].ID
+
+	statusDef := s.def("Status")
+	recs, err := s.crud.ListByField(s.ctx, statusDef, "status_type_id", types[0].ID)
+	if err != nil {
+		log.Fatalf("list Status by status_type_id for %q: %v", statusTypeCode, err)
+	}
+	for _, r := range recs {
+		if c, _ := r.Data["code"].(string); c == code {
+			return r.ID
+		}
+	}
+	log.Fatalf("no Status record for code %q under StatusType %q", code, statusTypeCode)
+	return ""
 }
 
 func (s *seeder) seedPurchaseOrders(vendors, currencies, items map[string]string) {
@@ -354,7 +380,7 @@ func (s *seeder) seedPurchaseOrders(vendors, currencies, items map[string]string
 			"vendor_id":   vendors[o.vendor],
 			"currency_id": currencies[o.currency],
 			"order_date":  o.date,
-			"status_id":   s.statusID(o.status),
+			"status_id":   s.statusID("purchase_order_status", o.status),
 		}, s.actor)
 		if err != nil {
 			log.Fatalf("create PurchaseOrder for %s: %v", o.vendor, err)
@@ -380,7 +406,7 @@ func (s *seeder) seedPurchaseOrders(vendors, currencies, items map[string]string
 		expectedVersion := poID.Version
 		if _, err := s.crud.Update(s.ctx, poDef, poID.ID, map[string]any{
 			"po_number": o.poNumber, "vendor_id": vendors[o.vendor], "currency_id": currencies[o.currency],
-			"order_date": o.date, "status_id": s.statusID(o.status), "total": total,
+			"order_date": o.date, "status_id": s.statusID("purchase_order_status", o.status), "total": total,
 		}, &expectedVersion, s.actor); err != nil {
 			log.Fatalf("update PurchaseOrder total: %v", err)
 		}
@@ -410,7 +436,7 @@ func (s *seeder) seedGoodsReceipts() {
 	grDef := s.def("GoodsReceipt")
 	grLineDef := s.def("GoodsReceiptLine")
 
-	received, err := s.crud.ListByField(s.ctx, poDef, "status_id", s.statusID("received"))
+	received, err := s.crud.ListByField(s.ctx, poDef, "status_id", s.statusID("purchase_order_status", "received"))
 	if err != nil {
 		log.Fatalf("list received PurchaseOrders: %v", err)
 	}
@@ -450,6 +476,129 @@ func (s *seeder) seedGoodsReceipts() {
 			}, s.actor); err != nil {
 				log.Fatalf("create GoodsReceiptLine for POLine %s: %v", line.ID, err)
 			}
+		}
+	}
+}
+
+// seedSalesOrders dedups on so_number — same getOrCreate-style natural-
+// key pattern as seedPurchaseOrders, and for the same reason can't just
+// call getOrCreate directly (SOLines need the parent's id first, total
+// is only known after the lines exist). Returns the so_number -> id map
+// so seedCustomerInvoices can look up the order it bills without a
+// second hardcoded table that could drift from this one.
+func (s *seeder) seedSalesOrders(customers, currencies, items map[string]string) map[string]string {
+	soDef := s.def("SalesOrder")
+	lineDef := s.def("SOLine")
+
+	type line struct {
+		sku       string
+		qty       float64
+		unitPrice float64
+	}
+	orders := []struct {
+		soNumber string
+		customer string
+		currency string
+		date     string
+		status   string
+		lines    []line
+	}{
+		{"SO-2026-0001", "Doha Retail Group", "QAR", "2026-07-05", "invoiced", []line{{"SKU-1001", 300, 0.6}}},
+		{"SO-2026-0002", "London Fashion House", "GBP", "2026-07-12", "invoiced", []line{{"SKU-1002", 20, 32}, {"SKU-1005", 15, 38}}},
+		{"SO-2026-0003", "Doha Retail Group", "QAR", "2026-07-18", "fulfilled", []line{{"SKU-1009", 1500, 0.15}}},
+		{"SO-2026-0004", "London Fashion House", "GBP", "2026-07-20", "confirmed", []line{{"SKU-1010", 25, 45}}},
+		{"SO-2026-0005", "Doha Retail Group", "QAR", "2026-07-22", "draft", []line{{"SKU-1006", 200, 0.9}}},
+		{"SO-2026-0006", "London Fashion House", "GBP", "2026-07-23", "cancelled", []line{{"SKU-1002", 10, 32}}},
+	}
+
+	soIDs := map[string]string{}
+	for _, o := range orders {
+		existing, err := s.crud.ListByField(s.ctx, soDef, "so_number", o.soNumber)
+		if err != nil {
+			log.Fatalf("list SalesOrder by so_number: %v", err)
+		}
+		if len(existing) > 0 {
+			soIDs[o.soNumber] = existing[0].ID
+			continue
+		}
+
+		soID, err := s.crud.Create(s.ctx, soDef, map[string]any{
+			"so_number":   o.soNumber,
+			"customer_id": customers[o.customer],
+			"currency_id": currencies[o.currency],
+			"order_date":  o.date,
+			"status_id":   s.statusID("sales_order_status", o.status),
+		}, s.actor)
+		if err != nil {
+			log.Fatalf("create SalesOrder for %s: %v", o.customer, err)
+		}
+		var total float64
+		for _, l := range o.lines {
+			lineTotal := l.qty * l.unitPrice
+			total += lineTotal
+			if _, err := s.crud.Create(s.ctx, lineDef, map[string]any{
+				"sales_order_id": soID.ID,
+				"item_id":        items[l.sku],
+				"qty":            l.qty,
+				"unit_price":     l.unitPrice,
+				"line_total":     lineTotal,
+			}, s.actor); err != nil {
+				log.Fatalf("create SOLine: %v", err)
+			}
+		}
+		expectedVersion := soID.Version
+		if _, err := s.crud.Update(s.ctx, soDef, soID.ID, map[string]any{
+			"so_number": o.soNumber, "customer_id": customers[o.customer], "currency_id": currencies[o.currency],
+			"order_date": o.date, "status_id": s.statusID("sales_order_status", o.status), "total": total,
+		}, &expectedVersion, s.actor); err != nil {
+			log.Fatalf("update SalesOrder total: %v", err)
+		}
+		soIDs[o.soNumber] = soID.ID
+	}
+	return soIDs
+}
+
+// seedCustomerInvoices gives every "invoiced" SalesOrder (SO-2026-0001,
+// SO-2026-0002 above) a real CustomerInvoice — sample data that
+// demonstrates the entity exists, same reasoning seedGoodsReceipts gives
+// for GoodsReceipt. Dedups on invoice_number (CustomerInvoice does have a
+// natural key, unlike GoodsReceipt). SO-2026-0001's invoice is left
+// "issued" (billed, not yet paid) and SO-2026-0002's is "paid", so the
+// demo data shows both live states of the customer_invoice_status
+// lifecycle, not just the happy path's terminal state.
+func (s *seeder) seedCustomerInvoices(customers, currencies, soIDs map[string]string) {
+	invDef := s.def("CustomerInvoice")
+	soDef := s.def("SalesOrder")
+
+	invoices := []struct {
+		invoiceNumber, soNumber, customer, currency, date, status string
+	}{
+		{"INV-2026-0001", "SO-2026-0001", "Doha Retail Group", "QAR", "2026-07-06", "issued"},
+		{"INV-2026-0002", "SO-2026-0002", "London Fashion House", "GBP", "2026-07-13", "paid"},
+	}
+	for _, inv := range invoices {
+		existing, err := s.crud.ListByField(s.ctx, invDef, "invoice_number", inv.invoiceNumber)
+		if err != nil {
+			log.Fatalf("list CustomerInvoice by invoice_number: %v", err)
+		}
+		if len(existing) > 0 {
+			continue
+		}
+		so, err := s.crud.Get(s.ctx, soDef, soIDs[inv.soNumber])
+		if err != nil {
+			log.Fatalf("get SalesOrder %s: %v", inv.soNumber, err)
+		}
+		total, _ := so.Data["total"].(float64)
+		if _, err := s.crud.Create(s.ctx, invDef, map[string]any{
+			"invoice_number": inv.invoiceNumber,
+			"sales_order_id": soIDs[inv.soNumber],
+			"customer_id":    customers[inv.customer],
+			"currency_id":    currencies[inv.currency],
+			"invoice_date":   inv.date,
+			"status_id":      s.statusID("customer_invoice_status", inv.status),
+			"total":          total,
+		}, s.actor); err != nil {
+			log.Fatalf("create CustomerInvoice %s: %v", inv.invoiceNumber, err)
 		}
 	}
 }
