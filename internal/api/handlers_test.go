@@ -2802,3 +2802,29 @@ func TestAPI_ApproveWorkflowJob_HTMXRequestGetsEmptyBody(t *testing.T) {
 		t.Fatalf("expected an empty body for an htmx approve request (so hx-swap removes the row cleanly), got:\n%s", rec.Body.String())
 	}
 }
+
+// TestWriteInternalError confirms the client-facing response never
+// leaks the real error's own text (which can carry SQLSTATE codes,
+// table/column names, or query fragments) while still writing a
+// generic 500 envelope.
+func TestWriteInternalError(t *testing.T) {
+	rec := httptest.NewRecorder()
+	writeInternalError(rec, "test context", fmt.Errorf("pq: relation \"secret_table\" does not exist"))
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("want 500, got %d", rec.Code)
+	}
+	var env struct {
+		Data  any     `json:"data"`
+		Error *string `json:"error"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&env); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if env.Error == nil || *env.Error != "internal error" {
+		t.Fatalf("expected the generic \"internal error\" message, got %v", env.Error)
+	}
+	if strings.Contains(*env.Error, "secret_table") {
+		t.Fatal("the real error text must never reach the client")
+	}
+}

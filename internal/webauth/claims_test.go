@@ -78,6 +78,19 @@ func TestOrgIDFromClaims_WrongShape(t *testing.T) {
 	}
 }
 
+// TestOrgIDFromClaims_RoleValueWrongShape is TestOrgIDFromClaims_WrongShape's
+// counterpart one level deeper: the outer claim is a real map, but one
+// role's own value isn't the expected {org_id: domain} map — must be
+// skipped, not panic, same fail-safe reasoning applied one level in.
+func TestOrgIDFromClaims_RoleValueWrongShape(t *testing.T) {
+	claims := map[string]any{
+		zitadelProjectRolesClaim: map[string]any{"tenant_member": "not a map either"},
+	}
+	if _, ok := orgIDFromClaims(claims); ok {
+		t.Fatal("expected ok=false when a role's own value isn't a map")
+	}
+}
+
 func TestStringClaim(t *testing.T) {
 	claims := map[string]any{"name": "Ada Lovelace", "count": 5}
 	if got := stringClaim(claims, "name"); got != "Ada Lovelace" {
