@@ -104,6 +104,7 @@ func main() {
 	currencies := s.seedCurrencies()
 	uoms := s.seedUnitsOfMeasure()
 	s.seedFinance()
+	s.seedRoles()
 	// gl_accounts (the ledger core's own typed chart, ADR-0004) is a
 	// projection of the finance.Account records seedFinance just
 	// created/confirmed — sync it now so cmd/backfill-... or any future
@@ -271,6 +272,30 @@ func (s *seeder) seedFinance() {
 	} {
 		s.getOrCreate("CostCenter", "code", c.code, map[string]any{
 			"code": c.code, "name": c.name, "type": c.ccType,
+		})
+	}
+}
+
+// seedRoles gives a tenant reference-data example Roles (foundation.Role,
+// ADR-0005 — Core-owned access-control roles, distinct from PartyRole's
+// business-relationship roles). Deliberately does NOT seed any UserRole
+// grants alongside them: a UserRole.user_id must be a real Zitadel OIDC
+// "sub" (see UserRole's own doc comment) — this command has no way to
+// know which real Zitadel user, if any, should hold a role in whatever
+// tenant it's pointed at, and inventing a fake sub would create a
+// misleading "phantom user has access" record with no real Zitadel
+// account behind it. Granting a real role to a real person is exactly
+// what the not-yet-built Self-service tenant member management page
+// (erp/BACKLOG-TASKS.md Phase 2) is for — this just gives that page
+// something real to assign once it exists.
+func (s *seeder) seedRoles() {
+	for _, r := range []struct{ code, name, description string }{
+		{"finance_manager", "Finance Manager", "Approves invoices and journal postings over the tenant's threshold"},
+		{"warehouse_supervisor", "Warehouse Supervisor", "Manages goods receipt and inventory adjustments"},
+		{"sales_rep", "Sales Rep", "Creates and manages sales orders and customer invoices"},
+	} {
+		s.getOrCreate("Role", "code", r.code, map[string]any{
+			"code": r.code, "name": r.name, "description": r.description,
 		})
 	}
 }

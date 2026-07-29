@@ -97,6 +97,48 @@ func AllForms() []*form.Definition {
 		PartyRoleForm(), PartyRelationshipForm(), AddressForm(), ContactMechanismForm(),
 		AttachmentForm(), UnitOfMeasureForm(), UomConversionForm(), CurrencyForm(),
 		ExchangeRateForm(), StatusTypeForm(), StatusForm(), StatusTransitionForm(),
+		RoleForm(), UserRoleForm(),
+	}
+}
+
+func RoleForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "Role",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Details",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "code", Label: "Code"},
+					{Name: "name", Label: "Name"},
+					{Name: "description", Label: "Description"},
+				},
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
+	}
+}
+
+func UserRoleForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "UserRole",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Details",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "user_id", Label: "User"},
+					{Name: "role_id", Label: "Role"},
+				},
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
 	}
 }
 

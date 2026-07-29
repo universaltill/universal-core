@@ -428,3 +428,48 @@ func TestAIProviderConnection_APIKeyEncryptedIsNotRequiredAtTheEntityLevel(t *te
 		t.Fatalf("expected an Ollama connection with no api_key_encrypted to be valid at the entity level, got %v", err)
 	}
 }
+
+func TestRole_RequiresCodeAndName(t *testing.T) {
+	def := Role()
+	if err := entity.ValidateRecord(def, map[string]any{"name": "Finance Manager"}); err == nil {
+		t.Fatal("expected an error for a Role missing its required code")
+	}
+	if err := entity.ValidateRecord(def, map[string]any{"code": "finance_manager"}); err == nil {
+		t.Fatal("expected an error for a Role missing its required name")
+	}
+	if err := entity.ValidateRecord(def, map[string]any{
+		"code": "finance_manager", "name": "Finance Manager", "description": "Approves invoices over threshold",
+	}); err != nil {
+		t.Fatalf("expected a fully-populated Role to validate, got %v", err)
+	}
+}
+
+// TestUserRole_SameUserCanHoldMultipleRoles mirrors
+// TestPartyRole_SamePartyCanHoldMultipleRoles's own reasoning — the
+// same real reason UserRole is many-to-many (ADR-0005: "a user can hold
+// more than one Role").
+func TestUserRole_SameUserCanHoldMultipleRoles(t *testing.T) {
+	def := UserRole()
+	userID := "zitadel-sub-123"
+
+	if err := entity.ValidateRecord(def, map[string]any{"user_id": userID, "role_id": "role-finance"}); err != nil {
+		t.Fatalf("first UserRole should validate: %v", err)
+	}
+	if err := entity.ValidateRecord(def, map[string]any{"user_id": userID, "role_id": "role-warehouse"}); err != nil {
+		t.Fatalf("second UserRole for the same user should validate: %v", err)
+	}
+}
+
+func TestUserRole_MissingRequiredUserID(t *testing.T) {
+	def := UserRole()
+	if err := entity.ValidateRecord(def, map[string]any{"role_id": "role-finance"}); err == nil {
+		t.Fatal("expected an error for a UserRole missing its required user_id")
+	}
+}
+
+func TestUserRole_MissingRequiredRoleID(t *testing.T) {
+	def := UserRole()
+	if err := entity.ValidateRecord(def, map[string]any{"user_id": "zitadel-sub-123"}); err == nil {
+		t.Fatal("expected an error for a UserRole missing its required role_id")
+	}
+}
