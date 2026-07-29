@@ -15,6 +15,25 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 )
 
+// Hook is a post-write callback the caller who constructs an Engine may
+// register per entity type via SetHook — the "lifecycle hooks (on-
+// create/update → ...)" mechanism ADR-0001's base-model design already
+// anticipated but never built (see uc-infra ADR-0004's own "not fully
+// closed" note, which is what this closes). Called from within the same
+// transaction as the record write, right before commit, so a hook that
+// returns an error rolls back the whole write — e.g. a ledger posting
+// that fails must also fail the GoodsReceipt/CustomerInvoice write that
+// triggered it, not leave an un-posted business document behind.
+//
+// This does NOT reintroduce entity-type branching into the generic
+// engine (CLAUDE.md's kernel-boundary rule): Create/Update look the
+// entity type up in a plain map and call whatever was registered — the
+// engine itself has zero knowledge of what a "GoodsReceipt" or
+// "CustomerInvoice" is, exactly the same "generic dispatch over
+// caller-supplied data" shape cmd/provision-tenant's own
+// modulePublishers map already uses.
+type Hook func(ctx context.Context, tx *sql.Tx, def *entity.Definition, rec data.Record, action audit.Action, actor audit.Actor) error
+
 // Engine is the generic CRUD engine, operating against one tenant's own
 // database (ADR-0003 — the *sql.DB passed to NewEngine is already
 // resolved to a specific tenant via internal/tenantdb.Router, not shared
@@ -25,6 +44,7 @@ type Engine struct {
 	db      *sql.DB
 	records *data.RecordRepo
 	audit   *data.AuditRepo
+	hooks   map[string]Hook
 }
 
 func NewEngine(db *sql.DB) *Engine {
@@ -32,7 +52,33 @@ func NewEngine(db *sql.DB) *Engine {
 		db:      db,
 		records: data.NewRecordRepo(db),
 		audit:   data.NewAuditRepo(db),
+		hooks:   map[string]Hook{},
 	}
+}
+
+// SetHook registers hook to run after every Create/Update of entityType,
+// within the write's own transaction — see Hook's own doc comment. Not
+// part of NewEngine's signature deliberately: every existing caller
+// (dozens, across cmd/ and every test in this repo) stays unchanged;
+// only application wiring that actually needs a hook calls this after
+// construction — cmd/seed-demo-data does so directly, and
+// cmd/universal-core's real HTTP path does so indirectly via
+// internal/api.Handler.RegisterHook (applied per request in that
+// package's own scope(), so internal/api itself never has to import a
+// specific kernel module to wire one in).
+func (e *Engine) SetHook(entityType string, hook Hook) {
+	e.hooks[entityType] = hook
+}
+
+func (e *Engine) runHook(ctx context.Context, tx *sql.Tx, def *entity.Definition, rec data.Record, action audit.Action, actor audit.Actor) error {
+	hook, ok := e.hooks[def.EntityType]
+	if !ok {
+		return nil
+	}
+	if err := hook(ctx, tx, def, rec, action, actor); err != nil {
+		return fmt.Errorf("%s hook: %w", action, err)
+	}
+	return nil
 }
 
 // Create validates the incoming data against def, inserts the record, and
@@ -61,6 +107,10 @@ func (e *Engine) Create(ctx context.Context, def *entity.Definition, fields map[
 	}
 	if err := e.audit.Insert(ctx, tx, auditEntry); err != nil {
 		return data.Record{}, fmt.Errorf("write audit entry: %w", err)
+	}
+
+	if err := e.runHook(ctx, tx, def, rec, audit.ActionCreate, actor); err != nil {
+		return data.Record{}, err
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -99,6 +149,11 @@ func (e *Engine) Update(ctx context.Context, def *entity.Definition, id string, 
 	}
 	if err := e.audit.Insert(ctx, tx, auditEntry); err != nil {
 		return 0, fmt.Errorf("write audit entry: %w", err)
+	}
+
+	rec := data.Record{ID: id, EntityType: def.EntityType, Data: fields, Version: newVersion}
+	if err := e.runHook(ctx, tx, def, rec, audit.ActionUpdate, actor); err != nil {
+		return 0, err
 	}
 
 	if err := tx.Commit(); err != nil {

@@ -83,6 +83,17 @@ func (r *RecordRepo) Get(ctx context.Context, entityType, id string) (Record, er
 	return r.get(ctx, r.db, entityType, id)
 }
 
+// GetTx is Get against a caller-supplied querier/tx instead of r.db —
+// the same "same shape as the Tx write methods, now needed for a read
+// too" reasoning CreateTx/UpdateTx/DeleteTx already established. First
+// real caller: internal/kernel/crud's post-write hooks (ADR-0001's
+// "lifecycle hooks" mechanism), which need to read another record (e.g.
+// a GoodsReceiptLine's POLine) from within the same transaction as the
+// write that triggered the hook, not a separate connection.
+func (r *RecordRepo) GetTx(ctx context.Context, q querier, entityType, id string) (Record, error) {
+	return r.get(ctx, q, entityType, id)
+}
+
 func (r *RecordRepo) get(ctx context.Context, q querier, entityType, id string) (Record, error) {
 	var raw []byte
 	var version int

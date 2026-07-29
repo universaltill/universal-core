@@ -22,6 +22,8 @@ import (
 	"github.com/universaltill/universal-core/internal/httpx"
 	"github.com/universaltill/universal-core/internal/i18n"
 	"github.com/universaltill/universal-core/internal/kernel/aiassist"
+	"github.com/universaltill/universal-core/internal/kernel/purchasing"
+	"github.com/universaltill/universal-core/internal/kernel/sales"
 	"github.com/universaltill/universal-core/internal/kernel/secretcrypt"
 	"github.com/universaltill/universal-core/internal/kernel/speechassist"
 	"github.com/universaltill/universal-core/internal/svcauth"
@@ -248,7 +250,16 @@ func main() {
 	} else {
 		log.Printf("SECRET_ENCRYPTION_KEY not set — the AI-provider settings page will refuse to store a tenant API key")
 	}
-	api.New(router, catalog, auth, svc, ai, speech, secretCryptor).Routes(mux)
+	handler := api.New(router, catalog, auth, svc, ai, speech, secretCryptor)
+	// The real composition root for lifecycle hooks (internal/kernel/
+	// crud.Hook) — internal/api itself never imports purchasing/sales
+	// directly, keeping that package entity-agnostic (its own doc
+	// comment); this is the one place concrete kernel modules are named
+	// to wire a hook in, the same role cmd/provision-tenant's own
+	// modulePublishers map already plays for module publishing.
+	handler.RegisterHook("GoodsReceiptLine", purchasing.PostGoodsReceiptLineToLedger)
+	handler.RegisterHook("CustomerInvoice", sales.PostCustomerInvoiceToLedger)
+	handler.Routes(mux)
 
 	// The durable workflow job queue (internal/kernel/workflow.Queue) has
 	// existed since the definition-registry increment, but nothing ever

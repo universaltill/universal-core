@@ -146,6 +146,24 @@ func nullableString(s string) any {
 	return s
 }
 
+// ExistsForSource reports whether a journal entry has already been
+// posted for (sourceType, sourceID) — the idempotency guard a hook
+// posting on a status transition needs (e.g. CustomerInvoice draft->
+// issued only ever posts once, even if the same transition is somehow
+// driven twice), since crud.Engine's Update hook has no other way to
+// know "have I already done this" without re-deriving it here.
+func (r *JournalEntryRepo) ExistsForSource(ctx context.Context, sourceType, sourceID string) (bool, error) {
+	var exists bool
+	err := r.db.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM journal_entries WHERE source_type = $1 AND source_id = $2)`,
+		sourceType, sourceID,
+	).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check existing journal entry for %s %s: %w", sourceType, sourceID, err)
+	}
+	return exists, nil
+}
+
 // List returns every posted journal entry, newest first, with lines
 // eager-loaded and account code/name denormalized — no pagination yet,
 // same "fine at today's scale, revisit when it isn't" convention
