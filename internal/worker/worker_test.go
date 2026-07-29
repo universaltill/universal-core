@@ -194,10 +194,27 @@ func TestRunner_ProcessesEnqueuedJobViaPolling(t *testing.T) {
 		t.Fatal("timed out waiting for the poll loop to pick up the enqueued job")
 	}
 
+	// ProcessOne (internal/kernel/workflow/queue.go) calls the step
+	// handler — which sends to processed above — *before* its own
+	// separate MarkDone DB write; receiving from processed only proves
+	// the handler ran, not that MarkDone has committed yet. A single
+	// immediate Get here raced that write often enough to flake under
+	// `go test -race` (found via a real CI failure, not by inspection
+	// alone) — poll briefly instead of assuming synchronous-with-the-
+	// channel-send ordering that ProcessOne never promises.
 	repo := data.NewWorkflowJobRepo(tenantDB)
-	got, err := repo.Get(ctx, job.ID)
-	if err != nil {
-		t.Fatalf("Get: %v", err)
+	deadline := time.Now().Add(time.Second)
+	var got data.WorkflowJob
+	for {
+		var err error
+		got, err = repo.Get(ctx, job.ID)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if got.Status == "done" || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	if got.Status != "done" {
 		t.Fatalf("expected status done, got %q", got.Status)
