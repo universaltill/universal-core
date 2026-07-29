@@ -194,6 +194,15 @@ func TestSeedDemoData_SeedsSampleRecordsAndIsIdempotent(t *testing.T) {
 		t.Fatalf("expected gl_accounts to be synced 1:1 with Account records (%d), got %d", counts["Account"], glAccountCount)
 	}
 
+	// The GoodsReceiptLine-create and CustomerInvoice-issue hooks
+	// (internal/kernel/purchasing/sales's ledger.go) are wired into this
+	// binary's crud.Engine same as production — confirms sample data
+	// actually posted, not just that the sample records exist.
+	journalEntryCount := countJournalEntries(t, tenantDB)
+	if journalEntryCount == 0 {
+		t.Fatal("expected at least one journal entry posted by the GoodsReceiptLine/CustomerInvoice hooks")
+	}
+
 	// Re-run: must be idempotent (getOrCreate, per this binary's own
 	// doc comment) — record counts must not double.
 	_, stderr, code = run(t, []string{"DATABASE_URL=" + controlDSN}, "-tenant-id="+id, "-actor-id=smoke-test")
@@ -207,6 +216,9 @@ func TestSeedDemoData_SeedsSampleRecordsAndIsIdempotent(t *testing.T) {
 	}
 	if got := countGLAccounts(t, tenantDB); got != glAccountCount {
 		t.Fatalf("gl_accounts count changed after re-running seed-demo-data: had %d, now %d (not idempotent)", glAccountCount, got)
+	}
+	if got := countJournalEntries(t, tenantDB); got != journalEntryCount {
+		t.Fatalf("journal entry count changed after re-running seed-demo-data: had %d, now %d (not idempotent — a hook may have double-posted)", journalEntryCount, got)
 	}
 }
 
@@ -226,6 +238,15 @@ func countGLAccounts(t *testing.T, tenantDB *sql.DB) int {
 	var n int
 	if err := tenantDB.QueryRowContext(context.Background(), `SELECT count(*) FROM gl_accounts`).Scan(&n); err != nil {
 		t.Fatalf("count gl_accounts: %v", err)
+	}
+	return n
+}
+
+func countJournalEntries(t *testing.T, tenantDB *sql.DB) int {
+	t.Helper()
+	var n int
+	if err := tenantDB.QueryRowContext(context.Background(), `SELECT count(*) FROM journal_entries`).Scan(&n); err != nil {
+		t.Fatalf("count journal_entries: %v", err)
 	}
 	return n
 }

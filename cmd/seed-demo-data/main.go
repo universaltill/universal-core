@@ -65,11 +65,20 @@ func main() {
 		log.Fatalf("resolve tenant %s database: %v", *tenantID, err)
 	}
 
+	engine := crud.NewEngine(sqlDB)
+	// Same composition-root wiring internal/api/handlers.go's scope()
+	// does for real requests — sample GoodsReceiptLines/CustomerInvoices
+	// created below post to the ledger through the exact same path a
+	// real user's create/update would, proving the hooks work end to
+	// end against real seed data, not just unit tests.
+	engine.SetHook("GoodsReceiptLine", purchasing.PostGoodsReceiptLineToLedger)
+	engine.SetHook("CustomerInvoice", sales.PostCustomerInvoiceToLedger)
+
 	s := &seeder{
 		ctx:        context.Background(),
 		actor:      audit.Actor{Type: audit.ActorHuman, ID: *actorID},
 		entityDefs: data.NewEntityDefinitionRepo(sqlDB),
-		crud:       crud.NewEngine(sqlDB),
+		crud:       engine,
 		defs:       map[string]*entity.Definition{},
 	}
 
@@ -653,15 +662,31 @@ func (s *seeder) seedSalesOrders(customers, currencies, items map[string]string)
 // "issued" (billed, not yet paid) and SO-2026-0002's is "paid", so the
 // demo data shows both live states of the customer_invoice_status
 // lifecycle, not just the happy path's terminal state.
+// seedCustomerInvoices creates each invoice in "draft" (customer_invoice_
+// status' only is_initial state — real production Creates go through
+// this same starting point, internal/api's createRecord handler enforces
+// it via ValidateStatusTransition even though this direct-crud.Engine
+// path doesn't) and then Updates it through the real draft->issued(->
+// paid) transitions, rather than creating it pre-set to its final
+// status. Not just more realistic sample data: PostCustomerInvoiceToLedger
+// (internal/kernel/sales/ledger.go) is a crud.Hook registered for
+// Update, not Create (an unissued invoice has no financial reality yet)
+// — creating pre-issued invoices directly would silently never exercise
+// it, leaving the ledger-posting path completely unverified by this
+// command despite looking like it seeded "issued" sample data.
 func (s *seeder) seedCustomerInvoices(customers, currencies, soIDs map[string]string) {
 	invDef := s.def("CustomerInvoice")
 	soDef := s.def("SalesOrder")
 
 	invoices := []struct {
-		invoiceNumber, soNumber, customer, currency, date, status string
+		invoiceNumber, soNumber, customer, currency, date string
+		// statusPath is every status this invoice moves through after
+		// draft, in order — {"issued"} for one, {"issued", "paid"} for
+		// the other, so the sample data still demonstrates both.
+		statusPath []string
 	}{
-		{"INV-2026-0001", "SO-2026-0001", "Doha Retail Group", "QAR", "2026-07-06", "issued"},
-		{"INV-2026-0002", "SO-2026-0002", "London Fashion House", "GBP", "2026-07-13", "paid"},
+		{"INV-2026-0001", "SO-2026-0001", "Doha Retail Group", "QAR", "2026-07-06", []string{"issued"}},
+		{"INV-2026-0002", "SO-2026-0002", "London Fashion House", "GBP", "2026-07-13", []string{"issued", "paid"}},
 	}
 	for _, inv := range invoices {
 		existing, err := s.crud.ListByField(s.ctx, invDef, "invoice_number", inv.invoiceNumber)
@@ -676,16 +701,27 @@ func (s *seeder) seedCustomerInvoices(customers, currencies, soIDs map[string]st
 			log.Fatalf("get SalesOrder %s: %v", inv.soNumber, err)
 		}
 		total, _ := so.Data["total"].(float64)
-		if _, err := s.crud.Create(s.ctx, invDef, map[string]any{
+		fields := map[string]any{
 			"invoice_number": inv.invoiceNumber,
 			"sales_order_id": soIDs[inv.soNumber],
 			"customer_id":    customers[inv.customer],
 			"currency_id":    currencies[inv.currency],
 			"invoice_date":   inv.date,
-			"status_id":      s.statusID("customer_invoice_status", inv.status),
+			"status_id":      s.statusID("customer_invoice_status", "draft"),
 			"total":          total,
-		}, s.actor); err != nil {
+		}
+		rec, err := s.crud.Create(s.ctx, invDef, fields, s.actor)
+		if err != nil {
 			log.Fatalf("create CustomerInvoice %s: %v", inv.invoiceNumber, err)
+		}
+		version := rec.Version
+		for _, status := range inv.statusPath {
+			fields["status_id"] = s.statusID("customer_invoice_status", status)
+			newVersion, err := s.crud.Update(s.ctx, invDef, rec.ID, fields, &version, s.actor)
+			if err != nil {
+				log.Fatalf("update CustomerInvoice %s to %s: %v", inv.invoiceNumber, status, err)
+			}
+			version = newVersion
 		}
 	}
 }
