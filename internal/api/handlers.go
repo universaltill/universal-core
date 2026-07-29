@@ -67,6 +67,35 @@ type Handler struct {
 	// all while this is disabled, rather than ever writing one to the
 	// database unencrypted (see secretcrypt's own doc comment).
 	secretCryptor *secretcrypt.Cryptor
+	// hooks is applied to every freshly-built crud.Engine in scope()
+	// (nil/empty is the common case — most tenants/entity types register
+	// none). Populated via RegisterHook by the real composition root
+	// (cmd/universal-core's main, the only caller so far — never by this
+	// package itself), which is what keeps this file from needing to
+	// import a specific kernel module (purchasing/sales/...) just to
+	// wire a ledger-posting hook: this package's own doc comment says it
+	// must stay entity-agnostic, and importing concrete modules by name
+	// here would quietly break that even though the *dispatch* inside
+	// crud.Engine itself stays generic either way. Independent review
+	// caught this coupling in an earlier draft that called SetHook
+	// directly with purchasing/sales imports in this file.
+	hooks []hookRegistration
+}
+
+type hookRegistration struct {
+	entityType string
+	hook       crud.Hook
+}
+
+// RegisterHook queues hook to be applied (via crud.Engine.SetHook) to
+// every tenantScope's Engine going forward — called once per hook by the
+// real composition root after New, before Routes/ListenAndServe. Not a
+// constructor parameter: New already has seven, and every hook this
+// Handler will ever need is registered exactly once at startup, not
+// per-request, so a post-construction setter (the same shape
+// crud.Engine.SetHook itself already uses) is the simpler fit.
+func (h *Handler) RegisterHook(entityType string, hook crud.Hook) {
+	h.hooks = append(h.hooks, hookRegistration{entityType, hook})
 }
 
 // New builds a Handler. catalog is the i18n.Catalog forms (and the
@@ -129,12 +158,22 @@ func (h *Handler) scope(ctx context.Context, tenantID string) (tenantScope, erro
 		// leaving workflowQueue nil for something later to panic on.
 		return tenantScope{}, fmt.Errorf("build workflow queue: %w", err)
 	}
+	engine := crud.NewEngine(db)
+	// Apply whatever the real composition root registered via
+	// RegisterHook (Handler's own doc comment on the hooks field) — this
+	// loop has zero knowledge of what any registered entityType/hook
+	// actually is, same generic-dispatch shape crud.Engine.SetHook
+	// itself already is.
+	for _, hr := range h.hooks {
+		engine.SetHook(hr.entityType, hr.hook)
+	}
+
 	return tenantScope{
 		db:            db,
 		entityDefs:    data.NewEntityDefinitionRepo(db),
 		formDefs:      data.NewFormDefinitionRepo(db),
 		workflowDefs:  data.NewWorkflowDefinitionRepo(db),
-		crud:          crud.NewEngine(db),
+		crud:          engine,
 		workflowQueue: workflowQueue,
 		reporting:     data.NewReportingRepo(db),
 	}, nil

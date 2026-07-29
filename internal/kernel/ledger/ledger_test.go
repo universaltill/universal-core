@@ -339,3 +339,54 @@ func TestPost_InactiveAccount_FailsBeforeAnyWrite(t *testing.T) {
 		t.Fatalf("expected no journal_entries written, got %d", count)
 	}
 }
+
+// TestPostTx_ParticipatesInCallerTransaction confirms PostTx doesn't
+// commit or roll back on its own — a failure in something else the
+// caller does on the same tx after PostTx succeeds must still roll back
+// PostTx's own writes too. This is exactly the contract
+// internal/kernel/crud's hook mechanism depends on (a GoodsReceiptLine
+// write and its ledger posting commit or roll back together).
+func TestPostTx_ParticipatesInCallerTransaction(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	accounts := data.NewGLAccountRepo(tenantDB)
+	if _, err := accounts.UpsertByCode(ctx, "1100", "Cash", "asset", "USD", true); err != nil {
+		t.Fatalf("upsert cash: %v", err)
+	}
+	if _, err := accounts.UpsertByCode(ctx, "4000", "Revenue", "income", "USD", true); err != nil {
+		t.Fatalf("upsert revenue: %v", err)
+	}
+
+	tx, err := tenantDB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	id, err := PostTx(ctx, tx, Entry{
+		Date:        "2026-01-15",
+		Description: "Cash sale",
+		Lines: []Line{
+			{AccountID: "1100", DebitMinor: 10000},
+			{AccountID: "4000", CreditMinor: 10000},
+		},
+	}, humanActor())
+	if err != nil {
+		t.Fatalf("PostTx: %v", err)
+	}
+	if id == "" {
+		t.Fatal("expected a non-empty journal entry id")
+	}
+	// Deliberately roll back instead of commit — simulating the caller's
+	// own write (e.g. the GoodsReceiptLine record) failing after PostTx
+	// itself already succeeded.
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+
+	var count int
+	if err := tenantDB.QueryRowContext(ctx, `SELECT count(*) FROM journal_entries WHERE id = $1`, id).Scan(&count); err != nil {
+		t.Fatalf("count journal_entries: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected the journal entry to not exist after the caller rolled back the shared tx, found %d", count)
+	}
+}

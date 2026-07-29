@@ -110,11 +110,35 @@ func (e *Entry) Validate() error {
 // account, and this was a real gap caught by independent review before
 // Post had ever been given a real caller.
 func Post(ctx context.Context, db *sql.DB, e Entry, actor audit.Actor) (journalEntryID string, err error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // rollback is a no-op after a successful commit
+
+	id, err := PostTx(ctx, tx, e, actor)
+	if err != nil {
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", fmt.Errorf("commit tx: %w", err)
+	}
+	return id, nil
+}
+
+// PostTx is Post's own logic, participating in a transaction the caller
+// already owns instead of opening its own — what internal/kernel/crud's
+// hook mechanism needs: a GoodsReceiptLine/CustomerInvoice write and its
+// ledger posting must commit or roll back together, which is only
+// possible if both run on the *same* `*sql.Tx`, not two independently-
+// committed ones. The caller is responsible for Commit/Rollback; PostTx
+// itself never calls either.
+func PostTx(ctx context.Context, tx *sql.Tx, e Entry, actor audit.Actor) (journalEntryID string, err error) {
 	if err := e.Validate(); err != nil {
 		return "", err
 	}
 
-	accounts := data.NewGLAccountRepo(db)
+	accounts := data.NewGLAccountRepo(tx)
 	accountIDs := make([]string, len(e.Lines))
 	debits := make([]int64, len(e.Lines))
 	credits := make([]int64, len(e.Lines))
@@ -131,13 +155,7 @@ func Post(ctx context.Context, db *sql.DB, e Entry, actor audit.Actor) (journalE
 		credits[i] = l.CreditMinor
 	}
 
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return "", fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback() //nolint:errcheck // rollback is a no-op after a successful commit
-
-	entries := data.NewJournalEntryRepo(db)
+	entries := data.NewJournalEntryRepo(tx)
 	id, err := entries.CreateTx(ctx, tx, e.Date, e.Description, e.SourceType, e.SourceID, accountIDs, debits, credits)
 	if err != nil {
 		return "", fmt.Errorf("create journal entry: %w", err)
@@ -150,12 +168,13 @@ func Post(ctx context.Context, db *sql.DB, e Entry, actor audit.Actor) (journalE
 	if err != nil {
 		return "", fmt.Errorf("build audit entry: %w", err)
 	}
-	if err := data.NewAuditRepo(db).Insert(ctx, tx, auditEntry); err != nil {
+	// AuditRepo.Insert takes its connection/tx as an explicit execer
+	// argument (satisfied by both *sql.DB and *sql.Tx) rather than
+	// through the repo's own constructor — NewAuditRepo(nil) is safe
+	// here, the nil db field is never read by Insert.
+	if err := data.NewAuditRepo(nil).Insert(ctx, tx, auditEntry); err != nil {
 		return "", fmt.Errorf("write audit entry: %w", err)
 	}
 
-	if err := tx.Commit(); err != nil {
-		return "", fmt.Errorf("commit tx: %w", err)
-	}
 	return id, nil
 }
