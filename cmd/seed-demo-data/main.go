@@ -92,6 +92,7 @@ func main() {
 
 	currencies := s.seedCurrencies()
 	uoms := s.seedUnitsOfMeasure()
+	s.seedFinance()
 	vendors, customers := s.seedParties()
 	items := s.seedItems(uoms)
 	s.seedInventory(items)
@@ -175,6 +176,83 @@ func (s *seeder) seedUnitsOfMeasure() map[string]string {
 		ids[u.code] = s.getOrCreate("UnitOfMeasure", "code", u.code, map[string]any{"code": u.code, "name": u.name})
 	}
 	return ids
+}
+
+// seedFinance seeds a small standard chart of accounts (5 top-level
+// accounts + child accounts under each, demonstrating Account's
+// parent_account_id self-reference), one FiscalYear with two Periods
+// (one closed, one open — demonstrating the field meaningfully rather
+// than leaving every seeded Period in its default state), and a handful
+// of TaxCodes/CostCenters shaped for the UK+GCC launch markets (BACKLOG.md
+// R1), same reasoning seedParties' own doc comment gives for its vendor/
+// customer names.
+func (s *seeder) seedFinance() {
+	accounts := []struct {
+		code, name, accountType, parentCode string
+	}{
+		{"1000", "Assets", "asset", ""},
+		{"1100", "Cash and Bank", "asset", "1000"},
+		{"1200", "Accounts Receivable", "asset", "1000"},
+		{"1300", "Inventory", "asset", "1000"},
+		{"2000", "Liabilities", "liability", ""},
+		{"2100", "Accounts Payable", "liability", "2000"},
+		{"3000", "Equity", "equity", ""},
+		{"3100", "Retained Earnings", "equity", "3000"},
+		{"4000", "Income", "income", ""},
+		{"4100", "Sales Revenue", "income", "4000"},
+		{"5000", "Expenses", "expense", ""},
+		{"5100", "Cost of Goods Sold", "expense", "5000"},
+		{"5200", "Operating Expenses", "expense", "5000"},
+	}
+	accountIDs := map[string]string{}
+	for _, a := range accounts {
+		fields := map[string]any{
+			"code": a.code, "name": a.name, "type": a.accountType, "is_active": true,
+		}
+		if a.parentCode != "" {
+			// Parents are seeded before children in the list above, so
+			// accountIDs[a.parentCode] is always already populated here —
+			// no second pass needed.
+			fields["parent_account_id"] = accountIDs[a.parentCode]
+		}
+		accountIDs[a.code] = s.getOrCreate("Account", "code", a.code, fields)
+	}
+
+	fyID := s.getOrCreate("FiscalYear", "name", "FY2026", map[string]any{
+		"name": "FY2026", "start_date": "2026-01-01", "end_date": "2026-12-31", "status": "open",
+	})
+	s.getOrCreate("Period", "name", "2026-01", map[string]any{
+		"fiscal_year_id": fyID, "name": "2026-01",
+		"start_date": "2026-01-01", "end_date": "2026-01-31", "status": "closed",
+	})
+	s.getOrCreate("Period", "name", "2026-02", map[string]any{
+		"fiscal_year_id": fyID, "name": "2026-02",
+		"start_date": "2026-02-01", "end_date": "2026-02-28", "status": "open",
+	})
+
+	for _, t := range []struct {
+		code, name, taxType, jurisdiction string
+		rate                              float64
+	}{
+		{"VAT5", "VAT Standard 5%", "vat", "QA", 5},
+		{"VAT0", "VAT Zero-Rated", "vat", "QA", 0},
+		{"VAT20", "UK VAT Standard 20%", "vat", "GB", 20},
+	} {
+		s.getOrCreate("TaxCode", "code", t.code, map[string]any{
+			"code": t.code, "name": t.name, "rate": t.rate,
+			"tax_type": t.taxType, "jurisdiction": t.jurisdiction,
+		})
+	}
+
+	for _, c := range []struct{ code, name, ccType string }{
+		{"CC-100", "Procurement", "operational"},
+		{"CC-200", "Sales", "operational"},
+		{"CC-900", "Head Office", "overhead"},
+	} {
+		s.getOrCreate("CostCenter", "code", c.code, map[string]any{
+			"code": c.code, "name": c.name, "type": c.ccType,
+		})
+	}
 }
 
 // seedParties creates both vendors and customers, tagging each with a

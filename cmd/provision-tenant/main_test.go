@@ -195,6 +195,32 @@ func TestProvisionTenant_RerunSameModule_IsIdempotent(t *testing.T) {
 	}
 }
 
+// TestProvisionTenant_FinanceModule_PublishesWithoutStatuses is finance's
+// own regression test for the modulePublishers map's nilable
+// publishStatuses field — finance is the first module with no
+// StatusType-managed entity (finance.go's own doc comment explains why),
+// so this is the first real exercise of the `if p.publishStatuses !=
+// nil` branch in main() via a real subprocess, not just purchasing/
+// sales always taking the non-nil path.
+func TestProvisionTenant_FinanceModule_PublishesWithoutStatuses(t *testing.T) {
+	dsn := freshControlDB(t)
+
+	stdout, stderr, code := run(t, []string{"DATABASE_URL=" + dsn}, "-name=Finance Only", "-actor-id=smoke-test", "-modules=finance")
+	if code != 0 {
+		t.Fatalf("run: exit %d, stderr: %s", code, stderr)
+	}
+	id := strings.TrimSpace(stdout)
+	testexec.DropTenantDatabase(t, testexec.Open(t, dsn), id)
+
+	router := openRouter(t, dsn)
+	tenantDB, err := router.Get(context.Background(), id)
+	if err != nil {
+		t.Fatalf("resolve tenant database: %v", err)
+	}
+	assertPublished(t, tenantDB, "entity_definitions", "Account", true)
+	assertPublished(t, tenantDB, "form_definitions", "Account", true)
+}
+
 func assertPublished(t *testing.T, tenantDB *sql.DB, table, entityType string, wantPublished bool) {
 	t.Helper()
 	var exists bool
