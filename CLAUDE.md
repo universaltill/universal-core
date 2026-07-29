@@ -32,6 +32,32 @@ important rule in this repo
   screen or API response goes into the Entity/Form Definition or the
   generator, never a one-off patch to generated output.
 
+## Testing — near-100% coverage (non-negotiable)
+Every change — new feature, bug fix, or refactor — ships with tests at
+**every applicable layer**, not just the one that's easiest to write:
+- **Unit tests** for the logic itself (entity/form/workflow validation,
+  kernel package behavior), including edge cases and error paths, not
+  just the happy path.
+- **Integration tests** against a real Postgres (`internal/data`,
+  seed/publish flows, status-graph seeding, cross-tenant isolation) —
+  mocking the database is not a substitute.
+- **Smoke tests**: a real compiled binary/server actually starts,
+  responds, and serves the routes it claims to.
+- **UI/UX and real browser E2E tests** (`internal/e2e`, headless
+  Chrome) for anything with a rendered page or client-side behavior — a
+  rendered-HTML-string test proves markup structure, never proves CSS is
+  actually applied or that inline `<script>` behaves correctly. Assert
+  against real computed styles / real DOM interaction, not string
+  matches.
+
+**Target near-100% coverage** — as close as practically possible, not
+"the happy path plus one edge case." A change without a matching test at
+every layer it touches is not done, regardless of how confident manual
+verification felt. This applies to existing code too: under-tested code
+you touch is debt to close, not a precedent to match. Gate every commit
+on the full suite passing (`go build`, `go vet`, `go test ./... -p 1`
+against a real local Postgres).
+
 ## Audit — AI-actor identity is first-class (ADR-0001 §14)
 Every mutation writes an audit row carrying `actor_type` (`human` |
 `ai_agent`), `actor_id`, and — when `ai_agent` — `model_version` and an
