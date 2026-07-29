@@ -23,6 +23,7 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/audit"
 	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
+	"github.com/universaltill/universal-core/internal/kernel/finance"
 	"github.com/universaltill/universal-core/internal/kernel/purchasing"
 	"github.com/universaltill/universal-core/internal/kernel/sales"
 	"github.com/universaltill/universal-core/internal/tenantdb"
@@ -93,6 +94,14 @@ func main() {
 	currencies := s.seedCurrencies()
 	uoms := s.seedUnitsOfMeasure()
 	s.seedFinance()
+	// gl_accounts (the ledger core's own typed chart, ADR-0004) is a
+	// projection of the finance.Account records seedFinance just
+	// created/confirmed — sync it now so cmd/backfill-... or any future
+	// posting code has a real, matching gl_accounts row to post against
+	// immediately, not only after some separate manual step.
+	if err := finance.SyncGLAccounts(context.Background(), sqlDB, s.actor); err != nil {
+		log.Fatalf("sync gl_accounts: %v", err)
+	}
 	vendors, customers := s.seedParties()
 	items := s.seedItems(uoms)
 	s.seedInventory(items)

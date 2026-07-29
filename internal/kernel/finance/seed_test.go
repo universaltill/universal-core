@@ -18,6 +18,7 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/audit"
 	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
+	"github.com/universaltill/universal-core/internal/kernel/foundation"
 )
 
 func freshTenantDB(t *testing.T) *sql.DB {
@@ -248,5 +249,225 @@ func TestAccount_HierarchyResolvesEndToEnd(t *testing.T) {
 	}
 	if got.Data["parent_account_id"] != parent.ID {
 		t.Fatalf("expected child's parent_account_id to be %q, got %v", parent.ID, got.Data["parent_account_id"])
+	}
+}
+
+func TestSyncGLAccounts_CreatesMatchingGLAccountsRows(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	entityDefs := data.NewEntityDefinitionRepo(tenantDB)
+	accountDefRaw, err := entityDefs.GetPublished(ctx, "Account")
+	if err != nil {
+		t.Fatalf("GetPublished(Account): %v", err)
+	}
+	accountDef, err := entity.Unmarshal(accountDefRaw.Definition)
+	if err != nil {
+		t.Fatalf("unmarshal Account: %v", err)
+	}
+	engine := crud.NewEngine(tenantDB)
+	if _, err := engine.Create(ctx, accountDef, map[string]any{
+		"code": "1000", "name": "Assets", "type": "asset", "is_active": true,
+	}, actor); err != nil {
+		t.Fatalf("create Account: %v", err)
+	}
+
+	if err := SyncGLAccounts(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("SyncGLAccounts: %v", err)
+	}
+
+	glAccounts := data.NewGLAccountRepo(tenantDB)
+	id, _, err := glAccounts.IDByCode(ctx, "1000")
+	if err != nil {
+		t.Fatalf("expected gl_accounts row for code 1000 after sync, got: %v", err)
+	}
+	var name, accountType, currency string
+	var isActive bool
+	if err := tenantDB.QueryRowContext(ctx,
+		`SELECT name, account_type, currency, is_active FROM gl_accounts WHERE id = $1`, id,
+	).Scan(&name, &accountType, &currency, &isActive); err != nil {
+		t.Fatalf("read gl_account: %v", err)
+	}
+	if name != "Assets" || accountType != "asset" || currency != defaultGLCurrency || !isActive {
+		t.Fatalf("unexpected gl_account: name=%q type=%q currency=%q active=%v", name, accountType, currency, isActive)
+	}
+}
+
+// TestSyncGLAccounts_ResolvesRealCurrencyCode confirms the sync doesn't
+// just always fall back to defaultGLCurrency — when an Account really
+// does set currency_id, the synced gl_accounts row gets that currency's
+// actual code, not the fallback.
+func TestSyncGLAccounts_ResolvesRealCurrencyCode(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	entityDefs := data.NewEntityDefinitionRepo(tenantDB)
+	currencyDefRaw, err := entityDefs.GetPublished(ctx, "Currency")
+	if err != nil {
+		t.Fatalf("GetPublished(Currency): %v", err)
+	}
+	currencyDef, err := entity.Unmarshal(currencyDefRaw.Definition)
+	if err != nil {
+		t.Fatalf("unmarshal Currency: %v", err)
+	}
+	accountDefRaw, err := entityDefs.GetPublished(ctx, "Account")
+	if err != nil {
+		t.Fatalf("GetPublished(Account): %v", err)
+	}
+	accountDef, err := entity.Unmarshal(accountDefRaw.Definition)
+	if err != nil {
+		t.Fatalf("unmarshal Account: %v", err)
+	}
+
+	engine := crud.NewEngine(tenantDB)
+	gbp, err := engine.Create(ctx, currencyDef, map[string]any{"code": "GBP", "name": "British Pound"}, actor)
+	if err != nil {
+		t.Fatalf("create Currency: %v", err)
+	}
+	if _, err := engine.Create(ctx, accountDef, map[string]any{
+		"code": "1100", "name": "Cash", "type": "asset", "currency_id": gbp.ID, "is_active": true,
+	}, actor); err != nil {
+		t.Fatalf("create Account: %v", err)
+	}
+
+	if err := SyncGLAccounts(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("SyncGLAccounts: %v", err)
+	}
+
+	glAccounts := data.NewGLAccountRepo(tenantDB)
+	id, _, err := glAccounts.IDByCode(ctx, "1100")
+	if err != nil {
+		t.Fatalf("expected gl_accounts row for code 1100, got: %v", err)
+	}
+	var currency string
+	if err := tenantDB.QueryRowContext(ctx, `SELECT currency FROM gl_accounts WHERE id = $1`, id).Scan(&currency); err != nil {
+		t.Fatalf("read gl_account currency: %v", err)
+	}
+	if currency != "GBP" {
+		t.Fatalf("expected the real Currency.code %q to be synced, got %q", "GBP", currency)
+	}
+}
+
+func TestSyncGLAccounts_IsIdempotent(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	entityDefs := data.NewEntityDefinitionRepo(tenantDB)
+	accountDefRaw, err := entityDefs.GetPublished(ctx, "Account")
+	if err != nil {
+		t.Fatalf("GetPublished(Account): %v", err)
+	}
+	accountDef, err := entity.Unmarshal(accountDefRaw.Definition)
+	if err != nil {
+		t.Fatalf("unmarshal Account: %v", err)
+	}
+	engine := crud.NewEngine(tenantDB)
+	if _, err := engine.Create(ctx, accountDef, map[string]any{
+		"code": "1000", "name": "Assets", "type": "asset", "is_active": true,
+	}, actor); err != nil {
+		t.Fatalf("create Account: %v", err)
+	}
+
+	if err := SyncGLAccounts(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("first SyncGLAccounts: %v", err)
+	}
+	if err := SyncGLAccounts(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("second SyncGLAccounts should be a no-op, got: %v", err)
+	}
+
+	var count int
+	if err := tenantDB.QueryRowContext(ctx, `SELECT count(*) FROM gl_accounts WHERE code = '1000'`).Scan(&count); err != nil {
+		t.Fatalf("count gl_accounts: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 gl_accounts row after re-running SyncGLAccounts, got %d", count)
+	}
+}
+
+// TestSyncGLAccounts_PropagatesAccountUpdate is the central promise
+// ADR-0004 makes about this function — editing a finance.Account (here:
+// renaming it and deactivating it) and re-syncing must update the
+// existing gl_accounts row in place, not just create-once-and-forget.
+// Caught as a real gap by independent review: TestSyncGLAccounts_
+// IsIdempotent only proved re-running sync over *unchanged* data was a
+// no-op, never that a real edit actually propagates.
+func TestSyncGLAccounts_PropagatesAccountUpdate(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	entityDefs := data.NewEntityDefinitionRepo(tenantDB)
+	accountDefRaw, err := entityDefs.GetPublished(ctx, "Account")
+	if err != nil {
+		t.Fatalf("GetPublished(Account): %v", err)
+	}
+	accountDef, err := entity.Unmarshal(accountDefRaw.Definition)
+	if err != nil {
+		t.Fatalf("unmarshal Account: %v", err)
+	}
+	engine := crud.NewEngine(tenantDB)
+	rec, err := engine.Create(ctx, accountDef, map[string]any{
+		"code": "1000", "name": "Assets", "type": "asset", "is_active": true,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create Account: %v", err)
+	}
+	if err := SyncGLAccounts(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("first SyncGLAccounts: %v", err)
+	}
+
+	version := rec.Version
+	if _, err := engine.Update(ctx, accountDef, rec.ID, map[string]any{
+		"code": "1000", "name": "Total Assets", "type": "asset", "is_active": false,
+	}, &version, actor); err != nil {
+		t.Fatalf("update Account: %v", err)
+	}
+	if err := SyncGLAccounts(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("second SyncGLAccounts: %v", err)
+	}
+
+	glAccounts := data.NewGLAccountRepo(tenantDB)
+	id, isActive, err := glAccounts.IDByCode(ctx, "1000")
+	if err != nil {
+		t.Fatalf("IDByCode: %v", err)
+	}
+	var name string
+	if err := tenantDB.QueryRowContext(ctx, `SELECT name FROM gl_accounts WHERE id = $1`, id).Scan(&name); err != nil {
+		t.Fatalf("read gl_account name: %v", err)
+	}
+	if name != "Total Assets" {
+		t.Fatalf("expected the renamed Account to propagate to gl_accounts, got name=%q", name)
+	}
+	if isActive {
+		t.Fatal("expected the deactivated Account to propagate to gl_accounts.is_active=false")
 	}
 }
