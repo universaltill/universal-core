@@ -32,6 +32,27 @@ important rule in this repo
   screen or API response goes into the Entity/Form Definition or the
   generator, never a one-off patch to generated output.
 
+## Plugin-first — core stays minimal
+The ERP core changes as little as possible. Settings/feature-level behavior
+that varies by tenant or jurisdiction is added via a plugin, not a core code
+change — a new tenant's country-specific behavior should never require
+touching this repo. Country/vertical-specific integrations (ERP connectors,
+e-invoicing, statutory reports) are ALWAYS a plugin, following the
+`ut-plugin-{type}-{name}` convention (unitill's plugin runtime, reused not
+duplicated).
+- **Tax calculation is the canonical example**: it differs per country, so
+  each tenant's tax rules/rates/jurisdiction logic are a plugin. The kernel
+  may host a generic, deterministic posting/ledger interface a tax plugin
+  calls into (see `internal/kernel/ledger` above) — but the actual tax
+  computation itself never lives in core.
+- Default new functionality to a plugin. Only put something in the kernel
+  when it's genuinely cross-cutting/deterministic and jurisdiction-
+  *invariant* (double-entry ledger posting mechanics, the metadata/workflow
+  runtime itself — see the kernel/deterministic-core boundary rule above).
+- If a feature needs something the plugin sandbox can't do yet, extend the
+  plugin platform (a guarded host function) rather than bypassing it into
+  core.
+
 ## Testing — near-100% coverage (non-negotiable)
 Every change — new feature, bug fix, or refactor — ships with tests at
 **every applicable layer**, not just the one that's easiest to write:
