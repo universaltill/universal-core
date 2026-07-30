@@ -12,14 +12,31 @@ import (
 	"time"
 )
 
-// ActorType distinguishes a human from an AI agent as the author of a
-// change. Never add a third bucket like "system" that hides which of the
-// two actually made the change.
+// ActorType records who authored a change.
+//
+// The original rule here was "never add a third bucket like system that
+// hides which of the two actually made the change". That rule is NARROWED
+// by ADR-0008, not discarded, and the danger it named is still real: a
+// `system` bucket becomes a laundry chute where a human approval or an
+// AI-drafted change gets recorded as "the system did it", destroying
+// exactly the accountability ADR-0001 §14 exists to preserve.
+//
+// The test for ActorSystem is therefore: did a person or a model cause
+// this change, however indirectly? If yes it is human or ai_agent, never
+// system. Publishing a scheduled workflow is a human act; only the
+// clock-driven firing is system.
 type ActorType string
 
 const (
 	ActorHuman ActorType = "human"
 	ActorAgent ActorType = "ai_agent"
+	// ActorSystem is the kernel acting on its own schedule — a scheduled
+	// workflow run (R18), not a person and not a model. Introduced rather
+	// than reusing one of the other two: `human` would invent someone who
+	// did not act and `ai_agent` would claim a model was involved, and an
+	// audit trail that misattributes an automated 3am run is worse than a
+	// third enum value. See migrations/tenant/0003_system_actor.sql.
+	ActorSystem ActorType = "system"
 )
 
 // Action is the kind of mutation being recorded.

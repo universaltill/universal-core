@@ -49,7 +49,19 @@ func NewWorkflowJobRepo(db *sql.DB) *WorkflowJobRepo {
 
 // Enqueue durably schedules a workflow run, starting at step 0. Defaults
 // MaxAttempts to 5 when unset.
+// EnqueueTx is Enqueue against a caller-supplied transaction. Scheduled
+// firing needs it: the job insert and the schedule's advance must commit
+// together, or a crash between them either loses the run or fires it
+// twice forever.
+func (r *WorkflowJobRepo) EnqueueTx(ctx context.Context, tx *sql.Tx, job WorkflowJob) (WorkflowJob, error) {
+	return r.enqueue(ctx, tx, job)
+}
+
 func (r *WorkflowJobRepo) Enqueue(ctx context.Context, job WorkflowJob) (WorkflowJob, error) {
+	return r.enqueue(ctx, r.db, job)
+}
+
+func (r *WorkflowJobRepo) enqueue(ctx context.Context, q querier, job WorkflowJob) (WorkflowJob, error) {
 	if job.MaxAttempts == 0 {
 		job.MaxAttempts = 5
 	}
@@ -57,13 +69,23 @@ func (r *WorkflowJobRepo) Enqueue(ctx context.Context, job WorkflowJob) (Workflo
 	if job.Actor.ModelVersion != "" {
 		modelVersion = job.Actor.ModelVersion
 	}
-	err := r.db.QueryRowContext(ctx,
+	// A scheduled run has no triggering record (R18). NULL rather than a
+	// placeholder: record_id is a UUID column, "" is not a UUID, and a
+	// synthetic one would look like a real record to every reader.
+	var entityType, recordID any
+	if job.EntityType != "" {
+		entityType = job.EntityType
+	}
+	if job.RecordID != "" {
+		recordID = job.RecordID
+	}
+	err := q.QueryRowContext(ctx,
 		`INSERT INTO workflow_jobs
 		 (workflow_name, workflow_version, entity_type, record_id,
 		  max_attempts, actor_type, actor_id, model_version)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		 RETURNING id, step_index, status, attempts, run_after`,
-		job.WorkflowName, job.WorkflowVersion, job.EntityType, job.RecordID,
+		job.WorkflowName, job.WorkflowVersion, entityType, recordID,
 		job.MaxAttempts, string(job.Actor.Type), job.Actor.ID, modelVersion,
 	).Scan(&job.ID, &job.StepIndex, &job.Status, &job.Attempts, &job.RunAfter)
 	if err != nil {
@@ -94,7 +116,7 @@ func (r *WorkflowJobRepo) ClaimNext(ctx context.Context) (WorkflowJob, error) {
 		 ORDER BY run_after
 		 FOR UPDATE SKIP LOCKED
 		 LIMIT 1`,
-	).Scan(&j.ID, &j.WorkflowName, &j.WorkflowVersion, &j.EntityType, &j.RecordID,
+	).Scan(&j.ID, &j.WorkflowName, &j.WorkflowVersion, &nullEntityType{&j.EntityType}, &nullEntityType{&j.RecordID},
 		&j.StepIndex, &j.Attempts, &j.MaxAttempts, &j.Actor.Type, &j.Actor.ID, &modelVersion)
 	if errors.Is(err, sql.ErrNoRows) {
 		return WorkflowJob{}, ErrNoJobAvailable
@@ -217,7 +239,7 @@ func (r *WorkflowJobRepo) Get(ctx context.Context, id string) (WorkflowJob, erro
 		        actor_type, actor_id, model_version
 		 FROM workflow_jobs WHERE id = $1`,
 		id,
-	).Scan(&j.ID, &j.WorkflowName, &j.WorkflowVersion, &j.EntityType, &j.RecordID,
+	).Scan(&j.ID, &j.WorkflowName, &j.WorkflowVersion, &nullEntityType{&j.EntityType}, &nullEntityType{&j.RecordID},
 		&j.StepIndex, &j.Status, &j.Attempts, &j.MaxAttempts, &lastError, &j.RunAfter,
 		&j.Actor.Type, &j.Actor.ID, &modelVersion)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -258,7 +280,7 @@ func (r *WorkflowJobRepo) ListByStatus(ctx context.Context, status string) ([]Wo
 	for rows.Next() {
 		var j WorkflowJob
 		var modelVersion, lastError sql.NullString
-		if err := rows.Scan(&j.ID, &j.WorkflowName, &j.WorkflowVersion, &j.EntityType, &j.RecordID,
+		if err := rows.Scan(&j.ID, &j.WorkflowName, &j.WorkflowVersion, &nullEntityType{&j.EntityType}, &nullEntityType{&j.RecordID},
 			&j.StepIndex, &j.Status, &j.Attempts, &j.MaxAttempts, &lastError, &j.RunAfter,
 			&j.Actor.Type, &j.Actor.ID, &modelVersion); err != nil {
 			return nil, fmt.Errorf("scan workflow job: %w", err)
@@ -345,4 +367,28 @@ func execRows(ctx context.Context, ex execer, query string, args ...any) (int64,
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// nullEntityType scans a nullable text/uuid column into a plain string,
+// mapping SQL NULL to "". Scheduled workflow runs (R18) have no
+// triggering record, so entity_type/record_id are NULL for them — see
+// migrations/tenant/0003_system_actor.sql. A plain *string cannot scan
+// NULL, and sql.NullString at every call site would push this detail
+// into every caller for a case only one of them cares about.
+type nullEntityType struct{ dst *string }
+
+func (n *nullEntityType) Scan(v any) error {
+	if v == nil {
+		*n.dst = ""
+		return nil
+	}
+	switch t := v.(type) {
+	case string:
+		*n.dst = t
+	case []byte:
+		*n.dst = string(t)
+	default:
+		return fmt.Errorf("cannot scan %T into a string column", v)
+	}
+	return nil
 }
