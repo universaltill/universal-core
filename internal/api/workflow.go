@@ -311,6 +311,35 @@ type workflowJobResponse struct {
 	RecordID        string `json:"record_id"`
 	StepIndex       int    `json:"step_index"`
 	Status          string `json:"status"`
+	// RequiredRole is the Role code this job's current require_approval step
+	// demands, empty when it names none (the "anyone may approve" default) or
+	// when the job is not waiting for approval at all. CanApprove is whether
+	// THIS caller could approve it right now.
+	//
+	// Both are omitempty so every existing client sees a byte-identical
+	// payload for the statuses it already queries — this is additive, not a
+	// wire-format change.
+	//
+	// Advisory, not a security boundary: the approve endpoint re-derives the
+	// same answer at click time and is what actually refuses. A client that
+	// ignored CanApprove entirely would be no more able to approve than
+	// before.
+	// Pointers, so the wire can express THREE states rather than two.
+	// Independent review proved the earlier value-typed version conflated
+	// them: a job whose definition could not be resolved looked byte-for-byte
+	// identical to a freely-approvable unrestricted one (both simply omitted
+	// the key), so a dashboard filtering on "no required role" would report a
+	// broken job — one that 500s for every caller who tries — as open work.
+	//
+	//	both nil              -> not applicable, or could not be resolved
+	//	required_role ""      -> unrestricted, anyone may approve
+	//	required_role "x"     -> gated on role "x"; can_approve says whether
+	//	                         THIS caller holds it
+	//
+	// Advisory, not a security boundary: the approve endpoint re-derives the
+	// same answer and is what actually refuses.
+	RequiredRole *string `json:"required_role,omitempty"`
+	CanApprove   *bool   `json:"can_approve,omitempty"`
 }
 
 // validWorkflowJobStatuses mirrors the CHECK constraint on
@@ -359,12 +388,59 @@ func (h *Handler) listWorkflowJobs(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, fmt.Sprintf("list workflow jobs with status %s", status), err)
 		return
 	}
+
+	// Role awareness is DESCRIBED, not enforced by filtering. An API client
+	// may legitimately want the whole queue — an ops dashboard counting what
+	// is pending should not silently under-report because the token it used
+	// happens to hold no roles. So every job is still returned; each one just
+	// says whether this caller could approve it, and what it needs.
+	//
+	// Only resolved for waiting_approval. A job in any other status is not
+	// sitting at a require_approval step, and asking approvalRoleFor about it
+	// would be asking a question with no meaningful answer (it would report
+	// the step-kind mismatch as an error).
+	var (
+		holds    map[string]bool
+		defCache map[string]*cachedWorkflowDef
+	)
+	if status == "waiting_approval" {
+		codes, err := foundation.RoleCodesForUser(r.Context(), ts.db, rc.Actor.ID)
+		if err != nil {
+			writeInternalError(w, fmt.Sprintf("resolve roles for user %s", rc.Actor.ID), err)
+			return
+		}
+		holds = make(map[string]bool, len(codes))
+		for _, c := range codes {
+			holds[c] = true
+		}
+		defCache = map[string]*cachedWorkflowDef{}
+	}
+
 	out := make([]workflowJobResponse, len(jobs))
 	for i, j := range jobs {
 		out[i] = workflowJobResponse{
 			ID: j.ID, WorkflowName: j.WorkflowName, WorkflowVersion: j.WorkflowVersion,
 			EntityType: j.EntityType, RecordID: j.RecordID, StepIndex: j.StepIndex, Status: j.Status,
 		}
+		if defCache == nil {
+			continue
+		}
+		// Same function the approve endpoint and the HTML inbox use, so all
+		// three surfaces cannot disagree about what a step requires.
+		requiredRole, err := approvalRoleFor(r.Context(), ts, j, defCache)
+		if err != nil {
+			// A job whose definition or step index will not resolve is a data
+			// problem, not this caller's fault. Report the job with BOTH
+			// fields nil rather than failing the whole listing: nil is the
+			// wire's "no verdict", distinct from an explicit false, so a
+			// client is never told it may act when the server could not
+			// decide — nor told it may not, which would be equally untrue.
+			log.Printf("api: list workflow jobs: resolve required role for job %s: %v", j.ID, err)
+			continue
+		}
+		canApprove := requiredRole == "" || holds[requiredRole]
+		out[i].RequiredRole = &requiredRole
+		out[i].CanApprove = &canApprove
 	}
 	httpx.WriteJSON(w, http.StatusOK, out)
 }
