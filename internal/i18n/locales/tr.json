@@ -275,5 +275,7 @@
   "field.FieldPermission.role_id": "Rol",
   "field.FieldPermission.entity_type": "Varlık türü",
   "field.FieldPermission.field_name": "Alan adı",
-  "field.FieldPermission.hidden": "Gizli"
+  "field.FieldPermission.hidden": "Gizli",
+  "error.access_denied.title": "Erişim reddedildi",
+  "error.access_denied.body": "Bu sayfayı görüntüleme izniniz yok. Erişime ihtiyacınız varsa kuruluşunuzdaki bir yöneticiden isteyin."
 }

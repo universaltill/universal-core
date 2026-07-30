@@ -56,6 +56,16 @@ func (h *Handler) importUploadPage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	locale := localeFromRequest(w, r)
+	// Same shell-leak this commit closes on /forms/{entityType}/new: the
+	// upload page makes no CRUD call of its own, so nothing else refuses
+	// it. Import is bulk record creation — gate it on write, and refuse
+	// here rather than letting a denied user upload and map a whole file
+	// only to have every row come back "access denied" at commit (which
+	// is what already happens, correctly, for anyone who gets past this).
+	allowed, err := ts.crud.CanWrite(r.Context(), entityType)
+	if !h.denyPageUnless(w, r, &rc, locale, allowed, err, "check write permission for "+entityType+" import page") {
+		return
+	}
 	// Rendered into a buffer first, not straight to w — this is a
 	// top-level page navigation, not an htmx-swap response, so it needs
 	// the real <html><head> shell that loads htmx.js (see layout.go);
@@ -119,6 +129,31 @@ func (h *Handler) importPreview(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeDefinitionLookupError(w, entityType, err)
 		return
+	}
+
+	// The mapping UI enumerates the Definition's fields as <select>
+	// options, so it is a field-METADATA surface like the list-page
+	// columns and the CSV export header — it does not inherit the guarded
+	// engine's row-level redaction and has to filter explicitly. Missed in
+	// the first draft of this commit and caught by independent review:
+	// every other such surface was filtered, and this one offered a
+	// hidden field as a mapping target, publishing its name to a user who
+	// cannot see it anywhere else in the app.
+	//
+	// Filtering the Definition here rather than the rendered options
+	// covers the whole downstream chain in one place — validation, the
+	// preview's own per-row results, and SuggestMappingAI, which would
+	// otherwise have sent the hidden field's name to the configured AI
+	// provider as part of its prompt.
+	redacted, err := ts.crud.HiddenFields(r.Context(), entityType)
+	if err != nil {
+		writeInternalError(w, fmt.Sprintf("resolve hidden fields for %s import preview", entityType), err)
+		return
+	}
+	if len(redacted) > 0 {
+		visible := *def
+		visible.Fields = visibleFields(def, redacted)
+		def = &visible
 	}
 
 	data, xlsx, ok := readUploadedFile(w, r)

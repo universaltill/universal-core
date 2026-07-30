@@ -54,6 +54,25 @@ func (h *Handler) exportRecordsCSV(w http.ResponseWriter, r *http.Request) {
 		writeCrudError(w, fmt.Sprintf("list %s records for export", entityType), err)
 		return
 	}
+	// A hidden field's VALUES are already stripped from records above by
+	// the guarded engine, but ExportCSV builds its header and column
+	// order from the Definition, so the column itself has to go too —
+	// otherwise the file names every field being withheld and pads it
+	// with blanks. Exported through a filtered copy of the Definition
+	// rather than a filtered result set, so header and cells can't drift
+	// apart. (A file produced this way still re-imports cleanly: the
+	// import wizard maps by header name, and a column that isn't there
+	// is simply a field the import doesn't set.)
+	redacted, err := ts.crud.HiddenFields(r.Context(), entityType)
+	if err != nil {
+		writeInternalError(w, fmt.Sprintf("resolve hidden fields for %s export", entityType), err)
+		return
+	}
+	if len(redacted) > 0 {
+		visible := *def
+		visible.Fields = visibleFields(def, redacted)
+		def = &visible
+	}
 	rows := make([]map[string]any, len(records))
 	for i, rec := range records {
 		rows[i] = rec.Data
