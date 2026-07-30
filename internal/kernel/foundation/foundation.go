@@ -551,6 +551,68 @@ func FieldPermission() *entity.Definition {
 	}
 }
 
+// Department is one node in a tenant's org-chart (Phase 2 of
+// `erp/BACKLOG-TASKS.md`, reference-data-model.md §7) — built as pure
+// org-structure data, deliberately with no Employee entity yet
+// (Employee/LeaveRequest/AttendanceRecord are a separate, later HR
+// task). This exists to give R17's future role/department-based
+// approval routing something to route against; it does not itself
+// implement routing.
+//
+// parent_department_id is a self-referencing FieldReference — the same
+// hierarchical-self-reference shape already proven end to end by
+// Account.parent_account_id (finance.go), not the two-party-join shape
+// PartyRelationship uses: reference-data-model.md's own field name for
+// Position ("reports_to_position_id", a singular FK) and every
+// hierarchy actually built in this kernel so far (Account, Task) use
+// this shape, so it's the one reused here despite the spec text's
+// "PartyRelationship pattern reused" wording, which predates Account's
+// hierarchy and reads as referring to the general pattern rather than
+// literally that entity.
+func Department() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "Department",
+		Version:    1,
+		Module:     "foundation",
+		Fields: []entity.Field{
+			{Name: "code", Type: entity.FieldString, Required: true},
+			{Name: "name", Type: entity.FieldString, Required: true},
+			{Name: "parent_department_id", Type: entity.FieldReference, Target: "Department"},
+		},
+	}
+}
+
+// Position is a role/seat within a Department's org-chart (reference-
+// data-model.md §7) — deliberately not the same thing as an Employee
+// (which occupies a Position, a later HR task): a Position can exist,
+// and sit in a reporting line, before anyone is assigned to it.
+//
+// department_id is NOT in reference-data-model.md's literal field list
+// (it puts department_id on the future Employee entity instead) and is
+// deliberately optional here rather than required, despite this
+// package's own doc comment on an earlier draft arguing the opposite —
+// independent review caught the real cost of requiring it: a
+// company-level/matrix position (e.g. CFO, reporting to no single
+// department) would have needed a synthetic root Department just to
+// satisfy the constraint, and once Employee actually lands, a required
+// Position.department_id would be a second, easily-diverging source of
+// truth alongside Employee's own department_id. Optional is the
+// reversible choice — reports_to_position_id is the same self-
+// referencing FieldReference shape as Department.parent_department_id
+// above.
+func Position() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "Position",
+		Version:    1,
+		Module:     "foundation",
+		Fields: []entity.Field{
+			{Name: "title", Type: entity.FieldString, Required: true},
+			{Name: "department_id", Type: entity.FieldReference, Target: "Department"},
+			{Name: "reports_to_position_id", Type: entity.FieldReference, Target: "Position"},
+		},
+	}
+}
+
 // All returns every foundation Definition — the set that must exist
 // before any operational module is enabled for a tenant.
 func All() []*entity.Definition {
@@ -574,5 +636,7 @@ func All() []*entity.Definition {
 		UserRole(),
 		Permission(),
 		FieldPermission(),
+		Department(),
+		Position(),
 	}
 }

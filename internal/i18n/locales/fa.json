@@ -100,6 +100,8 @@
   "entity.Period.name": "دوره",
   "entity.TaxCode.name": "کد مالیات",
   "entity.CostCenter.name": "مرکز هزینه",
+  "entity.Department.name": "بخش",
+  "entity.Position.name": "سمت",
   "module.finance.name": "مالی",
   "module.sales.name": "فروش",
   "module.manufacturing.name": "تولید",
@@ -276,6 +278,12 @@
   "field.FieldPermission.entity_type": "نوع موجودیت",
   "field.FieldPermission.field_name": "نام فیلد",
   "field.FieldPermission.hidden": "پنهان",
+  "field.Department.code": "کد",
+  "field.Department.name": "نام",
+  "field.Department.parent_department_id": "بخش والد",
+  "field.Position.title": "عنوان",
+  "field.Position.department_id": "بخش",
+  "field.Position.reports_to_position_id": "گزارش‌دهی به",
   "error.access_denied.title": "دسترسی رد شد",
   "error.access_denied.body": "شما اجازهٔ مشاهدهٔ این صفحه را ندارید. اگر به دسترسی نیاز دارید، از یکی از مدیران سازمان خود درخواست کنید."
 }

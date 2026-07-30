@@ -99,6 +99,49 @@ func AllForms() []*form.Definition {
 		ExchangeRateForm(), StatusTypeForm(), StatusForm(), StatusTransitionForm(),
 		RoleForm(), UserRoleForm(),
 		PermissionForm(), FieldPermissionForm(),
+		DepartmentForm(), PositionForm(),
+	}
+}
+
+func DepartmentForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "Department",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Details",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "code", Label: "Code"},
+					{Name: "name", Label: "Name"},
+					{Name: "parent_department_id", Label: "Parent Department"},
+				},
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
+	}
+}
+
+func PositionForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "Position",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Details",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "title", Label: "Title"},
+					{Name: "department_id", Label: "Department"},
+					{Name: "reports_to_position_id", Label: "Reports To"},
+				},
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
 	}
 }
 

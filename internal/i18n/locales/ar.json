@@ -100,6 +100,8 @@
   "entity.Period.name": "الفترة",
   "entity.TaxCode.name": "رمز الضريبة",
   "entity.CostCenter.name": "مركز التكلفة",
+  "entity.Department.name": "القسم",
+  "entity.Position.name": "المنصب",
   "module.finance.name": "المالية",
   "module.sales.name": "المبيعات",
   "module.manufacturing.name": "التصنيع",
@@ -276,6 +278,12 @@
   "field.FieldPermission.entity_type": "نوع الكيان",
   "field.FieldPermission.field_name": "اسم الحقل",
   "field.FieldPermission.hidden": "مخفي",
+  "field.Department.code": "الرمز",
+  "field.Department.name": "الاسم",
+  "field.Department.parent_department_id": "القسم الأصل",
+  "field.Position.title": "المسمى الوظيفي",
+  "field.Position.department_id": "القسم",
+  "field.Position.reports_to_position_id": "يتبع إلى",
   "error.access_denied.title": "تم رفض الوصول",
   "error.access_denied.body": "ليس لديك إذن لعرض هذه الصفحة. إذا كنت بحاجة إلى الوصول، اطلب ذلك من مسؤول في مؤسستك."
 }
