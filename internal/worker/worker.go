@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/universaltill/universal-core/internal/data"
+	"github.com/universaltill/universal-core/internal/kernel/audit"
 	"github.com/universaltill/universal-core/internal/kernel/workflow"
 	"github.com/universaltill/universal-core/internal/tenantdb"
 )
@@ -158,6 +159,28 @@ func (r *Runner) tick(ctx context.Context) {
 // poll just because PollInterval is coarse. Scoped to one tenant's own
 // queue; see tick for the fan-out across every tenant.
 func (r *Runner) tickTenant(ctx context.Context, tenantID string, q *workflow.Queue, lookup workflow.DefinitionLookup) {
+	// Scheduled workflows (R18) become ordinary queued jobs BEFORE this
+	// tick drains the queue, so a schedule that comes due runs in the
+	// same tick rather than waiting for the next one.
+	//
+	// Failures here are logged, not fatal: a broken schedule table must
+	// not stop event-triggered jobs — which are the ones a user is
+	// actually waiting on — from being processed.
+	if db, err := r.router.Get(ctx, tenantID); err != nil {
+		log.Printf("worker: tenant %s: resolve db for scheduling: %v", tenantID, err)
+	} else {
+		sched := workflow.NewScheduler(db)
+		now := time.Now().UTC()
+		if err := sched.Sync(ctx, now); err != nil {
+			log.Printf("worker: tenant %s: sync workflow schedules: %v", tenantID, err)
+		}
+		if fired, err := sched.FireDue(ctx, now, schedulerActor()); err != nil {
+			log.Printf("worker: tenant %s: fire due schedules: %v", tenantID, err)
+		} else if len(fired) > 0 {
+			log.Printf("worker: tenant %s: fired %d scheduled workflow(s): %v", tenantID, len(fired), fired)
+		}
+	}
+
 	if reclaimed, err := q.ReclaimStale(ctx, r.cfg.LeaseTimeout); err != nil {
 		log.Printf("worker: tenant %s: reclaim stale jobs: %v", tenantID, err)
 	} else if len(reclaimed) > 0 {
@@ -189,4 +212,13 @@ func (r *Runner) tickTenant(ctx context.Context, tenantID string, q *workflow.Qu
 		log.Printf("worker: tenant %s: processed job %s (%s v%d, entity %s/%s) -> step %d",
 			tenantID, job.ID, job.WorkflowName, job.WorkflowVersion, job.EntityType, job.RecordID, job.StepIndex)
 	}
+}
+
+// schedulerActor is the audit identity a scheduled run is attributed to.
+// Explicitly a system actor rather than borrowing whoever last published
+// the workflow: nobody clicked anything, and attributing an automated
+// 3am run to a real person makes the audit trail lie about who acted
+// (ADR-0001 §14 — actor identity is first-class, not decoration).
+func schedulerActor() audit.Actor {
+	return audit.Actor{Type: audit.ActorSystem, ID: "workflow-scheduler"}
 }

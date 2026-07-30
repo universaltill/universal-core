@@ -565,3 +565,76 @@ func TestRunner_RunConcurrent_ReturnsImmediatelyAndSpawnsPollers(t *testing.T) {
 		t.Fatal("expected at least one spawned poller to actually process the enqueued job")
 	}
 }
+
+// TestRunner_FiresScheduledWorkflowEndToEnd covers the wiring the two
+// package-level test suites each miss: internal/kernel/workflow proves a
+// schedule fires into the queue, and this package proves the queue
+// drains, but nothing proved tickTenant actually connects them. A bug
+// between "fired" and "drained" would have passed both.
+func TestRunner_FiresScheduledWorkflowEndToEnd(t *testing.T) {
+	router, control := newTestRouter(t)
+	_, tenantDB := newTestTenant(t, router)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Every minute, so it is due almost immediately without the test
+	// having to manipulate time.
+	def := &workflow.Definition{
+		Name: "scheduled_smoke", Version: 1,
+		Trigger: workflow.Trigger{Type: workflow.TriggerScheduled, Cron: "* * * * *"},
+		Steps:   []workflow.Step{{Kind: workflow.StepNotify}},
+	}
+	publish(t, tenantDB, def, humanActor())
+
+	processed := make(chan data.WorkflowJob, 4)
+	r := New(router, control, map[workflow.StepKind]workflow.StepHandler{
+		workflow.StepNotify: func(_ context.Context, job data.WorkflowJob, _ workflow.Step) error {
+			processed <- job
+			return nil
+		},
+	}, fastTestConfig())
+
+	stop := startRunner(r, ctx)
+	defer func() { cancel(); stop() }()
+
+	// Wait for Sync to register the schedule, then force it due. "* * * * *"
+	// alone would mean waiting up to a full minute for the next boundary —
+	// this asserts the WIRING (Sync -> FireDue -> ProcessOne), not the clock.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var n int
+		if err := tenantDB.QueryRowContext(ctx, `SELECT count(*) FROM workflow_schedules`).Scan(&n); err != nil {
+			t.Fatalf("count schedules: %v", err)
+		}
+		if n > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("tickTenant never registered the schedule — Sync is not wired in")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if _, err := tenantDB.ExecContext(ctx,
+		`UPDATE workflow_schedules SET next_due_at = now() - interval '1 minute'`); err != nil {
+		t.Fatalf("force due: %v", err)
+	}
+
+	select {
+	case job := <-processed:
+		if job.WorkflowName != "scheduled_smoke" {
+			t.Fatalf("processed the wrong workflow: %s", job.WorkflowName)
+		}
+		// A scheduled run is not about a record, and must say so rather
+		// than carrying a placeholder that looks real.
+		if job.EntityType != "" || job.RecordID != "" {
+			t.Fatalf("a scheduled run should carry no entity/record, got %q/%q", job.EntityType, job.RecordID)
+		}
+		// And is attributed to the system actor, not a person who was
+		// asleep (ADR-0008).
+		if job.Actor.Type != audit.ActorSystem {
+			t.Fatalf("scheduled run attributed to %q, want the system actor", job.Actor.Type)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("the worker never fired and processed a due scheduled workflow — FireDue is not wired into tickTenant")
+	}
+}
