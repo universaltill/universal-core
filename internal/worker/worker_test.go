@@ -138,7 +138,7 @@ func publish(t *testing.T, tenantDB *sql.DB, def *workflow.Definition, actor aud
 // fastTestConfig polls aggressively so tests don't wait a real
 // PollInterval-scale amount of wall-clock time.
 func fastTestConfig() Config {
-	return Config{PollInterval: 20 * time.Millisecond, LeaseTimeout: 200 * time.Millisecond, Concurrency: 1}
+	return Config{PollInterval: 20 * time.Millisecond, LeaseTimeout: 200 * time.Millisecond, Concurrency: 1, ScheduleSyncInterval: 20 * time.Millisecond}
 }
 
 // startRunner runs r.Run(ctx) in the background and returns a function
