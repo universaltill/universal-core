@@ -474,14 +474,29 @@ func Role() *entity.Definition {
 // identifier as `audit.Actor.ID` on every authenticated request
 // (`internal/webauth/bridge.go`), so UserRole reuses it directly rather
 // than inventing a second identity concept.
+//
+// department_id (v2, optional) scopes a grant to one Department — e.g.
+// "Finance Manager, but only within the Sales department" — for R17's
+// department-based approval routing (`erp/BACKLOG-TASKS.md` Phase 2).
+// Optional and nil-means-global by design, same reversible choice as
+// Position.department_id above and for the same reason: a company-wide
+// grant (e.g. a tenant-wide "Admin" role) shouldn't need a synthetic
+// root Department to stay ungated. Deliberately NOT wired into anything
+// yet: this ships the scoping data + a resolver
+// (RoleCodesForUserInDepartment, roles.go); resolving *which* department
+// a given approval request belongs to (the other half of R17's routing)
+// is separate, still-open work blocked on either Employee.department_id
+// (Phase 6, not started) or a new department field on trigger entities
+// like PurchaseOrder — see BACKLOG-TASKS.md's note on this task.
 func UserRole() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "UserRole",
-		Version:    1,
+		Version:    2,
 		Module:     "foundation",
 		Fields: []entity.Field{
 			{Name: "user_id", Type: entity.FieldString, Required: true},
 			{Name: "role_id", Type: entity.FieldReference, Required: true, Target: "Role"},
+			{Name: "department_id", Type: entity.FieldReference, Target: "Department"},
 		},
 	}
 }

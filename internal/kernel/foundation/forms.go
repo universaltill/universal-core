@@ -210,6 +210,16 @@ func RoleForm() *form.Definition {
 	}
 }
 
+// UserRoleForm deliberately does NOT surface department_id (v2 on the
+// entity, see UserRole's own doc comment) yet, even though the field is
+// real and already validates/persists — found by independent review:
+// exposing it as an editable picker here, before
+// internal/kernel/authz.loadRoles reads DepartmentID at all, would let
+// a tenant admin author "Finance Manager, Sales only" and believe it's
+// enforced when authorization silently ignores the scope entirely
+// (worse for department-scoping a tenant_admin grant, which would still
+// resolve to full unrestricted admin). Add this field to the form in
+// the same change that wires DepartmentID into enforcement, not before.
 func UserRoleForm() *form.Definition {
 	return &form.Definition{
 		EntityType: "UserRole",
