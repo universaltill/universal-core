@@ -288,5 +288,6 @@
   "error.access_denied.body": "شما اجازهٔ مشاهدهٔ این صفحه را ندارید. اگر به دسترسی نیاز دارید، از یکی از مدیران سازمان خود درخواست کنید.",
   "workflow_inbox.column_action": "اقدام",
   "workflow_inbox.requires_role": "نیازمند نقش {role}",
-  "workflow_inbox.unavailable": "در دسترس نیست"
+  "workflow_inbox.unavailable": "در دسترس نیست",
+  "workflow_inbox.requires_role_in_department": "نیازمند نقش {role} در بخش این رکورد"
 }

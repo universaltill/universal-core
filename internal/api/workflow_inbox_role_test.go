@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"github.com/universaltill/universal-core/internal/kernel/crud"
+	"github.com/universaltill/universal-core/internal/kernel/entity"
+	"github.com/universaltill/universal-core/internal/kernel/form"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
 	"github.com/universaltill/universal-core/internal/kernel/workflow"
 )
@@ -338,5 +340,237 @@ func TestAPI_ListWorkflowJobs_NonApprovalStatusUnchanged(t *testing.T) {
 	// clients see a byte-identical payload.
 	if strings.Contains(rec.Body.String(), "required_role") || strings.Contains(rec.Body.String(), "can_approve") {
 		t.Fatalf("non-approval statuses should carry neither field: %s", rec.Body.String())
+	}
+}
+
+// Department-scoped approval routing (R17, #4): a require_approval step
+// can demand a role held IN the triggering record's own department, not
+// any department. This drives the whole path — the record carries a
+// department_id, the step names that field, and only the approver granted
+// the role FOR that department may act.
+func TestAPI_DepartmentScopedApproval(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := foundation.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	// An entity whose records carry a department_id to route on.
+	entDef := &entity.Definition{
+		EntityType: "Requisition", Version: 1, Module: "foundation",
+		Fields: []entity.Field{
+			{Name: "title", Type: entity.FieldString, Required: true},
+			{Name: "department_id", Type: entity.FieldString},
+		},
+	}
+	formDef := &form.Definition{
+		EntityType: "Requisition", Version: 1,
+		Sections: []form.Section{{Title: "D", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "title"}, {Name: "department_id"}}}},
+	}
+	publishEntityAndForm(t, db, entDef, formDef)
+
+	eng := crud.NewEngine(db)
+	fin, err := eng.Create(ctx, foundation.Role(), map[string]any{"code": "finance_manager", "name": "FM"}, humanActor())
+	if err != nil {
+		t.Fatalf("role: %v", err)
+	}
+	// user-a holds finance_manager in dept-A; user-b in dept-B.
+	for _, g := range []struct{ user, dept string }{{"user-a", "dept-A"}, {"user-b", "dept-B"}} {
+		if _, err := eng.Create(ctx, foundation.UserRole(),
+			map[string]any{"user_id": g.user, "role_id": fin.ID, "department_id": g.dept}, humanActor()); err != nil {
+			t.Fatalf("grant %s: %v", g.user, err)
+		}
+	}
+
+	// The record being approved belongs to dept-A.
+	rec, err := eng.Create(ctx, entDef, map[string]any{"title": "New laptop", "department_id": "dept-A"}, humanActor())
+	if err != nil {
+		t.Fatalf("record: %v", err)
+	}
+
+	def := &workflow.Definition{
+		Name: "req_approval", Version: 1,
+		Trigger: workflow.Trigger{Type: workflow.TriggerManual},
+		Steps: []workflow.Step{{Kind: workflow.StepRequireApproval,
+			Params: map[string]any{"role": "finance_manager", "department": "department_id"}}},
+	}
+	publishWorkflow(t, db, def)
+
+	q, err := workflow.NewQueue(db, nil)
+	if err != nil {
+		t.Fatalf("queue: %v", err)
+	}
+	if _, err := q.Enqueue(ctx, def, "Requisition", rec.ID, humanActor()); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if _, err := q.ProcessOne(ctx, workflow.RegistryDefinitionLookup(db)); err != nil {
+		t.Fatalf("process: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+	jobs, _ := q.ListByStatus(ctx, "waiting_approval")
+	if len(jobs) != 1 {
+		t.Fatalf("expected 1 waiting job, got %d", len(jobs))
+	}
+	jobID := jobs[0].ID
+
+	approve := func(actor string) int {
+		req := newRequest("POST", "/api/workflow-jobs/"+jobID+"/approve", tenantID, actor, nil)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		return w.Code
+	}
+
+	// user-b holds finance_manager, but in the WRONG department — denied.
+	if code := approve("user-b"); code != http.StatusForbidden {
+		t.Fatalf("user-b (finance_manager in dept-B) approving a dept-A record: expected 403, got %d", code)
+	}
+	// A user with the role in NO department — denied.
+	if code := approve("user-nobody"); code != http.StatusForbidden {
+		t.Fatalf("user with no grant: expected 403, got %d", code)
+	}
+	// user-a holds it in dept-A, the record's department — allowed.
+	if code := approve("user-a"); code != http.StatusOK {
+		t.Fatalf("user-a (finance_manager in dept-A) approving a dept-A record: expected 200, got %d", code)
+	}
+}
+
+// A record with no value in the routing field routes to NOBODY, not to
+// everyone — an unset department must never fail open.
+func TestAPI_DepartmentScopedApproval_UnsetFieldRoutesToNobody(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := foundation.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	entDef := &entity.Definition{
+		EntityType: "Requisition", Version: 1, Module: "foundation",
+		Fields: []entity.Field{{Name: "title", Type: entity.FieldString, Required: true},
+			{Name: "department_id", Type: entity.FieldString}},
+	}
+	formDef := &form.Definition{EntityType: "Requisition", Version: 1,
+		Sections: []form.Section{{Title: "D", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "title"}, {Name: "department_id"}}}}}
+	publishEntityAndForm(t, db, entDef, formDef)
+
+	eng := crud.NewEngine(db)
+	fin, _ := eng.Create(ctx, foundation.Role(), map[string]any{"code": "finance_manager", "name": "FM"}, humanActor())
+	if _, err := eng.Create(ctx, foundation.UserRole(),
+		map[string]any{"user_id": "user-a", "role_id": fin.ID, "department_id": "dept-A"}, humanActor()); err != nil {
+		t.Fatalf("grant: %v", err)
+	}
+	// Record with NO department_id.
+	rec, _ := eng.Create(ctx, entDef, map[string]any{"title": "unrouted"}, humanActor())
+
+	def := &workflow.Definition{Name: "req_approval2", Version: 1,
+		Trigger: workflow.Trigger{Type: workflow.TriggerManual},
+		Steps: []workflow.Step{{Kind: workflow.StepRequireApproval,
+			Params: map[string]any{"role": "finance_manager", "department": "department_id"}}}}
+	publishWorkflow(t, db, def)
+	q, _ := workflow.NewQueue(db, nil)
+	if _, err := q.Enqueue(ctx, def, "Requisition", rec.ID, humanActor()); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if _, err := q.ProcessOne(ctx, workflow.RegistryDefinitionLookup(db)); err != nil {
+		t.Fatalf("process: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+	jobs, _ := q.ListByStatus(ctx, "waiting_approval")
+	req := newRequest("POST", "/api/workflow-jobs/"+jobs[0].ID+"/approve", tenantID, "user-a", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	// Even the correctly-graded user cannot approve: the record routes to
+	// no department, so it routes to nobody. Fail closed.
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("a record with no routing department must route to nobody, got %d", w.Code)
+	}
+}
+
+// The inbox and JSON API must reflect department scoping too, not just the
+// approve endpoint — all three go through userMeetsApproval, and this
+// pins that they agree for the department case (review finding #2).
+func TestAPI_DepartmentScoped_InboxAndListAgree(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := foundation.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	entDef := &entity.Definition{
+		EntityType: "Requisition", Version: 1, Module: "foundation",
+		Fields: []entity.Field{{Name: "title", Type: entity.FieldString, Required: true},
+			{Name: "department_id", Type: entity.FieldString}},
+	}
+	formDef := &form.Definition{EntityType: "Requisition", Version: 1,
+		Sections: []form.Section{{Title: "D", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "title"}, {Name: "department_id"}}}}}
+	publishEntityAndForm(t, db, entDef, formDef)
+
+	eng := crud.NewEngine(db)
+	fin, _ := eng.Create(ctx, foundation.Role(), map[string]any{"code": "finance_manager", "name": "FM"}, humanActor())
+	if _, err := eng.Create(ctx, foundation.UserRole(),
+		map[string]any{"user_id": "user-a", "role_id": fin.ID, "department_id": "dept-A"}, humanActor()); err != nil {
+		t.Fatalf("grant a: %v", err)
+	}
+	if _, err := eng.Create(ctx, foundation.UserRole(),
+		map[string]any{"user_id": "user-b", "role_id": fin.ID, "department_id": "dept-B"}, humanActor()); err != nil {
+		t.Fatalf("grant b: %v", err)
+	}
+	rec, _ := eng.Create(ctx, entDef, map[string]any{"title": "x", "department_id": "dept-A"}, humanActor())
+
+	def := &workflow.Definition{Name: "req_ia", Version: 1,
+		Trigger: workflow.Trigger{Type: workflow.TriggerManual},
+		Steps: []workflow.Step{{Kind: workflow.StepRequireApproval,
+			Params: map[string]any{"role": "finance_manager", "department": "department_id"}}}}
+	publishWorkflow(t, db, def)
+	q, _ := workflow.NewQueue(db, nil)
+	if _, err := q.Enqueue(ctx, def, "Requisition", rec.ID, humanActor()); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if _, err := q.ProcessOne(ctx, workflow.RegistryDefinitionLookup(db)); err != nil {
+		t.Fatalf("process: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	// user-a (dept-A, the record's dept): JSON says can_approve, inbox
+	// shows a button.
+	var envA struct {
+		Data []workflowJobResponse `json:"data"`
+	}
+	recA := getAs(t, mux, "/api/workflow-jobs?status=waiting_approval", tenantID, "user-a")
+	_ = json.Unmarshal(recA.Body.Bytes(), &envA)
+	if len(envA.Data) != 1 || envA.Data[0].CanApprove == nil || !*envA.Data[0].CanApprove {
+		t.Fatalf("user-a JSON can_approve should be true, got %+v", envA.Data)
+	}
+	inboxA := getAs(t, mux, "/workflow-jobs", tenantID, "user-a").Body.String()
+	if !strings.Contains(inboxA, "hx-post=") {
+		t.Fatal("user-a inbox should offer an Approve button")
+	}
+
+	// user-b (dept-B, wrong dept): JSON says cannot, inbox shows no button.
+	var envB struct {
+		Data []workflowJobResponse `json:"data"`
+	}
+	recB := getAs(t, mux, "/api/workflow-jobs?status=waiting_approval", tenantID, "user-b")
+	_ = json.Unmarshal(recB.Body.Bytes(), &envB)
+	if len(envB.Data) != 1 || envB.Data[0].CanApprove == nil || *envB.Data[0].CanApprove {
+		t.Fatalf("user-b JSON can_approve should be false, got %+v", envB.Data)
+	}
+	inboxB := getAs(t, mux, "/workflow-jobs", tenantID, "user-b").Body.String()
+	if strings.Contains(inboxB, "hx-post=") {
+		t.Fatal("user-b inbox must NOT offer an Approve button (wrong department)")
+	}
+	if !strings.Contains(inboxB, "uc-inbox-blocked") {
+		t.Fatal("user-b inbox should explain why it's blocked")
 	}
 }

@@ -288,5 +288,6 @@
   "error.access_denied.body": "ليس لديك إذن لعرض هذه الصفحة. إذا كنت بحاجة إلى الوصول، اطلب ذلك من مسؤول في مؤسستك.",
   "workflow_inbox.column_action": "الإجراء",
   "workflow_inbox.requires_role": "يتطلب دور {role}",
-  "workflow_inbox.unavailable": "غير متاح"
+  "workflow_inbox.unavailable": "غير متاح",
+  "workflow_inbox.requires_role_in_department": "يتطلب دور {role} في قسم هذا السجل"
 }
