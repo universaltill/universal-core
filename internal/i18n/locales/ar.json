@@ -267,5 +267,13 @@
   "field.CostCenter.name": "الاسم",
   "field.CostCenter.type": "النوع",
   "toast.error_fallback": "حدث خطأ ما. يرجى المحاولة مرة أخرى.",
-  "toast.network_error": "تعذر الوصول إلى الخادم. تحقق من اتصالك وحاول مرة أخرى."
+  "toast.network_error": "تعذر الوصول إلى الخادم. تحقق من اتصالك وحاول مرة أخرى.",
+  "field.Permission.role_id": "الدور",
+  "field.Permission.entity_type": "نوع الكيان",
+  "field.Permission.can_read": "يمكنه القراءة",
+  "field.Permission.can_write": "يمكنه الكتابة",
+  "field.FieldPermission.role_id": "الدور",
+  "field.FieldPermission.entity_type": "نوع الكيان",
+  "field.FieldPermission.field_name": "اسم الحقل",
+  "field.FieldPermission.hidden": "مخفي"
 }

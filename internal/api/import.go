@@ -43,7 +43,7 @@ func (h *Handler) importUploadPage(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	ts, err := h.scope(r.Context(), rc.TenantID)
+	ts, err := h.scope(r.Context(), rc)
 	if err != nil {
 		writeInternalError(w, "resolve tenant scope", err)
 		return
@@ -107,7 +107,7 @@ func (h *Handler) importPreview(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	ts, err := h.scope(r.Context(), rc.TenantID)
+	ts, err := h.scope(r.Context(), rc)
 	if err != nil {
 		writeInternalError(w, "resolve tenant scope", err)
 		return
@@ -169,7 +169,7 @@ func (h *Handler) importCommit(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	ts, err := h.scope(r.Context(), rc.TenantID)
+	ts, err := h.scope(r.Context(), rc)
 	if err != nil {
 		writeInternalError(w, "resolve tenant scope", err)
 		return

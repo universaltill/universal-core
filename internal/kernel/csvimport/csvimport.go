@@ -37,8 +37,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
-	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 )
 
@@ -137,6 +137,15 @@ func preview(r io.Reader, read reader, def *entity.Definition, mapping ColumnMap
 	return results, nil
 }
 
+// RecordCreator is the one engine capability this package needs —
+// satisfied by both the raw *crud.Engine (system callers) and
+// internal/kernel/authz's RBAC-guarded engine (the import HTTP route,
+// which is a user-driven write path and must be permission-checked like
+// any other write — ADR-0006).
+type RecordCreator interface {
+	Create(ctx context.Context, def *entity.Definition, fields map[string]any, actor audit.Actor) (data.Record, error)
+}
+
 // Commit previews the same way Preview does, then writes every row that
 // passed validation via engine — atomically per row (crud.Engine.Create
 // already writes the record and its audit entry together, one
@@ -144,17 +153,17 @@ func preview(r io.Reader, read reader, def *entity.Definition, mapping ColumnMap
 // its RowResult carries the validation error instead of a RecordID and
 // doesn't block the rows around it, so a batch of 500 rows with 3 bad
 // ones still imports the other 497.
-func Commit(ctx context.Context, r io.Reader, def *entity.Definition, mapping ColumnMapping, engine *crud.Engine, actor audit.Actor) ([]RowResult, error) {
+func Commit(ctx context.Context, r io.Reader, def *entity.Definition, mapping ColumnMapping, engine RecordCreator, actor audit.Actor) ([]RowResult, error) {
 	return commit(ctx, r, readCSV, def, mapping, engine, actor)
 }
 
 // CommitXLSX is Commit for an .xlsx file's first worksheet instead of a
 // CSV file.
-func CommitXLSX(ctx context.Context, r io.Reader, def *entity.Definition, mapping ColumnMapping, engine *crud.Engine, actor audit.Actor) ([]RowResult, error) {
+func CommitXLSX(ctx context.Context, r io.Reader, def *entity.Definition, mapping ColumnMapping, engine RecordCreator, actor audit.Actor) ([]RowResult, error) {
 	return commit(ctx, r, readXLSX, def, mapping, engine, actor)
 }
 
-func commit(ctx context.Context, r io.Reader, read reader, def *entity.Definition, mapping ColumnMapping, engine *crud.Engine, actor audit.Actor) ([]RowResult, error) {
+func commit(ctx context.Context, r io.Reader, read reader, def *entity.Definition, mapping ColumnMapping, engine RecordCreator, actor audit.Actor) ([]RowResult, error) {
 	results, err := preview(r, read, def, mapping)
 	if err != nil {
 		return nil, err

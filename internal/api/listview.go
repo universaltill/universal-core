@@ -41,7 +41,7 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	ts, err := h.scope(r.Context(), rc.TenantID)
+	ts, err := h.scope(r.Context(), rc)
 	if err != nil {
 		writeInternalError(w, "resolve tenant scope", err)
 		return
@@ -57,7 +57,7 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 
 	total, err := ts.crud.Count(r.Context(), def)
 	if err != nil {
-		writeInternalError(w, fmt.Sprintf("count %s records for list page", entityType), err)
+		writeCrudError(w, fmt.Sprintf("count %s records for list page", entityType), err)
 		return
 	}
 	totalPages := (total + listPageSize - 1) / listPageSize
@@ -73,7 +73,7 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 	}
 	records, err := ts.crud.ListPage(r.Context(), def, listPageSize, (page-1)*listPageSize)
 	if err != nil {
-		writeInternalError(w, fmt.Sprintf("list %s records for list page", entityType), err)
+		writeCrudError(w, fmt.Sprintf("list %s records for list page", entityType), err)
 		return
 	}
 

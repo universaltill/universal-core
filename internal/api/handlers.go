@@ -25,6 +25,7 @@ import (
 	"github.com/universaltill/universal-core/internal/httpx"
 	"github.com/universaltill/universal-core/internal/i18n"
 	"github.com/universaltill/universal-core/internal/kernel/aiassist"
+	"github.com/universaltill/universal-core/internal/kernel/authz"
 	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/csvimport"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
@@ -129,20 +130,29 @@ func New(router *tenantdb.Router, catalog *i18n.Catalog, auth *webauth.Authentic
 // router.Get's own cache lookup), so building one per request is not a
 // performance concern.
 type tenantScope struct {
-	db            *sql.DB
-	entityDefs    *data.EntityDefinitionRepo
-	formDefs      *data.FormDefinitionRepo
-	workflowDefs  *data.WorkflowDefinitionRepo
-	crud          *crud.Engine
+	db           *sql.DB
+	entityDefs   *data.EntityDefinitionRepo
+	formDefs     *data.FormDefinitionRepo
+	workflowDefs *data.WorkflowDefinitionRepo
+	// crud is the RBAC-guarded engine (ADR-0006): every handler CRUD
+	// call goes through authz.GuardedEngine's read/write checks
+	// structurally, so no individual handler carries (or can forget) a
+	// permission check. System paths that must not be subject to a
+	// user's permissions (workflow steps, seeding, provisioning) don't
+	// run through tenantScope at all — they build their own raw
+	// crud.Engine.
+	crud          *authz.GuardedEngine
 	workflowQueue *workflow.Queue
 	reporting     *data.ReportingRepo
 }
 
-// scope resolves tenantID's own database via h.router and builds a
+// scope resolves rc's tenant database via h.router and builds a
 // tenantScope against it. Every request handler calls this immediately
-// after requestContext.
-func (h *Handler) scope(ctx context.Context, tenantID string) (tenantScope, error) {
-	db, err := h.router.Get(ctx, tenantID)
+// after requestContext. It takes the full RequestContext, not just the
+// tenant id, because the CRUD engine it hands back is guarded per-actor
+// (ADR-0006) — who is asking is part of the scope now.
+func (h *Handler) scope(ctx context.Context, rc httpx.RequestContext) (tenantScope, error) {
+	db, err := h.router.Get(ctx, rc.TenantID)
 	if err != nil {
 		return tenantScope{}, fmt.Errorf("resolve tenant database: %w", err)
 	}
@@ -167,13 +177,14 @@ func (h *Handler) scope(ctx context.Context, tenantID string) (tenantScope, erro
 	for _, hr := range h.hooks {
 		engine.SetHook(hr.entityType, hr.hook)
 	}
+	guarded := authz.Guard(engine, authz.NewResolver(db, rc.Actor, rc.Machine))
 
 	return tenantScope{
 		db:            db,
 		entityDefs:    data.NewEntityDefinitionRepo(db),
 		formDefs:      data.NewFormDefinitionRepo(db),
 		workflowDefs:  data.NewWorkflowDefinitionRepo(db),
-		crud:          engine,
+		crud:          guarded,
 		workflowQueue: workflowQueue,
 		reporting:     data.NewReportingRepo(db),
 	}, nil
@@ -325,6 +336,21 @@ func writeInternalError(w http.ResponseWriter, logContext string, err error) {
 	httpx.WriteError(w, http.StatusInternalServerError, "internal error")
 }
 
+// writeCrudError is writeInternalError for errors coming back from a
+// guarded CRUD call (tenantScope.crud): an RBAC denial (ADR-0006) is
+// the requester's 403, not a server fault — mapped via the same
+// errors.Is convention crud.ErrInvalidTransition already uses for 400.
+// The response body stays a fixed string (like every API-level error
+// here); the localized denial surface on rendered pages is the
+// field-level enforcement commit's work, alongside menu filtering.
+func writeCrudError(w http.ResponseWriter, logContext string, err error) {
+	if errors.Is(err, authz.ErrDenied) {
+		httpx.WriteError(w, http.StatusForbidden, "access denied")
+		return
+	}
+	writeInternalError(w, logContext, err)
+}
+
 // idPattern matches the shape records.id/tenants.id actually are
 // (Postgres gen_random_uuid()). Rejecting a malformed id here means a
 // client typo becomes a clean 400 before ever reaching a query, instead
@@ -339,7 +365,7 @@ func (h *Handler) listRecords(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	ts, err := h.scope(r.Context(), rc.TenantID)
+	ts, err := h.scope(r.Context(), rc)
 	if err != nil {
 		writeInternalError(w, "resolve tenant scope", err)
 		return
@@ -353,7 +379,7 @@ func (h *Handler) listRecords(w http.ResponseWriter, r *http.Request) {
 	}
 	records, err := ts.crud.List(r.Context(), def)
 	if err != nil {
-		writeInternalError(w, fmt.Sprintf("list %s records", entityType), err)
+		writeCrudError(w, fmt.Sprintf("list %s records", entityType), err)
 		return
 	}
 	out := make([]recordResponse, len(records))
@@ -368,7 +394,7 @@ func (h *Handler) getRecord(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	ts, err := h.scope(r.Context(), rc.TenantID)
+	ts, err := h.scope(r.Context(), rc)
 	if err != nil {
 		writeInternalError(w, "resolve tenant scope", err)
 		return
@@ -391,7 +417,7 @@ func (h *Handler) getRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeInternalError(w, fmt.Sprintf("get %s %s", entityType, id), err)
+		writeCrudError(w, fmt.Sprintf("get %s %s", entityType, id), err)
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, toRecordResponse(rec))
@@ -419,7 +445,7 @@ func (h *Handler) createRecord(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	ts, err := h.scope(r.Context(), rc.TenantID)
+	ts, err := h.scope(r.Context(), rc)
 	if err != nil {
 		writeInternalError(w, "resolve tenant scope", err)
 		return
@@ -467,7 +493,7 @@ func (h *Handler) createRecord(w http.ResponseWriter, r *http.Request) {
 
 	rec, err := ts.crud.Create(r.Context(), entDef, fields, rc.Actor)
 	if err != nil {
-		writeInternalError(w, fmt.Sprintf("create %s record", entityType), err)
+		writeCrudError(w, fmt.Sprintf("create %s record", entityType), err)
 		return
 	}
 	h.triggerWorkflows(r.Context(), ts, entityType, rec.ID, workflow.TriggerOnCreate, rc.Actor)
@@ -484,7 +510,7 @@ func (h *Handler) updateRecord(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	ts, err := h.scope(r.Context(), rc.TenantID)
+	ts, err := h.scope(r.Context(), rc)
 	if err != nil {
 		writeInternalError(w, "resolve tenant scope", err)
 		return
@@ -556,7 +582,7 @@ func (h *Handler) updateRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeInternalError(w, fmt.Sprintf("update %s %s", entityType, id), err)
+		writeCrudError(w, fmt.Sprintf("update %s %s", entityType, id), err)
 		return
 	}
 	h.triggerWorkflows(r.Context(), ts, entityType, id, workflow.TriggerOnUpdate, rc.Actor)
@@ -567,7 +593,7 @@ func (h *Handler) updateRecord(w http.ResponseWriter, r *http.Request) {
 	}
 	rec, err := ts.crud.Get(r.Context(), entDef, id)
 	if err != nil {
-		writeInternalError(w, fmt.Sprintf("get %s %s after update", entityType, id), err)
+		writeCrudError(w, fmt.Sprintf("get %s %s after update", entityType, id), err)
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, toRecordResponse(rec))
@@ -699,7 +725,7 @@ func (h *Handler) writeRecordFormFragment(w http.ResponseWriter, r *http.Request
 	}
 	renderData, err := h.buildFormRenderData(r.Context(), ts, entDef, formDef, id)
 	if err != nil {
-		writeInternalError(w, fmt.Sprintf("build %s form render data (id=%q)", entityType, id), err)
+		writeCrudError(w, fmt.Sprintf("build %s form render data (id=%q)", entityType, id), err)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -762,7 +788,7 @@ func (h *Handler) renderForm(w http.ResponseWriter, r *http.Request, id string) 
 	if !ok {
 		return
 	}
-	ts, err := h.scope(r.Context(), rc.TenantID)
+	ts, err := h.scope(r.Context(), rc)
 	if err != nil {
 		writeInternalError(w, "resolve tenant scope", err)
 		return
@@ -791,7 +817,7 @@ func (h *Handler) renderForm(w http.ResponseWriter, r *http.Request, id string) 
 		return
 	}
 	if err != nil {
-		writeInternalError(w, fmt.Sprintf("build %s form render data (id=%q)", entityType, id), err)
+		writeCrudError(w, fmt.Sprintf("build %s form render data (id=%q)", entityType, id), err)
 		return
 	}
 

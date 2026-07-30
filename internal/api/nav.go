@@ -40,7 +40,7 @@ func (h *Handler) renderNav(r *http.Request, rc *httpx.RequestContext, locale st
 	}
 
 	if rc != nil {
-		ts, err := h.scope(r.Context(), rc.TenantID)
+		ts, err := h.scope(r.Context(), *rc)
 		if err != nil {
 			log.Printf("api: nav: resolve tenant scope: %v", err)
 		} else if modules, err := h.accessibleModules(r.Context(), ts, locale); err != nil {
