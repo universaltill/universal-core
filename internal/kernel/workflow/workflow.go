@@ -70,7 +70,22 @@ func (d *Definition) Validate() error {
 	}
 	for i, s := range d.Steps {
 		switch s.Kind {
-		case StepRequireApproval, StepNotify:
+		case StepRequireApproval:
+			// role is optional (an unset role means "anyone may approve"
+			// — see internal/api/workflow.go's approveWorkflowJob), but if
+			// the key is present at all it must be a real, non-empty Role
+			// code, not e.g. a number or an empty string: this param is
+			// what internal/api's approval gate reads to decide who may
+			// resume the job, so a malformed value here must fail the
+			// definition at publish time rather than silently resolving
+			// to "no restriction" the moment someone tries to approve it.
+			if raw, ok := s.Params["role"]; ok {
+				code, isString := raw.(string)
+				if !isString || code == "" {
+					return fmt.Errorf("step %d: require_approval's \"role\" param must be a non-empty string, got %#v", i, raw)
+				}
+			}
+		case StepNotify:
 			// no extra requirement in this first increment
 		default:
 			return fmt.Errorf("step %d: unknown kind %q — steps stay a closed declarative set", i, s.Kind)

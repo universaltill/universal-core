@@ -338,14 +338,22 @@ func writeInternalError(w http.ResponseWriter, logContext string, err error) {
 
 // writeCrudError is writeInternalError for errors coming back from a
 // guarded CRUD call (tenantScope.crud): an RBAC denial (ADR-0006) is
-// the requester's 403, not a server fault — mapped via the same
-// errors.Is convention crud.ErrInvalidTransition already uses for 400.
-// The response body stays a fixed string (like every API-level error
-// here); the localized denial surface on rendered pages is the
-// field-level enforcement commit's work, alongside menu filtering.
+// the requester's 403, not a server fault, mapped to a fixed "access
+// denied" string (the localized denial surface on rendered pages is the
+// field-level enforcement commit's work, alongside menu filtering). A
+// rejected self-reference cycle (ADR-0007) is likewise the requester's
+// own bad input, not a server fault, so it gets crud.ErrReferenceCycle's
+// own text (entity type + field name — the same information the caller
+// already submitted in its own request) rather than a fixed string —
+// the same "safe to describe exactly what's wrong" reasoning this file's
+// other 400-mapped kernel errors (crud.ErrInvalidTransition) already use.
 func writeCrudError(w http.ResponseWriter, logContext string, err error) {
 	if errors.Is(err, authz.ErrDenied) {
 		httpx.WriteError(w, http.StatusForbidden, "access denied")
+		return
+	}
+	if errors.Is(err, crud.ErrReferenceCycle) {
+		httpx.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	writeInternalError(w, logContext, err)

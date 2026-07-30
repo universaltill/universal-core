@@ -194,6 +194,14 @@ func (q *Queue) ResumeAfterApproval(ctx context.Context, jobID string) error {
 	return q.jobs.ResumeAfterApproval(ctx, jobID)
 }
 
+// Get returns one job by id — see data.WorkflowJobRepo.Get. The approve
+// endpoint's own first step: it needs the job's WorkflowName/Version/
+// StepIndex to resolve which step is actually waiting before deciding
+// whether the caller may resume it, ahead of calling ResumeAfterApproval.
+func (q *Queue) Get(ctx context.Context, jobID string) (data.WorkflowJob, error) {
+	return q.jobs.Get(ctx, jobID)
+}
+
 // ListByStatus returns every job currently in status, oldest first — see
 // data.WorkflowJobRepo.ListByStatus. The read side of the approval loop:
 // ResumeAfterApproval resumes a job by id, this is how a caller finds
