@@ -64,6 +64,22 @@ type Data struct {
 	// internal/api's loadReferenceOptions) simply renders an empty
 	// dropdown, not an error.
 	ReferenceOptions map[string][]ReferenceOption
+	// RedactedFields names the entity fields this form's viewer may not
+	// see (internal/kernel/authz's FieldPermission rules, resolved by the
+	// caller — this package deliberately has no access to the registry or
+	// the permission model, same separation ReferenceOptions already
+	// keeps). A redacted field renders neither as a visible input NOR as
+	// one of viewModel.HiddenFields' preservation inputs, so its name
+	// never reaches the DOM at all.
+	//
+	// Not to be confused with viewModel.HiddenFields, which means very
+	// nearly the opposite: those are fields deliberately carried through
+	// the form invisibly so a partial form doesn't wipe them. A redacted
+	// field is preserved too, but server-side (authz.GuardedEngine's
+	// EffectiveWriteFields restores its stored value on write) precisely
+	// because sending it to a browser that must not see it is the thing
+	// being prevented.
+	RedactedFields map[string]bool
 }
 
 // Render writes the HTML/HTMX form for def against ent's field shapes and
@@ -264,7 +280,7 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 
 		switch s.Component {
 		case form.ComponentFields:
-			fields, err := r.buildFields(s, ent, effective, data.ReferenceOptions, locale)
+			fields, err := r.buildFields(s, ent, effective, data.ReferenceOptions, data.RedactedFields, locale)
 			if err != nil {
 				return viewModel{}, fmt.Errorf("section %q: %w", s.Title, err)
 			}
@@ -290,7 +306,7 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 
 		vm.Sections = append(vm.Sections, sv)
 	}
-	vm.HiddenFields = buildHiddenFields(ent, effective, rendered)
+	vm.HiddenFields = buildHiddenFields(ent, effective, rendered, data.RedactedFields)
 
 	for _, a := range def.Actions {
 		av := actionView{Label: a.Label, Op: a.Op, Route: a.Route}
@@ -344,10 +360,17 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 // failure mode survives via visible_if unless "shown" means "actually
 // rendered for this record's current data", not "named somewhere in the
 // form".
-func buildHiddenFields(ent *entity.Definition, record map[string]any, rendered map[string]bool) []hiddenFieldView {
+// redacted is the set of fields this viewer may not see (Data.
+// RedactedFields). Those get NO hidden input either — emitting one would
+// publish the field's name in the DOM and, worse, submit it back empty on
+// every save. Their preservation happens server-side instead
+// (authz.GuardedEngine.EffectiveWriteFields restores the stored value),
+// which is the only place it can happen for a value the browser is never
+// allowed to hold.
+func buildHiddenFields(ent *entity.Definition, record map[string]any, rendered, redacted map[string]bool) []hiddenFieldView {
 	var out []hiddenFieldView
 	for _, ef := range ent.Fields {
-		if rendered[ef.Name] {
+		if rendered[ef.Name] || redacted[ef.Name] {
 			continue
 		}
 		out = append(out, hiddenFieldView{Name: ef.Name, Value: FormatFieldValue(record[ef.Name])})
@@ -383,9 +406,19 @@ func FormatFieldValue(v any) string {
 	}
 }
 
-func (r *Renderer) buildFields(s form.Section, ent *entity.Definition, record map[string]any, referenceOptions map[string][]ReferenceOption, locale string) ([]fieldView, error) {
+func (r *Renderer) buildFields(s form.Section, ent *entity.Definition, record map[string]any, referenceOptions map[string][]ReferenceOption, redacted map[string]bool, locale string) ([]fieldView, error) {
 	var out []fieldView
 	for _, ff := range s.Fields {
+		if redacted[ff.Name] {
+			// Skipped before evalVisibleIf, not after: a visible_if
+			// expression can reference other fields' values, but this
+			// field itself must not render regardless of what any
+			// expression concludes. Skipping here also keeps it out of
+			// the `rendered` set the caller builds, which is exactly what
+			// makes buildHiddenFields' own redaction check below the only
+			// other place this decision has to be made.
+			continue
+		}
 		visible, err := evalVisibleIf(ff.VisibleIf, record)
 		if err != nil {
 			return nil, err

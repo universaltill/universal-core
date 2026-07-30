@@ -275,5 +275,7 @@
   "field.FieldPermission.role_id": "نقش",
   "field.FieldPermission.entity_type": "نوع موجودیت",
   "field.FieldPermission.field_name": "نام فیلد",
-  "field.FieldPermission.hidden": "پنهان"
+  "field.FieldPermission.hidden": "پنهان",
+  "error.access_denied.title": "دسترسی رد شد",
+  "error.access_denied.body": "شما اجازهٔ مشاهدهٔ این صفحه را ندارید. اگر به دسترسی نیاز دارید، از یکی از مدیران سازمان خود درخواست کنید."
 }

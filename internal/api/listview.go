@@ -57,9 +57,20 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 
 	total, err := ts.crud.Count(r.Context(), def)
 	if err != nil {
-		writeCrudError(w, fmt.Sprintf("count %s records for list page", entityType), err)
+		h.writeCrudPageError(w, r, &rc, locale, fmt.Sprintf("count %s records for list page", entityType), err)
 		return
 	}
+	// The guarded engine already strips hidden fields from the rows
+	// below, but a column has to disappear too: a header for a field
+	// whose every cell is blank tells a user exactly which fields are
+	// being kept from them, and reads as broken data rather than as
+	// policy.
+	redacted, err := ts.crud.HiddenFields(r.Context(), entityType)
+	if err != nil {
+		writeInternalError(w, fmt.Sprintf("resolve hidden fields for %s list page", entityType), err)
+		return
+	}
+	columns := visibleFields(def, redacted)
 	totalPages := (total + listPageSize - 1) / listPageSize
 	if totalPages < 1 {
 		totalPages = 1
@@ -73,7 +84,7 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 	}
 	records, err := ts.crud.ListPage(r.Context(), def, listPageSize, (page-1)*listPageSize)
 	if err != nil {
-		writeCrudError(w, fmt.Sprintf("list %s records for list page", entityType), err)
+		h.writeCrudPageError(w, r, &rc, locale, fmt.Sprintf("list %s records for list page", entityType), err)
 		return
 	}
 
@@ -124,7 +135,7 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 			view.NextLabel = h.catalog.T(locale, "list.next")
 		}
 	}
-	for _, f := range def.Fields {
+	for _, f := range columns {
 		// Same "field.{EntityType}.{FieldName}" convention formrender
 		// uses for form labels (falls back to the raw field name when no
 		// translation exists yet) — previously every list page showed
@@ -134,7 +145,7 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, rec := range records {
 		row := recordRowView{Href: "/forms/" + entityType + "/" + rec.ID}
-		for _, f := range def.Fields {
+		for _, f := range columns {
 			row.Cells = append(row.Cells, h.cellText(entityType, f, rec.Data[f.Name], referenceLabels, locale))
 		}
 		view.Rows = append(view.Rows, row)
@@ -149,6 +160,29 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 	if err := h.renderShell(w, locale, nav, template.HTML(buf.String())); err != nil {
 		writeInternalError(w, fmt.Sprintf("render %s list shell", entityType), err)
 	}
+}
+
+// visibleFields returns def's fields minus the ones this viewer may not
+// see, in declaration order. Used wherever a surface enumerates an
+// entity's fields ITSELF rather than reading a record's data (list
+// columns, CSV export columns) — those can't inherit the guarded
+// engine's row-level redaction, because they're built from the
+// Definition, which is metadata every user can already see the shape of.
+//
+// Returns def.Fields unchanged (no copy) in the overwhelmingly common
+// case of nothing redacted.
+func visibleFields(def *entity.Definition, redacted map[string]bool) []entity.Field {
+	if len(redacted) == 0 {
+		return def.Fields
+	}
+	out := make([]entity.Field, 0, len(def.Fields))
+	for _, f := range def.Fields {
+		if redacted[f.Name] {
+			continue
+		}
+		out = append(out, f)
+	}
+	return out
 }
 
 // cellText formats one list-row cell — a reference field resolves to
