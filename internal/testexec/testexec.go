@@ -148,6 +148,87 @@ func DropTenantDatabase(t *testing.T, control *sql.DB, tenantID string) {
 	})
 }
 
+// DropConnectedDatabase registers a t.Cleanup that drops whatever
+// physical database db is connected to, discovering its name from the
+// connection itself (SELECT current_database()) rather than from a
+// control-plane lookup.
+//
+// This is DropTenantDatabase's sibling for the common case where a test
+// holds a tenant's own *sql.DB but NOT the control database — which is
+// every test-side tenant helper in internal/api, internal/worker and
+// internal/e2e. Threading a control handle through those would have
+// meant changing the signature of a helper with over a hundred call
+// sites, to obtain a mapping the tenant's own connection can already
+// answer for itself.
+//
+// Why this exists at all: internal/tenantdb.Router.Create provisions a
+// SECOND, separately-named Postgres database per tenant (ADR-0003).
+// Dropping the control database a tenant's row lived in does not drop
+// that database, so a test that provisions a tenant and cleans up only
+// its control database leaks the tenant's database permanently — and
+// silently, since nothing fails. Left unnoticed, this reached ~4,100
+// orphaned uc_tenant_* databases on one dev machine, growing every time
+// the suite ran (found 2026-07-30; the same class of bug an earlier
+// review already caught once in cmd/'s smoke tests, which is what
+// DropTenantDatabase was factored out for).
+//
+// Connections are terminated before the drop because the cleanup that
+// closes the Router's own pools is registered EARLIER than this one and
+// therefore runs LATER (t.Cleanup is LIFO) — so the tenant's pool is
+// still open at this point, and DROP DATABASE would otherwise fail with
+// "database is being accessed by other users."
+func DropConnectedDatabase(t *testing.T, db *sql.DB) {
+	t.Helper()
+	var dbName string
+	if err := db.QueryRowContext(context.Background(), `SELECT current_database()`).Scan(&dbName); err != nil {
+		// Read eagerly, not inside the cleanup: by cleanup time the
+		// connection may already be closed, and a failure to even
+		// identify the database is worth surfacing while the test is
+		// still running rather than silently leaking.
+		t.Fatalf("DropConnectedDatabase: resolve current_database(): %v", err)
+	}
+	DropDatabaseByName(t, dbName)
+}
+
+// DropDatabaseByName registers a t.Cleanup that terminates every
+// connection to dbName and drops it, over its own admin connection to
+// TEST_DATABASE_URL (the database being dropped cannot be the one the
+// dropping connection is attached to).
+func DropDatabaseByName(t *testing.T, dbName string) {
+	t.Helper()
+	base := TestDatabaseURL(t)
+	t.Cleanup(func() {
+		admin, err := sql.Open("pgx", base)
+		if err != nil {
+			t.Logf("DropDatabaseByName(%s): open admin connection: %v", dbName, err)
+			return
+		}
+		defer admin.Close()
+		quoted := `"` + strings.ReplaceAll(dbName, `"`, `""`) + `"`
+
+		// Terminate-then-drop, retried: a test whose background goroutines
+		// outlive it (internal/worker deliberately has one that does not
+		// join its pollers) can hold a *sql.DB whose pool reopens a
+		// connection in the window between the terminate and the drop,
+		// making DROP DATABASE fail with "database is being accessed by
+		// other users". Independent review raised this and could not
+		// reproduce it in 130 runs — but the failure mode is the leak this
+		// helper exists to prevent, reappearing silently, so it is closed
+		// by construction rather than left to timing.
+		for attempt := 0; attempt < 3; attempt++ {
+			_, _ = admin.Exec(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()`, dbName)
+			if _, err = admin.Exec(`DROP DATABASE IF EXISTS ` + quoted); err == nil {
+				return
+			}
+		}
+		// Errorf, not Logf: a database that survived every attempt IS a
+		// leak, and this helper's whole purpose is that leaks stop being
+		// invisible. Not Fatalf — that would skip the remaining cleanups
+		// and strand more state than it reports.
+		t.Errorf("DropDatabaseByName(%s): database survived %d drop attempts and has LEAKED: %v", dbName, 3, err)
+	})
+}
+
 // Run executes the binary at binPath with the given environment and
 // arguments, capturing stdout/stderr separately and normalizing a
 // nonzero exit into exitCode rather than an error — the shape every

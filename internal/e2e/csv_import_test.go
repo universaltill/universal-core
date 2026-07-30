@@ -47,6 +47,7 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
 	"github.com/universaltill/universal-core/internal/kernel/purchasing"
 	"github.com/universaltill/universal-core/internal/tenantdb"
+	"github.com/universaltill/universal-core/internal/testexec"
 )
 
 // freshControlDB returns a connection to a brand-new, uniquely-named
@@ -182,6 +183,10 @@ func testServer(t *testing.T) (srv *httptest.Server, tenantID string, tenantDB *
 	if err != nil {
 		t.Fatalf("router.Get: %v", err)
 	}
+	// See internal/api's newTestTenant: the tenant's own physical
+	// database (ADR-0003) outlives the control database's cleanup and
+	// leaked permanently without this.
+	testexec.DropConnectedDatabase(t, tenantDB)
 
 	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
 		t.Fatalf("foundation.Publish: %v", err)

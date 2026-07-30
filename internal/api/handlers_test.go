@@ -25,6 +25,7 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
 	"github.com/universaltill/universal-core/internal/kernel/workflow"
 	"github.com/universaltill/universal-core/internal/tenantdb"
+	"github.com/universaltill/universal-core/internal/testexec"
 )
 
 // freshControlDB returns a connection to a brand-new, uniquely-named
@@ -106,6 +107,11 @@ func newTestTenant(t *testing.T, router *tenantdb.Router) (tenantID string, tena
 	if err != nil {
 		t.Fatalf("router.Get: %v", err)
 	}
+	// Router.Create provisions a SECOND physical database (ADR-0003) that
+	// freshControlDB's own cleanup knows nothing about — without this,
+	// every test in this package leaked one permanently (~4,100 orphans
+	// on the dev machine before this was found).
+	testexec.DropConnectedDatabase(t, tenantDB)
 	return tenantID, tenantDB
 }
 

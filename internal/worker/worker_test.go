@@ -19,6 +19,7 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/audit"
 	"github.com/universaltill/universal-core/internal/kernel/workflow"
 	"github.com/universaltill/universal-core/internal/tenantdb"
+	"github.com/universaltill/universal-core/internal/testexec"
 )
 
 // freshControlDB returns a connection to a brand-new, uniquely-named
@@ -98,6 +99,10 @@ func newTestTenant(t *testing.T, router *tenantdb.Router) (tenantID string, tena
 	if err != nil {
 		t.Fatalf("router.Get: %v", err)
 	}
+	// See internal/api's identical helper: the tenant's own physical
+	// database (ADR-0003) is not dropped by the control database's
+	// cleanup, and leaked permanently without this.
+	testexec.DropConnectedDatabase(t, tenantDB)
 	return tenantID, tenantDB
 }
 
