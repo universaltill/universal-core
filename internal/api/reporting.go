@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/universaltill/universal-core/internal/httpx"
 	"github.com/universaltill/universal-core/internal/kernel/formrender"
 )
 
@@ -28,6 +29,42 @@ const (
 // statuses that actually have activity," not a wall of zeroes for a new
 // tenant.
 var poStatusDisplayOrder = []string{"draft", "submitted", "approved", "received", "cancelled"}
+
+// purchasingReportEntityTypes is every entity type ReportingRepo's four
+// aggregate queries read from — including join targets, not just the
+// entity type each query's WHERE clause filters on:
+// PurchaseOrderStatusBreakdown joins PurchaseOrder to Status (reads the
+// status code off the Status record, not PurchaseOrder's own data), and
+// TopVendorsBySpend/StockoutRiskItems join to Party/Item respectively.
+// Missing a join target here is a real leak, not a cosmetic gap: a role
+// denied read on Status alone would otherwise still see every status
+// label and count in the breakdown even with PurchaseOrder itself
+// correctly gated. ADR-0006's 2026-07-30 addendum
+// (uc-infra/docs/adr/0006-rbac-enforcement-guarded-engine.md) gates the
+// whole report on read access to all five as one unit, ahead of running
+// any of the queries — not per-row/per-column filtering within the
+// report, which is a separate, still-deferred design problem (there is
+// no entity.Definition for a hand-written aggregate to filter against).
+var purchasingReportEntityTypes = []string{"PurchaseOrder", "Status", "Party", "InventoryItem", "Item"}
+
+// requireReportRead denies the whole report page unless the actor can
+// read every entity type it aggregates, reusing ts.crud.CanRead (the
+// same GuardedEngine/Resolver method dashboard.go already uses to filter
+// nav links) rather than inventing a new permission check: ReportingRepo
+// itself bypasses the guarded engine for its aggregate SQL, but the
+// question this must answer first — can this actor see PurchaseOrder/
+// Party/InventoryItem/Item at all — is exactly what the Resolver already
+// knows, opt-in semantics and all (a type with zero Permission rows
+// stays readable, same as everywhere else this method is used).
+func (h *Handler) requireReportRead(w http.ResponseWriter, r *http.Request, rc *httpx.RequestContext, ts tenantScope, locale string) bool {
+	for _, entityType := range purchasingReportEntityTypes {
+		allowed, err := ts.crud.CanRead(r.Context(), entityType)
+		if !h.denyPageUnless(w, r, rc, locale, allowed, err, "check "+entityType+" read permission for purchasing report") {
+			return false
+		}
+	}
+	return true
+}
 
 // renderPurchasingReport is the "mgmt reporting workbench" QUEUE.md's
 // design-partner opportunity entry has been tracking since the
@@ -55,6 +92,10 @@ func (h *Handler) renderPurchasingReport(w http.ResponseWriter, r *http.Request)
 	}
 	locale := localeFromRequest(w, r)
 	ctx := r.Context()
+
+	if !h.requireReportRead(w, r, &rc, ts, locale) {
+		return
+	}
 
 	statusRows, err := ts.reporting.PurchaseOrderStatusBreakdown(ctx)
 	if err != nil {

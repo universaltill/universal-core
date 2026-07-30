@@ -85,6 +85,25 @@ func (h *Handler) renderModuleMenu(w http.ResponseWriter, r *http.Request) {
 		Hub:  entityHubLayout(h, locale, group.Name, group.Entities),
 	}
 	for _, link := range moduleReportLinks[key] {
+		visible := true
+		for _, entityType := range link.RequiredRead {
+			readable, err := ts.crud.CanRead(r.Context(), entityType)
+			if err != nil {
+				writeInternalError(w, "check report link visibility", err)
+				return
+			}
+			if !readable {
+				visible = false
+				break
+			}
+		}
+		if !visible {
+			// Same "don't link to it if you can't reach it" reasoning
+			// accessibleModules already applies to individual entities
+			// (see its own doc comment) — a report link this actor would
+			// only be refused at is worse than no link, not neutral.
+			continue
+		}
 		view.Reports = append(view.Reports, moduleMenuReport{
 			Label: h.catalog.T(locale, link.LabelKey),
 			Href:  link.Href,
@@ -178,8 +197,19 @@ func entityIcon(entityType string) string {
 // dashboard.go's moduleIcons gives for a plain hardcoded map: exactly
 // one small, stable piece of presentation data, not worth a registry of
 // its own for a single report per module today.
-var moduleReportLinks = map[string][]struct{ LabelKey, Href string }{
-	"purchasing": {{"report.purchasing.nav_label", "/reports/purchasing"}},
+//
+// RequiredRead names every entity type the linked report itself gates on
+// (ADR-0006's 2026-07-30 addendum) — checked here too, so a user who
+// would be refused at the report itself never sees the link in the
+// first place (independent review of that addendum found this menu
+// still offering the link unconditionally: exactly the "tile that leads
+// to a 403" outcome dashboard.go's own CanRead filtering exists to
+// prevent for entity nodes, just not yet applied to report links).
+var moduleReportLinks = map[string][]struct {
+	LabelKey, Href string
+	RequiredRead   []string
+}{
+	"purchasing": {{"report.purchasing.nav_label", "/reports/purchasing", purchasingReportEntityTypes}},
 }
 
 type moduleMenuView struct {
