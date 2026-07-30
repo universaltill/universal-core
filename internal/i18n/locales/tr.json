@@ -100,6 +100,8 @@
   "entity.Period.name": "Dönem",
   "entity.TaxCode.name": "Vergi Kodu",
   "entity.CostCenter.name": "Maliyet Merkezi",
+  "entity.Department.name": "Departman",
+  "entity.Position.name": "Pozisyon",
   "module.finance.name": "Finans",
   "module.sales.name": "Satış",
   "module.manufacturing.name": "Üretim",
@@ -276,6 +278,12 @@
   "field.FieldPermission.entity_type": "Varlık türü",
   "field.FieldPermission.field_name": "Alan adı",
   "field.FieldPermission.hidden": "Gizli",
+  "field.Department.code": "Kod",
+  "field.Department.name": "Ad",
+  "field.Department.parent_department_id": "Üst Departman",
+  "field.Position.title": "Unvan",
+  "field.Position.department_id": "Departman",
+  "field.Position.reports_to_position_id": "Bağlı Olduğu Pozisyon",
   "error.access_denied.title": "Erişim reddedildi",
   "error.access_denied.body": "Bu sayfayı görüntüleme izniniz yok. Erişime ihtiyacınız varsa kuruluşunuzdaki bir yöneticiden isteyin."
 }

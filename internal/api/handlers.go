@@ -965,15 +965,34 @@ func (h *Handler) loadReferenceOptions(ctx context.Context, ts tenantScope, entD
 	return out
 }
 
+// referenceLabelFieldCandidates is the generic, entity-agnostic order of
+// preference for picking which field labels a record in a reference
+// picker/list cell: "name" is the overwhelming convention in this
+// kernel's own Definitions (Party, Item, and most other entities), but
+// an entity without one still deserves a human-readable label instead of
+// falling straight to a raw id — "title" (e.g. Position) is the next
+// most obvious "the thing a human calls this record" field already used
+// elsewhere in this kernel (IssueReport). Deliberately NOT extended to
+// "code" here: several existing entities (Account, TaxCode, CostCenter,
+// Currency, UnitOfMeasure) declare "code" as a short identifier rather
+// than a human-facing label, an existing test
+// (TestAPI_RenderForm_ReferenceFieldWithoutNameFieldFallsBackToID) pins
+// today's id-fallback behavior for a "code"-only entity, and widening
+// the label convention that far is a bigger behavior change than this
+// task's Position.reports_to_position_id picker needs. This is a
+// data-driven field-name lookup, not entity-type-specific branching — it
+// never checks targetType, only which of these field names the
+// Definition happens to declare.
+var referenceLabelFieldCandidates = []string{"name", "title"}
+
 // referenceOptionsFor lists every record of targetType for tenantID,
-// labeled by that entity's "name" field if it has one (the overwhelming
-// convention in this kernel's own Definitions — Party, Item, and every
-// other real entity so far all declare one) or its raw id otherwise.
-// Record data itself is tenant-owned business data, not UI chrome — no
-// i18n applies to the label the way it does to entity/module type
-// names (see locale.go's entityDisplayName, a genuinely different
-// concern: translating "PurchaseOrder" the identifier, not translating
-// one specific vendor's name).
+// labeled by the first field in referenceLabelFieldCandidates the target
+// entity declares, or its raw id if it declares none of them. Record
+// data itself is tenant-owned business data, not UI chrome — no i18n
+// applies to the label the way it does to entity/module type names (see
+// locale.go's entityDisplayName, a genuinely different concern:
+// translating "PurchaseOrder" the identifier, not translating one
+// specific vendor's name).
 func (h *Handler) referenceOptionsFor(ctx context.Context, ts tenantScope, targetType string) ([]formrender.ReferenceOption, error) {
 	targetDef, err := ts.entityDef(ctx, targetType)
 	if err != nil {
@@ -983,9 +1002,12 @@ func (h *Handler) referenceOptionsFor(ctx context.Context, ts tenantScope, targe
 	if err != nil {
 		return nil, fmt.Errorf("list %s records: %w", targetType, err)
 	}
-	labelField := "name"
-	if _, ok := targetDef.FieldByName(labelField); !ok {
-		labelField = ""
+	labelField := ""
+	for _, candidate := range referenceLabelFieldCandidates {
+		if _, ok := targetDef.FieldByName(candidate); ok {
+			labelField = candidate
+			break
+		}
 	}
 	opts := make([]formrender.ReferenceOption, len(records))
 	for i, rec := range records {

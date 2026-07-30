@@ -100,6 +100,8 @@
   "entity.Period.name": "Period",
   "entity.TaxCode.name": "Tax Code",
   "entity.CostCenter.name": "Cost Center",
+  "entity.Department.name": "Department",
+  "entity.Position.name": "Position",
   "module.finance.name": "Finance",
   "module.sales.name": "Sales",
   "module.manufacturing.name": "Manufacturing",
@@ -276,6 +278,12 @@
   "field.FieldPermission.entity_type": "Entity type",
   "field.FieldPermission.field_name": "Field name",
   "field.FieldPermission.hidden": "Hidden",
+  "field.Department.code": "Code",
+  "field.Department.name": "Name",
+  "field.Department.parent_department_id": "Parent Department",
+  "field.Position.title": "Title",
+  "field.Position.department_id": "Department",
+  "field.Position.reports_to_position_id": "Reports To",
   "error.access_denied.title": "Access denied",
   "error.access_denied.body": "You don't have permission to view this page. If you need access, ask an administrator in your organization."
 }

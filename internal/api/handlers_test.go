@@ -1527,6 +1527,62 @@ func TestAPI_RenderForm_ReferenceFieldWithoutNameFieldFallsBackToID(t *testing.T
 	}
 }
 
+// TestAPI_RenderForm_ReferenceFieldFallsBackToTitleField is the
+// regression test for the Position.reports_to_position_id picker (and
+// any other entity with a "title" field but no "name" field, e.g.
+// IssueReport): referenceOptionsFor's label-field fallback chain
+// (name -> title -> id) was previously name-only, which rendered every
+// option in such a picker as a raw UUID — real usability bug, found by
+// this feature's own independent review, since Position has no "name"
+// field per reference-data-model.md §7's own spec (title is its label).
+// Deliberately does NOT extend to a "code" fallback (see
+// referenceLabelFieldCandidates' own doc comment) — this test's sibling
+// TestAPI_RenderForm_ReferenceFieldWithoutNameFieldFallsBackToID pins
+// that a code-only entity still falls back to id.
+func TestAPI_RenderForm_ReferenceFieldFallsBackToTitleField(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	titleOnlyEntDef := &entity.Definition{
+		EntityType: "Vendor",
+		Version:    1,
+		Fields:     []entity.Field{{Name: "title", Type: entity.FieldString, Required: true}},
+	}
+	titleOnlyFormDef := &form.Definition{
+		EntityType: "Vendor",
+		Version:    1,
+		Sections:   []form.Section{{Title: "Details", Component: form.ComponentFields, Fields: []form.FormField{{Name: "title", Label: "Title"}}}},
+	}
+	publishEntityAndForm(t, db, titleOnlyEntDef, titleOnlyFormDef)
+	publishEntityAndForm(t, db, orderEntityDefWithVendorReference(), orderFormDefWithVendorReference())
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	createReq := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{"title":"Regional Manager"}`))
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", createRec.Code, createRec.Body.String())
+	}
+	var created struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal create response: %v", err)
+	}
+
+	req := newRequest("GET", "/forms/Order/new", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if !strings.Contains(rec.Body.String(), `<option value="`+created.Data.ID+`" >Regional Manager</option>`) {
+		t.Fatalf("expected the option labeled by its title field (not its raw id), got:\n%s", rec.Body.String())
+	}
+}
+
 func TestAPI_RenderRecordForm_ShowsMasterDetailChildren(t *testing.T) {
 	router := newTestRouter(t)
 	withDevAuthEnabled(t)
@@ -2207,6 +2263,18 @@ func TestAPI_ModuleMenu_ShowsTranslatedEntityNames(t *testing.T) {
 	}
 	if !strings.Contains(body, `<span class="uc-hub-node-code">Party</span>`) {
 		t.Fatalf("expected Party's technical code shown alongside its name, got:\n%s", body)
+	}
+	// Department/Position are new alongside Party in this same module —
+	// confirming their entity.{Type}.name keys actually landed (a wholly
+	// missing key from every locale isn't caught by
+	// i18n's TestLocales_HaveIdenticalKeySets, which only compares locale
+	// files against each other) rather than silently falling back to the
+	// raw "Department"/"Position" identifier catalog.TOrDefault would use.
+	if !strings.Contains(body, "القسم") {
+		t.Fatalf("expected Department's Arabic display name, got:\n%s", body)
+	}
+	if !strings.Contains(body, "المنصب") {
+		t.Fatalf("expected Position's Arabic display name, got:\n%s", body)
 	}
 }
 

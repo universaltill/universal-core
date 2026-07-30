@@ -16,6 +16,8 @@ import (
 	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/db"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
+	"github.com/universaltill/universal-core/internal/kernel/crud"
+	"github.com/universaltill/universal-core/internal/kernel/entity"
 )
 
 func freshTenantDB(t *testing.T) *sql.DB {
@@ -237,5 +239,117 @@ func TestPublishForms_IsIdempotent(t *testing.T) {
 	}
 	if err := PublishForms(ctx, db, humanActor()); err != nil {
 		t.Fatalf("second PublishForms should be a no-op, got: %v", err)
+	}
+}
+
+// TestDepartment_HierarchyResolvesEndToEnd is the org-chart mirror of
+// finance's TestAccount_HierarchyResolvesEndToEnd: proves
+// parent_department_id round-trips through the real crud.Engine against
+// real Postgres, not just that Department() declares a reference field.
+func TestDepartment_HierarchyResolvesEndToEnd(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	if err := Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	entityDefs := data.NewEntityDefinitionRepo(tenantDB)
+	v, err := entityDefs.GetPublished(ctx, "Department")
+	if err != nil {
+		t.Fatalf("GetPublished(Department): %v", err)
+	}
+	def, err := entity.Unmarshal(v.Definition)
+	if err != nil {
+		t.Fatalf("unmarshal Department definition: %v", err)
+	}
+
+	engine := crud.NewEngine(tenantDB)
+	parent, err := engine.Create(ctx, def, map[string]any{
+		"code": "co", "name": "Company",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create parent Department: %v", err)
+	}
+
+	child, err := engine.Create(ctx, def, map[string]any{
+		"code": "eng", "name": "Engineering", "parent_department_id": parent.ID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create child Department: %v", err)
+	}
+
+	got, err := engine.Get(ctx, def, child.ID)
+	if err != nil {
+		t.Fatalf("Get(child): %v", err)
+	}
+	if got.Data["parent_department_id"] != parent.ID {
+		t.Fatalf("expected child's parent_department_id to be %q, got %v", parent.ID, got.Data["parent_department_id"])
+	}
+}
+
+// TestPosition_HierarchyResolvesEndToEnd mirrors the Department test
+// above for Position's own self-reference (reports_to_position_id) and
+// confirms department_id (a reference to a DIFFERENT entity type, not a
+// self-reference) round-trips in the same Create call.
+func TestPosition_HierarchyResolvesEndToEnd(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	if err := Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	entityDefs := data.NewEntityDefinitionRepo(tenantDB)
+	deptV, err := entityDefs.GetPublished(ctx, "Department")
+	if err != nil {
+		t.Fatalf("GetPublished(Department): %v", err)
+	}
+	deptDef, err := entity.Unmarshal(deptV.Definition)
+	if err != nil {
+		t.Fatalf("unmarshal Department definition: %v", err)
+	}
+	posV, err := entityDefs.GetPublished(ctx, "Position")
+	if err != nil {
+		t.Fatalf("GetPublished(Position): %v", err)
+	}
+	posDef, err := entity.Unmarshal(posV.Definition)
+	if err != nil {
+		t.Fatalf("unmarshal Position definition: %v", err)
+	}
+
+	engine := crud.NewEngine(tenantDB)
+	dept, err := engine.Create(ctx, deptDef, map[string]any{
+		"code": "fin", "name": "Finance",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create Department: %v", err)
+	}
+
+	manager, err := engine.Create(ctx, posDef, map[string]any{
+		"title": "Finance Manager", "department_id": dept.ID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create manager Position: %v", err)
+	}
+
+	report, err := engine.Create(ctx, posDef, map[string]any{
+		"title": "Accountant", "department_id": dept.ID, "reports_to_position_id": manager.ID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create report Position: %v", err)
+	}
+
+	got, err := engine.Get(ctx, posDef, report.ID)
+	if err != nil {
+		t.Fatalf("Get(report): %v", err)
+	}
+	if got.Data["department_id"] != dept.ID {
+		t.Fatalf("expected report's department_id to be %q, got %v", dept.ID, got.Data["department_id"])
+	}
+	if got.Data["reports_to_position_id"] != manager.ID {
+		t.Fatalf("expected report's reports_to_position_id to be %q, got %v", manager.ID, got.Data["reports_to_position_id"])
 	}
 }

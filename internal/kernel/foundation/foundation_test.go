@@ -473,3 +473,62 @@ func TestUserRole_MissingRequiredRoleID(t *testing.T) {
 		t.Fatal("expected an error for a UserRole missing its required role_id")
 	}
 }
+
+func TestDepartment_RequiresCodeAndName(t *testing.T) {
+	def := Department()
+	if err := entity.ValidateRecord(def, map[string]any{"name": "Finance"}); err == nil {
+		t.Fatal("expected an error for a Department missing its required code")
+	}
+	if err := entity.ValidateRecord(def, map[string]any{"code": "fin"}); err == nil {
+		t.Fatal("expected an error for a Department missing its required name")
+	}
+	if err := entity.ValidateRecord(def, map[string]any{"code": "fin", "name": "Finance"}); err != nil {
+		t.Fatalf("expected a top-level Department (no parent) to validate, got %v", err)
+	}
+}
+
+// TestDepartment_ParentIsOptional confirms a Department can sit at the
+// top of the org chart with no parent_department_id — the field-level
+// mirror of TestAccount_HierarchyResolvesEndToEnd's real-DB proof that a
+// root node needs no parent value.
+func TestDepartment_ParentIsOptional(t *testing.T) {
+	def := Department()
+	if err := entity.ValidateRecord(def, map[string]any{
+		"code": "eng", "name": "Engineering", "parent_department_id": "dept-root",
+	}); err != nil {
+		t.Fatalf("expected a Department with a parent to validate, got %v", err)
+	}
+}
+
+func TestPosition_RequiresTitle(t *testing.T) {
+	def := Position()
+	if err := entity.ValidateRecord(def, map[string]any{"department_id": "dept-1"}); err == nil {
+		t.Fatal("expected an error for a Position missing its required title")
+	}
+	if err := entity.ValidateRecord(def, map[string]any{
+		"title": "Finance Manager", "department_id": "dept-1",
+	}); err != nil {
+		t.Fatalf("expected a top-of-chart Position (no reports_to) to validate, got %v", err)
+	}
+}
+
+// TestPosition_DepartmentIsOptional confirms a company-level/matrix
+// Position (e.g. CFO, reporting to no single department) can be created
+// with no department_id at all — the design point independent review
+// caught: a required department_id would have forced a synthetic root
+// Department onto every such Position.
+func TestPosition_DepartmentIsOptional(t *testing.T) {
+	def := Position()
+	if err := entity.ValidateRecord(def, map[string]any{"title": "CFO"}); err != nil {
+		t.Fatalf("expected a Position with no department_id to validate, got %v", err)
+	}
+}
+
+func TestPosition_ReportsToIsOptional(t *testing.T) {
+	def := Position()
+	if err := entity.ValidateRecord(def, map[string]any{
+		"title": "Accountant", "department_id": "dept-1", "reports_to_position_id": "pos-manager",
+	}); err != nil {
+		t.Fatalf("expected a Position with reports_to_position_id to validate, got %v", err)
+	}
+}

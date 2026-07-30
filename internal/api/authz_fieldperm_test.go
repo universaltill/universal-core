@@ -52,21 +52,28 @@ func employeeFormDef() *form.Definition {
 	}
 }
 
-// departmentEntityDef is a second entity in the SAME module as Employee,
+// widgetEntityDef is a second entity in the SAME module as Employee,
 // left readable — so a test can tell "the module disappeared" apart from
-// "one node inside it disappeared."
-func departmentEntityDef() *entity.Definition {
+// "one node inside it disappeared." Deliberately a fictional entity type
+// ("Widget", not "Department") — this test predates foundation.Department
+// (the real org-chart entity, `internal/kernel/foundation/foundation.go`)
+// and originally used that name as its placeholder; renamed to avoid
+// colliding with the real entity_type once it existed (same
+// entity_definitions_entity_type_version_key collision a real
+// foundation.Publish + this fixture's own publishEntityAndForm would hit
+// if their names matched).
+func widgetEntityDef() *entity.Definition {
 	return &entity.Definition{
-		EntityType: "Department",
+		EntityType: "Widget",
 		Version:    1,
 		Module:     "foundation",
 		Fields:     []entity.Field{{Name: "name", Type: entity.FieldString, Required: true}},
 	}
 }
 
-func departmentFormDef() *form.Definition {
+func widgetFormDef() *form.Definition {
 	return &form.Definition{
-		EntityType: "Department",
+		EntityType: "Widget",
 		Version:    1,
 		Sections: []form.Section{{
 			Title:     "Details",
@@ -430,12 +437,12 @@ func TestAPI_RBAC_NavAndDashboardHideDeniedEntityTypes(t *testing.T) {
 	// accessibleModules only lists entity types that have a published
 	// FORM as well as a published entity Definition, and foundation's own
 	// forms aren't published here — so the module contents under test are
-	// exactly the ones published below. Employee and Department both
+	// exactly the ones published below. Employee and Widget both
 	// declare Module "foundation" (one denied, one not, so that module
 	// survives minus a node); Vendor declares no Module and so lands
 	// alone in "general", which must disappear entirely once denied.
 	publishEntityAndForm(t, db, employeeEntityDef(), employeeFormDef())
-	publishEntityAndForm(t, db, departmentEntityDef(), departmentFormDef())
+	publishEntityAndForm(t, db, widgetEntityDef(), widgetFormDef())
 	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
 	seedRBAC(t, db,
 		map[string][]string{"clerk": {"user-clerk"}, authz.AdminRoleCode: {"user-admin"}},
@@ -475,7 +482,7 @@ func TestAPI_RBAC_NavAndDashboardHideDeniedEntityTypes(t *testing.T) {
 	if strings.Contains(menu.Body.String(), "/records/Employee") {
 		t.Fatalf("module menu linked to a denied entity type:\n%s", menu.Body.String())
 	}
-	if !strings.Contains(menu.Body.String(), "/records/Department") {
+	if !strings.Contains(menu.Body.String(), "/records/Widget") {
 		t.Fatalf("module menu lost an entity type the clerk CAN read:\n%s", menu.Body.String())
 	}
 	adminMenu := getAs(t, mux, "/modules/foundation", tenantID, "user-admin")

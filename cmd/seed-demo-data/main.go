@@ -105,6 +105,7 @@ func main() {
 	uoms := s.seedUnitsOfMeasure()
 	s.seedFinance()
 	s.seedRoles()
+	s.seedOrgChart()
 	// gl_accounts (the ledger core's own typed chart, ADR-0004) is a
 	// projection of the finance.Account records seedFinance just
 	// created/confirmed — sync it now so cmd/backfill-... or any future
@@ -298,6 +299,37 @@ func (s *seeder) seedRoles() {
 			"code": r.code, "name": r.name, "description": r.description,
 		})
 	}
+}
+
+// seedOrgChart gives a tenant a small example Department/Position
+// hierarchy (foundation.Department/Position — the org-chart entities,
+// `erp/BACKLOG-TASKS.md`'s "Department/org-chart model" task) so a fresh
+// tenant's Position form doesn't open onto an empty department_id
+// picker with nothing to select — the same "sample data actually
+// demonstrates the pattern" reasoning seedParties' own doc comment gives
+// for PartyRole. Position's title has no natural-key alternative
+// (unlike Department's code), so it's keyed on title directly here —
+// fine for this small, fixed demo set, not a general pattern.
+func (s *seeder) seedOrgChart() {
+	companyID := s.getOrCreate("Department", "code", "co", map[string]any{
+		"code": "co", "name": "Demo Organization",
+	})
+	financeID := s.getOrCreate("Department", "code", "fin", map[string]any{
+		"code": "fin", "name": "Finance", "parent_department_id": companyID,
+	})
+	warehouseID := s.getOrCreate("Department", "code", "wh", map[string]any{
+		"code": "wh", "name": "Warehouse", "parent_department_id": companyID,
+	})
+
+	cfoID := s.getOrCreate("Position", "title", "CFO", map[string]any{
+		"title": "CFO", "department_id": financeID,
+	})
+	s.getOrCreate("Position", "title", "Finance Manager", map[string]any{
+		"title": "Finance Manager", "department_id": financeID, "reports_to_position_id": cfoID,
+	})
+	s.getOrCreate("Position", "title", "Warehouse Supervisor", map[string]any{
+		"title": "Warehouse Supervisor", "department_id": warehouseID,
+	})
 }
 
 // seedParties creates both vendors and customers, tagging each with a

@@ -225,4 +225,27 @@ func TestUniversalCore_DevAuthEnabled_ValidHeaders_ServesRecordsAPI(t *testing.T
 	if !strings.Contains(string(body), `"data"`) {
 		t.Fatalf("expected the standard {data,error} envelope, got: %s", body)
 	}
+
+	// Department is one of the two org-chart entities added alongside
+	// Party in foundation.All() — this confirms the real compiled binary
+	// actually serves it too, not just Party (the one entity type every
+	// other smoke assertion in this file already covered).
+	deptReq, err := http.NewRequest(http.MethodGet, baseURL+"/api/records/Department", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	deptReq.Header.Set("X-Tenant-ID", tenantID)
+	deptReq.Header.Set("X-Actor-ID", "smoke-test")
+	deptResp, err := http.DefaultClient.Do(deptReq)
+	if err != nil {
+		t.Fatalf("GET /api/records/Department: %v", err)
+	}
+	defer deptResp.Body.Close()
+	deptBody, _ := io.ReadAll(deptResp.Body)
+	if deptResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for /api/records/Department, got %d: %s", deptResp.StatusCode, deptBody)
+	}
+	if !strings.Contains(string(deptBody), `"data"`) {
+		t.Fatalf("expected the standard {data,error} envelope for Department, got: %s", deptBody)
+	}
 }
