@@ -18,12 +18,22 @@ const (
 	TriggerOnCreate TriggerType = "on_create"
 	TriggerOnUpdate TriggerType = "on_update"
 	TriggerManual   TriggerType = "manual"
+	// TriggerScheduled fires on a cron expression instead of a record
+	// event (R18). The expression lives in Trigger.Cron and is validated
+	// at publish time, not at fire time — a bad schedule must be a
+	// rejected Definition, not a worker that discovers the problem at 3am
+	// and either spins or silently never runs.
+	TriggerScheduled TriggerType = "scheduled"
 )
 
 // Trigger declares what starts a workflow run.
 type Trigger struct {
 	Type       TriggerType `json:"type"`
 	EntityType string      `json:"entity_type,omitempty"` // required for on_create/on_update
+	// Cron is a 5-field UTC expression, required for and only meaningful
+	// to TriggerScheduled — see cron.go, including why it is a strict
+	// subset of cron and why it is UTC rather than tenant-local.
+	Cron string `json:"cron,omitempty"`
 }
 
 // StepKind is the closed set of actions a workflow step may perform —
@@ -60,8 +70,43 @@ func (d *Definition) Validate() error {
 		if d.Trigger.EntityType == "" {
 			return fmt.Errorf("trigger %q requires an entity_type", d.Trigger.Type)
 		}
+		if d.Trigger.Cron != "" {
+			return fmt.Errorf("trigger %q must not set a cron expression (it fires on a record event, not a schedule)", d.Trigger.Type)
+		}
 	case TriggerManual:
-		// no extra requirement
+		if d.Trigger.Cron != "" {
+			return fmt.Errorf("trigger %q must not set a cron expression", d.Trigger.Type)
+		}
+	case TriggerScheduled:
+		if d.Trigger.Cron == "" {
+			return fmt.Errorf("trigger %q requires a cron expression", d.Trigger.Type)
+		}
+		if d.Trigger.EntityType != "" {
+			// A scheduled workflow fires on the clock, not on a record
+			// event. A leftover entity_type — from a UI that changed the
+			// trigger type without clearing the other field — would look
+			// meaningful and be silently ignored.
+			return fmt.Errorf("trigger %q must not set an entity_type (it fires on a schedule, not on a record event)", d.Trigger.Type)
+		}
+		// Parsed here so a malformed schedule is rejected at publish time.
+		// The alternative — validating when the worker first evaluates it
+		// — means a typo ships, sits silently, and surfaces as a job that
+		// never runs, which is the hardest kind of failure to notice.
+		sched, err := ParseSchedule(d.Trigger.Cron)
+		if err != nil {
+			return fmt.Errorf("workflow %q: %w", d.Name, err)
+		}
+		// And proved to actually occur. "0 0 30 2 *" parses cleanly and
+		// never happens; catching that here turns an invisible
+		// never-fires into a refused publish.
+		//
+		// Searched from a FIXED epoch, not time.Now(): validation that
+		// reads the clock is not reproducible, and independent review
+		// proved an unchanged Definition could pass today and fail the
+		// identical check decades later purely from the passage of time.
+		if _, err := sched.Next(validationEpoch); err != nil {
+			return fmt.Errorf("workflow %q: %w", d.Name, err)
+		}
 	default:
 		return fmt.Errorf("unknown trigger type %q", d.Trigger.Type)
 	}
