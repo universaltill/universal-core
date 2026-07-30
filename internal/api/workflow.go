@@ -15,6 +15,7 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"strings"
 
 	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/httpx"
@@ -169,6 +170,14 @@ func (h *Handler) approveWorkflowJob(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "resumed"})
 }
 
+// cachedWorkflowDef is one memoized definition lookup — the resolved
+// Definition or the error that resolving it produced. Both are cached:
+// see approvalRoleFor.
+type cachedWorkflowDef struct {
+	def *workflow.Definition
+	err error
+}
+
 // errApprovalRoleDenied is requireApprovalRole's own sentinel (as opposed
 // to any other error resolving the step/role, which is a genuine 500) —
 // mapped to 403 by its one caller, approveWorkflowJob.
@@ -181,36 +190,13 @@ var errApprovalRoleDenied = errors.New("caller does not hold the role required t
 // comment on why that's the deliberate backward-compatible default, not
 // an oversight.
 func requireApprovalRole(ctx context.Context, ts tenantScope, job data.WorkflowJob, userID string) error {
-	defVersion, err := ts.workflowDefs.GetVersion(ctx, job.WorkflowName, job.WorkflowVersion)
+	requiredRole, err := approvalRoleFor(ctx, ts, job, nil)
 	if err != nil {
-		return fmt.Errorf("get workflow definition %s v%d: %w", job.WorkflowName, job.WorkflowVersion, err)
+		return err
 	}
-	def, err := workflow.Unmarshal(defVersion.Definition)
-	if err != nil {
-		return fmt.Errorf("unmarshal workflow definition %s v%d: %w", job.WorkflowName, job.WorkflowVersion, err)
-	}
-	if job.StepIndex < 0 || job.StepIndex >= len(def.Steps) {
-		return fmt.Errorf("workflow job %s: step index %d out of range for %s v%d (%d steps)", job.ID, job.StepIndex, job.WorkflowName, job.WorkflowVersion, len(def.Steps))
-	}
-	step := def.Steps[job.StepIndex]
-	if step.Kind != workflow.StepRequireApproval {
-		return fmt.Errorf("workflow job %s: step %d is a %q step, not require_approval — nothing should have halted it waiting for approval", job.ID, job.StepIndex, step.Kind)
-	}
-	raw, present := step.Params["role"]
-	if !present {
+	if requiredRole == "" {
 		return nil
 	}
-	// workflow.Definition.Validate (run by Unmarshal above) already
-	// rejects a non-string/empty "role" param at publish time, so this
-	// can't actually be false for a definition that made it this far —
-	// checked explicitly anyway rather than discarding it (a silently
-	// ignored malformed value here would mean "no restriction", which is
-	// exactly the fail-open bug this whole check exists to prevent).
-	requiredRole, ok := raw.(string)
-	if !ok || requiredRole == "" {
-		return fmt.Errorf("workflow job %s: step %d's role param is %#v, not a valid Role code", job.ID, job.StepIndex, raw)
-	}
-
 	codes, err := foundation.RoleCodesForUser(ctx, ts.db, userID)
 	if err != nil {
 		return fmt.Errorf("resolve roles for user %s: %w", userID, err)
@@ -221,6 +207,95 @@ func requireApprovalRole(ctx context.Context, ts tenantScope, job data.WorkflowJ
 		}
 	}
 	return fmt.Errorf("%w: requires role %q", errApprovalRoleDenied, requiredRole)
+}
+
+// approvalRoleFor returns the Role code job's current require_approval
+// step demands, or "" when the step names none (the backward-compatible
+// "anyone may approve" default).
+//
+// Extracted so the enforcement path (requireApprovalRole, called by
+// approveWorkflowJob) and the DISPLAY path (the workflow inbox, deciding
+// whether to offer an Approve button) resolve the requirement through the
+// same code rather than each implementing it. Two implementations would
+// drift, and both directions of drift are bad: an inbox more permissive
+// than the gate offers buttons that 403, and an inbox stricter than the
+// gate hides work a user could actually have done.
+//
+// What that does NOT buy is freedom from a race. Sharing this function
+// removes IMPLEMENTATION drift, not TEMPORAL drift: the inbox resolves at
+// render time and the gate re-resolves at click time, so a job that
+// advances to a differently-gated step, or a role grant that changes in
+// between, still leaves a stale button that 403s. The window is small and
+// the failure is the same silent htmx no-swap this task exists to reduce
+// — narrowed from the routine case to a race, not eliminated. Closing it
+// properly needs the inbox to handle a non-2xx approve response, which is
+// the separately-tracked htmx-error-surfacing gap (QUEUE.md, alongside
+// the optimistic-locking 409).
+//
+// defCache, when non-nil, memoizes the definition lookup per
+// (name, version) for the caller's lifetime. The inbox resolves a whole
+// page of jobs that overwhelmingly share a handful of workflow
+// definitions, so without it the page is an N+1 of identical registry
+// reads; approveWorkflowJob handles exactly one job and passes nil.
+func approvalRoleFor(ctx context.Context, ts tenantScope, job data.WorkflowJob, defCache map[string]*cachedWorkflowDef) (string, error) {
+	cacheKey := fmt.Sprintf("%s@%d", job.WorkflowName, job.WorkflowVersion)
+	var def *workflow.Definition
+	entry, cached := (*cachedWorkflowDef)(nil), false
+	if defCache != nil {
+		entry, cached = defCache[cacheKey]
+	}
+	if cached {
+		if entry.err != nil {
+			return "", entry.err
+		}
+		def = entry.def
+	} else {
+		resolved, err := func() (*workflow.Definition, error) {
+			defVersion, err := ts.workflowDefs.GetVersion(ctx, job.WorkflowName, job.WorkflowVersion)
+			if err != nil {
+				return nil, fmt.Errorf("get workflow definition %s v%d: %w", job.WorkflowName, job.WorkflowVersion, err)
+			}
+			d, err := workflow.Unmarshal(defVersion.Definition)
+			if err != nil {
+				return nil, fmt.Errorf("unmarshal workflow definition %s v%d: %w", job.WorkflowName, job.WorkflowVersion, err)
+			}
+			return d, nil
+		}()
+		// Failures are memoized too. Caching only successes meant that a
+		// single missing or malformed definition reproduced exactly the
+		// N+1 of identical failing lookups this cache exists to prevent —
+		// and a broken definition is precisely when an inbox is most
+		// likely to hold many jobs pointing at it. (Independent review.)
+		if defCache != nil {
+			defCache[cacheKey] = &cachedWorkflowDef{def: resolved, err: err}
+		}
+		if err != nil {
+			return "", err
+		}
+		def = resolved
+	}
+	if job.StepIndex < 0 || job.StepIndex >= len(def.Steps) {
+		return "", fmt.Errorf("workflow job %s: step index %d out of range for %s v%d (%d steps)", job.ID, job.StepIndex, job.WorkflowName, job.WorkflowVersion, len(def.Steps))
+	}
+	step := def.Steps[job.StepIndex]
+	if step.Kind != workflow.StepRequireApproval {
+		return "", fmt.Errorf("workflow job %s: step %d is a %q step, not require_approval — nothing should have halted it waiting for approval", job.ID, job.StepIndex, step.Kind)
+	}
+	raw, present := step.Params["role"]
+	if !present {
+		return "", nil
+	}
+	// workflow.Definition.Validate (run by Unmarshal above) already
+	// rejects a non-string/empty "role" param at publish time, so this
+	// can't actually be false for a definition that made it this far —
+	// checked explicitly anyway rather than discarding it (a silently
+	// ignored malformed value here would mean "no restriction", which is
+	// exactly the fail-open bug this whole check exists to prevent).
+	requiredRole, ok := raw.(string)
+	if !ok || requiredRole == "" {
+		return "", fmt.Errorf("workflow job %s: step %d's role param is %#v, not a valid Role code", job.ID, job.StepIndex, raw)
+	}
+	return requiredRole, nil
 }
 
 // workflowJobResponse is the JSON shape for one row of listWorkflowJobs —
@@ -330,17 +405,63 @@ func (h *Handler) renderWorkflowInbox(w http.ResponseWriter, r *http.Request) {
 		ColumnWorkflow: h.catalog.T(locale, "workflow_inbox.column_workflow"),
 		ColumnEntity:   h.catalog.T(locale, "workflow_inbox.column_entity"),
 		ColumnRecord:   h.catalog.T(locale, "workflow_inbox.column_record"),
+		ColumnAction:   h.catalog.T(locale, "workflow_inbox.column_action"),
 		ApproveLabel:   h.catalog.T(locale, "workflow_inbox.approve_button"),
 	}
+
+	// The viewer's own roles, resolved ONCE for the whole page rather than
+	// per row — this is the same set for every job, and the inbox is the
+	// one place that renders many jobs at a time.
+	viewerRoles, err := foundation.RoleCodesForUser(r.Context(), ts.db, rc.Actor.ID)
+	if err != nil {
+		writeInternalError(w, fmt.Sprintf("resolve roles for user %s", rc.Actor.ID), err)
+		return
+	}
+	holds := make(map[string]bool, len(viewerRoles))
+	for _, c := range viewerRoles {
+		holds[c] = true
+	}
+	defCache := map[string]*cachedWorkflowDef{}
+
 	for _, j := range jobs {
-		view.Rows = append(view.Rows, workflowInboxRowView{
+		row := workflowInboxRowView{
 			ID:           j.ID,
 			WorkflowName: j.WorkflowName,
 			EntityLabel:  h.entityDisplayName(locale, j.EntityType),
 			RecordHref:   "/forms/" + j.EntityType + "/" + j.RecordID,
 			RecordID:     j.RecordID,
 			ApproveHref:  "/api/workflow-jobs/" + j.ID + "/approve",
-		})
+		}
+
+		// Resolved through the SAME function approveWorkflowJob's own gate
+		// uses, so what the inbox offers and what the API will accept
+		// cannot disagree.
+		requiredRole, err := approvalRoleFor(r.Context(), ts, j, defCache)
+		switch {
+		case err != nil:
+			// A job whose definition or step index can't be resolved is a
+			// data problem, not this viewer's fault. Show the row without
+			// an Approve button rather than failing the whole page —
+			// hiding every other pending approval because one job is
+			// malformed would be a worse outcome — and log it, since a
+			// silently unactionable row is exactly the confusion this
+			// task exists to remove.
+			log.Printf("api: workflow inbox: resolve required role for job %s: %v", j.ID, err)
+			row.BlockedReason = h.catalog.T(locale, "workflow_inbox.unavailable")
+		case requiredRole == "" || holds[requiredRole]:
+			// Unrestricted step, or the viewer holds the role.
+			row.CanApprove = true
+		default:
+			// The case this task is about. Before role-gating existed
+			// every step was unrestricted, so this was unreachable;
+			// role-gating turned it into the routine case, and the button
+			// was still being offered — clicking it now 403s, and htmx
+			// does not swap on a non-2xx response, so the click visibly
+			// did nothing with no explanation at all.
+			row.BlockedReason = strings.ReplaceAll(
+				h.catalog.T(locale, "workflow_inbox.requires_role"), "{role}", requiredRole)
+		}
+		view.Rows = append(view.Rows, row)
 	}
 
 	var buf bytes.Buffer
@@ -360,6 +481,7 @@ type workflowInboxView struct {
 	ColumnWorkflow string
 	ColumnEntity   string
 	ColumnRecord   string
+	ColumnAction   string
 	ApproveLabel   string
 	Rows           []workflowInboxRowView
 }
@@ -371,6 +493,14 @@ type workflowInboxRowView struct {
 	RecordHref   string
 	RecordID     string
 	ApproveHref  string
+	// CanApprove and BlockedReason are mutually exclusive: exactly one of
+	// an Approve button or an explanation renders, never both and never
+	// neither. The row itself always renders — a pending approval the
+	// viewer cannot action is still information they may need (it is why
+	// their purchase order is sitting there), so this greys the action
+	// out rather than hiding the work.
+	CanApprove    bool
+	BlockedReason string
 }
 
 var workflowInboxTmpl = template.Must(template.New("workflowInbox").Parse(`
@@ -381,14 +511,14 @@ var workflowInboxTmpl = template.Must(template.New("workflowInbox").Parse(`
 <p class="uc-empty">{{.Empty}}</p>
 {{else}}
 <table class="uc-table">
-<thead><tr><th>{{.ColumnWorkflow}}</th><th>{{.ColumnEntity}}</th><th>{{.ColumnRecord}}</th><th></th></tr></thead>
+<thead><tr><th>{{.ColumnWorkflow}}</th><th>{{.ColumnEntity}}</th><th>{{.ColumnRecord}}</th><th>{{.ColumnAction}}</th></tr></thead>
 <tbody>
 {{range .Rows}}
 <tr id="workflow-job-{{.ID}}">
 <td>{{.WorkflowName}}</td>
 <td>{{.EntityLabel}}</td>
 <td><a href="{{.RecordHref}}">{{.RecordID}}</a></td>
-<td><button hx-post="{{.ApproveHref}}" hx-target="closest tr" hx-swap="outerHTML">{{$.ApproveLabel}}</button></td>
+<td>{{if .CanApprove}}<button hx-post="{{.ApproveHref}}" hx-target="closest tr" hx-swap="outerHTML">{{$.ApproveLabel}}</button>{{else}}<span class="uc-inbox-blocked" title="{{.BlockedReason}}">{{.BlockedReason}}</span>{{end}}</td>
 </tr>
 {{end}}
 </tbody>

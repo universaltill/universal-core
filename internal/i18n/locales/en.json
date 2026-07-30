@@ -285,5 +285,8 @@
   "field.Position.department_id": "Department",
   "field.Position.reports_to_position_id": "Reports To",
   "error.access_denied.title": "Access denied",
-  "error.access_denied.body": "You don't have permission to view this page. If you need access, ask an administrator in your organization."
+  "error.access_denied.body": "You don't have permission to view this page. If you need access, ask an administrator in your organization.",
+  "workflow_inbox.column_action": "Action",
+  "workflow_inbox.requires_role": "Needs the {role} role",
+  "workflow_inbox.unavailable": "Unavailable"
 }

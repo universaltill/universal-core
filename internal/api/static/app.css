@@ -452,3 +452,13 @@ button.uc-btn:hover {
   visibility: visible;
   transform: translateY(0);
 }
+
+/* A pending approval the viewer cannot action (workflow inbox). Rendered
+   in place of the Approve button rather than hiding the row: the job is
+   still information they may need — it is why their document is sitting
+   there — so it greys the action out instead of concealing the work. */
+.uc-inbox-blocked {
+  color: var(--uc-muted);
+  font-style: italic;
+  font-size: 0.9em;
+}
