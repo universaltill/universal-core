@@ -44,11 +44,14 @@ func RoleCodesForUser(ctx context.Context, db *sql.DB, userID string) ([]string,
 	if err != nil {
 		return nil, err
 	}
+	seen := make(map[string]bool, len(grants))
 	var codes []string
 	for _, g := range grants {
-		if g.Code != "" {
-			codes = append(codes, g.Code)
+		if g.Code == "" || seen[g.Code] {
+			continue
 		}
+		seen[g.Code] = true
+		codes = append(codes, g.Code)
 	}
 	return codes, nil
 }
@@ -58,14 +61,42 @@ func RoleCodesForUser(ctx context.Context, db *sql.DB, userID string) ([]string,
 // its code (what conventions like ADR-0006's tenant_admin override key
 // on). internal/kernel/authz needs both per request, so they resolve
 // together rather than in two round-trip sets of queries.
+//
+// DepartmentID is the UserRole grant row's own department_id (v2, see
+// UserRole's doc comment) — empty means a global grant (every
+// department), not "department unknown". Populated here so a caller
+// that already has RoleGrantsForUser's result can filter by department
+// itself without a second query; RoleCodesForUserInDepartment below is
+// the same filter as a convenience wrapper for the common case.
 type RoleGrant struct {
-	ID   string
-	Code string
+	ID           string
+	Code         string
+	DepartmentID string
 }
 
 // RoleGrantsForUser resolves every Role userID holds in this tenant —
 // same contract as RoleCodesForUser (which is now a thin projection of
 // this): read-only, nil-not-error for a user with zero grants.
+//
+// Returns one RoleGrant per UserRole row whose role_id still resolves to
+// a live Role record — not deduplicated by role_id, so a user can hold
+// the same Role twice with different department scope (e.g. "Finance
+// Manager" granted globally via one UserRole row and again scoped to a
+// specific department via another) without collapsing those into one
+// grant and silently dropping whichever DepartmentID lost the
+// collision. A UserRole row whose role_id no longer resolves (the Role
+// record was deleted; crud.Engine.Delete soft-deletes with no cascade,
+// so this is a real, reachable state) is skipped entirely, same as the
+// pre-department-scoping version of this function did by construction —
+// found by independent review: an earlier draft of this rewrite dropped
+// that filter, which meant deleting a Role silently stopped revoking
+// the Permission/FieldPermission grants it had authorized, since
+// internal/kernel/authz.loadRoles keys off RoleGrant.ID regardless of
+// whether Code resolved. Existing callers (authz's r.roleIDs map,
+// RoleCodesForUser's linear scans) are dedup-tolerant for the
+// same-role-twice case this function deliberately allows through — that
+// part of the original claim was verified correct, just not the
+// dangling-role-id case, which this filter closes.
 func RoleGrantsForUser(ctx context.Context, db *sql.DB, userID string) ([]RoleGrant, error) {
 	records := data.NewRecordRepo(db)
 
@@ -73,13 +104,22 @@ func RoleGrantsForUser(ctx context.Context, db *sql.DB, userID string) ([]RoleGr
 	if err != nil {
 		return nil, fmt.Errorf("list UserRole by user_id: %w", err)
 	}
-	roleIDs := make(map[string]bool)
-	for _, ur := range userRoles {
-		if rid, _ := ur.Data["role_id"].(string); rid != "" {
-			roleIDs[rid] = true
-		}
+	type seed struct {
+		roleID       string
+		departmentID string
 	}
-	if len(roleIDs) == 0 {
+	roleIDs := make(map[string]bool)
+	seeds := make([]seed, 0, len(userRoles))
+	for _, ur := range userRoles {
+		rid, _ := ur.Data["role_id"].(string)
+		if rid == "" {
+			continue
+		}
+		deptID, _ := ur.Data["department_id"].(string)
+		roleIDs[rid] = true
+		seeds = append(seeds, seed{roleID: rid, departmentID: deptID})
+	}
+	if len(seeds) == 0 {
 		return nil, nil
 	}
 
@@ -87,13 +127,50 @@ func RoleGrantsForUser(ctx context.Context, db *sql.DB, userID string) ([]RoleGr
 	if err != nil {
 		return nil, fmt.Errorf("list Role: %w", err)
 	}
-	var grants []RoleGrant
+	codeByID := make(map[string]string, len(roleIDs))
 	for _, r := range roles {
-		if !roleIDs[r.ID] {
+		if roleIDs[r.ID] {
+			code, _ := r.Data["code"].(string)
+			codeByID[r.ID] = code
+		}
+	}
+
+	var grants []RoleGrant
+	for _, s := range seeds {
+		code, ok := codeByID[s.roleID]
+		if !ok {
+			// role_id points at a Role record that no longer exists —
+			// exclude it rather than emit a grant with an empty Code,
+			// the same filter records.List's roleIDs check applied
+			// implicitly before this function tracked per-row
+			// department scope.
 			continue
 		}
-		code, _ := r.Data["code"].(string)
-		grants = append(grants, RoleGrant{ID: r.ID, Code: code})
+		grants = append(grants, RoleGrant{ID: s.roleID, Code: code, DepartmentID: s.departmentID})
 	}
 	return grants, nil
+}
+
+// RoleCodesForUserInDepartment resolves which Role.code values userID
+// holds either globally (a UserRole grant with no department_id) or
+// scoped to departmentID specifically — the filter R17's department-
+// based approval routing needs once it can resolve "the requester's
+// department" (still separate, open work — see UserRole's doc comment).
+// A grant scoped to a *different* department does not count. Same
+// nil-not-error-on-zero-grants contract as RoleCodesForUser.
+func RoleCodesForUserInDepartment(ctx context.Context, db *sql.DB, userID, departmentID string) ([]string, error) {
+	grants, err := RoleGrantsForUser(ctx, db, userID)
+	if err != nil {
+		return nil, err
+	}
+	var codes []string
+	for _, g := range grants {
+		if g.Code == "" {
+			continue
+		}
+		if g.DepartmentID == "" || g.DepartmentID == departmentID {
+			codes = append(codes, g.Code)
+		}
+	}
+	return codes, nil
 }

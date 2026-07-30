@@ -474,6 +474,29 @@ func TestUserRole_MissingRequiredRoleID(t *testing.T) {
 	}
 }
 
+// TestUserRole_DepartmentIsOptional confirms a v2 UserRole with no
+// department_id (a global grant, per its own doc comment) still
+// validates — the same reversible-optional-field precedent as
+// Position.department_id, not a required field a pre-v2 UserRole row
+// would suddenly fail to satisfy.
+func TestUserRole_DepartmentIsOptional(t *testing.T) {
+	def := UserRole()
+	if err := entity.ValidateRecord(def, map[string]any{
+		"user_id": "zitadel-sub-123", "role_id": "role-finance",
+	}); err != nil {
+		t.Fatalf("expected a UserRole with no department_id (global grant) to validate, got %v", err)
+	}
+}
+
+func TestUserRole_DepartmentScopedGrantValidates(t *testing.T) {
+	def := UserRole()
+	if err := entity.ValidateRecord(def, map[string]any{
+		"user_id": "zitadel-sub-123", "role_id": "role-finance", "department_id": "dept-sales",
+	}); err != nil {
+		t.Fatalf("expected a department-scoped UserRole to validate, got %v", err)
+	}
+}
+
 func TestDepartment_RequiresCodeAndName(t *testing.T) {
 	def := Department()
 	if err := entity.ValidateRecord(def, map[string]any{"name": "Finance"}); err == nil {

@@ -399,6 +399,64 @@ func TestGuardedEngine_EnforcesAndDelegates(t *testing.T) {
 	}
 }
 
+// TestResolver_DeletedRole_RevokesAccess is the regression test for a
+// bug independent review found while reviewing an unrelated change to
+// foundation.RoleGrantsForUser (department-scoped UserRole grants,
+// erp/BACKLOG-TASKS.md's "Department-scoped approval routing" task): a
+// draft of that rewrite stopped filtering out UserRole rows whose
+// role_id no longer resolves to a live Role record (crud.Engine.Delete
+// soft-deletes with no cascade to referencing rows, so this is a real,
+// reachable state, not hypothetical), which meant deleting a Role
+// silently left every Permission grant it had authorized still active —
+// an admin revoking a role got no actual revocation. Confirms both
+// halves of that blast radius: entity-level CanRead/CanWrite and
+// field-level HiddenFields both go back to "as if the grant never
+// existed" the moment the Role record is deleted.
+func TestResolver_DeletedRole_RevokesAccess(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	clerk := f.role("clerk")
+	f.grant("user-clerk", clerk.ID)
+	f.permit(clerk.ID, "Party", true, true)
+	f.create("FieldPermission", map[string]any{
+		"role_id": clerk.ID, "entity_type": "Party", "field_name": "name", "hidden": true,
+	})
+
+	r := humanResolver(f, "user-clerk")
+	got, err := r.CanRead(ctx, "Party")
+	mustCan(t, got, err, true, "clerk CanRead(Party) before Role deletion")
+	got, err = r.CanWrite(ctx, "Party")
+	mustCan(t, got, err, true, "clerk CanWrite(Party) before Role deletion")
+	hidden, err := r.HiddenFields(ctx, "Party")
+	if err != nil {
+		t.Fatalf("HiddenFields before Role deletion: %v", err)
+	}
+	if !hidden["name"] {
+		t.Fatalf("expected Party.name hidden before Role deletion, got %v", hidden)
+	}
+
+	if err := f.engine.Delete(ctx, f.def("Role"), clerk.ID, f.actor); err != nil {
+		t.Fatalf("delete Role clerk: %v", err)
+	}
+
+	// A fresh Resolver — loadRoles memoizes per-instance, and the point
+	// is a new request (a fresh Resolver, same as every real HTTP
+	// request gets) sees the revocation, not that a live instance's
+	// cache invalidates mid-request.
+	r = humanResolver(f, "user-clerk")
+	got, err = r.CanRead(ctx, "Party")
+	mustCan(t, got, err, false, "clerk CanRead(Party) after Role deletion")
+	got, err = r.CanWrite(ctx, "Party")
+	mustCan(t, got, err, false, "clerk CanWrite(Party) after Role deletion")
+	hidden, err = r.HiddenFields(ctx, "Party")
+	if err != nil {
+		t.Fatalf("HiddenFields after Role deletion: %v", err)
+	}
+	if hidden["name"] {
+		t.Fatalf("expected Party.name NOT hidden after Role deletion (the only role hiding it is gone), got %v", hidden)
+	}
+}
+
 // A denied writer still gets validation-first behavior on
 // ValidateStatusTransition (deliberately ungated — see its doc
 // comment); the write itself is what carries the 403.
