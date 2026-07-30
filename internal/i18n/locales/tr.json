@@ -267,5 +267,13 @@
   "field.CostCenter.name": "Ad",
   "field.CostCenter.type": "Tür",
   "toast.error_fallback": "Bir şeyler ters gitti. Lütfen tekrar deneyin.",
-  "toast.network_error": "Sunucuya ulaşılamadı. Bağlantınızı kontrol edip tekrar deneyin."
+  "toast.network_error": "Sunucuya ulaşılamadı. Bağlantınızı kontrol edip tekrar deneyin.",
+  "field.Permission.role_id": "Rol",
+  "field.Permission.entity_type": "Varlık türü",
+  "field.Permission.can_read": "Okuyabilir",
+  "field.Permission.can_write": "Yazabilir",
+  "field.FieldPermission.role_id": "Rol",
+  "field.FieldPermission.entity_type": "Varlık türü",
+  "field.FieldPermission.field_name": "Alan adı",
+  "field.FieldPermission.hidden": "Gizli"
 }

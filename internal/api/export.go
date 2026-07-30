@@ -37,7 +37,7 @@ func (h *Handler) exportRecordsCSV(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	ts, err := h.scope(r.Context(), rc.TenantID)
+	ts, err := h.scope(r.Context(), rc)
 	if err != nil {
 		writeInternalError(w, "resolve tenant scope", err)
 		return
@@ -51,7 +51,7 @@ func (h *Handler) exportRecordsCSV(w http.ResponseWriter, r *http.Request) {
 	}
 	records, err := ts.crud.List(r.Context(), def)
 	if err != nil {
-		writeInternalError(w, fmt.Sprintf("list %s records for export", entityType), err)
+		writeCrudError(w, fmt.Sprintf("list %s records for export", entityType), err)
 		return
 	}
 	rows := make([]map[string]any, len(records))

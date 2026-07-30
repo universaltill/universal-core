@@ -100,7 +100,7 @@ func (h *Handler) approveWorkflowJob(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	ts, err := h.scope(r.Context(), rc.TenantID)
+	ts, err := h.scope(r.Context(), rc)
 	if err != nil {
 		writeInternalError(w, "resolve tenant scope", err)
 		return
@@ -171,7 +171,7 @@ func (h *Handler) listWorkflowJobs(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	ts, err := h.scope(r.Context(), rc.TenantID)
+	ts, err := h.scope(r.Context(), rc)
 	if err != nil {
 		writeInternalError(w, "resolve tenant scope", err)
 		return
@@ -218,7 +218,7 @@ func (h *Handler) renderWorkflowInbox(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	ts, err := h.scope(r.Context(), rc.TenantID)
+	ts, err := h.scope(r.Context(), rc)
 	if err != nil {
 		writeInternalError(w, "resolve tenant scope", err)
 		return

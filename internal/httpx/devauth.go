@@ -17,6 +17,15 @@ import (
 type RequestContext struct {
 	TenantID string
 	Actor    audit.Actor
+	// Machine marks a service-token request (internal/svcauth) as
+	// opposed to a human browser session (internal/webauth) or the
+	// DevAuth stopgap. internal/kernel/authz reads it to apply
+	// ADR-0006's machine-actor posture (service tokens bypass
+	// entity/field RBAC — they're already coarse-gated by Zitadel's
+	// tenant_integration role). An explicit flag, set only by the
+	// middleware that actually verified the token, not inferred from
+	// the actor id's shape.
+	Machine bool
 }
 
 type ctxKey int

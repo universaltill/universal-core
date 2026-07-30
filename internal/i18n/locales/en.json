@@ -267,5 +267,13 @@
   "field.CostCenter.name": "Name",
   "field.CostCenter.type": "Type",
   "toast.error_fallback": "Something went wrong. Please try again.",
-  "toast.network_error": "Couldn't reach the server. Check your connection and try again."
+  "toast.network_error": "Couldn't reach the server. Check your connection and try again.",
+  "field.Permission.role_id": "Role",
+  "field.Permission.entity_type": "Entity type",
+  "field.Permission.can_read": "Can read",
+  "field.Permission.can_write": "Can write",
+  "field.FieldPermission.role_id": "Role",
+  "field.FieldPermission.entity_type": "Entity type",
+  "field.FieldPermission.field_name": "Field name",
+  "field.FieldPermission.hidden": "Hidden"
 }

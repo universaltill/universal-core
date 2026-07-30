@@ -98,6 +98,51 @@ func AllForms() []*form.Definition {
 		AttachmentForm(), UnitOfMeasureForm(), UomConversionForm(), CurrencyForm(),
 		ExchangeRateForm(), StatusTypeForm(), StatusForm(), StatusTransitionForm(),
 		RoleForm(), UserRoleForm(),
+		PermissionForm(), FieldPermissionForm(),
+	}
+}
+
+func PermissionForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "Permission",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Details",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "role_id", Label: "Role"},
+					{Name: "entity_type", Label: "Entity type"},
+					{Name: "can_read", Label: "Can read"},
+					{Name: "can_write", Label: "Can write"},
+				},
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
+	}
+}
+
+func FieldPermissionForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "FieldPermission",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Details",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "role_id", Label: "Role"},
+					{Name: "entity_type", Label: "Entity type"},
+					{Name: "field_name", Label: "Field name"},
+					{Name: "hidden", Label: "Hidden"},
+				},
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
 	}
 }
 

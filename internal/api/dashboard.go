@@ -56,7 +56,7 @@ func (h *Handler) sessionContext(r *http.Request) (httpx.RequestContext, bool) {
 func (h *Handler) writeDashboard(w http.ResponseWriter, r *http.Request, rc httpx.RequestContext) {
 	locale := localeFromRequest(w, r)
 
-	ts, err := h.scope(r.Context(), rc.TenantID)
+	ts, err := h.scope(r.Context(), rc)
 	if err != nil {
 		writeInternalError(w, "resolve tenant scope", err)
 		return

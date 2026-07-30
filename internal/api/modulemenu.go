@@ -48,7 +48,7 @@ func (h *Handler) renderModuleMenu(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	ts, err := h.scope(r.Context(), rc.TenantID)
+	ts, err := h.scope(r.Context(), rc)
 	if err != nil {
 		writeInternalError(w, "resolve tenant scope", err)
 		return

@@ -69,7 +69,7 @@ func (h *Handler) aiProviderSettingsPage(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
-	ts, err := h.scope(r.Context(), rc.TenantID)
+	ts, err := h.scope(r.Context(), rc)
 	if err != nil {
 		writeInternalError(w, "resolve tenant scope", err)
 		return
@@ -150,7 +150,7 @@ func (h *Handler) aiProviderSettingsSave(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
-	ts, err := h.scope(r.Context(), rc.TenantID)
+	ts, err := h.scope(r.Context(), rc)
 	if err != nil {
 		writeInternalError(w, "resolve tenant scope", err)
 		return
@@ -311,7 +311,7 @@ func (h *Handler) aiProviderSettingsClear(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
-	ts, err := h.scope(r.Context(), rc.TenantID)
+	ts, err := h.scope(r.Context(), rc)
 	if err != nil {
 		writeInternalError(w, "resolve tenant scope", err)
 		return

@@ -486,6 +486,71 @@ func UserRole() *entity.Definition {
 	}
 }
 
+// Permission is one entity-level RBAC grant: "this Role may read
+// (and/or write) this entity type" (ADR-0006, `uc-infra/docs/adr/0006-
+// rbac-enforcement-guarded-engine.md`). Enforcement semantics live in
+// internal/kernel/authz, but the two facts that shape this entity's
+// design are worth restating at the data model:
+//
+//   - Grants are additive (union over the user's roles); there is no
+//     "deny" row. Absence of any Permission row for an entity type
+//     means that type is not opted into RBAC at all and stays fully
+//     accessible (backward compatibility with every tenant provisioned
+//     before this entity existed).
+//   - The moment ANY Permission row exists for an entity type, that
+//     type flips to deny-unless-granted for non-admin, non-machine
+//     users — creating a narrow grant is also the act of opting the
+//     entity type into enforcement.
+//
+// entity_type is a plain FieldString, not a reference — Entity
+// Definitions live in the registry (entity_definitions), not in
+// records, so there is nothing for a FieldReference to point at. A
+// typo'd entity_type yields an inert rule (ADR-0006 records this as an
+// accepted limitation), visible and fixable in the generated UI.
+func Permission() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "Permission",
+		Version:    1,
+		Module:     "foundation",
+		Fields: []entity.Field{
+			{Name: "role_id", Type: entity.FieldReference, Required: true, Target: "Role"},
+			{Name: "entity_type", Type: entity.FieldString, Required: true},
+			{Name: "can_read", Type: entity.FieldBool},
+			{Name: "can_write", Type: entity.FieldBool},
+		},
+	}
+}
+
+// FieldPermission is one field-level RBAC rule: "for holders of this
+// Role, this field on this entity type is hidden" (R5's "a hidden field
+// is hidden by RBAC, not by the layout"). Deliberately flat and
+// standalone rather than a composition under Permission — a field rule
+// is meaningful on its own (field hiding applies even to entity types
+// that aren't entity-level opted-in, e.g. hide `credit_limit` on
+// Customer for a junior role while Customer itself stays open), and
+// R11a's composition machinery (atomic save, roll-up) buys nothing
+// here. Visibility resolves as the union of what each held role can
+// see: a field is hidden from a user only when EVERY role they hold
+// hides it (ADR-0006).
+//
+// Enforcement of these rows (read stripping, form filtering, write
+// rejection) ships as the second commit of the ADR-0006 task; the
+// entity lands with the model so both commits publish one registry
+// shape.
+func FieldPermission() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "FieldPermission",
+		Version:    1,
+		Module:     "foundation",
+		Fields: []entity.Field{
+			{Name: "role_id", Type: entity.FieldReference, Required: true, Target: "Role"},
+			{Name: "entity_type", Type: entity.FieldString, Required: true},
+			{Name: "field_name", Type: entity.FieldString, Required: true},
+			{Name: "hidden", Type: entity.FieldBool},
+		},
+	}
+}
+
 // All returns every foundation Definition — the set that must exist
 // before any operational module is enabled for a tenant.
 func All() []*entity.Definition {
@@ -507,5 +572,7 @@ func All() []*entity.Definition {
 		AIProviderConnection(),
 		Role(),
 		UserRole(),
+		Permission(),
+		FieldPermission(),
 	}
 }
