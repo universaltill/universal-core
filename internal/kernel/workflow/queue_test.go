@@ -385,6 +385,38 @@ func TestQueue_ListByStatus_ReturnsOnlyMatchingStatus(t *testing.T) {
 	}
 }
 
+// TestQueue_Get_ReturnsJobByID confirms the passthrough approveWorkflowJob
+// (internal/api) needs to resolve WorkflowName/Version/StepIndex before
+// deciding whether a caller may resume a waiting_approval job — same
+// shape as ListByStatus's own test, one level down (by id instead of by
+// status).
+func TestQueue_Get_ReturnsJobByID(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	def := poApprovalWorkflow()
+	q, err := NewQueue(db, nil)
+	if err != nil {
+		t.Fatalf("NewQueue: %v", err)
+	}
+
+	enqueued, err := q.Enqueue(ctx, def, "PurchaseOrder", "33333333-3333-3333-3333-333333333333", humanActor())
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	got, err := q.Get(ctx, enqueued.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.ID != enqueued.ID || got.WorkflowName != def.Name || got.WorkflowVersion != def.Version {
+		t.Fatalf("expected the enqueued job back, got %+v", got)
+	}
+
+	if _, err := q.Get(ctx, "99999999-9999-9999-9999-999999999999"); !errors.Is(err, data.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for an unknown job id, got %v", err)
+	}
+}
+
 // TestWorkflowJobRepo_TenantIsolation is the regression test for the
 // code-review finding that by-ID methods without a tenant check would let
 // one tenant's request read or resume another tenant's job. Proven here
@@ -538,6 +570,62 @@ func TestQueue_ProcessOne_InvalidDefinitionFromLookup(t *testing.T) {
 	}
 	if got.Status != "queued" || got.Attempts != 1 {
 		t.Fatalf("expected an invalid definition to be recorded like any other step failure, got status=%q attempts=%d", got.Status, got.Attempts)
+	}
+}
+
+// TestQueue_ProcessOne_MalformedApprovalRoleNeverReachesWaitingApproval is
+// the queue-level sibling of TestDefinitionValidate_
+// RequireApprovalRoleParamMustBeString: even if a require_approval step's
+// role param were somehow malformed by the time ProcessOne's lookup
+// returns it (Enqueue's own upfront Validate call is the normal defense,
+// but this proves the second, independent layer holds too — the same
+// "defense in depth, not defense in one place" reasoning
+// TestQueue_ProcessOne_InvalidDefinitionFromLookup already established
+// for a lookup returning a corrupted definition), the job fails at
+// ProcessOne and is never marked waiting_approval — it can never reach
+// the point internal/api's approval gate would have to reason about a
+// bad role value at all.
+func TestQueue_ProcessOne_MalformedApprovalRoleNeverReachesWaitingApproval(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	def := &Definition{
+		Name: "malformed_role", Version: 1,
+		Trigger: Trigger{Type: TriggerManual},
+		Steps:   []Step{{Kind: StepNotify}}, // valid at Enqueue time
+	}
+	q, err := NewQueue(db, nil)
+	if err != nil {
+		t.Fatalf("NewQueue: %v", err)
+	}
+	job, err := q.Enqueue(ctx, def, "PurchaseOrder", "66666666-6666-6666-6666-666666666666", humanActor())
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	// Simulates a lookup returning a definition whose role param is
+	// malformed (e.g. written out-of-band, bypassing Enqueue's check) —
+	// same "lookup can return something Enqueue would have refused"
+	// premise as TestQueue_ProcessOne_InvalidDefinitionFromLookup.
+	malformedLookup := func(ctx context.Context, name string, version int) (*Definition, error) {
+		return &Definition{
+			Name: name, Version: version, Trigger: Trigger{Type: TriggerManual},
+			Steps: []Step{{Kind: StepRequireApproval, Params: map[string]any{"role": 42}}},
+		}, nil
+	}
+	if _, err := q.ProcessOne(ctx, malformedLookup); err != nil {
+		t.Fatalf("ProcessOne should record the validation failure on the job, not return it: %v", err)
+	}
+
+	repo := data.NewWorkflowJobRepo(db)
+	got, err := repo.Get(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status == "waiting_approval" {
+		t.Fatal("a malformed role param must never reach waiting_approval — that would mean approveWorkflowJob has to reason about it")
+	}
+	if got.Status != "queued" || got.Attempts != 1 {
+		t.Fatalf("expected the malformed definition to be recorded like any other step failure, got status=%q attempts=%d", got.Status, got.Attempts)
 	}
 }
 

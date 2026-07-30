@@ -55,6 +55,52 @@ func TestDefinitionValidate_RejectsArbitraryStepKind(t *testing.T) {
 	}
 }
 
+// TestDefinitionValidate_RequireApprovalRoleParamMustBeString is the
+// regression test for a real security bug an independent review caught:
+// internal/api's approval-role gate read `Params["role"].(string)` with
+// the "ok" discarded, so a non-string role param (e.g. published as
+// `{"role": 42}`, easy to produce since Params is a plain map[string]any
+// with no compile-time shape) silently resolved to "" and was treated as
+// "no restriction" — the exact fail-open bug this whole gate exists to
+// prevent. Fixed by rejecting it here, at Validate (which both Enqueue
+// and every resumed job's definition lookup already call), so a
+// malformed role param can never reach a running job at all.
+func TestDefinitionValidate_RequireApprovalRoleParamMustBeString(t *testing.T) {
+	d := &Definition{
+		Name:    "x",
+		Trigger: Trigger{Type: TriggerManual},
+		Steps:   []Step{{Kind: StepRequireApproval, Params: map[string]any{"role": 42}}},
+	}
+	if err := d.Validate(); err == nil {
+		t.Fatal("expected error: a non-string role param must be rejected, not silently treated as no restriction")
+	}
+}
+
+func TestDefinitionValidate_RequireApprovalRoleParamMustBeNonEmpty(t *testing.T) {
+	d := &Definition{
+		Name:    "x",
+		Trigger: Trigger{Type: TriggerManual},
+		Steps:   []Step{{Kind: StepRequireApproval, Params: map[string]any{"role": ""}}},
+	}
+	if err := d.Validate(); err == nil {
+		t.Fatal("expected error: an explicit empty-string role param must be rejected")
+	}
+}
+
+// TestDefinitionValidate_RequireApprovalWithNoRoleParamIsValid confirms
+// the fix above doesn't overreach: omitting "role" entirely is still the
+// deliberate, backward-compatible "anyone may approve" case, not an error.
+func TestDefinitionValidate_RequireApprovalWithNoRoleParamIsValid(t *testing.T) {
+	d := &Definition{
+		Name:    "x",
+		Trigger: Trigger{Type: TriggerManual},
+		Steps:   []Step{{Kind: StepRequireApproval}},
+	}
+	if err := d.Validate(); err != nil {
+		t.Fatalf("expected a require_approval step with no role param to stay valid, got %v", err)
+	}
+}
+
 func TestExecute_HaltsAtApprovalStep(t *testing.T) {
 	results, err := Execute(poApprovalWorkflow())
 	if err != nil {

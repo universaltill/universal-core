@@ -18,6 +18,7 @@ import (
 
 	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/db"
+	"github.com/universaltill/universal-core/internal/httpx"
 	"github.com/universaltill/universal-core/internal/i18n"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
@@ -166,6 +167,34 @@ func itemWithFlagFormDef() *form.Definition {
 				{Name: "sku", Label: "SKU"},
 				{Name: "is_urgent", Label: "Urgent"},
 			}},
+		},
+	}
+}
+
+// nodeEntityDef/nodeFormDef are a throwaway self-referencing entity
+// (same shape Account.parent_account_id/Department.parent_department_id
+// take — see internal/kernel/crud/cycle_test.go's categoryDef, which
+// exercises the same guard at the crud.Engine layer directly) — used
+// here to prove the guard's HTTP-level wiring: crud.ErrReferenceCycle
+// actually reaches the client as a 400 through writeCrudError, not just
+// through crud.Engine's own package tests.
+func nodeEntityDef() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "Node",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "name", Type: entity.FieldString, Required: true},
+			{Name: "parent_node_id", Type: entity.FieldReference, Target: "Node"},
+		},
+	}
+}
+
+func nodeFormDef() *form.Definition {
+	return &form.Definition{
+		EntityType: "Node",
+		Version:    1,
+		Sections: []form.Section{
+			{Title: "Details", Component: form.ComponentFields, Fields: []form.FormField{{Name: "name", Label: "Name"}}},
 		},
 	}
 }
@@ -583,6 +612,45 @@ func TestAPI_UpdateRecord_ValidationFailureIs400(t *testing.T) {
 	mux.ServeHTTP(updateRec, updateReq)
 	if updateRec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for a validation failure, got %d: %s", updateRec.Code, updateRec.Body.String())
+	}
+}
+
+// TestAPI_UpdateRecord_SelfReferenceCycleIs400 is the HTTP-level proof
+// that crud.ErrReferenceCycle (internal/kernel/crud/cycle_test.go proves
+// the guard itself) actually reaches a real client as 400 through
+// writeCrudError — before this test, nothing exercised
+// internal/api/handlers.go's own mapping line at all.
+func TestAPI_UpdateRecord_SelfReferenceCycleIs400(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, nodeEntityDef(), nodeFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	createRoot := newRequest("POST", "/api/records/Node", tenantID, "farshid", []byte(`{"name":"Root"}`))
+	rootRec := httptest.NewRecorder()
+	mux.ServeHTTP(rootRec, createRoot)
+	var root struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rootRec.Body.Bytes(), &root); err != nil {
+		t.Fatalf("unmarshal root create response: %v", err)
+	}
+
+	// A record pointing at itself is the direct-cycle case.
+	updateReq := newRequest("POST", "/api/records/Node/"+root.Data.ID, tenantID, "farshid",
+		[]byte(`{"name":"Root","parent_node_id":"`+root.Data.ID+`","version":1}`))
+	updateRec := httptest.NewRecorder()
+	mux.ServeHTTP(updateRec, updateReq)
+	if updateRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a self-reference cycle, got %d: %s", updateRec.Code, updateRec.Body.String())
+	}
+	if strings.Contains(updateRec.Body.String(), "crud:") {
+		t.Fatalf("expected no raw Go package prefix in the client-facing error body, got: %s", updateRec.Body.String())
 	}
 }
 
@@ -2562,6 +2630,305 @@ func TestAPI_ApproveWorkflowJob_ResumesWaitingApproval(t *testing.T) {
 	}
 	if got.StepIndex != 1 {
 		t.Fatalf("expected step_index advanced past the require_approval step (0) to 1, got %d", got.StepIndex)
+	}
+}
+
+// TestAPI_ApproveWorkflowJob_DeniesCallerWithoutNamedRole confirms the
+// require_approval step's `role` param, previously decorative (see
+// uc-infra ADR-0006's addendum), now actually gates who may resume the
+// job: a caller who doesn't hold the named Role gets 403, and the job is
+// left exactly as it was — still waiting_approval, not silently resumed.
+func TestAPI_ApproveWorkflowJob_DeniesCallerWithoutNamedRole(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	actor := humanActor()
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
+	if err := foundation.Publish(ctx, db, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	def := &workflow.Definition{
+		Name: "vendor_approval", Version: 1,
+		Trigger: workflow.Trigger{Type: workflow.TriggerOnCreate, EntityType: "Vendor"},
+		Steps: []workflow.Step{
+			{Kind: workflow.StepRequireApproval, Params: map[string]any{"role": "cfo"}},
+			{Kind: workflow.StepNotify},
+		},
+	}
+	publishWorkflow(t, db, def)
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	createReq := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{"name":"Acme Textiles"}`))
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", createRec.Code, createRec.Body.String())
+	}
+
+	q, err := workflow.NewQueue(db, nil)
+	if err != nil {
+		t.Fatalf("NewQueue: %v", err)
+	}
+	if _, err := q.ProcessOne(ctx, workflow.RegistryDefinitionLookup(db)); err != nil {
+		t.Fatalf("ProcessOne (halt at approval): %v", err)
+	}
+	var jobID string
+	if err := db.QueryRow(`SELECT id FROM workflow_jobs WHERE workflow_name = $1`, def.Name).Scan(&jobID); err != nil {
+		t.Fatalf("find enqueued job: %v", err)
+	}
+
+	// "farshid" holds no Role at all, let alone "cfo".
+	approveReq := newRequest("POST", "/api/workflow-jobs/"+jobID+"/approve", tenantID, "farshid", nil)
+	approveRec := httptest.NewRecorder()
+	mux.ServeHTTP(approveRec, approveReq)
+	if approveRec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for a caller without the required role, got %d: %s", approveRec.Code, approveRec.Body.String())
+	}
+
+	jobRepo := data.NewWorkflowJobRepo(db)
+	got, err := jobRepo.Get(ctx, jobID)
+	if err != nil {
+		t.Fatalf("Get after denied approve: %v", err)
+	}
+	if got.Status != "waiting_approval" {
+		t.Fatalf("expected the job to remain waiting_approval after a denied approve attempt, got %q", got.Status)
+	}
+}
+
+// TestAPI_ApproveWorkflowJob_RoleHolderCanApprove is
+// TestAPI_ApproveWorkflowJob_DeniesCallerWithoutNamedRole's positive
+// sibling: once "farshid" actually holds the "cfo" Role via UserRole, the
+// same require_approval step lets the approve endpoint through.
+func TestAPI_ApproveWorkflowJob_RoleHolderCanApprove(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	actor := humanActor()
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
+	if err := foundation.Publish(ctx, db, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	def := &workflow.Definition{
+		Name: "vendor_approval", Version: 1,
+		Trigger: workflow.Trigger{Type: workflow.TriggerOnCreate, EntityType: "Vendor"},
+		Steps: []workflow.Step{
+			{Kind: workflow.StepRequireApproval, Params: map[string]any{"role": "cfo"}},
+			{Kind: workflow.StepNotify},
+		},
+	}
+	publishWorkflow(t, db, def)
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	roleRec := httptest.NewRecorder()
+	mux.ServeHTTP(roleRec, newRequest("POST", "/api/records/Role", tenantID, "farshid", []byte(`{"code":"cfo","name":"Chief Financial Officer"}`)))
+	if roleRec.Code != http.StatusCreated {
+		t.Fatalf("create Role: expected 201, got %d: %s", roleRec.Code, roleRec.Body.String())
+	}
+	var role struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(roleRec.Body.Bytes(), &role); err != nil {
+		t.Fatalf("unmarshal Role response: %v", err)
+	}
+
+	userRoleRec := httptest.NewRecorder()
+	mux.ServeHTTP(userRoleRec, newRequest("POST", "/api/records/UserRole", tenantID, "farshid",
+		[]byte(`{"user_id":"farshid","role_id":"`+role.Data.ID+`"}`)))
+	if userRoleRec.Code != http.StatusCreated {
+		t.Fatalf("create UserRole: expected 201, got %d: %s", userRoleRec.Code, userRoleRec.Body.String())
+	}
+
+	createReq := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{"name":"Acme Textiles"}`))
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", createRec.Code, createRec.Body.String())
+	}
+
+	q, err := workflow.NewQueue(db, nil)
+	if err != nil {
+		t.Fatalf("NewQueue: %v", err)
+	}
+	if _, err := q.ProcessOne(ctx, workflow.RegistryDefinitionLookup(db)); err != nil {
+		t.Fatalf("ProcessOne (halt at approval): %v", err)
+	}
+	var jobID string
+	if err := db.QueryRow(`SELECT id FROM workflow_jobs WHERE workflow_name = $1`, def.Name).Scan(&jobID); err != nil {
+		t.Fatalf("find enqueued job: %v", err)
+	}
+
+	approveReq := newRequest("POST", "/api/workflow-jobs/"+jobID+"/approve", tenantID, "farshid", nil)
+	approveRec := httptest.NewRecorder()
+	mux.ServeHTTP(approveRec, approveReq)
+	if approveRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for a caller holding the required role, got %d: %s", approveRec.Code, approveRec.Body.String())
+	}
+
+	jobRepo := data.NewWorkflowJobRepo(db)
+	got, err := jobRepo.Get(ctx, jobID)
+	if err != nil {
+		t.Fatalf("Get after approve: %v", err)
+	}
+	if got.Status != "queued" {
+		t.Fatalf("expected the job back to queued after a role holder's approval, got %q", got.Status)
+	}
+}
+
+// TestAPI_ApproveWorkflowJob_MachineActorBypassesRoleCheck confirms the
+// `!rc.Machine` carve-out in approveWorkflowJob actually works: a service
+// token holds no Role/UserRole grants at all (RBAC's own ADR-0006
+// posture — machine actors are coarse-gated by Zitadel's
+// tenant_integration role instead), so without this bypass no service
+// integration could ever resume a role-gated job. Builds the request's
+// RequestContext directly (Machine: true) rather than through a header,
+// the same "already-authenticated request passes through unchanged"
+// pattern internal/httpx's own DevAuth tests use — this repo has no
+// lighter-weight way to simulate a verified service-token request in this
+// package.
+func TestAPI_ApproveWorkflowJob_MachineActorBypassesRoleCheck(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	actor := humanActor()
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
+	if err := foundation.Publish(ctx, db, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	def := &workflow.Definition{
+		Name: "vendor_approval", Version: 1,
+		Trigger: workflow.Trigger{Type: workflow.TriggerOnCreate, EntityType: "Vendor"},
+		Steps: []workflow.Step{
+			{Kind: workflow.StepRequireApproval, Params: map[string]any{"role": "cfo"}},
+			{Kind: workflow.StepNotify},
+		},
+	}
+	publishWorkflow(t, db, def)
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	createReq := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{"name":"Acme Textiles"}`))
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", createRec.Code, createRec.Body.String())
+	}
+
+	q, err := workflow.NewQueue(db, nil)
+	if err != nil {
+		t.Fatalf("NewQueue: %v", err)
+	}
+	if _, err := q.ProcessOne(ctx, workflow.RegistryDefinitionLookup(db)); err != nil {
+		t.Fatalf("ProcessOne (halt at approval): %v", err)
+	}
+	var jobID string
+	if err := db.QueryRow(`SELECT id FROM workflow_jobs WHERE workflow_name = $1`, def.Name).Scan(&jobID); err != nil {
+		t.Fatalf("find enqueued job: %v", err)
+	}
+
+	// "svc-integration" holds no Role at all — a human caller with no
+	// grants would get 403 (proven by
+	// TestAPI_ApproveWorkflowJob_DeniesCallerWithoutNamedRole); a machine
+	// actor must bypass the check entirely.
+	approveReq := httptest.NewRequest("POST", "/api/workflow-jobs/"+jobID+"/approve", nil)
+	approveReq.Header.Set("X-Tenant-ID", tenantID)
+	approveReq = approveReq.WithContext(httpx.WithRequestContext(approveReq.Context(), httpx.RequestContext{
+		TenantID: tenantID,
+		Actor:    audit.Actor{Type: audit.ActorHuman, ID: "svc-integration"},
+		Machine:  true,
+	}))
+	approveRec := httptest.NewRecorder()
+	mux.ServeHTTP(approveRec, approveReq)
+	if approveRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for a machine actor bypassing the role check, got %d: %s", approveRec.Code, approveRec.Body.String())
+	}
+}
+
+// TestAPI_ApproveWorkflowJob_RoleGateIsTenantScoped proves the new role
+// lookup respects ADR-0003's database-per-tenant isolation: "farshid"
+// holds "cfo" in tenant A, but tenant B is a genuinely separate database
+// with no such grant — the same actor id must still be denied there.
+func TestAPI_ApproveWorkflowJob_RoleGateIsTenantScoped(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantA, dbA := newTestTenant(t, router)
+	tenantB, dbB := newTestTenant(t, router)
+	ctx := context.Background()
+	actor := humanActor()
+	for _, db := range []*sql.DB{dbA, dbB} {
+		publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
+		if err := foundation.Publish(ctx, db, actor); err != nil {
+			t.Fatalf("foundation.Publish: %v", err)
+		}
+	}
+	def := &workflow.Definition{
+		Name: "vendor_approval", Version: 1,
+		Trigger: workflow.Trigger{Type: workflow.TriggerOnCreate, EntityType: "Vendor"},
+		Steps: []workflow.Step{
+			{Kind: workflow.StepRequireApproval, Params: map[string]any{"role": "cfo"}},
+			{Kind: workflow.StepNotify},
+		},
+	}
+	publishWorkflow(t, dbA, def)
+	publishWorkflow(t, dbB, def)
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	// Grant "farshid" the cfo role in tenant A only.
+	roleRec := httptest.NewRecorder()
+	mux.ServeHTTP(roleRec, newRequest("POST", "/api/records/Role", tenantA, "farshid", []byte(`{"code":"cfo","name":"Chief Financial Officer"}`)))
+	if roleRec.Code != http.StatusCreated {
+		t.Fatalf("create Role in tenant A: expected 201, got %d: %s", roleRec.Code, roleRec.Body.String())
+	}
+	var role struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(roleRec.Body.Bytes(), &role); err != nil {
+		t.Fatalf("unmarshal Role response: %v", err)
+	}
+	userRoleRec := httptest.NewRecorder()
+	mux.ServeHTTP(userRoleRec, newRequest("POST", "/api/records/UserRole", tenantA, "farshid",
+		[]byte(`{"user_id":"farshid","role_id":"`+role.Data.ID+`"}`)))
+	if userRoleRec.Code != http.StatusCreated {
+		t.Fatalf("create UserRole in tenant A: expected 201, got %d: %s", userRoleRec.Code, userRoleRec.Body.String())
+	}
+
+	// Halt a job in tenant B, where "farshid" holds no such grant.
+	createReq := newRequest("POST", "/api/records/Vendor", tenantB, "farshid", []byte(`{"name":"Acme Textiles"}`))
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", createRec.Code, createRec.Body.String())
+	}
+	q, err := workflow.NewQueue(dbB, nil)
+	if err != nil {
+		t.Fatalf("NewQueue: %v", err)
+	}
+	if _, err := q.ProcessOne(ctx, workflow.RegistryDefinitionLookup(dbB)); err != nil {
+		t.Fatalf("ProcessOne (halt at approval): %v", err)
+	}
+	var jobID string
+	if err := dbB.QueryRow(`SELECT id FROM workflow_jobs WHERE workflow_name = $1`, def.Name).Scan(&jobID); err != nil {
+		t.Fatalf("find enqueued job: %v", err)
+	}
+
+	approveReq := newRequest("POST", "/api/workflow-jobs/"+jobID+"/approve", tenantB, "farshid", nil)
+	approveRec := httptest.NewRecorder()
+	mux.ServeHTTP(approveRec, approveReq)
+	if approveRec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 — tenant A's cfo grant must not leak into tenant B, got %d: %s", approveRec.Code, approveRec.Body.String())
 	}
 }
 

@@ -8,6 +8,7 @@ package crud
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 
 	"github.com/universaltill/universal-core/internal/data"
@@ -119,6 +120,90 @@ func (e *Engine) Create(ctx context.Context, def *entity.Definition, fields map[
 	return rec, nil
 }
 
+// ErrReferenceCycle is returned by Update when a self-referencing
+// FieldReference field (e.g. Account.parent_account_id,
+// Department.parent_department_id, Position.reports_to_position_id)
+// would form a cycle — see checkSelfReferenceCycle's own doc comment.
+var ErrReferenceCycle = errors.New("self-reference would form a cycle")
+
+// selfReferenceFields returns every field on def that references def's
+// own entity type — the shape any hierarchy field (parent/reports-to)
+// takes generically, without def ever naming a specific entity type.
+func selfReferenceFields(def *entity.Definition) []entity.Field {
+	var out []entity.Field
+	for _, f := range def.Fields {
+		if f.Type == entity.FieldReference && f.Target == def.EntityType {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// maxReferenceChainWalk bounds checkSelfReferenceCycle's walk cost for a
+// pathologically long but genuinely acyclic chain — the visited-set check
+// below already guarantees termination on any cycle (self-involving or
+// not) within the number of distinct nodes actually visited, well under
+// this cap for any realistic org chart or account hierarchy; this is
+// purely a defensive cap on a chain that just keeps going.
+const maxReferenceChainWalk = 10_000
+
+// checkSelfReferenceCycle walks a self-referencing field's chain starting
+// at newParentID, following the same field name up through each visited
+// record, and fails only if the walk reaches back to recordID itself (the
+// record being updated — a direct or indirect cycle this write would
+// introduce). If the walk instead revisits some OTHER id first, that's a
+// pre-existing cycle elsewhere in the chain that this write neither
+// causes nor perpetuates — recordID provably can never be reached from a
+// node once it repeats (each node has exactly one outgoing edge, so a
+// repeat makes the remaining walk exactly periodic among nodes already
+// ruled out) — so the walk stops and the write is allowed, the same
+// "not this guard's concern" posture already taken for a dangling
+// reference. This is the generic fix for the gap
+// `finance.Account.parent_account_id` already had and
+// `Department.parent_department_id`/`Position.reports_to_position_id`
+// inherited: none of them had any protection against a chain that loops
+// back on itself, which would be an infinite loop the moment anything
+// (e.g. R17 approval routing) walks the chain upward. Lives in
+// crud.Engine, not internal/kernel/entity, because it needs the record
+// repo to walk stored data — entity.ValidateRecord is pure field-shape
+// validation with no DB access (see ADR-0007).
+//
+// Reads via GetTxIncludingDeleted, not GetTx: a soft-deleted record's data
+// is still physically stored, and a chain routed through one can still
+// form a real cycle with a live record — the normal deleted-is-absent
+// view would let that slip past as "reached the top of the chain".
+//
+// Callers must hold Update's per-entity-type advisory lock before calling
+// this — see Update's own doc comment on why an unlocked walk is
+// bypassable by two concurrent updates each closing one half of a cycle.
+func checkSelfReferenceCycle(ctx context.Context, tx *sql.Tx, records *data.RecordRepo, entityType, recordID, fieldName, newParentID string) error {
+	visited := map[string]bool{}
+	currentID := newParentID
+	for i := 0; i < maxReferenceChainWalk; i++ {
+		if currentID == recordID {
+			return fmt.Errorf("%s.%s: %w", entityType, fieldName, ErrReferenceCycle)
+		}
+		if visited[currentID] {
+			return nil // a pre-existing cycle elsewhere, not involving recordID
+		}
+		visited[currentID] = true
+
+		rec, err := records.GetTxIncludingDeleted(ctx, tx, entityType, currentID)
+		if err != nil {
+			if errors.Is(err, data.ErrNotFound) {
+				return nil // dangling reference — not this guard's concern
+			}
+			return fmt.Errorf("walk %s.%s reference chain: %w", entityType, fieldName, err)
+		}
+		next, ok := rec.Data[fieldName].(string)
+		if !ok || next == "" {
+			return nil // reached the top of the chain
+		}
+		currentID = next
+	}
+	return fmt.Errorf("%s.%s: reference chain exceeded %d hops (possibly corrupted): %w", entityType, fieldName, maxReferenceChainWalk, ErrReferenceCycle)
+}
+
 // Update validates and applies a full replacement of fields, atomically
 // with its audit entry. expectedVersion is optimistic-locking's hook —
 // nil skips the check (unconditional update, the original behaviour);
@@ -127,6 +212,30 @@ func (e *Engine) Create(ctx context.Context, def *entity.Definition, fields map[
 // record's new version on success, so a caller re-rendering the record
 // (a form, an API response) can embed the version it should check against
 // next time.
+//
+// Also rejects a self-referencing FieldReference update that would form a
+// cycle (ErrReferenceCycle) — see checkSelfReferenceCycle. Create never
+// needs this check: a newly-created record's id doesn't exist until after
+// the insert, so it cannot yet appear in anything's reference chain.
+//
+// A self-referencing update first takes a per-entity-type Postgres
+// advisory transaction lock (pg_advisory_xact_lock), serializing every
+// concurrent Update that touches that entity type's self-referencing
+// field(s) within this tenant's database. Without it, two concurrent
+// updates each walking the chain under plain READ COMMITTED can each see
+// a cycle-free chain and each commit — e.g. "set A.parent = B" and "set
+// B.parent = A" running at the same time neither observes the other's
+// still-uncommitted write, so both checks pass and the two commits
+// together produce a live two-node cycle that no single write ever
+// appeared to create. expectedVersion's optimistic locking cannot catch
+// this either: it guards one record's own version, not a chain spanning
+// several records. The lock is released automatically at the end of this
+// transaction (COMMIT or ROLLBACK) — "_xact" in the name, not held
+// across requests. Scoped by entity type, not by record, deliberately:
+// locking only the specific rows walked would need to know the chain in
+// advance (the very thing being computed), and self-referencing writes
+// (org-chart/account-hierarchy edits) are rare enough that serializing
+// all of them for one entity type has no realistic throughput cost.
 func (e *Engine) Update(ctx context.Context, def *entity.Definition, id string, fields map[string]any, expectedVersion *int, actor audit.Actor) (int, error) {
 	if err := entity.ValidateRecord(def, fields); err != nil {
 		return 0, fmt.Errorf("validation failed: %w", err)
@@ -137,6 +246,25 @@ func (e *Engine) Update(ctx context.Context, def *entity.Definition, id string, 
 		return 0, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck
+
+	selfRefFields := selfReferenceFields(def)
+	if len(selfRefFields) > 0 {
+		if err := e.records.LockSelfReferenceChainTx(ctx, tx, def.EntityType); err != nil {
+			return 0, err
+		}
+	}
+	for _, f := range selfRefFields {
+		newParentID, ok := fields[f.Name].(string)
+		if !ok || newParentID == "" {
+			continue
+		}
+		if newParentID == id {
+			return 0, fmt.Errorf("%s.%s: %w", def.EntityType, f.Name, ErrReferenceCycle)
+		}
+		if err := checkSelfReferenceCycle(ctx, tx, e.records, def.EntityType, id, f.Name, newParentID); err != nil {
+			return 0, err
+		}
+	}
 
 	newVersion, err := e.records.UpdateTx(ctx, tx, def.EntityType, id, fields, expectedVersion)
 	if err != nil {

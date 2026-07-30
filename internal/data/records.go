@@ -94,6 +94,56 @@ func (r *RecordRepo) GetTx(ctx context.Context, q querier, entityType, id string
 	return r.get(ctx, q, entityType, id)
 }
 
+// GetTxIncludingDeleted is GetTx without the `deleted_at IS NULL` filter
+// every other read applies — it sees a soft-deleted record's own stored
+// data instead of treating it as absent. The one caller that needs this:
+// crud.checkSelfReferenceCycle, which walks a self-referencing field's
+// real stored reference chain (e.g. Account.parent_account_id) to detect
+// a cycle. A soft-deleted record's data is still physically present, so
+// a chain routed through one can still form a real cycle with a live
+// record — GetTx's normal deleted-record-is-absent view would let that
+// slip past undetected, reporting "reached the top of the chain" for a
+// node that in fact still points right back into the cycle.
+func (r *RecordRepo) GetTxIncludingDeleted(ctx context.Context, q querier, entityType, id string) (Record, error) {
+	var raw []byte
+	var version int
+	err := q.QueryRowContext(ctx,
+		`SELECT data, version FROM records WHERE id = $1 AND entity_type = $2`,
+		id, entityType,
+	).Scan(&raw, &version)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Record{}, ErrNotFound
+	}
+	if err != nil {
+		return Record{}, fmt.Errorf("get record (including deleted): %w", err)
+	}
+	var recData map[string]any
+	if err := json.Unmarshal(raw, &recData); err != nil {
+		return Record{}, fmt.Errorf("unmarshal record data: %w", err)
+	}
+	return Record{ID: id, EntityType: entityType, Data: recData, Version: version}, nil
+}
+
+// LockSelfReferenceChainTx takes a per-entity-type Postgres advisory
+// transaction lock (pg_advisory_xact_lock) — serializes every concurrent
+// caller locking the same entityType within this tenant's database until
+// each one's transaction commits or rolls back. crud.Engine.Update's own
+// doc comment explains why a self-referencing FieldReference update
+// needs this (two concurrent updates can each close one half of a cycle
+// without ever observing the other's still-uncommitted write). Takes
+// *sql.Tx specifically, not the generic querier interface most of this
+// file's methods accept: pg_advisory_xact_lock only means what its name
+// says inside a transaction — called against a bare connection it would
+// hold for the rest of that connection's life instead of releasing at
+// commit/rollback, so requiring *sql.Tx here makes that misuse a compile
+// error rather than a runtime surprise.
+func (r *RecordRepo) LockSelfReferenceChainTx(ctx context.Context, tx *sql.Tx, entityType string) error {
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, "self-ref:"+entityType); err != nil {
+		return fmt.Errorf("acquire self-reference lock for %s: %w", entityType, err)
+	}
+	return nil
+}
+
 func (r *RecordRepo) get(ctx context.Context, q querier, entityType, id string) (Record, error) {
 	var raw []byte
 	var version int

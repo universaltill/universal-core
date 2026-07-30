@@ -19,6 +19,7 @@ import (
 	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/httpx"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
+	"github.com/universaltill/universal-core/internal/kernel/foundation"
 	"github.com/universaltill/universal-core/internal/kernel/workflow"
 )
 
@@ -79,6 +80,17 @@ func (h *Handler) triggerWorkflows(ctx context.Context, ts tenantScope, entityTy
 // own tests), and a caller doesn't need to distinguish those cases from
 // "you got the id wrong."
 //
+// Role-gated (R17's first slice — see uc-infra/docs/adr/0006's
+// addendum): the require_approval step's own `role` param (a Role.code,
+// e.g. `poApprovalWorkflow`'s `{"role": "cfo"}`) previously named the
+// approver but was never checked against anyone — any authenticated
+// tenant-scoped caller could resume any job regardless of the step's
+// `role`. A step with no `role` param keeps today's behaviour (anyone in
+// the tenant may approve it) — this only starts enforcing a role that a
+// workflow author actually named. Department-scoped routing (resolving
+// *which* role/user from the org chart, not just checking a statically
+// named one) is a separate, still-open backlog item.
+//
 // Actually running the resumed job's remaining steps is the worker's
 // job (internal/worker), not this handler's — ResumeAfterApproval only
 // flips the job back to 'queued' and requeues it; the next poll picks
@@ -111,6 +123,33 @@ func (h *Handler) approveWorkflowJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	job, err := ts.workflowQueue.Get(r.Context(), id)
+	if errors.Is(err, data.ErrNotFound) {
+		httpx.WriteError(w, http.StatusNotFound, fmt.Sprintf("workflow job %q not found or not waiting for approval", id))
+		return
+	}
+	if err != nil {
+		writeInternalError(w, fmt.Sprintf("look up workflow job %s", id), err)
+		return
+	}
+	// Not found and wrong status report the same 404 — see this func's
+	// own doc comment on why a caller doesn't need to distinguish them.
+	if job.Status != "waiting_approval" {
+		httpx.WriteError(w, http.StatusNotFound, fmt.Sprintf("workflow job %q not found or not waiting for approval", id))
+		return
+	}
+
+	if !rc.Machine {
+		if err := requireApprovalRole(r.Context(), ts, job, rc.Actor.ID); err != nil {
+			if errors.Is(err, errApprovalRoleDenied) {
+				httpx.WriteError(w, http.StatusForbidden, err.Error())
+				return
+			}
+			writeInternalError(w, fmt.Sprintf("resolve required approval role for workflow job %s", id), err)
+			return
+		}
+	}
+
 	if err := ts.workflowQueue.ResumeAfterApproval(r.Context(), id); err != nil {
 		if errors.Is(err, data.ErrNotFound) {
 			httpx.WriteError(w, http.StatusNotFound, fmt.Sprintf("workflow job %q not found or not waiting for approval", id))
@@ -128,6 +167,60 @@ func (h *Handler) approveWorkflowJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "resumed"})
+}
+
+// errApprovalRoleDenied is requireApprovalRole's own sentinel (as opposed
+// to any other error resolving the step/role, which is a genuine 500) —
+// mapped to 403 by its one caller, approveWorkflowJob.
+var errApprovalRoleDenied = errors.New("caller does not hold the role required to approve this workflow step")
+
+// requireApprovalRole resolves the require_approval step job is currently
+// waiting at and checks userID actually holds the Role its `role` param
+// names, returning errApprovalRoleDenied if not. A step with no `role`
+// param (or an empty one) is a no-op — see approveWorkflowJob's own doc
+// comment on why that's the deliberate backward-compatible default, not
+// an oversight.
+func requireApprovalRole(ctx context.Context, ts tenantScope, job data.WorkflowJob, userID string) error {
+	defVersion, err := ts.workflowDefs.GetVersion(ctx, job.WorkflowName, job.WorkflowVersion)
+	if err != nil {
+		return fmt.Errorf("get workflow definition %s v%d: %w", job.WorkflowName, job.WorkflowVersion, err)
+	}
+	def, err := workflow.Unmarshal(defVersion.Definition)
+	if err != nil {
+		return fmt.Errorf("unmarshal workflow definition %s v%d: %w", job.WorkflowName, job.WorkflowVersion, err)
+	}
+	if job.StepIndex < 0 || job.StepIndex >= len(def.Steps) {
+		return fmt.Errorf("workflow job %s: step index %d out of range for %s v%d (%d steps)", job.ID, job.StepIndex, job.WorkflowName, job.WorkflowVersion, len(def.Steps))
+	}
+	step := def.Steps[job.StepIndex]
+	if step.Kind != workflow.StepRequireApproval {
+		return fmt.Errorf("workflow job %s: step %d is a %q step, not require_approval — nothing should have halted it waiting for approval", job.ID, job.StepIndex, step.Kind)
+	}
+	raw, present := step.Params["role"]
+	if !present {
+		return nil
+	}
+	// workflow.Definition.Validate (run by Unmarshal above) already
+	// rejects a non-string/empty "role" param at publish time, so this
+	// can't actually be false for a definition that made it this far —
+	// checked explicitly anyway rather than discarding it (a silently
+	// ignored malformed value here would mean "no restriction", which is
+	// exactly the fail-open bug this whole check exists to prevent).
+	requiredRole, ok := raw.(string)
+	if !ok || requiredRole == "" {
+		return fmt.Errorf("workflow job %s: step %d's role param is %#v, not a valid Role code", job.ID, job.StepIndex, raw)
+	}
+
+	codes, err := foundation.RoleCodesForUser(ctx, ts.db, userID)
+	if err != nil {
+		return fmt.Errorf("resolve roles for user %s: %w", userID, err)
+	}
+	for _, code := range codes {
+		if code == requiredRole {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: requires role %q", errApprovalRoleDenied, requiredRole)
 }
 
 // workflowJobResponse is the JSON shape for one row of listWorkflowJobs —
