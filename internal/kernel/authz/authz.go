@@ -20,6 +20,20 @@
 //     entity type -> that type is not under RBAC and stays fully
 //     accessible (every tenant provisioned before this package existed
 //     keeps working unchanged). One or more rows -> deny-unless-granted.
+//   - FIELD level (FieldPermission rows): a field is hidden from a user
+//     only when EVERY role they hold hides it — the same union-of-
+//     visibility reading additive grants imply, since a role with no
+//     rule for a field implicitly sees it. A hidden field is stripped
+//     from every read (API JSON, rendered form, list columns, CSV
+//     export) and is not writable: a payload that tries to set it to
+//     anything other than its stored value is denied, and one that
+//     simply omits it has the stored value restored rather than wiped
+//     (crud.Update is a full replacement, so silent restoration is what
+//     keeps field hiding from becoming field deletion — the same
+//     data-loss failure formrender.buildHiddenFields exists to prevent).
+//     A user holding NO roles has no field rules applying to them and
+//     sees everything the entity level lets them see; the entity-level
+//     opt-in, not this, is what gates a roleless user out of a type.
 //   - EXCEPT the RBAC control plane itself (Role, UserRole, Permission,
 //     FieldPermission): once a tenant has configured RBAC at all (any
 //     tenant_admin grant, or any Permission/FieldPermission row),
@@ -54,6 +68,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"maps"
+	"reflect"
 
 	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
@@ -91,6 +107,21 @@ type entityPerm struct {
 	canWrite   bool
 }
 
+// permRule / fieldRule are one Permission / FieldPermission row reduced
+// to the fields resolution actually uses, grouped by entity_type at load
+// time (see loadRules).
+type permRule struct {
+	roleID   string
+	canRead  bool
+	canWrite bool
+}
+
+type fieldRule struct {
+	roleID    string
+	fieldName string
+	hidden    bool
+}
+
 // Resolver answers permission questions for one authenticated actor
 // against one tenant database, for the duration of one request. It is
 // deliberately lazy: a request that never touches a guarded path never
@@ -109,10 +140,20 @@ type Resolver struct {
 	admin       bool
 	roleIDs     map[string]bool
 
+	// rulesLoaded/perms/fields hold every policy row in the tenant,
+	// grouped by entity_type, loaded at most once per request — see
+	// loadRules on why this is one query per policy type rather than one
+	// per entity type touched.
+	rulesLoaded bool
+	perms       map[string][]permRule
+	fields      map[string][]fieldRule
+	anyRules    bool
+
 	configuredLoaded bool
 	configured       bool
 
-	memo map[string]entityPerm
+	memo       map[string]entityPerm
+	hiddenMemo map[string]map[string]bool
 }
 
 // NewResolver builds a Resolver for one request. actor is the
@@ -121,10 +162,11 @@ type Resolver struct {
 // service-token requests, which bypass RBAC (package comment).
 func NewResolver(db *sql.DB, actor audit.Actor, machine bool) *Resolver {
 	return &Resolver{
-		db:      db,
-		userID:  actor.ID,
-		machine: machine,
-		memo:    make(map[string]entityPerm),
+		db:         db,
+		userID:     actor.ID,
+		machine:    machine,
+		memo:       make(map[string]entityPerm),
+		hiddenMemo: make(map[string]map[string]bool),
 	}
 }
 
@@ -147,6 +189,68 @@ func (r *Resolver) loadRoles(ctx context.Context) error {
 	return nil
 }
 
+// loadRules reads every Permission and FieldPermission row in the tenant
+// once per request and groups them by entity_type.
+//
+// Two whole-table reads rather than a filtered read per entity type
+// touched: policy rows are a handful per tenant (one per role/entity-type
+// pair an admin deliberately authored), while the number of entity types
+// a single request resolves is now unbounded — nav/menu filtering asks
+// CanRead about EVERY published entity type on EVERY page. The
+// per-entity-type query this replaced would have turned that into ~20
+// round trips per page render; grouping in memory makes it two, and
+// makes rbacConfigured's own row counts free.
+func (r *Resolver) loadRules(ctx context.Context) error {
+	if r.rulesLoaded {
+		return nil
+	}
+	records := data.NewRecordRepo(r.db)
+
+	permRows, err := records.List(ctx, "Permission")
+	if err != nil {
+		return fmt.Errorf("list Permission rules: %w", err)
+	}
+	r.perms = make(map[string][]permRule)
+	for _, row := range permRows {
+		et, _ := row.Data["entity_type"].(string)
+		if et == "" {
+			// An inert rule (ADR-0006's recorded limitation): entity_type
+			// is a plain string, so a blank/typo'd one names no type. Kept
+			// out of the grouping rather than silently applied to
+			// something.
+			continue
+		}
+		rid, _ := row.Data["role_id"].(string)
+		canRead, _ := row.Data["can_read"].(bool)
+		canWrite, _ := row.Data["can_write"].(bool)
+		r.perms[et] = append(r.perms[et], permRule{roleID: rid, canRead: canRead, canWrite: canWrite})
+	}
+
+	fieldRows, err := records.List(ctx, "FieldPermission")
+	if err != nil {
+		return fmt.Errorf("list FieldPermission rules: %w", err)
+	}
+	r.fields = make(map[string][]fieldRule)
+	for _, row := range fieldRows {
+		et, _ := row.Data["entity_type"].(string)
+		if et == "" {
+			continue
+		}
+		rid, _ := row.Data["role_id"].(string)
+		name, _ := row.Data["field_name"].(string)
+		hidden, _ := row.Data["hidden"].(bool)
+		r.fields[et] = append(r.fields[et], fieldRule{roleID: rid, fieldName: name, hidden: hidden})
+	}
+
+	// Counted before the entity_type filtering above, deliberately: a
+	// typo'd rule is inert for access decisions but still proves the
+	// tenant has started configuring RBAC, which is what closes the
+	// control plane's bootstrap window (rbacConfigured).
+	r.anyRules = len(permRows) > 0 || len(fieldRows) > 0
+	r.rulesLoaded = true
+	return nil
+}
+
 func (r *Resolver) resolve(ctx context.Context, entityType string) (entityPerm, error) {
 	if p, ok := r.memo[entityType]; ok {
 		return p, nil
@@ -154,21 +258,19 @@ func (r *Resolver) resolve(ctx context.Context, entityType string) (entityPerm, 
 	if err := r.loadRoles(ctx); err != nil {
 		return entityPerm{}, err
 	}
-	records := data.NewRecordRepo(r.db)
-	rows, err := records.ListByField(ctx, "Permission", "entity_type", entityType)
-	if err != nil {
-		return entityPerm{}, fmt.Errorf("list Permission for %s: %w", entityType, err)
+	if err := r.loadRules(ctx); err != nil {
+		return entityPerm{}, err
 	}
+	rows := r.perms[entityType]
 	p := entityPerm{rulesExist: len(rows) > 0}
 	for _, row := range rows {
-		rid, _ := row.Data["role_id"].(string)
-		if rid == "" || !r.roleIDs[rid] {
+		if row.roleID == "" || !r.roleIDs[row.roleID] {
 			continue
 		}
-		if b, _ := row.Data["can_read"].(bool); b {
+		if row.canRead {
 			p.canRead = true
 		}
-		if b, _ := row.Data["can_write"].(bool); b {
+		if row.canWrite {
 			p.canWrite = true
 			// A write grant implies read (package comment) — a role
 			// that may change a record may also see it.
@@ -179,6 +281,65 @@ func (r *Resolver) resolve(ctx context.Context, entityType string) (entityPerm, 
 	return p, nil
 }
 
+// HiddenFields returns the set of entityType field names this actor may
+// neither see nor write, resolved as the union of what their roles can
+// see: a field is hidden only when EVERY role they hold has a
+// hidden=true FieldPermission row for it (package comment). Returns nil
+// — not an empty map — for the overwhelmingly common "nothing hidden"
+// case, so callers can skip their filtering work on a plain len() check.
+//
+// An actor holding no roles at all has no field rules applying to them:
+// "every role hides it" is not satisfiable over an empty set, and
+// treating it as vacuously true would hide every ruled field from every
+// roleless user, including on entity types their tenant never opted into
+// RBAC. Gating a roleless user out of a type is the entity level's job.
+func (r *Resolver) HiddenFields(ctx context.Context, entityType string) (map[string]bool, error) {
+	if r.machine {
+		return nil, nil
+	}
+	if err := r.loadRoles(ctx); err != nil {
+		return nil, err
+	}
+	if r.admin || len(r.roleIDs) == 0 {
+		return nil, nil
+	}
+	if h, ok := r.hiddenMemo[entityType]; ok {
+		return h, nil
+	}
+	if err := r.loadRules(ctx); err != nil {
+		return nil, err
+	}
+
+	// hidingRoles[field] is the set of roles THIS actor holds that hide
+	// field — counted per role rather than per row so two duplicate rows
+	// for the same role can't stand in for a second role's agreement.
+	hidingRoles := make(map[string]map[string]bool)
+	for _, fr := range r.fields[entityType] {
+		if !fr.hidden || fr.fieldName == "" || fr.roleID == "" || !r.roleIDs[fr.roleID] {
+			continue
+		}
+		set, ok := hidingRoles[fr.fieldName]
+		if !ok {
+			set = make(map[string]bool)
+			hidingRoles[fr.fieldName] = set
+		}
+		set[fr.roleID] = true
+	}
+
+	var hidden map[string]bool
+	for name, set := range hidingRoles {
+		if len(set) != len(r.roleIDs) {
+			continue // at least one held role still sees it
+		}
+		if hidden == nil {
+			hidden = make(map[string]bool, len(hidingRoles))
+		}
+		hidden[name] = true
+	}
+	r.hiddenMemo[entityType] = hidden
+	return hidden, nil
+}
+
 // rbacConfigured reports whether this tenant has set up RBAC at all:
 // any Permission/FieldPermission row, or any user actually granted the
 // tenant_admin role. Memoized per request; only consulted for writes
@@ -187,17 +348,14 @@ func (r *Resolver) rbacConfigured(ctx context.Context) (bool, error) {
 	if r.configuredLoaded {
 		return r.configured, nil
 	}
-	records := data.NewRecordRepo(r.db)
-	for _, t := range []string{"Permission", "FieldPermission"} {
-		n, err := records.CountByEntityType(ctx, t)
-		if err != nil {
-			return false, fmt.Errorf("count %s: %w", t, err)
-		}
-		if n > 0 {
-			r.configured, r.configuredLoaded = true, true
-			return true, nil
-		}
+	if err := r.loadRules(ctx); err != nil {
+		return false, err
 	}
+	if r.anyRules {
+		r.configured, r.configuredLoaded = true, true
+		return true, nil
+	}
+	records := data.NewRecordRepo(r.db)
 	adminRoles, err := records.ListByField(ctx, "Role", "code", AdminRoleCode)
 	if err != nil {
 		return false, fmt.Errorf("list %s roles: %w", AdminRoleCode, err)
@@ -306,18 +464,200 @@ func (g *GuardedEngine) checkWrite(ctx context.Context, def *entity.Definition) 
 	return nil
 }
 
+// CanRead / CanWrite / HiddenFields expose the underlying Resolver's
+// answers to callers that need them for something other than a CRUD call
+// — nav/menu filtering (which entity types to link to at all) and the
+// presentation layers that render a record's fields themselves (list
+// columns, CSV export columns, generated form fields). They exist here
+// rather than handing internal/api a second reference to the Resolver so
+// there is exactly one object a request handler asks about permissions,
+// and no way to end up asking a DIFFERENT resolver than the one guarding
+// the engine it is about to call.
+func (g *GuardedEngine) CanRead(ctx context.Context, entityType string) (bool, error) {
+	return g.res.CanRead(ctx, entityType)
+}
+
+func (g *GuardedEngine) CanWrite(ctx context.Context, entityType string) (bool, error) {
+	return g.res.CanWrite(ctx, entityType)
+}
+
+func (g *GuardedEngine) HiddenFields(ctx context.Context, entityType string) (map[string]bool, error) {
+	return g.res.HiddenFields(ctx, entityType)
+}
+
+// redact removes every field this actor may not see from recs, in place.
+// data.RecordRepo builds a fresh map per row on every read (each is
+// json.Unmarshal'd out of the records table), so there is no shared or
+// cached map for this to corrupt.
+func (g *GuardedEngine) redact(ctx context.Context, def *entity.Definition, recs []data.Record) error {
+	hidden, err := g.res.HiddenFields(ctx, def.EntityType)
+	if err != nil {
+		return err
+	}
+	if len(hidden) == 0 {
+		return nil
+	}
+	for _, rec := range recs {
+		for name := range hidden {
+			delete(rec.Data, name)
+		}
+	}
+	return nil
+}
+
+// EffectiveWriteFields returns the field map a write of def/id should
+// actually apply, given what this actor may see. For every hidden field:
+// a submitted value that differs from what is already stored is denied
+// (a user cannot write a field they cannot read), and an omitted one is
+// restored from the stored record rather than left absent.
+//
+// The restoration is the important half. data.RecordRepo.UpdateTx
+// replaces a record's whole data blob rather than patching it, so a form
+// that legitimately omits a hidden field would otherwise ERASE it on
+// every save — turning "hide this field from the sales clerk" into "let
+// the sales clerk delete this field," which is a worse outcome than not
+// hiding it at all. (Same failure mode, same fix, as
+// formrender.buildHiddenFields' own off-form-field preservation.)
+//
+// Idempotent by construction: re-running it on its own output restores
+// the same stored values and finds nothing that differs. That is what
+// lets internal/api call it BEFORE its pre-write entity.ValidateRecord
+// (so a hidden required field is present for validation and a denied
+// user still gets 403 rather than a misleading 400 about a field they
+// cannot see) while Create/Update below still call it themselves — the
+// guarantee that a handler cannot forget an authorization step, which is
+// the whole reason this engine exists, does not depend on that handler
+// courtesy.
+//
+// id is "" for a create, where there is no stored record: any submitted
+// value for a hidden field is a write of an unreadable field and is
+// denied outright.
+//
+// Checks entity-level write permission FIRST, before resolving field
+// rules or reading anything. Independent review caught the ordering:
+// without this, a user with NO access to the entity type at all — who
+// merely happens to hold some role carrying a FieldPermission rule for
+// it — reached the g.raw.Get below (an unauthorized read of the real
+// record) and could tell an existing id from a missing one by whether
+// they got 403 or 404. An authorization function must not be the thing
+// that leaks; a caller that runs this before its own checks has to get
+// the refusal here, not after.
+func (g *GuardedEngine) EffectiveWriteFields(ctx context.Context, def *entity.Definition, id string, fields map[string]any) (map[string]any, error) {
+	if err := g.checkWrite(ctx, def); err != nil {
+		return nil, err
+	}
+	hidden, err := g.res.HiddenFields(ctx, def.EntityType)
+	if err != nil {
+		return nil, err
+	}
+	if len(hidden) == 0 {
+		return fields, nil
+	}
+
+	var stored map[string]any
+	if id != "" {
+		// Deliberately g.raw, not g.Get: this needs the record as actually
+		// stored, including the very fields the caller may not see.
+		rec, err := g.raw.Get(ctx, def, id)
+		if err != nil {
+			return nil, err
+		}
+		stored = rec.Data
+	}
+
+	out := make(map[string]any, len(fields))
+	maps.Copy(out, fields)
+	for name := range hidden {
+		submitted, present := out[name]
+		current := stored[name]
+		if present && !sameFieldValue(submitted, current) {
+			return nil, fmt.Errorf("%w: no permission to write field %s.%s", ErrDenied, def.EntityType, name)
+		}
+		if current == nil {
+			// Never stored, or a create — leave it unset rather than
+			// writing an explicit nil the record would then carry.
+			delete(out, name)
+			continue
+		}
+		out[name] = current
+	}
+	return out, nil
+}
+
+// sameFieldValue reports whether a submitted field value is the same as
+// the stored one, for the purpose of deciding "this isn't a write."
+//
+// Numbers are compared as float64 regardless of their Go type. Stored
+// values always come back from json.Unmarshal as float64, and every
+// value that reaches here over HTTP does too (encoding/json for a JSON
+// body, csvimport.Coerce for a form or CSV cell) — but a Go caller
+// writing map[string]any{"minor_unit": 2} produces an int, and a
+// DeepEqual against the stored float64(2) would refuse an update that
+// changes nothing. Over-denial is the safe direction, but a permission
+// check that rejects a genuine no-op is still a bug, and independent
+// review proved this one reachable from any in-process caller.
+//
+// Everything else falls back to reflect.DeepEqual: it never panics on
+// the uncomparable types a stored JSON blob could in principle hold
+// (slices, maps), where == would.
+func sameFieldValue(submitted, stored any) bool {
+	if a, ok := numericValue(submitted); ok {
+		if b, ok := numericValue(stored); ok {
+			return a == b
+		}
+		return false
+	}
+	return reflect.DeepEqual(submitted, stored)
+}
+
+func numericValue(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case float32:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	case int32:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	default:
+		return 0, false
+	}
+}
+
 func (g *GuardedEngine) Create(ctx context.Context, def *entity.Definition, fields map[string]any, actor audit.Actor) (data.Record, error) {
 	if err := g.checkWrite(ctx, def); err != nil {
 		return data.Record{}, err
 	}
-	return g.raw.Create(ctx, def, fields, actor)
+	effective, err := g.EffectiveWriteFields(ctx, def, "", fields)
+	if err != nil {
+		return data.Record{}, err
+	}
+	rec, err := g.raw.Create(ctx, def, effective, actor)
+	if err != nil {
+		return data.Record{}, err
+	}
+	// The created record is echoed straight back to the caller (API JSON,
+	// re-rendered form), so it goes through the same redaction a read of
+	// it would — a create must not become a way to see a hidden field's
+	// server-side default.
+	if err := g.redact(ctx, def, []data.Record{rec}); err != nil {
+		return data.Record{}, err
+	}
+	return rec, nil
 }
 
 func (g *GuardedEngine) Update(ctx context.Context, def *entity.Definition, id string, fields map[string]any, expectedVersion *int, actor audit.Actor) (int, error) {
 	if err := g.checkWrite(ctx, def); err != nil {
 		return 0, err
 	}
-	return g.raw.Update(ctx, def, id, fields, expectedVersion, actor)
+	effective, err := g.EffectiveWriteFields(ctx, def, id, fields)
+	if err != nil {
+		return 0, err
+	}
+	return g.raw.Update(ctx, def, id, effective, expectedVersion, actor)
 }
 
 func (g *GuardedEngine) Delete(ctx context.Context, def *entity.Definition, id string, actor audit.Actor) error {
@@ -331,14 +671,28 @@ func (g *GuardedEngine) Get(ctx context.Context, def *entity.Definition, id stri
 	if err := g.checkRead(ctx, def); err != nil {
 		return data.Record{}, err
 	}
-	return g.raw.Get(ctx, def, id)
+	rec, err := g.raw.Get(ctx, def, id)
+	if err != nil {
+		return data.Record{}, err
+	}
+	if err := g.redact(ctx, def, []data.Record{rec}); err != nil {
+		return data.Record{}, err
+	}
+	return rec, nil
 }
 
 func (g *GuardedEngine) List(ctx context.Context, def *entity.Definition) ([]data.Record, error) {
 	if err := g.checkRead(ctx, def); err != nil {
 		return nil, err
 	}
-	return g.raw.List(ctx, def)
+	recs, err := g.raw.List(ctx, def)
+	if err != nil {
+		return nil, err
+	}
+	if err := g.redact(ctx, def, recs); err != nil {
+		return nil, err
+	}
+	return recs, nil
 }
 
 func (g *GuardedEngine) Count(ctx context.Context, def *entity.Definition) (int, error) {
@@ -352,14 +706,36 @@ func (g *GuardedEngine) ListPage(ctx context.Context, def *entity.Definition, li
 	if err := g.checkRead(ctx, def); err != nil {
 		return nil, err
 	}
-	return g.raw.ListPage(ctx, def, limit, offset)
+	recs, err := g.raw.ListPage(ctx, def, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	if err := g.redact(ctx, def, recs); err != nil {
+		return nil, err
+	}
+	return recs, nil
 }
 
+// ListByField filters on fieldName server-side, so a hidden field is
+// still usable as a FILTER here even though its value is redacted from
+// the rows returned. That is deliberate and load-bearing: the only
+// caller is the master-detail child fetch, which filters on the child's
+// parent-link field — hiding that field from a role would otherwise make
+// the parent's whole lines table render empty rather than merely
+// value-redacted. Matching on a value the caller already supplied
+// discloses nothing they did not already have.
 func (g *GuardedEngine) ListByField(ctx context.Context, def *entity.Definition, fieldName, value string) ([]data.Record, error) {
 	if err := g.checkRead(ctx, def); err != nil {
 		return nil, err
 	}
-	return g.raw.ListByField(ctx, def, fieldName, value)
+	recs, err := g.raw.ListByField(ctx, def, fieldName, value)
+	if err != nil {
+		return nil, err
+	}
+	if err := g.redact(ctx, def, recs); err != nil {
+		return nil, err
+	}
+	return recs, nil
 }
 
 // ValidateStatusTransition is validation, not data access — it runs

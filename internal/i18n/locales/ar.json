@@ -275,5 +275,7 @@
   "field.FieldPermission.role_id": "الدور",
   "field.FieldPermission.entity_type": "نوع الكيان",
   "field.FieldPermission.field_name": "اسم الحقل",
-  "field.FieldPermission.hidden": "مخفي"
+  "field.FieldPermission.hidden": "مخفي",
+  "error.access_denied.title": "تم رفض الوصول",
+  "error.access_denied.body": "ليس لديك إذن لعرض هذه الصفحة. إذا كنت بحاجة إلى الوصول، اطلب ذلك من مسؤول في مؤسستك."
 }

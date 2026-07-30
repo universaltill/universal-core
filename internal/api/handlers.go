@@ -464,6 +464,21 @@ func (h *Handler) createRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Field-level RBAC is applied BEFORE the validation below, not left
+	// entirely to crud.Create's own guarded call: a field this user may
+	// not see is stripped from the form they were served, so validating
+	// their raw submission would report a hidden required field as a
+	// missing one (a 400 naming a field they aren't allowed to know
+	// exists) instead of letting the write proceed on the stored value.
+	// The guarded engine repeats this check on the way through — it is
+	// idempotent, and the structural guarantee must not depend on this
+	// handler having remembered to call it (see EffectiveWriteFields).
+	fields, err = ts.crud.EffectiveWriteFields(r.Context(), entDef, "", fields)
+	if err != nil {
+		writeCrudError(w, fmt.Sprintf("apply field permissions for new %s", entityType), err)
+		return
+	}
+
 	// Validated explicitly here, ahead of crud.Create (which validates
 	// again internally — cheap, no DB round trip, and Create doesn't
 	// expose a way to distinguish "your input was invalid" from "the
@@ -531,6 +546,21 @@ func (h *Handler) updateRecord(w http.ResponseWriter, r *http.Request) {
 	fields, err := parseRecordFields(r, entDef)
 	if err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Same reasoning as createRecord's own call: resolve what this user
+	// is actually allowed to write before validating it. On an update
+	// this also RESTORES every hidden field's stored value, without which
+	// the record-write path's full-replacement semantics would erase
+	// each one on every save (see EffectiveWriteFields).
+	fields, err = ts.crud.EffectiveWriteFields(r.Context(), entDef, id, fields)
+	if errors.Is(err, data.ErrNotFound) {
+		httpx.WriteError(w, http.StatusNotFound, fmt.Sprintf("%s %q not found", entityType, id))
+		return
+	}
+	if err != nil {
+		writeCrudError(w, fmt.Sprintf("apply field permissions for %s %s", entityType, id), err)
 		return
 	}
 
@@ -800,6 +830,21 @@ func (h *Handler) renderForm(w http.ResponseWriter, r *http.Request, id string) 
 		return
 	}
 
+	if id == "" {
+		// The blank "new record" form is the one page in this package that
+		// reaches a user without making a single CRUD call of its own (an
+		// entity with no reference fields loads nothing), so the guarded
+		// engine never gets a chance to refuse it — ADR-0006 recorded that
+		// as an accepted leak for its first commit, and this closes it. A
+		// create form is a write surface, so CanWrite is the right gate:
+		// a read-only role has no business being handed one, even though
+		// submitting it would have been refused anyway.
+		allowed, err := ts.crud.CanWrite(r.Context(), entityType)
+		if !h.denyPageUnless(w, r, &rc, locale, allowed, err, "check write permission for new "+entityType+" form") {
+			return
+		}
+	}
+
 	entDef, err := ts.entityDef(r.Context(), entityType)
 	if err != nil {
 		writeDefinitionLookupError(w, entityType, err)
@@ -817,7 +862,7 @@ func (h *Handler) renderForm(w http.ResponseWriter, r *http.Request, id string) 
 		return
 	}
 	if err != nil {
-		writeCrudError(w, fmt.Sprintf("build %s form render data (id=%q)", entityType, id), err)
+		h.writeCrudPageError(w, r, &rc, locale, fmt.Sprintf("build %s form render data (id=%q)", entityType, id), err)
 		return
 	}
 
@@ -851,8 +896,17 @@ func (h *Handler) renderForm(w http.ResponseWriter, r *http.Request, id string) 
 // copies that could silently drift (e.g. one remembering to populate
 // master-detail children, the other not).
 func (h *Handler) buildFormRenderData(ctx context.Context, ts tenantScope, entDef *entity.Definition, formDef *form.Definition, id string) (formrender.Data, error) {
+	// Resolved before anything else: a field this viewer may not see must
+	// be absent from the form whether or not there's a record to load,
+	// since a blank "new" form leaks a hidden field's NAME just as
+	// readily as a populated one leaks its value.
+	redacted, err := ts.crud.HiddenFields(ctx, entDef.EntityType)
+	if err != nil {
+		return formrender.Data{}, fmt.Errorf("resolve hidden fields for %s: %w", entDef.EntityType, err)
+	}
 	renderData := formrender.Data{
 		ReferenceOptions: h.loadReferenceOptions(ctx, ts, entDef),
+		RedactedFields:   redacted,
 	}
 	if id == "" {
 		return renderData, nil

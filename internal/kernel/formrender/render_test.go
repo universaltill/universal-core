@@ -890,3 +890,96 @@ func TestRender_ErrorsOnMalformedVisibleIf(t *testing.T) {
 		t.Fatal("expected error for malformed visible_if expression")
 	}
 }
+
+// TestRender_RedactedFieldIsAbsentEntirely covers ADR-0006's field-level
+// commit: a field the viewer's RBAC rules hide must render neither as a
+// visible input NOR as one of buildHiddenFields' preservation inputs.
+//
+// The second half is the one worth a test of its own. Every other
+// off-form field DOES get a hidden input here (that's the fix for a real
+// data-loss bug — see buildHiddenFields' own doc comment), so the
+// obvious implementation of redaction — skip it in buildFields and stop
+// — would leave the field name sitting in the DOM and submit it back
+// empty on every save. Its preservation has to happen server-side
+// instead (authz.GuardedEngine.EffectiveWriteFields), precisely because
+// the browser must never hold the value.
+func TestRender_RedactedFieldIsAbsentEntirely(t *testing.T) {
+	r := testRenderer(t)
+	data := Data{
+		RecordID: "po-1",
+		Record: map[string]any{
+			"vendor_id":      "v1",
+			"payment_method": "LC",
+			"lc_reference":   "LC-99",
+			"total":          1234.0,
+		},
+		Children:       map[string][]map[string]any{},
+		RedactedFields: map[string]bool{"total": true},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	body := buf.String()
+
+	if strings.Contains(body, `name="total"`) {
+		t.Fatalf("redacted field rendered an input (visible or hidden), got:\n%s", body)
+	}
+	if strings.Contains(body, "1234") {
+		t.Fatalf("redacted field's value reached the DOM, got:\n%s", body)
+	}
+	// Everything else still renders exactly as before — redaction must be
+	// surgical, not a reason for the rest of the form to change shape.
+	if !strings.Contains(body, `name="vendor_id"`) {
+		t.Fatalf("visible field missing after redacting another, got:\n%s", body)
+	}
+	if !strings.Contains(body, `name="lc_reference"`) {
+		t.Fatalf("conditionally-visible field missing after redacting another, got:\n%s", body)
+	}
+}
+
+// A redacted field must stay redacted even when its VisibleIf would
+// otherwise show it: the permission decision outranks the layout
+// expression, which is exactly R5's "a hidden field is hidden by RBAC,
+// not by the layout."
+func TestRender_RedactionOutranksVisibleIf(t *testing.T) {
+	r := testRenderer(t)
+	data := Data{
+		RecordID:       "po-1",
+		Record:         map[string]any{"vendor_id": "v1", "payment_method": "LC", "lc_reference": "LC-77"},
+		Children:       map[string][]map[string]any{},
+		RedactedFields: map[string]bool{"lc_reference": true},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	body := buf.String()
+	if strings.Contains(body, "lc_reference") || strings.Contains(body, "LC-77") {
+		t.Fatalf("visible_if=true field survived redaction, got:\n%s", body)
+	}
+}
+
+// Nothing redacted -> byte-identical output to before this mechanism
+// existed. This is the backward-compatibility guarantee for every tenant
+// that has never authored a FieldPermission row (i.e. all of them today).
+func TestRender_NoRedactionMatchesUnfilteredRender(t *testing.T) {
+	r := testRenderer(t)
+	base := func(redacted map[string]bool) string {
+		t.Helper()
+		var buf strings.Builder
+		err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), Data{
+			RecordID:       "po-1",
+			Record:         map[string]any{"vendor_id": "v1", "payment_method": "LC", "lc_reference": "LC-1"},
+			Children:       map[string][]map[string]any{},
+			RedactedFields: redacted,
+		}, "en")
+		if err != nil {
+			t.Fatalf("render: %v", err)
+		}
+		return buf.String()
+	}
+	if got, want := base(map[string]bool{}), base(nil); got != want {
+		t.Fatalf("empty redaction set changed the render:\n%s\n---\n%s", got, want)
+	}
+}

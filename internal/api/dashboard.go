@@ -197,6 +197,25 @@ func (h *Handler) accessibleModules(ctx context.Context, ts tenantScope, locale 
 			}
 			return nil, fmt.Errorf("look up entity definition for %s: %w", entityType, err)
 		}
+		// Don't offer a link to something this user would only be refused
+		// at (ADR-0006's field-level commit). Filtering here rather than
+		// in each caller covers the nav bar, the dashboard hub, and a
+		// module's own menu page in one place, and means a module whose
+		// entity types are ALL denied disappears entirely instead of
+		// becoming a tile leading to a 403.
+		//
+		// Affordable because the resolver loads the tenant's whole policy
+		// set once per request and answers from memory (see
+		// authz.Resolver.loadRules) — this runs on every page via
+		// renderNav, so a per-entity-type query here would have been a
+		// per-page N+1.
+		readable, err := ts.crud.CanRead(ctx, entityType)
+		if err != nil {
+			return nil, fmt.Errorf("check read permission for %s: %w", entityType, err)
+		}
+		if !readable {
+			continue
+		}
 		key := def.Module
 		if key == "" {
 			key = "general"

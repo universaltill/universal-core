@@ -340,6 +340,30 @@ table.uc-table tbody tr:last-child td {
   border-radius: 6px;
 }
 
+/* The rendered 403 (see denied.go). Styled as a real page rather than
+   left as unstyled default markup: a permission refusal is one of the
+   few pages a user hits without meaning to, so it has to read as part of
+   this app rather than as something broken. */
+.uc-denied {
+  max-width: 34rem;
+  margin: 3rem auto;
+  padding: 2rem;
+  background: #ffffff;
+  border: 1px solid var(--uc-border);
+  border-radius: 6px;
+  text-align: center;
+}
+
+.uc-denied h1 {
+  margin-top: 0;
+  font-size: 1.25rem;
+}
+
+.uc-denied p {
+  color: var(--uc-muted);
+  margin-bottom: 0;
+}
+
 .uc-list-pager {
   display: flex;
   align-items: center;
