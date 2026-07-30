@@ -14,6 +14,7 @@ import (
 	"database/sql"
 	"errors"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/universaltill/universal-core/internal/data"
@@ -35,6 +36,17 @@ type Config struct {
 	// between reclaiming too eagerly (stealing a job from a worker that's
 	// merely slow) and too late (an orphaned job sitting invisible).
 	LeaseTimeout time.Duration
+	// ScheduleSyncInterval is how often (per tenant, at most) the
+	// scheduler reconciles workflow_schedules against the published
+	// definitions. Zero means the 30s default. Separate from PollInterval
+	// deliberately: FireDue is one cheap indexed query and belongs on
+	// every tick so a due schedule fires promptly, but Sync reads every
+	// published definition — running THAT every 2s per tenant is an O(n)
+	// registry scan forever, and it measurably slowed ticks enough to
+	// flake the multi-tenant timing test on a busy CI runner. A schedule
+	// published mid-interval waits at most this long to be noticed;
+	// firing latency is unaffected.
+	ScheduleSyncInterval time.Duration
 	// Concurrency is how many goroutines run the poll loop in parallel
 	// within this process. Safe by construction:
 	// data.WorkflowJobRepo.ClaimNext uses SELECT ... FOR UPDATE SKIP
@@ -75,6 +87,11 @@ type Runner struct {
 	tenants  *data.TenantRepo
 	handlers map[workflow.StepKind]workflow.StepHandler
 	cfg      Config
+
+	// Schedule-sync throttle state — see shouldSyncSchedules. Mutex-
+	// guarded because RunConcurrent runs several poll loops on one Runner.
+	syncMu           sync.Mutex
+	lastScheduleSync map[string]time.Time
 }
 
 // New builds a Runner. handlers is passed straight through to
@@ -171,8 +188,19 @@ func (r *Runner) tickTenant(ctx context.Context, tenantID string, q *workflow.Qu
 	} else {
 		sched := workflow.NewScheduler(db)
 		now := time.Now().UTC()
-		if err := sched.Sync(ctx, now); err != nil {
-			log.Printf("worker: tenant %s: sync workflow schedules: %v", tenantID, err)
+		// Sync is throttled per tenant (Config.ScheduleSyncInterval);
+		// FireDue runs every tick. The reconcile reads every published
+		// definition and running that O(n) scan on every 2s tick forever
+		// is pure waste — it measurably slowed ticks enough to flake the
+		// multi-tenant timing test on a busy CI runner, which is how the
+		// cost the reviewer flagged became a proven one. Firing stays
+		// per-tick: it is one indexed query, and it is the half a user
+		// actually waits on.
+		if r.shouldSyncSchedules(tenantID, now) {
+			if err := sched.Sync(ctx, now); err != nil {
+				log.Printf("worker: tenant %s: sync workflow schedules: %v", tenantID, err)
+				r.forgetScheduleSync(tenantID) // retry next tick, not next interval
+			}
 		}
 		if fired, err := sched.FireDue(ctx, now, schedulerActor()); err != nil {
 			log.Printf("worker: tenant %s: fire due schedules: %v", tenantID, err)
@@ -221,4 +249,34 @@ func (r *Runner) tickTenant(ctx context.Context, tenantID string, q *workflow.Qu
 // (ADR-0001 §14 — actor identity is first-class, not decoration).
 func schedulerActor() audit.Actor {
 	return audit.Actor{Type: audit.ActorSystem, ID: "workflow-scheduler"}
+}
+
+const defaultScheduleSyncInterval = 30 * time.Second
+
+// shouldSyncSchedules reports whether tenantID's schedule reconcile is
+// due, and records the attempt. Guarded by a mutex because RunConcurrent
+// runs several poll loops over one Runner.
+func (r *Runner) shouldSyncSchedules(tenantID string, now time.Time) bool {
+	interval := r.cfg.ScheduleSyncInterval
+	if interval <= 0 {
+		interval = defaultScheduleSyncInterval
+	}
+	r.syncMu.Lock()
+	defer r.syncMu.Unlock()
+	if r.lastScheduleSync == nil {
+		r.lastScheduleSync = map[string]time.Time{}
+	}
+	if last, ok := r.lastScheduleSync[tenantID]; ok && now.Sub(last) < interval {
+		return false
+	}
+	r.lastScheduleSync[tenantID] = now
+	return true
+}
+
+// forgetScheduleSync clears the throttle after a FAILED sync, so the next
+// tick retries instead of waiting out the interval on an error.
+func (r *Runner) forgetScheduleSync(tenantID string) {
+	r.syncMu.Lock()
+	defer r.syncMu.Unlock()
+	delete(r.lastScheduleSync, tenantID)
 }
