@@ -40,6 +40,33 @@ import (
 // via Zitadel but haven't been assigned any Core-side Role yet), not a
 // failure.
 func RoleCodesForUser(ctx context.Context, db *sql.DB, userID string) ([]string, error) {
+	grants, err := RoleGrantsForUser(ctx, db, userID)
+	if err != nil {
+		return nil, err
+	}
+	var codes []string
+	for _, g := range grants {
+		if g.Code != "" {
+			codes = append(codes, g.Code)
+		}
+	}
+	return codes, nil
+}
+
+// RoleGrant is one resolved Role a user holds: the Role record's id
+// (what Permission.role_id / FieldPermission.role_id reference) plus
+// its code (what conventions like ADR-0006's tenant_admin override key
+// on). internal/kernel/authz needs both per request, so they resolve
+// together rather than in two round-trip sets of queries.
+type RoleGrant struct {
+	ID   string
+	Code string
+}
+
+// RoleGrantsForUser resolves every Role userID holds in this tenant —
+// same contract as RoleCodesForUser (which is now a thin projection of
+// this): read-only, nil-not-error for a user with zero grants.
+func RoleGrantsForUser(ctx context.Context, db *sql.DB, userID string) ([]RoleGrant, error) {
 	records := data.NewRecordRepo(db)
 
 	userRoles, err := records.ListByField(ctx, "UserRole", "user_id", userID)
@@ -60,14 +87,13 @@ func RoleCodesForUser(ctx context.Context, db *sql.DB, userID string) ([]string,
 	if err != nil {
 		return nil, fmt.Errorf("list Role: %w", err)
 	}
-	var codes []string
+	var grants []RoleGrant
 	for _, r := range roles {
 		if !roleIDs[r.ID] {
 			continue
 		}
-		if code, _ := r.Data["code"].(string); code != "" {
-			codes = append(codes, code)
-		}
+		code, _ := r.Data["code"].(string)
+		grants = append(grants, RoleGrant{ID: r.ID, Code: code})
 	}
-	return codes, nil
+	return grants, nil
 }

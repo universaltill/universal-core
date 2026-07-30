@@ -187,7 +187,7 @@ func (a *Authenticator) Guard(next http.Handler) http.Handler {
 			return
 		}
 
-		rc := httpx.RequestContext{TenantID: tenantID, Actor: ident.actor}
+		rc := httpx.RequestContext{TenantID: tenantID, Actor: ident.actor, Machine: true}
 		next.ServeHTTP(w, r.WithContext(httpx.WithRequestContext(r.Context(), rc)))
 	})
 }

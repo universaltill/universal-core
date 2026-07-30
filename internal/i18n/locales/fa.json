@@ -267,5 +267,13 @@
   "field.CostCenter.name": "نام",
   "field.CostCenter.type": "نوع",
   "toast.error_fallback": "مشکلی پیش آمد. لطفاً دوباره تلاش کنید.",
-  "toast.network_error": "امکان دسترسی به سرور نبود. اتصال خود را بررسی کرده و دوباره تلاش کنید."
+  "toast.network_error": "امکان دسترسی به سرور نبود. اتصال خود را بررسی کرده و دوباره تلاش کنید.",
+  "field.Permission.role_id": "نقش",
+  "field.Permission.entity_type": "نوع موجودیت",
+  "field.Permission.can_read": "امکان خواندن",
+  "field.Permission.can_write": "امکان نوشتن",
+  "field.FieldPermission.role_id": "نقش",
+  "field.FieldPermission.entity_type": "نوع موجودیت",
+  "field.FieldPermission.field_name": "نام فیلد",
+  "field.FieldPermission.hidden": "پنهان"
 }
