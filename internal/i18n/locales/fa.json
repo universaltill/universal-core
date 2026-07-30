@@ -285,5 +285,8 @@
   "field.Position.department_id": "بخش",
   "field.Position.reports_to_position_id": "گزارش‌دهی به",
   "error.access_denied.title": "دسترسی رد شد",
-  "error.access_denied.body": "شما اجازهٔ مشاهدهٔ این صفحه را ندارید. اگر به دسترسی نیاز دارید، از یکی از مدیران سازمان خود درخواست کنید."
+  "error.access_denied.body": "شما اجازهٔ مشاهدهٔ این صفحه را ندارید. اگر به دسترسی نیاز دارید، از یکی از مدیران سازمان خود درخواست کنید.",
+  "workflow_inbox.column_action": "اقدام",
+  "workflow_inbox.requires_role": "نیازمند نقش {role}",
+  "workflow_inbox.unavailable": "در دسترس نیست"
 }

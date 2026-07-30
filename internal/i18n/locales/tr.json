@@ -285,5 +285,8 @@
   "field.Position.department_id": "Departman",
   "field.Position.reports_to_position_id": "Bağlı Olduğu Pozisyon",
   "error.access_denied.title": "Erişim reddedildi",
-  "error.access_denied.body": "Bu sayfayı görüntüleme izniniz yok. Erişime ihtiyacınız varsa kuruluşunuzdaki bir yöneticiden isteyin."
+  "error.access_denied.body": "Bu sayfayı görüntüleme izniniz yok. Erişime ihtiyacınız varsa kuruluşunuzdaki bir yöneticiden isteyin.",
+  "workflow_inbox.column_action": "İşlem",
+  "workflow_inbox.requires_role": "{role} rolü gerekiyor",
+  "workflow_inbox.unavailable": "Kullanılamıyor"
 }
