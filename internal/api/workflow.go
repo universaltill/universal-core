@@ -15,6 +15,7 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/universaltill/universal-core/internal/data"
@@ -190,23 +191,95 @@ var errApprovalRoleDenied = errors.New("caller does not hold the role required t
 // comment on why that's the deliberate backward-compatible default, not
 // an oversight.
 func requireApprovalRole(ctx context.Context, ts tenantScope, job data.WorkflowJob, userID string) error {
-	requiredRole, err := approvalRoleFor(ctx, ts, job, nil)
+	req, err := approvalRoleFor(ctx, ts, job, nil)
 	if err != nil {
 		return err
 	}
-	if requiredRole == "" {
+	ok, err := userMeetsApproval(ctx, ts, job, req, userID)
+	if err != nil {
+		return err
+	}
+	if ok {
 		return nil
 	}
-	codes, err := foundation.RoleCodesForUser(ctx, ts.db, userID)
-	if err != nil {
-		return fmt.Errorf("resolve roles for user %s: %w", userID, err)
+	if req.DepartmentField != "" {
+		return fmt.Errorf("%w: requires role %q in the record's own department", errApprovalRoleDenied, req.Role)
 	}
-	for _, code := range codes {
-		if code == requiredRole {
-			return nil
+	return fmt.Errorf("%w: requires role %q", errApprovalRoleDenied, req.Role)
+}
+
+// approvalRequirement is what a require_approval step demands: a Role, and
+// optionally the department it must be held in. DepartmentField is the
+// NAME of a field on the triggering record carrying the department id —
+// empty means the role is checked tenant-wide, the original behaviour.
+type approvalRequirement struct {
+	Role            string
+	DepartmentField string
+}
+
+// userMeetsApproval is the ONE place that decides whether userID may
+// approve job given req — used by the enforcement gate, the HTML inbox,
+// and the JSON API, so none of the three can disagree about who may act
+// (the same single-source discipline approvalRoleFor already established
+// for the role name).
+//
+// When req has a DepartmentField, the department id is read from that
+// field on the triggering record and the role must be held FOR that
+// department (foundation.RoleCodesForUserInDepartment). A record that
+// carries no value in that field routes to nobody rather than to
+// everyone: an unset department is not "any department", and treating it
+// as such would be exactly the fail-open the whole gate exists to
+// prevent.
+func userMeetsApproval(ctx context.Context, ts tenantScope, job data.WorkflowJob, req approvalRequirement, userID string) (bool, error) {
+	if req.Role == "" {
+		return true, nil
+	}
+	if req.DepartmentField == "" {
+		codes, err := foundation.RoleCodesForUser(ctx, ts.db, userID)
+		if err != nil {
+			return false, fmt.Errorf("resolve roles for user %s: %w", userID, err)
 		}
+		return slices.Contains(codes, req.Role), nil
 	}
-	return fmt.Errorf("%w: requires role %q", errApprovalRoleDenied, requiredRole)
+
+	deptID, err := recordDepartmentID(ctx, ts, job, req.DepartmentField)
+	if err != nil {
+		return false, err
+	}
+	if deptID == "" {
+		// The record names no department in that field — routes to
+		// nobody, deliberately (see doc comment).
+		return false, nil
+	}
+	codes, err := foundation.RoleCodesForUserInDepartment(ctx, ts.db, userID, deptID)
+	if err != nil {
+		return false, fmt.Errorf("resolve department-scoped roles for user %s: %w", userID, err)
+	}
+	return slices.Contains(codes, req.Role), nil
+}
+
+// recordDepartmentID reads the department id from the named field of the
+// job's triggering record. A scheduled run (no record) or a blank field
+// yields "" — routing to nobody, per userMeetsApproval's contract.
+func recordDepartmentID(ctx context.Context, ts tenantScope, job data.WorkflowJob, field string) (string, error) {
+	if job.EntityType == "" || job.RecordID == "" {
+		return "", nil
+	}
+	def, err := ts.entityDef(ctx, job.EntityType)
+	if err != nil {
+		return "", fmt.Errorf("look up %s definition for department routing: %w", job.EntityType, err)
+	}
+	// SystemFieldForRouting, not the guarded Get: routing is the kernel
+	// deciding who may approve, and it must not depend on whether the
+	// approver is allowed to READ the routing field. Reading it through
+	// their own permissions would wrongly deny a legitimate approver whose
+	// role hides department_id, or 500 one with no read grant on the type
+	// — both found by independent review.
+	id, err := ts.crud.SystemFieldForRouting(ctx, def, job.RecordID, field)
+	if err != nil {
+		return "", fmt.Errorf("read %s %s.%s for department routing: %w", job.EntityType, job.RecordID, field, err)
+	}
+	return id, nil
 }
 
 // approvalRoleFor returns the Role code job's current require_approval
@@ -237,7 +310,7 @@ func requireApprovalRole(ctx context.Context, ts tenantScope, job data.WorkflowJ
 // page of jobs that overwhelmingly share a handful of workflow
 // definitions, so without it the page is an N+1 of identical registry
 // reads; approveWorkflowJob handles exactly one job and passes nil.
-func approvalRoleFor(ctx context.Context, ts tenantScope, job data.WorkflowJob, defCache map[string]*cachedWorkflowDef) (string, error) {
+func approvalRoleFor(ctx context.Context, ts tenantScope, job data.WorkflowJob, defCache map[string]*cachedWorkflowDef) (approvalRequirement, error) {
 	cacheKey := fmt.Sprintf("%s@%d", job.WorkflowName, job.WorkflowVersion)
 	var def *workflow.Definition
 	entry, cached := (*cachedWorkflowDef)(nil), false
@@ -246,7 +319,7 @@ func approvalRoleFor(ctx context.Context, ts tenantScope, job data.WorkflowJob, 
 	}
 	if cached {
 		if entry.err != nil {
-			return "", entry.err
+			return approvalRequirement{}, entry.err
 		}
 		def = entry.def
 	} else {
@@ -270,20 +343,20 @@ func approvalRoleFor(ctx context.Context, ts tenantScope, job data.WorkflowJob, 
 			defCache[cacheKey] = &cachedWorkflowDef{def: resolved, err: err}
 		}
 		if err != nil {
-			return "", err
+			return approvalRequirement{}, err
 		}
 		def = resolved
 	}
 	if job.StepIndex < 0 || job.StepIndex >= len(def.Steps) {
-		return "", fmt.Errorf("workflow job %s: step index %d out of range for %s v%d (%d steps)", job.ID, job.StepIndex, job.WorkflowName, job.WorkflowVersion, len(def.Steps))
+		return approvalRequirement{}, fmt.Errorf("workflow job %s: step index %d out of range for %s v%d (%d steps)", job.ID, job.StepIndex, job.WorkflowName, job.WorkflowVersion, len(def.Steps))
 	}
 	step := def.Steps[job.StepIndex]
 	if step.Kind != workflow.StepRequireApproval {
-		return "", fmt.Errorf("workflow job %s: step %d is a %q step, not require_approval — nothing should have halted it waiting for approval", job.ID, job.StepIndex, step.Kind)
+		return approvalRequirement{}, fmt.Errorf("workflow job %s: step %d is a %q step, not require_approval — nothing should have halted it waiting for approval", job.ID, job.StepIndex, step.Kind)
 	}
 	raw, present := step.Params["role"]
 	if !present {
-		return "", nil
+		return approvalRequirement{}, nil
 	}
 	// workflow.Definition.Validate (run by Unmarshal above) already
 	// rejects a non-string/empty "role" param at publish time, so this
@@ -293,9 +366,12 @@ func approvalRoleFor(ctx context.Context, ts tenantScope, job data.WorkflowJob, 
 	// exactly the fail-open bug this whole check exists to prevent).
 	requiredRole, ok := raw.(string)
 	if !ok || requiredRole == "" {
-		return "", fmt.Errorf("workflow job %s: step %d's role param is %#v, not a valid Role code", job.ID, job.StepIndex, raw)
+		return approvalRequirement{}, fmt.Errorf("workflow job %s: step %d's role param is %#v, not a valid Role code", job.ID, job.StepIndex, raw)
 	}
-	return requiredRole, nil
+	// department is optional and already validated at publish time; a
+	// blank/absent one leaves DepartmentField "" = tenant-wide check.
+	deptField, _ := step.Params["department"].(string)
+	return approvalRequirement{Role: requiredRole, DepartmentField: deptField}, nil
 }
 
 // workflowJobResponse is the JSON shape for one row of listWorkflowJobs —
@@ -399,20 +475,11 @@ func (h *Handler) listWorkflowJobs(w http.ResponseWriter, r *http.Request) {
 	// sitting at a require_approval step, and asking approvalRoleFor about it
 	// would be asking a question with no meaningful answer (it would report
 	// the step-kind mismatch as an error).
-	var (
-		holds    map[string]bool
-		defCache map[string]*cachedWorkflowDef
-	)
+	// Department-scoped approval resolves per-job (userMeetsApproval), so
+	// there is no one tenant-wide role set to precompute — only the
+	// definition cache is shared across the page's jobs.
+	var defCache map[string]*cachedWorkflowDef
 	if status == "waiting_approval" {
-		codes, err := foundation.RoleCodesForUser(r.Context(), ts.db, rc.Actor.ID)
-		if err != nil {
-			writeInternalError(w, fmt.Sprintf("resolve roles for user %s", rc.Actor.ID), err)
-			return
-		}
-		holds = make(map[string]bool, len(codes))
-		for _, c := range codes {
-			holds[c] = true
-		}
 		defCache = map[string]*cachedWorkflowDef{}
 	}
 
@@ -427,7 +494,7 @@ func (h *Handler) listWorkflowJobs(w http.ResponseWriter, r *http.Request) {
 		}
 		// Same function the approve endpoint and the HTML inbox use, so all
 		// three surfaces cannot disagree about what a step requires.
-		requiredRole, err := approvalRoleFor(r.Context(), ts, j, defCache)
+		req, err := approvalRoleFor(r.Context(), ts, j, defCache)
 		if err != nil {
 			// A job whose definition or step index will not resolve is a data
 			// problem, not this caller's fault. Report the job with BOTH
@@ -438,9 +505,14 @@ func (h *Handler) listWorkflowJobs(w http.ResponseWriter, r *http.Request) {
 			log.Printf("api: list workflow jobs: resolve required role for job %s: %v", j.ID, err)
 			continue
 		}
-		canApprove := requiredRole == "" || holds[requiredRole]
-		out[i].RequiredRole = &requiredRole
-		out[i].CanApprove = &canApprove
+		ok, err := userMeetsApproval(r.Context(), ts, j, req, rc.Actor.ID)
+		if err != nil {
+			log.Printf("api: list workflow jobs: resolve approvability for job %s: %v", j.ID, err)
+			continue
+		}
+		role := req.Role
+		out[i].RequiredRole = &role
+		out[i].CanApprove = &ok
 	}
 	httpx.WriteJSON(w, http.StatusOK, out)
 }
@@ -485,18 +557,10 @@ func (h *Handler) renderWorkflowInbox(w http.ResponseWriter, r *http.Request) {
 		ApproveLabel:   h.catalog.T(locale, "workflow_inbox.approve_button"),
 	}
 
-	// The viewer's own roles, resolved ONCE for the whole page rather than
-	// per row — this is the same set for every job, and the inbox is the
-	// one place that renders many jobs at a time.
-	viewerRoles, err := foundation.RoleCodesForUser(r.Context(), ts.db, rc.Actor.ID)
-	if err != nil {
-		writeInternalError(w, fmt.Sprintf("resolve roles for user %s", rc.Actor.ID), err)
-		return
-	}
-	holds := make(map[string]bool, len(viewerRoles))
-	for _, c := range viewerRoles {
-		holds[c] = true
-	}
+	// Department-scoped approval (R17) resolves per-job against the record's
+	// own department, so the viewer's roles can no longer be reduced to one
+	// tenant-wide set up front — userMeetsApproval does the resolution per
+	// row, sharing the definition cache below.
 	defCache := map[string]*cachedWorkflowDef{}
 
 	for _, j := range jobs {
@@ -512,30 +576,36 @@ func (h *Handler) renderWorkflowInbox(w http.ResponseWriter, r *http.Request) {
 		// Resolved through the SAME function approveWorkflowJob's own gate
 		// uses, so what the inbox offers and what the API will accept
 		// cannot disagree.
-		requiredRole, err := approvalRoleFor(r.Context(), ts, j, defCache)
+		req, err := approvalRoleFor(r.Context(), ts, j, defCache)
+		var meets bool
+		if err == nil {
+			meets, err = userMeetsApproval(r.Context(), ts, j, req, rc.Actor.ID)
+		}
 		switch {
 		case err != nil:
-			// A job whose definition or step index can't be resolved is a
+			// A job whose definition/step/record can't be resolved is a
 			// data problem, not this viewer's fault. Show the row without
 			// an Approve button rather than failing the whole page —
 			// hiding every other pending approval because one job is
 			// malformed would be a worse outcome — and log it, since a
 			// silently unactionable row is exactly the confusion this
 			// task exists to remove.
-			log.Printf("api: workflow inbox: resolve required role for job %s: %v", j.ID, err)
+			log.Printf("api: workflow inbox: resolve approvability for job %s: %v", j.ID, err)
 			row.BlockedReason = h.catalog.T(locale, "workflow_inbox.unavailable")
-		case requiredRole == "" || holds[requiredRole]:
-			// Unrestricted step, or the viewer holds the role.
+		case meets:
 			row.CanApprove = true
 		default:
-			// The case this task is about. Before role-gating existed
-			// every step was unrestricted, so this was unreachable;
-			// role-gating turned it into the routine case, and the button
-			// was still being offered — clicking it now 403s, and htmx
-			// does not swap on a non-2xx response, so the click visibly
-			// did nothing with no explanation at all.
-			row.BlockedReason = strings.ReplaceAll(
-				h.catalog.T(locale, "workflow_inbox.requires_role"), "{role}", requiredRole)
+			// Gated on a role (optionally in a department) the viewer does
+			// not hold. Before role-gating existed every step was
+			// unrestricted, so this was unreachable; now it is the routine
+			// case, and the button used to be offered anyway — clicking it
+			// 403s, and htmx does not swap on a non-2xx response, so the
+			// click visibly did nothing with no explanation.
+			msg := h.catalog.T(locale, "workflow_inbox.requires_role")
+			if req.DepartmentField != "" {
+				msg = h.catalog.T(locale, "workflow_inbox.requires_role_in_department")
+			}
+			row.BlockedReason = strings.ReplaceAll(msg, "{role}", req.Role)
 		}
 		view.Rows = append(view.Rows, row)
 	}

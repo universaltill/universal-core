@@ -667,6 +667,29 @@ func (g *GuardedEngine) Delete(ctx context.Context, def *entity.Definition, id s
 	return g.raw.Delete(ctx, def, id, actor)
 }
 
+// SystemFieldForRouting reads one field off a record WITHOUT this actor's
+// field/entity permissions applied — the same unguarded g.raw path
+// EffectiveWriteFields already uses, and for the same reason: this is the
+// kernel making a decision (here, which department an approval routes to),
+// not the user reading data. Routing must not depend on whether the
+// approver happens to be allowed to see the routing field: a
+// FieldPermission hiding department_id from their role would otherwise
+// wrongly deny a legitimate approver, and no entity-read grant would 500
+// them (both found by independent review of R17 department routing).
+//
+// Deliberately returns only the ONE named field's string value, never the
+// whole record, so this cannot become a general RBAC bypass — a caller
+// gets exactly the routing key it asked for and nothing else. Absent or
+// non-string yields "".
+func (g *GuardedEngine) SystemFieldForRouting(ctx context.Context, def *entity.Definition, id, field string) (string, error) {
+	rec, err := g.raw.Get(ctx, def, id)
+	if err != nil {
+		return "", err
+	}
+	v, _ := rec.Data[field].(string)
+	return v, nil
+}
+
 func (g *GuardedEngine) Get(ctx context.Context, def *entity.Definition, id string) (data.Record, error) {
 	if err := g.checkRead(ctx, def); err != nil {
 		return data.Record{}, err

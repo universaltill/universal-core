@@ -130,6 +130,26 @@ func (d *Definition) Validate() error {
 					return fmt.Errorf("step %d: require_approval's \"role\" param must be a non-empty string, got %#v", i, raw)
 				}
 			}
+			// Optional "department" param scopes the role check to one
+			// department (R17 routing): its value is the NAME of a field
+			// on the triggering record whose value is the department id,
+			// so an approver must hold the role granted FOR that
+			// department, not any department. A field name, not a
+			// department id, because the id is per-record and only known
+			// at run time — "Finance Manager in the PurchaseOrder's own
+			// department" generalises, "in department X" hardcoded in the
+			// definition does not. Meaningless without a role to scope, so
+			// require one; and it must be a non-empty string for the same
+			// fail-at-publish reason as role above.
+			if raw, ok := s.Params["department"]; ok {
+				field, isString := raw.(string)
+				if !isString || field == "" {
+					return fmt.Errorf("step %d: require_approval's \"department\" param must be a non-empty field name, got %#v", i, raw)
+				}
+				if _, hasRole := s.Params["role"]; !hasRole {
+					return fmt.Errorf("step %d: require_approval's \"department\" param has no \"role\" to scope", i)
+				}
+			}
 		case StepNotify:
 			// no extra requirement in this first increment
 		default:

@@ -511,3 +511,48 @@ func TestRoleCodesForUser_NoGrants_ReturnsEmptyNotError(t *testing.T) {
 		t.Fatalf("expected zero role codes, got %v", codes)
 	}
 }
+
+// Department-scoped resolution is what R17 routing consumes: a user may
+// hold the same role in several departments, and an approval scoped to
+// department X must only see the grant for X.
+func TestRoleCodesForUserInDepartment_ScopesToTheGrantsDepartment(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	eng := crud.NewEngine(db)
+	actor := humanActor()
+
+	fin, err := eng.Create(ctx, Role(), map[string]any{"code": "finance_manager", "name": "FM"}, actor)
+	if err != nil {
+		t.Fatalf("role: %v", err)
+	}
+	// Same user holds finance_manager in dept-A but NOT dept-B.
+	if _, err := eng.Create(ctx, UserRole(), map[string]any{
+		"user_id": "u1", "role_id": fin.ID, "department_id": "dept-A",
+	}, actor); err != nil {
+		t.Fatalf("grant: %v", err)
+	}
+
+	inA, err := RoleCodesForUserInDepartment(ctx, db, "u1", "dept-A")
+	if err != nil {
+		t.Fatalf("resolve A: %v", err)
+	}
+	if !containsCode(inA, "finance_manager") {
+		t.Fatalf("u1 should hold finance_manager in dept-A, got %v", inA)
+	}
+	inB, err := RoleCodesForUserInDepartment(ctx, db, "u1", "dept-B")
+	if err != nil {
+		t.Fatalf("resolve B: %v", err)
+	}
+	if containsCode(inB, "finance_manager") {
+		t.Fatalf("u1 must NOT hold finance_manager in dept-B — the grant was scoped to A, got %v", inB)
+	}
+}
+
+func containsCode(xs []string, w string) bool {
+	for _, x := range xs {
+		if x == w {
+			return true
+		}
+	}
+	return false
+}
