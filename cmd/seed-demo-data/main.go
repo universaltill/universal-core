@@ -27,6 +27,7 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/finance"
+	"github.com/universaltill/universal-core/internal/kernel/hr"
 	"github.com/universaltill/universal-core/internal/kernel/projects"
 	"github.com/universaltill/universal-core/internal/kernel/purchasing"
 	"github.com/universaltill/universal-core/internal/kernel/sales"
@@ -140,6 +141,12 @@ func main() {
 	s.seedCustomerInvoices(customers, currencies, soIDs)
 	if hasPublished(s.ctx, s.entityDefs, "FixedAsset") {
 		s.seedFixedAssets(currencies, accounts, vendors)
+	}
+	if hasPublished(s.ctx, s.entityDefs, "Employee") {
+		if err := hr.PublishStatuses(context.Background(), sqlDB, s.actor); err != nil {
+			log.Fatalf("publish hr statuses: %v", err)
+		}
+		s.seedHR()
 	}
 	if hasPublished(s.ctx, s.entityDefs, "Project") {
 		if err := projects.PublishStatuses(context.Background(), sqlDB, s.actor); err != nil {
@@ -1323,4 +1330,41 @@ func (s *seeder) seedProjects(currencies, customers map[string]string) {
 			log.Fatalf("create TimeEntry: %v", err)
 		}
 	}
+}
+
+// seedHR gives the demo tenant one employment and a leave request
+// against it. Deliberately reuses the same "Demo Engineer" Party that
+// seedProjects creates and tags with the `employee` PartyRole, which is
+// what makes ADR-0013's shape visible in the data: one Party, an
+// Employee record that points at it and carries only the employment,
+// and a LeaveRequest hanging off the employment rather than the person.
+func (s *seeder) seedHR() {
+	if !hasPublished(s.ctx, s.entityDefs, "LeaveRequest") {
+		return
+	}
+	// The Party comes first whether or not Projects is licensed — the
+	// employee role is HR's own precondition, not a projects artifact.
+	person := s.getOrCreate("Party", "name", "Demo Engineer", map[string]any{
+		"party_type": "person", "name": "Demo Engineer", "status": "active",
+	})
+	s.getOrCreate("PartyRole", "party_id", person, map[string]any{
+		"party_id": person, "role_type": "employee",
+	})
+
+	employeeID := s.getOrCreate("Employee", "employee_number", "EMP-1001", map[string]any{
+		"employee_number": "EMP-1001",
+		"party_id":        person,
+		"hire_date":       "2024-03-04",
+		"status_id":       s.statusID("employee_status", "active"),
+	})
+	s.getOrCreate("LeaveRequest", "request_number", "LV-2026-001", map[string]any{
+		"request_number": "LV-2026-001",
+		"employee_id":    employeeID,
+		"leave_type":     "annual",
+		"start_date":     "2026-08-10",
+		"end_date":       "2026-08-14",
+		"days":           5.0,
+		"reason":         "Summer holiday",
+		"status_id":      s.statusID("leave_request_status", "submitted"),
+	})
 }

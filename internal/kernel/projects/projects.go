@@ -19,9 +19,18 @@
 //     tree view. Also filed — it needs the same kind of "reference must
 //     agree with a field of mine" constraint the kernel lacks.
 //
-// **There is no Employee entity, and this module does not add one.**
-// §8's rows say TimeEntry "references Employee", but this kernel models
-// a person's employment as a Party holding the `employee` PartyRole —
+// **TimeEntry and Task reference Party, not hr.Employee — and that is
+// deliberate (ADR-0013 rule 4).** An Employee entity now exists (the HR
+// module, board #16), and it is an employment RECORD keyed by party_id
+// rather than a person master. HR-domain records reference it; these
+// two do not, because a contractor who is not an employee can log
+// project time and be assigned a task. Retargeting them would forbid a
+// real case and cost a v2 Definition plus a migration of every logged
+// hour.
+//
+// The rest of this note is the reasoning ADR-0013 records, kept because
+// it is what makes rule 4 make sense: this kernel models a person's
+// employment as a Party holding the `employee` PartyRole —
 // the same Party-Role pattern vendor_id and customer_id already use,
 // documented in foundation.go's own PartyRole comment ("a person can be
 // both: an 'employee' PartyRole and…"). So employee_id and assignee_id
@@ -30,15 +39,10 @@
 // the ADR" warns about: the same human duplicated across finance, sales
 // and HR because each module grew its own.
 //
-// That decision reaches beyond this module: board card #16
-// (Employee/Department/Position) currently plans to add a real
-// foundation.Employee, and reference-data-model.md §7 gives it
-// attributes (hire_date, employment_status, position_id) that have
-// nowhere to live on Party or PartyRole. If #16 does add one,
-// TimeEntry.employee_id and Task.assignee_id must be retargeted — a
-// v2 Definition plus a data migration for every logged hour. Flagged on
-// #16 so that cycle decides it deliberately instead of rediscovering
-// the conflict (independent review).
+// That question — raised here by #18's independent review — was settled
+// by ADR-0013 when #16 shipped: Employee exists, carries only the
+// employment, and these two fields stay on Party. No migration was
+// needed.
 //
 // Deliberately NOT in this slice:
 //   - **ProjectBudgetLine** (§8's fourth row): planned cost by category,
@@ -105,8 +109,9 @@ func Project() *entity.Definition {
 // new hierarchy like this one inherits the guard rather than
 // re-implementing (or forgetting) it.
 //
-// assignee_id targets Party — see this package's doc comment on why
-// there is no Employee entity to point at.
+// assignee_id targets Party, not hr.Employee — see this package's doc
+// comment and ADR-0013 rule 4: a contractor who holds no employment can
+// still be assigned a task.
 func Task() *entity.Definition {
 	return &entity.Definition{
 		EntityType:     "Task",

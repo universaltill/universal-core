@@ -1098,7 +1098,15 @@ var referenceLabelFieldCandidates = []string{"name", "title"}
 // label its records in a picker/list cell — the first of
 // referenceLabelFieldCandidates present, or "" if the entity declares
 // none of them (in which case callers fall back to the raw id).
+// An explicit Definition.LabelField wins over the name/title
+// convention — see that field's own doc comment for why an entity may
+// legitimately have neither.
 func referenceLabelFieldFor(targetDef *entity.Definition) string {
+	if targetDef.LabelField != "" {
+		if _, ok := targetDef.FieldByName(targetDef.LabelField); ok {
+			return targetDef.LabelField
+		}
+	}
 	for _, candidate := range referenceLabelFieldCandidates {
 		if _, ok := targetDef.FieldByName(candidate); ok {
 			return candidate

@@ -53,13 +53,25 @@ const FormatV1 = "erp_module/v1"
 // highest version, so it wins (independent review, demonstrated: a
 // one-field "Party" v99 replaced foundation's real definition). The set
 // mirrors cmd/provision-tenant's modulePublishers plus foundation
-// itself; a new built-in module must be added here too, which is why
-// the test asserts against that command's list.
-var reservedModules = map[string]bool{
+// itself; a new built-in module must be added here too.
+//
+// It had already drifted by three modules (assets, projects, hr) before
+// anyone noticed, and the comment claimed a parity test that did not
+// exist — so ReservedModules is now exported and
+// cmd/provision-tenant's own test asserts the two lists agree. The
+// drift is not cosmetic: the independent review demonstrated a bundle
+// declaring an unlisted built-in module key installing its own
+// Employee v1, after which the real hr.Publish returns nil (moduleseed
+// skips an already-published key/version) and reports success while
+// the genuine Definition never lands.
+var ReservedModules = map[string]bool{
 	"foundation": true,
 	"purchasing": true,
 	"sales":      true,
 	"finance":    true,
+	"assets":     true,
+	"projects":   true,
+	"hr":         true,
 }
 
 // manifest is the raw file shape. Definitions stay json.RawMessage so
@@ -128,7 +140,7 @@ func Load(raw []byte) (*Bundle, error) {
 	if m.Module == "" || m.Module != strings.ToLower(m.Module) || strings.ContainsAny(m.Module, " \t\n") {
 		return nil, fmt.Errorf("modulebundle: module key %q must be non-empty lowercase with no whitespace", m.Module)
 	}
-	if reservedModules[m.Module] {
+	if ReservedModules[m.Module] {
 		return nil, fmt.Errorf("modulebundle: module key %q is reserved for a built-in module", m.Module)
 	}
 	if len(m.Entities) == 0 {

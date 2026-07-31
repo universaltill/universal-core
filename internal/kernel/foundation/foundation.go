@@ -485,9 +485,10 @@ func Role() *entity.Definition {
 // yet: this ships the scoping data + a resolver
 // (RoleCodesForUserInDepartment, roles.go); resolving *which* department
 // a given approval request belongs to (the other half of R17's routing)
-// is separate, still-open work blocked on either Employee.department_id
-// (Phase 6, not started) or a new department field on trigger entities
-// like PurchaseOrder — see BACKLOG-TASKS.md's note on this task.
+// is separate, still-open work needing either Employee.department_id
+// (now shipped — hr.Employee, board #16/ADR-0013, so this half is
+// unblocked) or a new department field on trigger entities like
+// PurchaseOrder — see BACKLOG-TASKS.md's note on this task.
 func UserRole() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "UserRole",
@@ -568,9 +569,11 @@ func FieldPermission() *entity.Definition {
 
 // Department is one node in a tenant's org-chart (Phase 2 of
 // `erp/BACKLOG-TASKS.md`, reference-data-model.md §7) — built as pure
-// org-structure data, deliberately with no Employee entity yet
-// (Employee/LeaveRequest/AttendanceRecord are a separate, later HR
-// task). This exists to give R17's future role/department-based
+// org-structure data, at a time when no Employee entity existed.
+// hr.Employee and hr.LeaveRequest have since shipped (board #16,
+// ADR-0013) and reference Department from there; AttendanceRecord is
+// still later HR work (#17). This exists to give R17's
+// role/department-based
 // approval routing something to route against; it does not itself
 // implement routing.
 //
@@ -609,7 +612,7 @@ func Department() *entity.Definition {
 // independent review caught the real cost of requiring it: a
 // company-level/matrix position (e.g. CFO, reporting to no single
 // department) would have needed a synthetic root Department just to
-// satisfy the constraint, and once Employee actually lands, a required
+// satisfy the constraint, and now that Employee has landed (hr.Employee, ADR-0013), a required
 // Position.department_id would be a second, easily-diverging source of
 // truth alongside Employee's own department_id. Optional is the
 // reversible choice — reports_to_position_id is the same self-
@@ -649,11 +652,12 @@ func Position() *entity.Definition {
 // ends_at is optional (FieldDate, inclusive through the end of that
 // day in the server's own local time zone — see ActiveDelegatorsFor in
 // roles.go) — empty means the delegation runs indefinitely until
-// explicitly revoked. There is no automatic expiry tied to a real return-from-leave
-// event because no Employee/LeaveRequest entity exists yet to detect one
-// (Phase 6, not started — see Department's own doc comment above); this
-// is a manually-toggled substitute-approver switch, not leave-aware
-// automation.
+// explicitly revoked. There is no automatic expiry tied to a real
+// return-from-leave event: when this was written no Employee/
+// LeaveRequest entity existed to detect one, and both now do (hr,
+// board #16, ADR-0013), so leave-aware expiry is buildable — it is
+// simply not built. This stays a manually-toggled substitute-approver
+// switch, not leave-aware automation.
 //
 // revoked is the immediate off switch — set true to end a delegation
 // before its ends_at (or an indefinite one) without deleting the row, so

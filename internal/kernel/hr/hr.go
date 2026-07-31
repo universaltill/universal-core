@@ -1,0 +1,159 @@
+// Package hr is the HR/HCM module (reference-data-model.md §7,
+// BACKLOG.md R22) — Employee and LeaveRequest. A licensed module like
+// purchasing/sales/assets/projects. Department and Position already
+// live in internal/kernel/foundation (shipped 2026-07-30 with the
+// org-chart work) and are referenced from here rather than moved:
+// relocating a published Definition would cost a version bump and a
+// migration for no behavioural gain.
+//
+// **Employee is an employment record, not a person** — ADR-0013. The
+// person lives on Party and nowhere else; this entity carries only the
+// employment: which position, which department, hired when, still
+// employed or not. That is what lets one human hold two employments
+// over time (a rehire is a second record, not an edit that destroys the
+// first one's history) without ever duplicating their name or contact
+// details.
+//
+// Read ADR-0013 before adding a reference to "the employee" from a new
+// module. Its rule 4 is the one that catches people out: HR-domain
+// records (LeaveRequest here, AttendanceRecord in #17, Payslip later)
+// reference **Employee**, because they are about the employment
+// relationship; cross-domain records reference **Party**, because a
+// contractor who is not an employee can still log project time or be
+// assigned a task. projects.TimeEntry.employee_id pointing at Party is
+// therefore correct and deliberate, not an inconsistency to "fix".
+//
+// **Not enforced here.** Listed in full rather than partially, because
+// enumerating some invariants makes a reader assume the rest are
+// covered — the independent review found four more beyond the three
+// this list originally had, every one of them accepted by the live
+// engine:
+//   - the referenced Party actually holding the `employee` PartyRole;
+//   - an Employee's department_id agreeing with its position's own;
+//   - a Party having at most one ACTIVE employment at a time (two are
+//     accepted, which #16's own test relies on for the rehire case —
+//     but two SIMULTANEOUS active ones are equally accepted);
+//   - employee_number being unique (nothing in entity.Field expresses
+//     uniqueness; "natural key" below is a convention, not a
+//     guarantee);
+//   - `days` being positive, or agreeing with the start/end span: -99
+//     days and 500 days over a two-day span both save cleanly.
+//     entity.Field has no Min/Max — filed as #80, which #17's
+//     hours_worked will want too;
+//   - leave falling inside its employment's hire/end window: leave
+//     dated 2030 against an employment that ended in 2020 saves;
+//   - employee_id pointing at an Employee that exists at all — a
+//     dangling reference is accepted (#78).
+//
+// What IS enforced: the leave_type enum, and both NotBefore date
+// chains (an employment ending before it started, or leave ending
+// before it starts, are rejected).
+//
+// Deliberately NOT in this slice: PayrollRun/Payslip (§7's last row —
+// payroll calculation is explicitly out of R22's scoped-down phase, and
+// it is country-specific, so per jurisdiction it is plugin work),
+// AttendanceRecord (#17, reordered behind this card), and leave-balance
+// accrual — LeaveRequest records a request and its approval, and a
+// balance engine needs policy (carry-over, accrual rate, public
+// holidays) that is per-tenant and per-jurisdiction.
+package hr
+
+import "github.com/universaltill/universal-core/internal/kernel/entity"
+
+// Employee is one employment relationship (reference-data-model.md §7,
+// ADR-0013). party_id is required and is the ONLY link to who the
+// person is — no name, no contact, no language: those are Party's, and
+// duplicating them here is the failure mode this shape exists to
+// prevent.
+func Employee() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "Employee",
+		Version:    1,
+		Module:     "hr",
+		// Employee has no name of its own by design (ADR-0013 — the
+		// person's name is Party's), which without this made every
+		// picker, list cell and export show a raw UUID and made the
+		// picker unsearchable: it can only sort/filter by a field it
+		// knows is the label (independent review). employee_number is
+		// what a payroll clerk actually calls the record.
+		LabelField:     "employee_number",
+		StatusTypeCode: "employee_status",
+		Fields: []entity.Field{
+			// employee_number is the identifier payroll and badges use,
+			// distinct from the Party's own identity. Conventionally
+			// unique per tenant, but nothing enforces that — see the
+			// package comment; entity.Field has no Unique.
+			{Name: "employee_number", Type: entity.FieldString, Required: true},
+			{Name: "party_id", Type: entity.FieldReference, Required: true, Target: "Party"},
+			{Name: "position_id", Type: entity.FieldReference, Target: "Position"},
+			// department_id is carried directly rather than derived through
+			// position_id: an employee can be seconded to a department that
+			// isn't their position's, and a headcount-by-department report
+			// shouldn't need a join through the org chart to answer. The two
+			// can disagree; nothing enforces agreement yet (see the package
+			// comment and #78).
+			{Name: "department_id", Type: entity.FieldReference, Target: "Department"},
+			{Name: "hire_date", Type: entity.FieldDate, Required: true},
+			// end_date is when THIS employment ended. A rehire is a new
+			// Employee record against the same Party (ADR-0013), so this
+			// never needs clearing to bring someone back.
+			{Name: "end_date", Type: entity.FieldDate, NotBefore: "hire_date"},
+			{Name: "status_id", Type: entity.FieldReference, Required: true, Target: "Status"},
+		},
+		Relationships: []entity.Relationship{
+			// Related list, not composition: a leave request records
+			// something that was asked and decided, and it outlives the
+			// employment — someone's leave history must not vanish because
+			// they left. Same call TimeEntry gets on Task.
+			{Name: "leave", Kind: entity.RelationRelatedList, Target: "LeaveRequest", ParentField: "employee_id"},
+		},
+	}
+}
+
+// LeaveRequest is time off asked for and decided
+// (reference-data-model.md §7). Its status graph is an approval chain —
+// unlike Employee's, which is a lifecycle — and it is the R9 approval
+// workflow's intended subject: the routing built in Phase 2
+// (department-scoped approval, delegation, escalation) applies to this
+// entity without anything new here, because that machinery is generic
+// over entity type.
+//
+// employee_id references Employee, not Party: leave accrues against an
+// employment (ADR-0013 rule 4). Someone with two employments over time
+// has two separate leave histories, which is correct.
+func LeaveRequest() *entity.Definition {
+	return &entity.Definition{
+		EntityType:     "LeaveRequest",
+		Version:        1,
+		Module:         "hr",
+		StatusTypeCode: "leave_request_status",
+		Fields: []entity.Field{
+			{Name: "request_number", Type: entity.FieldString, Required: true},
+			{Name: "employee_id", Type: entity.FieldReference, Required: true, Target: "Employee"},
+			{Name: "leave_type", Type: entity.FieldEnum, Required: true,
+				// Jurisdiction-invariant categories only. Which of these a
+				// tenant actually grants, how much, and how it accrues is
+				// per-country policy — plugin territory, not an enum value
+				// to guess at here.
+				EnumValues: []string{"annual", "sick", "unpaid", "parental", "other"},
+				Default:    "annual"},
+			{Name: "start_date", Type: entity.FieldDate, Required: true},
+			{Name: "end_date", Type: entity.FieldDate, Required: true, NotBefore: "start_date"},
+			// Days rather than a computed span: half-days, public holidays
+			// and non-working days make "end minus start" wrong in every
+			// jurisdiction, and the correct calculation is exactly the
+			// per-country policy this module doesn't own.
+			{Name: "days", Type: entity.FieldNumber, Required: true},
+			{Name: "reason", Type: entity.FieldString},
+			{Name: "status_id", Type: entity.FieldReference, Required: true, Target: "Status"},
+		},
+	}
+}
+
+// All returns every Definition this module adds.
+func All() []*entity.Definition {
+	return []*entity.Definition{
+		Employee(),
+		LeaveRequest(),
+	}
+}

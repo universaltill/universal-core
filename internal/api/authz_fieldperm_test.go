@@ -21,13 +21,13 @@ import (
 // API client actually receives — JSON keys, rendered HTML, CSV columns,
 // nav links, status codes.
 
-// employeeEntityDef has one obviously-sensitive optional field, which is
+// salariedStaffEntityDef has one obviously-sensitive optional field, which is
 // the realistic shape of a field rule (hiding an OPTIONAL field; hiding
 // a required one makes creation impossible for that role — recorded in
 // ADR-0006's limitations).
-func employeeEntityDef() *entity.Definition {
+func salariedStaffEntityDef() *entity.Definition {
 	return &entity.Definition{
-		EntityType: "Employee",
+		EntityType: "SalariedStaff",
 		Version:    1,
 		Module:     "foundation",
 		Fields: []entity.Field{
@@ -37,9 +37,9 @@ func employeeEntityDef() *entity.Definition {
 	}
 }
 
-func employeeFormDef() *form.Definition {
+func salariedStaffFormDef() *form.Definition {
 	return &form.Definition{
-		EntityType: "Employee",
+		EntityType: "SalariedStaff",
 		Version:    1,
 		Sections: []form.Section{{
 			Title:     "Details",
@@ -52,7 +52,7 @@ func employeeFormDef() *form.Definition {
 	}
 }
 
-// widgetEntityDef is a second entity in the SAME module as Employee,
+// widgetEntityDef is a second entity in the SAME module as SalariedStaff,
 // left readable — so a test can tell "the module disappeared" apart from
 // "one node inside it disappeared." Deliberately a fictional entity type
 // ("Widget", not "Department") — this test predates foundation.Department
@@ -108,7 +108,7 @@ func seedFieldRule(t *testing.T, db *sql.DB, roleCode, userID, entityType, field
 	return role.ID
 }
 
-// fieldPermFixture sets up a tenant with Employee published, one record,
+// fieldPermFixture sets up a tenant with SalariedStaff published, one record,
 // and salary hidden from "user-clerk" (who holds the "clerk" role).
 // "user-open" holds no roles and therefore sees everything.
 func fieldPermFixture(t *testing.T) (tenantID string, db *sql.DB, mux *http.ServeMux, recordID string) {
@@ -120,13 +120,13 @@ func fieldPermFixture(t *testing.T) (tenantID string, db *sql.DB, mux *http.Serv
 	if err := foundation.Publish(ctx, db, humanActor()); err != nil {
 		t.Fatalf("foundation.Publish: %v", err)
 	}
-	publishEntityAndForm(t, db, employeeEntityDef(), employeeFormDef())
-	seedFieldRule(t, db, "clerk", "user-clerk", "Employee", "salary")
+	publishEntityAndForm(t, db, salariedStaffEntityDef(), salariedStaffFormDef())
+	seedFieldRule(t, db, "clerk", "user-clerk", "SalariedStaff", "salary")
 
-	rec, err := crud.NewEngine(db).Create(ctx, employeeEntityDef(),
+	rec, err := crud.NewEngine(db).Create(ctx, salariedStaffEntityDef(),
 		map[string]any{"name": "Dana", "salary": "120000"}, humanActor())
 	if err != nil {
-		t.Fatalf("seed Employee: %v", err)
+		t.Fatalf("seed SalariedStaff: %v", err)
 	}
 
 	mux = http.NewServeMux()
@@ -146,7 +146,7 @@ func getAs(t *testing.T, mux *http.ServeMux, target, tenantID, actorID string) *
 func TestAPI_FieldPermission_JSONStripsHiddenField(t *testing.T) {
 	tenantID, _, mux, recordID := fieldPermFixture(t)
 
-	for _, target := range []string{"/api/records/Employee", "/api/records/Employee/" + recordID} {
+	for _, target := range []string{"/api/records/SalariedStaff", "/api/records/SalariedStaff/" + recordID} {
 		rec := getAs(t, mux, target, tenantID, "user-clerk")
 		if rec.Code != http.StatusOK {
 			t.Fatalf("clerk GET %s: expected 200, got %d: %s", target, rec.Code, rec.Body.String())
@@ -162,7 +162,7 @@ func TestAPI_FieldPermission_JSONStripsHiddenField(t *testing.T) {
 
 	// A user with no field rules against them still sees it — proving the
 	// stripping is per-actor, not a global schema change.
-	rec := getAs(t, mux, "/api/records/Employee/"+recordID, tenantID, "user-open")
+	rec := getAs(t, mux, "/api/records/SalariedStaff/"+recordID, tenantID, "user-open")
 	if !strings.Contains(rec.Body.String(), "120000") {
 		t.Fatalf("unrestricted user lost the field: %s", rec.Body.String())
 	}
@@ -174,7 +174,7 @@ func TestAPI_FieldPermission_JSONStripsHiddenField(t *testing.T) {
 func TestAPI_FieldPermission_FormOmitsHiddenFieldEntirely(t *testing.T) {
 	tenantID, _, mux, recordID := fieldPermFixture(t)
 
-	rec := getAs(t, mux, "/forms/Employee/"+recordID, tenantID, "user-clerk")
+	rec := getAs(t, mux, "/forms/SalariedStaff/"+recordID, tenantID, "user-clerk")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("clerk form: expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -196,7 +196,7 @@ func TestAPI_FieldPermission_FormOmitsHiddenFieldEntirely(t *testing.T) {
 func TestAPI_FieldPermission_ListPageDropsColumn(t *testing.T) {
 	tenantID, _, mux, _ := fieldPermFixture(t)
 
-	rec := getAs(t, mux, "/records/Employee", tenantID, "user-clerk")
+	rec := getAs(t, mux, "/records/SalariedStaff", tenantID, "user-clerk")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("clerk list page: expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -222,7 +222,7 @@ func TestAPI_FieldPermission_ListPageDropsColumn(t *testing.T) {
 func TestAPI_FieldPermission_CSVExportDropsColumn(t *testing.T) {
 	tenantID, _, mux, _ := fieldPermFixture(t)
 
-	rec := getAs(t, mux, "/export/Employee", tenantID, "user-clerk")
+	rec := getAs(t, mux, "/export/SalariedStaff", tenantID, "user-clerk")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("clerk export: expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -239,7 +239,7 @@ func TestAPI_FieldPermission_CSVExportDropsColumn(t *testing.T) {
 	}
 
 	// Unrestricted user still gets both columns.
-	open := getAs(t, mux, "/export/Employee", tenantID, "user-open")
+	open := getAs(t, mux, "/export/SalariedStaff", tenantID, "user-open")
 	if !strings.Contains(open.Body.String(), "salary") {
 		t.Fatalf("unrestricted export lost the column:\n%s", open.Body.String())
 	}
@@ -253,7 +253,7 @@ func TestAPI_FieldPermission_SaveFromRedactedFormPreservesHiddenValue(t *testing
 	tenantID, db, mux, recordID := fieldPermFixture(t)
 
 	// Exactly what the redacted form submits: the visible field only.
-	req := newRequest("POST", "/api/records/Employee/"+recordID, tenantID, "user-clerk",
+	req := newRequest("POST", "/api/records/SalariedStaff/"+recordID, tenantID, "user-clerk",
 		[]byte(`{"name":"Dana Renamed"}`))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -262,7 +262,7 @@ func TestAPI_FieldPermission_SaveFromRedactedFormPreservesHiddenValue(t *testing
 		t.Fatalf("clerk save: expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
 
-	stored, err := crud.NewEngine(db).Get(context.Background(), employeeEntityDef(), recordID)
+	stored, err := crud.NewEngine(db).Get(context.Background(), salariedStaffEntityDef(), recordID)
 	if err != nil {
 		t.Fatalf("raw Get: %v", err)
 	}
@@ -287,14 +287,14 @@ func TestAPI_FieldPermission_WritingHiddenFieldIs403(t *testing.T) {
 		return rec
 	}
 
-	if rec := post("/api/records/Employee/"+recordID, []byte(`{"name":"Dana","salary":"999999"}`)); rec.Code != http.StatusForbidden {
+	if rec := post("/api/records/SalariedStaff/"+recordID, []byte(`{"name":"Dana","salary":"999999"}`)); rec.Code != http.StatusForbidden {
 		t.Fatalf("clerk update of hidden field: expected 403, got %d: %s", rec.Code, rec.Body.String())
 	}
-	if rec := post("/api/records/Employee", []byte(`{"name":"New Hire","salary":"888888"}`)); rec.Code != http.StatusForbidden {
+	if rec := post("/api/records/SalariedStaff", []byte(`{"name":"New Hire","salary":"888888"}`)); rec.Code != http.StatusForbidden {
 		t.Fatalf("clerk create setting hidden field: expected 403, got %d: %s", rec.Code, rec.Body.String())
 	}
 
-	stored, err := crud.NewEngine(db).Get(context.Background(), employeeEntityDef(), recordID)
+	stored, err := crud.NewEngine(db).Get(context.Background(), salariedStaffEntityDef(), recordID)
 	if err != nil {
 		t.Fatalf("raw Get: %v", err)
 	}
@@ -309,13 +309,13 @@ func TestAPI_FieldPermission_ImportSettingHiddenFieldWritesNothing(t *testing.T)
 	tenantID, db, mux, _ := fieldPermFixture(t)
 	ctx := context.Background()
 
-	before, err := crud.NewEngine(db).Count(ctx, employeeEntityDef())
+	before, err := crud.NewEngine(db).Count(ctx, salariedStaffEntityDef())
 	if err != nil {
 		t.Fatalf("count before: %v", err)
 	}
 
 	csvContent := []byte("name,salary\nMallory,1\n")
-	req := newMultipartRequest(t, "/import/Employee/commit", tenantID, "user-clerk", "staff.csv", csvContent,
+	req := newMultipartRequest(t, "/import/SalariedStaff/commit", tenantID, "user-clerk", "staff.csv", csvContent,
 		map[string]string{"mapping.name": "name", "mapping.salary": "salary"})
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
@@ -323,7 +323,7 @@ func TestAPI_FieldPermission_ImportSettingHiddenFieldWritesNothing(t *testing.T)
 	if !strings.Contains(rec.Body.String(), "access denied") {
 		t.Fatalf("expected per-row access-denied results, got:\n%s", rec.Body.String())
 	}
-	after, err := crud.NewEngine(db).Count(ctx, employeeEntityDef())
+	after, err := crud.NewEngine(db).Count(ctx, salariedStaffEntityDef())
 	if err != nil {
 		t.Fatalf("count after: %v", err)
 	}
@@ -437,17 +437,17 @@ func TestAPI_RBAC_NavAndDashboardHideDeniedEntityTypes(t *testing.T) {
 	// accessibleModules only lists entity types that have a published
 	// FORM as well as a published entity Definition, and foundation's own
 	// forms aren't published here — so the module contents under test are
-	// exactly the ones published below. Employee and Widget both
+	// exactly the ones published below. SalariedStaff and Widget both
 	// declare Module "foundation" (one denied, one not, so that module
 	// survives minus a node); Vendor declares no Module and so lands
 	// alone in "general", which must disappear entirely once denied.
-	publishEntityAndForm(t, db, employeeEntityDef(), employeeFormDef())
+	publishEntityAndForm(t, db, salariedStaffEntityDef(), salariedStaffFormDef())
 	publishEntityAndForm(t, db, widgetEntityDef(), widgetFormDef())
 	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
 	seedRBAC(t, db,
 		map[string][]string{"clerk": {"user-clerk"}, authz.AdminRoleCode: {"user-admin"}},
 		[]map[string]any{
-			{"role": "clerk", "entity_type": "Employee", "can_read": false, "can_write": false},
+			{"role": "clerk", "entity_type": "SalariedStaff", "can_read": false, "can_write": false},
 			{"role": "clerk", "entity_type": "Vendor", "can_read": false, "can_write": false},
 		},
 	)
@@ -479,14 +479,14 @@ func TestAPI_RBAC_NavAndDashboardHideDeniedEntityTypes(t *testing.T) {
 	if menu.Code != http.StatusOK {
 		t.Fatalf("clerk module menu: expected 200, got %d: %s", menu.Code, menu.Body.String())
 	}
-	if strings.Contains(menu.Body.String(), "/records/Employee") {
+	if strings.Contains(menu.Body.String(), "/records/SalariedStaff") {
 		t.Fatalf("module menu linked to a denied entity type:\n%s", menu.Body.String())
 	}
 	if !strings.Contains(menu.Body.String(), "/records/Widget") {
 		t.Fatalf("module menu lost an entity type the clerk CAN read:\n%s", menu.Body.String())
 	}
 	adminMenu := getAs(t, mux, "/modules/foundation", tenantID, "user-admin")
-	if !strings.Contains(adminMenu.Body.String(), "/records/Employee") {
+	if !strings.Contains(adminMenu.Body.String(), "/records/SalariedStaff") {
 		t.Fatalf("admin module menu lost a readable entity type:\n%s", adminMenu.Body.String())
 	}
 }
@@ -503,15 +503,15 @@ func TestAPI_FieldPermission_NoRulesChangesNothing(t *testing.T) {
 	if err := foundation.Publish(ctx, db, humanActor()); err != nil {
 		t.Fatalf("foundation.Publish: %v", err)
 	}
-	publishEntityAndForm(t, db, employeeEntityDef(), employeeFormDef())
-	if _, err := crud.NewEngine(db).Create(ctx, employeeEntityDef(),
+	publishEntityAndForm(t, db, salariedStaffEntityDef(), salariedStaffFormDef())
+	if _, err := crud.NewEngine(db).Create(ctx, salariedStaffEntityDef(),
 		map[string]any{"name": "Dana", "salary": "120000"}, humanActor()); err != nil {
-		t.Fatalf("seed Employee: %v", err)
+		t.Fatalf("seed SalariedStaff: %v", err)
 	}
 	mux := http.NewServeMux()
 	testHandler(t, router).Routes(mux)
 
-	rec := getAs(t, mux, "/api/records/Employee", tenantID, "anyone")
+	rec := getAs(t, mux, "/api/records/SalariedStaff", tenantID, "anyone")
 	var envelope struct {
 		Data []recordResponse `json:"data"`
 	}
@@ -521,7 +521,7 @@ func TestAPI_FieldPermission_NoRulesChangesNothing(t *testing.T) {
 	if len(envelope.Data) != 1 || envelope.Data[0].Data["salary"] != "120000" {
 		t.Fatalf("a tenant with no rules lost data: %v", envelope.Data)
 	}
-	for _, target := range []string{"/records/Employee", "/forms/Employee/new", "/import/Employee", "/export/Employee"} {
+	for _, target := range []string{"/records/SalariedStaff", "/forms/SalariedStaff/new", "/import/SalariedStaff", "/export/SalariedStaff"} {
 		if got := getAs(t, mux, target, tenantID, "anyone"); got.Code != http.StatusOK {
 			t.Fatalf("GET %s with no rules: expected 200, got %d: %s", target, got.Code, got.Body.String())
 		}
@@ -548,26 +548,26 @@ func TestAPI_FieldPermission_DeniedUserGetsNoExistenceOracle(t *testing.T) {
 	if err := foundation.Publish(ctx, db, humanActor()); err != nil {
 		t.Fatalf("foundation.Publish: %v", err)
 	}
-	publishEntityAndForm(t, db, employeeEntityDef(), employeeFormDef())
+	publishEntityAndForm(t, db, salariedStaffEntityDef(), salariedStaffFormDef())
 
-	// The clerk holds a field rule on Employee.salary...
-	seedFieldRule(t, db, "clerk", "user-clerk", "Employee", "salary")
-	// ...while Employee is opted into RBAC granting only somebody else.
+	// The clerk holds a field rule on SalariedStaff.salary...
+	seedFieldRule(t, db, "clerk", "user-clerk", "SalariedStaff", "salary")
+	// ...while SalariedStaff is opted into RBAC granting only somebody else.
 	seedRBAC(t, db,
 		map[string][]string{"other": {"user-other"}},
-		[]map[string]any{{"role": "other", "entity_type": "Employee", "can_read": true, "can_write": true}},
+		[]map[string]any{{"role": "other", "entity_type": "SalariedStaff", "can_read": true, "can_write": true}},
 	)
 
-	rec, err := crud.NewEngine(db).Create(ctx, employeeEntityDef(),
+	rec, err := crud.NewEngine(db).Create(ctx, salariedStaffEntityDef(),
 		map[string]any{"name": "Dana", "salary": "120000"}, humanActor())
 	if err != nil {
-		t.Fatalf("seed Employee: %v", err)
+		t.Fatalf("seed SalariedStaff: %v", err)
 	}
 
 	mux := http.NewServeMux()
 	testHandler(t, router).Routes(mux)
 	post := func(id string) int {
-		req := newRequest("POST", "/api/records/Employee/"+id, tenantID, "user-clerk", []byte(`{"name":"x"}`))
+		req := newRequest("POST", "/api/records/SalariedStaff/"+id, tenantID, "user-clerk", []byte(`{"name":"x"}`))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, req)
@@ -593,7 +593,7 @@ func TestAPI_FieldPermission_DeniedUserGetsNoExistenceOracle(t *testing.T) {
 func TestAPI_FieldPermission_ImportMappingHidesField(t *testing.T) {
 	tenantID, _, mux, _ := fieldPermFixture(t)
 
-	req := newMultipartRequest(t, "/import/Employee/preview", tenantID, "user-clerk",
+	req := newMultipartRequest(t, "/import/SalariedStaff/preview", tenantID, "user-clerk",
 		"staff.csv", []byte("name\nDana\n"), nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)

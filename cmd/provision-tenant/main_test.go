@@ -12,6 +12,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/universaltill/universal-core/internal/db"
+	"github.com/universaltill/universal-core/internal/kernel/modulebundle"
 	"github.com/universaltill/universal-core/internal/tenantdb"
 	"github.com/universaltill/universal-core/internal/testexec"
 )
@@ -364,6 +365,82 @@ func TestProvisionTenant_ProjectsModule(t *testing.T) {
 		}
 		if n != g.want {
 			t.Errorf("expected %d %s rows, got %d", g.want, g.code, n)
+		}
+	}
+}
+
+// TestProvisionTenant_HRModule is the smoke layer for the HR module
+// (universaltill/uc-infra#16): the real compiled binary publishes
+// Employee and LeaveRequest with both status graphs.
+func TestProvisionTenant_HRModule(t *testing.T) {
+	dsn := freshControlDB(t)
+
+	stdout, stderr, code := run(t, []string{"DATABASE_URL=" + dsn}, "-name=HR Smoke Test", "-actor-id=smoke-test", "-modules=hr")
+	if code != 0 {
+		t.Fatalf("run: exit %d, stderr: %s", code, stderr)
+	}
+	id := strings.TrimSpace(stdout)
+	testexec.DropTenantDatabase(t, testexec.Open(t, dsn), id)
+
+	router := openRouter(t, dsn)
+	tenantDB, err := router.Get(context.Background(), id)
+	if err != nil {
+		t.Fatalf("resolve tenant database: %v", err)
+	}
+	ctx := context.Background()
+
+	for _, et := range []string{"Employee", "LeaveRequest"} {
+		var count int
+		if err := tenantDB.QueryRowContext(ctx,
+			`SELECT count(*) FROM entity_definitions WHERE entity_type = $1 AND status = 'published'`, et,
+		).Scan(&count); err != nil {
+			t.Fatalf("count published %s: %v", et, err)
+		}
+		if count != 1 {
+			t.Errorf("expected 1 published %s definition, got %d", et, count)
+		}
+	}
+	for _, g := range []struct {
+		code string
+		want int
+	}{{"employee_status", 4}, {"leave_request_status", 5}} {
+		var n int
+		if err := tenantDB.QueryRowContext(ctx,
+			`SELECT count(*) FROM records r
+			 WHERE r.entity_type = 'Status' AND r.deleted_at IS NULL
+			   AND r.data->>'status_type_id' IN (
+			     SELECT id::text FROM records
+			     WHERE entity_type = 'StatusType' AND data->>'code' = $1 AND deleted_at IS NULL)`, g.code,
+		).Scan(&n); err != nil {
+			t.Fatalf("count %s statuses: %v", g.code, err)
+		}
+		if n != g.want {
+			t.Errorf("expected %d %s rows, got %d", g.want, g.code, n)
+		}
+	}
+}
+
+// TestModulePublishers_MatchReservedModules is the parity test
+// modulebundle.ReservedModules' own comment claimed existed and did
+// not. Without it the two lists drifted by three modules, and the
+// independent review showed the consequence: a bundle declaring an
+// unlisted built-in key installs its own Definition, after which the
+// real module's Publish silently no-ops and reports success.
+func TestModulePublishers_MatchReservedModules(t *testing.T) {
+	// foundation is always published and has no entry in
+	// modulePublishers, so it is the one legitimate difference.
+	want := map[string]bool{"foundation": true}
+	for key := range modulePublishers {
+		want[key] = true
+	}
+	for key := range want {
+		if !modulebundle.ReservedModules[key] {
+			t.Errorf("built-in module %q is missing from modulebundle.ReservedModules — a bundle could claim that key and silently pre-empt the real module", key)
+		}
+	}
+	for key := range modulebundle.ReservedModules {
+		if !want[key] {
+			t.Errorf("modulebundle.ReservedModules has %q, which is not a built-in module — bundles are needlessly barred from that key", key)
 		}
 	}
 }

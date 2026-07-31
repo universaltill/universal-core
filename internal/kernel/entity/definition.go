@@ -106,6 +106,20 @@ type Definition struct {
 	// kernel boundary rule is about behavior, not about a Definition
 	// carrying data a UI groups by.
 	Module string `json:"module,omitempty"`
+	// LabelField names the field that should label a record of this type
+	// in a reference picker, a list cell, or anywhere else a human needs
+	// to recognise it. Optional: when empty, the renderer falls back to
+	// the "name"/"title" convention most Definitions follow.
+	//
+	// It exists for the entity that deliberately has no such field.
+	// hr.Employee is the first (ADR-0013 makes it an employment record —
+	// the person's name lives on Party and duplicating it here is the
+	// whole thing that design prevents), and without this it rendered as
+	// a raw UUID in every picker, list cell and export, AND became
+	// unsearchable, because the picker can only sort/filter by a field
+	// it knows to be the label. Declaring the label is data, not an
+	// entity-type branch in the engine.
+	LabelField string `json:"label_field,omitempty"`
 	// StatusTypeCode names the foundation StatusType (reference-data-
 	// model.md §0's generic "Status/StatusType" pattern — see
 	// foundation.StatusType/Status/StatusTransition) that governs this
@@ -138,6 +152,21 @@ func (d *Definition) FieldByName(name string) (Field, bool) {
 func (d *Definition) Validate() error {
 	if d.EntityType == "" {
 		return fmt.Errorf("entity_type is required")
+	}
+	if d.LabelField != "" {
+		f, ok := d.FieldByName(d.LabelField)
+		if !ok {
+			return fmt.Errorf("label_field %q is not a field of %s", d.LabelField, d.EntityType)
+		}
+		// A reference or bool labels nothing a human can read, and an
+		// i18n_text label can't drive the picker's sort/filter (the same
+		// reason reference_search degrades for one) — so the label must
+		// be a plain scalar.
+		switch f.Type {
+		case FieldString, FieldNumber, FieldDate, FieldEnum:
+		default:
+			return fmt.Errorf("label_field %q on %s is a %s; a label must be a string, number, date or enum", d.LabelField, d.EntityType, f.Type)
+		}
 	}
 	seen := make(map[string]bool, len(d.Fields))
 	for _, f := range d.Fields {

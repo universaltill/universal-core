@@ -461,7 +461,7 @@ func TestAPI_PurchasingReport_DeniedWhenAnyUnderlyingTypeIsRestricted(t *testing
 // negative control the table-driven denial test above can't provide by
 // itself: it proves the gate is scoped to purchasingReportEntityTypes,
 // not "any Permission row anywhere makes this report 403." A role denied
-// read on an entity type the report never touches (Employee — no query
+// read on an entity type the report never touches (SalariedStaff — no query
 // in internal/data/reporting.go reads it) must still see the real
 // report. Without this, an over-broad gate (deny-on-anything-denies-the-
 // report) would pass every other test in this file.
@@ -488,14 +488,14 @@ func TestAPI_PurchasingReport_DeniedOnUnrelatedTypeStillSeesReport(t *testing.T)
 
 	seedRBAC(t, db,
 		map[string][]string{"outsider": {"user-outsider"}},
-		[]map[string]any{{"role": "outsider", "entity_type": "Employee", "can_read": false, "can_write": false}},
+		[]map[string]any{{"role": "outsider", "entity_type": "SalariedStaff", "can_read": false, "can_write": false}},
 	)
 
 	mux := http.NewServeMux()
 	testHandler(t, router).Routes(mux)
 	rec := getAs(t, mux, "/reports/purchasing", tenantID, "user-outsider")
 	if rec.Code != http.StatusOK {
-		t.Fatalf("role denied on an unrelated type (Employee): expected 200, got %d: %s", rec.Code, rec.Body.String())
+		t.Fatalf("role denied on an unrelated type (SalariedStaff): expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
 	if !strings.Contains(rec.Body.String(), "314") {
 		t.Fatalf("expected the seeded PurchaseOrder total in the report:\n%s", rec.Body.String())
