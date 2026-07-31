@@ -37,6 +37,12 @@ func (h *Handler) renderNav(r *http.Request, rc *httpx.RequestContext, locale st
 		Locale:      locale,
 		CurrentPath: r.URL.Path,
 		Locales:     supportedLocaleList,
+		Regions:     h.regionOptions(r, locale),
+		// The nav is rendered from inside a page handler that already
+		// persisted any explicit ?region=, so this read-only resolution
+		// shows the choice the page itself is formatting with.
+		ActiveRegion: regionalLocale(r, locale).Tag(),
+		RegionLabel:  h.catalog.T(locale, "nav.region"),
 	}
 
 	if rc != nil {
@@ -119,6 +125,8 @@ type navView struct {
 	CurrentPath             string
 	TenantID                string
 	Locales                 []string
+	Regions                 []regionOption
+	ActiveRegion            string
 	Modules                 []moduleGroup
 	ShowApprovals           bool
 	ApprovalsLabel          string
@@ -131,6 +139,7 @@ type navView struct {
 	ShowLogout              bool
 	LogoutLabel             string
 	SwitcherLabel           string
+	RegionLabel             string
 	ActiveTenantName        string
 	SwitchReturnTo          string
 	Tenants                 []navTenantOption
@@ -160,5 +169,6 @@ var navTmpl = template.Must(template.New("nav").Parse(`
 {{$path := .CurrentPath}}
 {{$active := .Locale}}
 {{range .Locales}}<a class="uc-nav-lang{{if eq . $active}} uc-nav-lang-active{{end}}" href="{{$path}}?lang={{.}}">{{.}}</a>{{end}}
+{{if gt (len .Regions) 1}}{{$ar := .ActiveRegion}}<select class="uc-nav-region" aria-label="{{.RegionLabel}}" onchange="if(this.value)window.location=this.value">{{range .Regions}}<option value="{{.Href}}"{{if eq .Tag $ar}} selected{{end}}>{{.Label}}</option>{{end}}</select>{{end}}
 </nav>
 `))

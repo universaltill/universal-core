@@ -12,6 +12,7 @@ import (
 	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/formrender"
+	uclocale "github.com/universaltill/universal-core/internal/kernel/locale"
 )
 
 // listPageSize is how many records one list-page shows before paginating
@@ -50,6 +51,7 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 	}
 	entityType := r.PathValue("entityType")
 	locale := localeFromRequest(w, r)
+	loc := regionalLocale(r, locale)
 
 	def, err := ts.entityDef(r.Context(), entityType)
 	if err != nil {
@@ -237,7 +239,7 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 	for _, rec := range records {
 		row := recordRowView{Href: "/forms/" + entityType + "/" + rec.ID}
 		for _, f := range columns {
-			row.Cells = append(row.Cells, h.cellText(entityType, f, rec.Data[f.Name], referenceLabels, locale))
+			row.Cells = append(row.Cells, h.cellText(entityType, f, rec.Data[f.Name], referenceLabels, locale, loc))
 		}
 		view.Rows = append(view.Rows, row)
 	}
@@ -311,8 +313,27 @@ func visibleFields(def *entity.Definition, redacted map[string]bool) []entity.Fi
 // lookup), so a status of "active"/"draft" reads in the visitor's own
 // language on the list page too, not just inside the form. Every other
 // field type uses the same formatting the form renderer already uses.
-func (h *Handler) cellText(entityType string, f entity.Field, value any, referenceLabels map[string]map[string]string, locale string) string {
+func (h *Handler) cellText(entityType string, f entity.Field, value any, referenceLabels map[string]map[string]string, locale string, loc uclocale.Locale) string {
 	switch f.Type {
+	case entity.FieldDate:
+		// Regional formatting (board #22): the stored value is always
+		// ISO 8601, but 03/04/2026 and 04/03/2026 are the same day to
+		// different readers, and a Farsi reader expects a Jalali date
+		// entirely. Display only — the form's date INPUT keeps rendering
+		// the raw ISO value, because that round-trips back through
+		// csvimport.Coerce on submit.
+		if s, ok := value.(string); ok && s != "" {
+			return loc.FormatDate(s)
+		}
+	case entity.FieldNumber:
+		// Same reasoning for grouping/decimal separators and digit
+		// shapes. Precision is left as the value's own (-1) — this
+		// column has no currency context to fix a scale from; a money
+		// column formatted to its Currency's minor_unit is follow-up
+		// work, filed on the board.
+		if v, ok := value.(float64); ok {
+			return loc.FormatNumber(v, -1)
+		}
 	case entity.FieldReference:
 		if id, ok := value.(string); ok && id != "" {
 			if label, ok := referenceLabels[f.Name][id]; ok {
