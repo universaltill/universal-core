@@ -237,6 +237,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("load i18n catalog: %v", err)
 	}
+	// webauth's own pages (the tenant picker, #25) localize through the
+	// same catalog; nil-safe setter so test/e2e wiring stays untouched.
+	auth.SetI18n(catalog)
 	ai, ollamaURL, ollamaModel := aiClientFromEnv()
 	if ai.Enabled() {
 		log.Printf("AI assistance enabled (OLLAMA_URL=%s, model=%s) — import mapping suggestions", ollamaURL, ollamaModel)
@@ -264,6 +267,10 @@ func main() {
 		ProjectID: os.Getenv("ZITADEL_PROJECT_ID"),
 	})
 	handler.SetMemberMgmt(memberMgmt, data.NewTenantRepo(controlDB))
+	// Also the slug directory for /t/{slug} path-prefix tenancy (#25,
+	// ADR-0011) — same repo SetMemberMgmt wired; the explicit setter
+	// keeps prefix routing independent of member management being on.
+	handler.SetTenantRepo(data.NewTenantRepo(controlDB))
 	if memberMgmt.Enabled() {
 		log.Printf("member management enabled — /settings/members manages Zitadel users/grants at runtime (ADR-0010)")
 	} else {

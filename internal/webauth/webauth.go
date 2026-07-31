@@ -42,6 +42,7 @@ import (
 	"golang.org/x/oauth2"
 
 	"github.com/universaltill/universal-core/internal/data"
+	"github.com/universaltill/universal-core/internal/i18n"
 )
 
 const (
@@ -81,6 +82,9 @@ type Authenticator struct {
 	verifier *oidc.IDTokenVerifier
 	endSess  string // provider end_session_endpoint (may be empty)
 	sealer   *sealer
+	// catalog is optional (SetI18n, choose.go) — nil falls back to the
+	// built-in English copy on webauth's own pages.
+	catalog *i18n.Catalog
 }
 
 // New builds an Authenticator. When login is not configured it returns
@@ -141,6 +145,30 @@ func (a *Authenticator) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /ui/login", a.handleLogin)
 	mux.HandleFunc("GET /ui/auth/callback", a.handleCallback)
 	mux.HandleFunc("GET /ui/logout", a.handleLogout)
+	// The tenant picker + switcher (#25, ADR-0011). Like the routes
+	// above they sit outside Guard: choose serves a session that is
+	// authenticated but deliberately not yet Valid() (no active tenant),
+	// and switch is what makes it valid.
+	mux.HandleFunc("GET /ui/auth/choose", a.handleChoose)
+	mux.HandleFunc("POST /ui/auth/switch", a.handleSwitch)
+}
+
+// rawSessionFromCookie opens the session cookie without the Valid()
+// gate — the picker/switcher need the authenticated-but-unresolved
+// session Valid() correctly rejects. Expiry is still enforced.
+func (a *Authenticator) rawSessionFromCookie(r *http.Request) *Session {
+	if !a.Enabled() {
+		return nil
+	}
+	c, err := r.Cookie(sessionCookie)
+	if err != nil {
+		return nil
+	}
+	sess, err := a.sealer.open(c.Value)
+	if err != nil || sess.Subject == "" || time.Now().After(sess.Expiry) {
+		return nil
+	}
+	return sess
 }
 
 func (a *Authenticator) sessionFromCookie(r *http.Request) *Session {
@@ -224,39 +252,65 @@ func (a *Authenticator) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	orgID, ok := orgIDFromClaims(claims)
-	if !ok {
-		a.notLinked(w)
-		return
+	// Every org the claim asserts, resolved to the tenants it maps to
+	// (#25, ADR-0011): unmapped orgs are skipped (an org grant with no
+	// tenants row is the notLinked case only when NOTHING maps), one
+	// mapped tenant signs straight in as before, several defer the
+	// choice to /ui/auth/choose — the picker the old fail-closed
+	// single-org guard was explicitly waiting for.
+	var tenantIDs []string
+	for _, orgID := range orgIDsFromClaims(claims) {
+		tenantID, err := a.tenants.GetByZitadelOrgID(r.Context(), orgID)
+		if errors.Is(err, data.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			http.Error(w, "sign-in failed", http.StatusInternalServerError)
+			return
+		}
+		tenantIDs = append(tenantIDs, tenantID)
 	}
-	tenantID, err := a.tenants.GetByZitadelOrgID(r.Context(), orgID)
-	if errors.Is(err, data.ErrNotFound) {
+	if len(tenantIDs) == 0 {
 		a.notLinked(w)
-		return
-	}
-	if err != nil {
-		http.Error(w, "sign-in failed", http.StatusInternalServerError)
 		return
 	}
 
 	sess := &Session{
-		Subject:  idToken.Subject,
-		Name:     stringClaim(claims, "name"),
-		Email:    stringClaim(claims, "email"),
-		TenantID: tenantID,
-		Expiry:   time.Now().Add(a.cfg.SessionTTL),
+		Subject: idToken.Subject,
+		Name:    stringClaim(claims, "name"),
+		Email:   stringClaim(claims, "email"),
+		Expiry:  time.Now().Add(a.cfg.SessionTTL),
 	}
-	sealed, err := a.sealer.seal(sess)
-	if err != nil {
+	if len(tenantIDs) == 1 {
+		sess.TenantID = tenantIDs[0]
+	} else {
+		sess.TenantIDs = tenantIDs
+	}
+	if err := a.writeSession(w, sess); err != nil {
 		http.Error(w, "sign-in failed", http.StatusInternalServerError)
 		return
+	}
+	if sess.NeedsChoice() {
+		http.Redirect(w, r, "/ui/auth/choose?returnTo="+url.QueryEscape(fs.ReturnTo), http.StatusFound)
+		return
+	}
+	http.Redirect(w, r, fs.ReturnTo, http.StatusFound)
+}
+
+// writeSession seals sess into the session cookie — shared by the
+// callback, the tenant picker, and the switcher (the latter two re-seal
+// an existing session with a different active tenant).
+func (a *Authenticator) writeSession(w http.ResponseWriter, sess *Session) error {
+	sealed, err := a.sealer.seal(sess)
+	if err != nil {
+		return err
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name: sessionCookie, Value: sealed, Path: "/", HttpOnly: true,
 		Secure: a.secureCookies(), SameSite: http.SameSiteLaxMode,
 		Expires: sess.Expiry, MaxAge: int(time.Until(sess.Expiry).Seconds()),
 	})
-	http.Redirect(w, r, fs.ReturnTo, http.StatusFound)
+	return nil
 }
 
 func (a *Authenticator) handleLogout(w http.ResponseWriter, r *http.Request) {
@@ -298,9 +352,9 @@ func (a *Authenticator) loginExpired(w http.ResponseWriter) {
 
 // notLinked is the Universal-Core-specific failure ut-cloud has no
 // equivalent of: a real, successfully-authenticated Zitadel user with no
-// tenants row linked to their org (orgIDFromClaims found nothing, or it
-// found an org id that isn't in tenants.zitadel_org_id — both routed
-// here, see handleCallback). Tenant linking is a manual, out-of-band
+// tenants row linked to any of their orgs (orgIDsFromClaims found
+// nothing, or none of the org ids it found are in
+// tenants.zitadel_org_id — both routed here, see handleCallback). Tenant linking is a manual, out-of-band
 // step for now (matches cmd/provision-tenant's own current scope, no
 // self-serve onboarding exists yet) — this page is the correct terminal
 // state, not a bug to route around.

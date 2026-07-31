@@ -1,93 +1,113 @@
 package webauth
 
-import "testing"
+import (
+	"slices"
+	"testing"
+)
 
-func TestOrgIDFromClaims(t *testing.T) {
+func TestOrgIDsFromClaims(t *testing.T) {
 	claims := map[string]any{
 		zitadelProjectRolesClaim: map[string]any{
 			"tenant_member": map[string]any{"123456": "acme.id.universaltill.com"},
 		},
 	}
-	orgID, ok := orgIDFromClaims(claims)
-	if !ok {
-		t.Fatal("expected orgIDFromClaims to succeed")
-	}
-	if orgID != "123456" {
-		t.Fatalf("got org id %q, want 123456", orgID)
+	if got := orgIDsFromClaims(claims); !slices.Equal(got, []string{"123456"}) {
+		t.Fatalf("got %v, want [123456]", got)
 	}
 }
 
-// TestOrgIDFromClaims_MultipleDistinctOrgsFailsClosed is the regression
-// test for a real bug independent review found: the original version
-// returned whichever org id happened to come out of Go's randomized map
-// iteration first, so a user granted tenant_member in two different
-// customer orgs (a shared accountant, say) could silently land in a
-// different tenant on every other sign-in. Run several times — a flaky
-// pass here would mean it's still picking one at random rather than
-// genuinely refusing to.
-func TestOrgIDFromClaims_MultipleDistinctOrgsFailsClosed(t *testing.T) {
+// TestOrgIDsFromClaims_MultipleDistinctOrgsStableOrder is the successor
+// of the old fail-closed regression test: the predecessor
+// (orgIDFromClaims) refused to pick between two orgs because Go's
+// randomized map iteration once made it land users in a different
+// tenant on alternate sign-ins. Multi-org is now a first-class result
+// feeding the tenant picker (#25) — the property that survives is
+// DETERMINISM: the same claims must yield the same slice, in the same
+// (sorted) order, every time. Run several times, same reasoning as the
+// original: a flaky pass would mean map-iteration order is leaking
+// through again.
+func TestOrgIDsFromClaims_MultipleDistinctOrgsStableOrder(t *testing.T) {
 	claims := map[string]any{
 		zitadelProjectRolesClaim: map[string]any{
 			"tenant_member": map[string]any{
-				"org-a": "acme.id.universaltill.com",
 				"org-b": "beta.id.universaltill.com",
+				"org-a": "acme.id.universaltill.com",
 			},
 		},
 	}
+	want := []string{"org-a", "org-b"}
 	for range 20 {
-		if _, ok := orgIDFromClaims(claims); ok {
-			t.Fatal("expected ok=false when more than one distinct org is asserted, got ok=true")
+		if got := orgIDsFromClaims(claims); !slices.Equal(got, want) {
+			t.Fatalf("got %v, want %v (stable sorted order)", got, want)
 		}
 	}
 }
 
-// TestOrgIDFromClaims_SameOrgUnderTwoRolesStillResolves confirms the
-// fix above doesn't over-correct: a user with two DIFFERENT roles that
-// both happen to name the SAME org (not a real scenario yet — this
-// package has only one role — but the claim shape allows it) must
-// still resolve, since there's only one distinct org, not an ambiguity.
-func TestOrgIDFromClaims_SameOrgUnderTwoRolesStillResolves(t *testing.T) {
+// TestOrgIDsFromClaims_SameOrgUnderTwoRolesDeduplicates: a human role
+// plus another (here filtered-anyway) role naming the same org is one
+// accessible org, not two picker entries.
+func TestOrgIDsFromClaims_SameOrgUnderTwoRolesDeduplicates(t *testing.T) {
 	claims := map[string]any{
 		zitadelProjectRolesClaim: map[string]any{
-			"tenant_member": map[string]any{"org-a": "acme.id.universaltill.com"},
-			"tenant_admin":  map[string]any{"org-a": "acme.id.universaltill.com"},
+			"tenant_member":      map[string]any{"org-a": "acme.id.universaltill.com"},
+			"tenant_integration": map[string]any{"org-a": "acme.id.universaltill.com"},
 		},
 	}
-	orgID, ok := orgIDFromClaims(claims)
-	if !ok {
-		t.Fatal("expected ok=true when every asserted role points at the same single org")
-	}
-	if orgID != "org-a" {
-		t.Fatalf("got %q, want org-a", orgID)
+	if got := orgIDsFromClaims(claims); !slices.Equal(got, []string{"org-a"}) {
+		t.Fatalf("got %v, want [org-a]", got)
 	}
 }
 
-func TestOrgIDFromClaims_MissingClaim(t *testing.T) {
-	if _, ok := orgIDFromClaims(map[string]any{}); ok {
-		t.Fatal("expected ok=false when the project-roles claim is absent (no role grants)")
+func TestOrgIDsFromClaims_MissingClaim(t *testing.T) {
+	if got := orgIDsFromClaims(map[string]any{}); len(got) != 0 {
+		t.Fatalf("expected no orgs when the project-roles claim is absent, got %v", got)
 	}
 }
 
-func TestOrgIDFromClaims_WrongShape(t *testing.T) {
-	// A malformed/unexpected claim shape must fail closed (ok=false), not
-	// panic or silently return a zero-value org id that would resolve to
-	// some tenant's zitadel_org_id by coincidence.
+func TestOrgIDsFromClaims_WrongShape(t *testing.T) {
+	// A malformed/unexpected claim shape must yield nothing (routed to
+	// the not-linked page), not panic or return a zero-value org id that
+	// might resolve to some tenant's zitadel_org_id by coincidence.
 	claims := map[string]any{zitadelProjectRolesClaim: "not a map"}
-	if _, ok := orgIDFromClaims(claims); ok {
-		t.Fatal("expected ok=false for a malformed claim shape")
+	if got := orgIDsFromClaims(claims); len(got) != 0 {
+		t.Fatalf("expected no orgs for a malformed claim shape, got %v", got)
 	}
 }
 
-// TestOrgIDFromClaims_RoleValueWrongShape is TestOrgIDFromClaims_WrongShape's
-// counterpart one level deeper: the outer claim is a real map, but one
-// role's own value isn't the expected {org_id: domain} map — must be
-// skipped, not panic, same fail-safe reasoning applied one level in.
-func TestOrgIDFromClaims_RoleValueWrongShape(t *testing.T) {
+// TestOrgIDsFromClaims_RoleValueWrongShape: the outer claim is a real
+// map, but one role's own value isn't the expected {org_id: domain}
+// map — skipped, not a panic; a well-formed sibling role still counts.
+func TestOrgIDsFromClaims_RoleValueWrongShape(t *testing.T) {
 	claims := map[string]any{
 		zitadelProjectRolesClaim: map[string]any{"tenant_member": "not a map either"},
 	}
-	if _, ok := orgIDFromClaims(claims); ok {
-		t.Fatal("expected ok=false when a role's own value isn't a map")
+	if got := orgIDsFromClaims(claims); len(got) != 0 {
+		t.Fatalf("expected no orgs when a role's own value isn't a map, got %v", got)
+	}
+}
+
+// TestOrgIDsFromClaims_MachineRoleFiltered: a tenant_integration grant
+// (the machine/connector role) must NOT put its org into a human's
+// accessible set — the browser-path mirror of svcauth rejecting a
+// tenant_member-only token on the machine path (independent review,
+// 2026-07-31).
+func TestOrgIDsFromClaims_MachineRoleFiltered(t *testing.T) {
+	claims := map[string]any{
+		zitadelProjectRolesClaim: map[string]any{
+			"tenant_member":      map[string]any{"org-a": "acme.id.universaltill.com"},
+			"tenant_integration": map[string]any{"org-b": "beta.id.universaltill.com"},
+		},
+	}
+	if got := orgIDsFromClaims(claims); !slices.Equal(got, []string{"org-a"}) {
+		t.Fatalf("tenant_integration's org must be filtered out; got %v, want [org-a]", got)
+	}
+	onlyMachine := map[string]any{
+		zitadelProjectRolesClaim: map[string]any{
+			"tenant_integration": map[string]any{"org-b": "beta.id.universaltill.com"},
+		},
+	}
+	if got := orgIDsFromClaims(onlyMachine); len(got) != 0 {
+		t.Fatalf("a machine-role-only claim must yield no human-accessible orgs, got %v", got)
 	}
 }
 

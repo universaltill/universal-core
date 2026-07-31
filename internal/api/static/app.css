@@ -82,6 +82,60 @@ a:hover {
   flex: 1;
 }
 
+/* Tenant switcher (#25) — a native <details> dropdown so it needs no
+   script; only rendered when the session can access >1 tenant. */
+.uc-nav-tenant {
+  position: relative;
+  color: var(--uc-nav-text);
+  font-size: 0.85rem;
+}
+
+.uc-nav-tenant > summary::-webkit-details-marker {
+  /* Safari ignores list-style:none on summary; this is its own opt-out. */
+  display: none;
+}
+
+.uc-nav-tenant > summary {
+  cursor: pointer;
+  list-style: none;
+  opacity: 0.85;
+  padding: 0.15rem 0.5rem;
+  border: 1px solid color-mix(in srgb, var(--uc-nav-text) 35%, transparent);
+  border-radius: 4px;
+}
+
+.uc-nav-tenant[open] > summary,
+.uc-nav-tenant > summary:hover {
+  opacity: 1;
+}
+
+.uc-nav-tenant-menu {
+  position: absolute;
+  inset-inline-end: 0;
+  top: 100%;
+  z-index: 30;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
+.uc-nav-tenant-form {
+  margin: 0;
+}
+
+.uc-nav-tenant-form button {
+  display: block;
+  width: max-content;
+  min-width: 100%;
+  background: var(--uc-surface, #fff);
+  color: var(--uc-text, #1a1a1a);
+  border: 1px solid #d0d0d0;
+  padding: 0.4rem 0.8rem;
+  cursor: pointer;
+}
+
+.uc-nav-tenant-form button:hover {
+  background: #f0f0f0;
+}
+
 .uc-nav-lang {
   color: var(--uc-nav-text);
   opacity: 0.6;

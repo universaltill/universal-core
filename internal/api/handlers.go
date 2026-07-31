@@ -256,8 +256,18 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	// in the first place. No-op registration when webauth is disabled.
 	h.auth.Register(mux)
 
+	// guardTenantHeader runs innermost on every authed route: a page's
+	// X-UC-Tenant stamp that disagrees with the session refuses rather
+	// than mutating the wrong tenant (tenanturl.go, ADR-0011). authPage
+	// additionally canonicalizes an authenticated browser's un-prefixed
+	// page GET to its /t/{slug}/… form — page routes only, never API/
+	// HTMX endpoints (their un-prefixed contract is load-bearing for
+	// connectors and partials).
 	auth := func(handler http.HandlerFunc) http.Handler {
-		return h.svc.Guard(h.auth.Guard(httpx.DevAuth(handler)))
+		return h.svc.Guard(h.auth.Guard(httpx.DevAuth(h.guardTenantHeader(handler))))
+	}
+	authPage := func(handler http.HandlerFunc) http.Handler {
+		return h.svc.Guard(h.auth.Guard(httpx.DevAuth(h.guardTenantHeader(h.canonicalPage(handler)))))
 	}
 	// "/{$}" — the Go 1.22+ ServeMux exact-match wildcard — not plain
 	// "/", which would act as a catch-all subtree match and silently
@@ -281,19 +291,19 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	// testing, not curl — no existing test ever exercised editing a
 	// record that already existed).
 	mux.Handle("POST /api/records/{entityType}/{id}", auth(h.updateRecord))
-	mux.Handle("GET /forms/{entityType}/new", auth(h.renderNewForm))
-	mux.Handle("GET /forms/{entityType}/{id}", auth(h.renderRecordForm))
+	mux.Handle("GET /forms/{entityType}/new", authPage(h.renderNewForm))
+	mux.Handle("GET /forms/{entityType}/{id}", authPage(h.renderRecordForm))
 	// The module's actual landing page — a table of existing records,
 	// not just New/Import links (see listview.go's doc comment: found
 	// missing the first time a real login actually reached the
 	// dashboard, since New/Import alone give nowhere to go look at data
 	// that already exists).
-	mux.Handle("GET /records/{entityType}", auth(h.renderRecordList))
+	mux.Handle("GET /records/{entityType}", authPage(h.renderRecordList))
 	// A module's searchable menu of its own entity types — the page
 	// each dashboard hub node/nav link actually lands on (see
 	// modulemenu.go's doc comment).
-	mux.Handle("GET /modules/{key}", auth(h.renderModuleMenu))
-	mux.Handle("GET /import/{entityType}", auth(h.importUploadPage))
+	mux.Handle("GET /modules/{key}", authPage(h.renderModuleMenu))
+	mux.Handle("GET /import/{entityType}", authPage(h.importUploadPage))
 	mux.Handle("POST /import/{entityType}/preview", auth(h.importPreview))
 	mux.Handle("POST /import/{entityType}/commit", auth(h.importCommit))
 	// The exporter half of Farshid's original "importer exporter
@@ -302,7 +312,7 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	// The in-app issue logger — see issuereport.go's own doc comment.
 	// Not entity-scoped: IssueReport is one fixed foundation entity, not
 	// a generic-per-entity-type route the way /import is.
-	mux.Handle("GET /issue-report/new", auth(h.issueReportNewPage))
+	mux.Handle("GET /issue-report/new", authPage(h.issueReportNewPage))
 	mux.Handle("POST /issue-report/transcribe", auth(h.issueReportTranscribe))
 	mux.Handle("POST /issue-report/submit", auth(h.issueReportSubmit))
 	// Resumes a job halted at a require_approval step — see workflow.go's
@@ -314,29 +324,35 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	mux.Handle("GET /api/workflow-jobs", auth(h.listWorkflowJobs))
 	// The human-facing page on top of the two routes above — see
 	// renderWorkflowInbox's doc comment.
-	mux.Handle("GET /workflow-jobs", auth(h.renderWorkflowInbox))
+	mux.Handle("GET /workflow-jobs", authPage(h.renderWorkflowInbox))
 	// The mgmt reporting workbench (QUEUE.md's design-partner opportunity
 	// entry) — see reporting.go's doc comment.
-	mux.Handle("GET /reports/purchasing", auth(h.renderPurchasingReport))
+	mux.Handle("GET /reports/purchasing", authPage(h.renderPurchasingReport))
 	// The BYOK AI-provider settings page — see aiprovidersettings.go's own
 	// doc comment. Not entity-scoped in the URL, same reasoning as
 	// /issue-report/*: AIProviderConnection is one fixed foundation
 	// entity a tenant upserts a single row of, not a generic
 	// per-entity-type route.
-	mux.Handle("GET /settings/ai-provider", auth(h.aiProviderSettingsPage))
+	mux.Handle("GET /settings/ai-provider", authPage(h.aiProviderSettingsPage))
 	mux.Handle("POST /settings/ai-provider", auth(h.aiProviderSettingsSave))
 	mux.Handle("POST /settings/ai-provider/clear", auth(h.aiProviderSettingsClear))
 	// The self-service tenant member management page (universal-core#3,
 	// ADR-0010) — see members.go's own doc comment. Every route is
 	// additionally gated to the tenant_admin role code server-side
 	// (requireMembersAccess), on top of auth()'s session gate.
-	mux.Handle("GET /settings/members", auth(h.membersPage))
+	mux.Handle("GET /settings/members", authPage(h.membersPage))
 	mux.Handle("POST /settings/members/invite", auth(h.membersInvite))
 	mux.Handle("POST /settings/members/remove", auth(h.membersRemove))
 	mux.Handle("POST /settings/members/password-link", auth(h.membersPasswordLink))
 	mux.Handle("POST /settings/members/password-email", auth(h.membersPasswordEmail))
 	mux.Handle("POST /settings/members/roles/assign", auth(h.membersAssignRole))
 	mux.Handle("POST /settings/members/roles/revoke", auth(h.membersRevokeRole))
+	// Path-prefix tenancy (#25, ADR-0011) — the whole /t/{slug}/ subtree
+	// resolves + cross-checks the slug, then re-dispatches into this same
+	// mux with the prefix stripped (see tenanturl.go). Wrapped in the raw
+	// auth chain, NOT auth(): guardTenantHeader and canonicalPage belong
+	// to the inner, re-dispatched routes.
+	mux.Handle("/t/{slug}/", h.svc.Guard(h.auth.Guard(httpx.DevAuth(h.tenantPrefixed(mux)))))
 }
 
 // requestContext fetches the httpx.RequestContext a preceding DevAuth (or

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"golang.org/x/crypto/nacl/secretbox"
@@ -24,11 +25,54 @@ var (
 // at login time — every later request reads it straight out of this
 // sealed cookie, no DB lookup per request.
 type Session struct {
-	Subject  string    `json:"sub"`
-	Name     string    `json:"name,omitempty"`
-	Email    string    `json:"email,omitempty"`
-	TenantID string    `json:"tenant_id"`
-	Expiry   time.Time `json:"exp"`
+	Subject  string `json:"sub"`
+	Name     string `json:"name,omitempty"`
+	Email    string `json:"email,omitempty"`
+	TenantID string `json:"tenant_id"`
+	// TenantIDs is every tenant this login may act in — the id_token's
+	// project-roles claim resolved against tenants.zitadel_org_id once,
+	// at sign-in (#25, ADR-0011). TenantID (the active tenant) is always
+	// either empty (choice pending, see NeedsChoice) or an element of
+	// this set; /ui/auth/switch re-seals the cookie with a different
+	// element, never a value outside it. Omitted from the cookie for the
+	// common single-tenant login (nil set + non-empty TenantID means
+	// exactly one accessible tenant: the active one) to keep the sealed
+	// cookie small.
+	TenantIDs []string  `json:"tenant_ids,omitempty"`
+	Expiry    time.Time `json:"exp"`
+}
+
+// AccessibleTenantIDs is the set a switcher may offer: TenantIDs when
+// carried, else the single active tenant.
+func (s *Session) AccessibleTenantIDs() []string {
+	if s == nil {
+		return nil
+	}
+	if len(s.TenantIDs) > 0 {
+		return s.TenantIDs
+	}
+	if s.TenantID != "" {
+		return []string{s.TenantID}
+	}
+	return nil
+}
+
+// CanAccess reports whether tenantID is in this session's accessible
+// set.
+func (s *Session) CanAccess(tenantID string) bool {
+	if s == nil || tenantID == "" {
+		return false
+	}
+	return slices.Contains(s.AccessibleTenantIDs(), tenantID)
+}
+
+// NeedsChoice reports a real, authenticated multi-tenant login that
+// hasn't picked its active tenant yet — Valid() is deliberately false
+// for it (downstream handlers must never see an empty TenantID), and
+// Guard routes it to /ui/auth/choose instead of back to /ui/login.
+func (s *Session) NeedsChoice() bool {
+	return s != nil && s.Subject != "" && s.TenantID == "" &&
+		len(s.TenantIDs) > 0 && time.Now().Before(s.Expiry)
 }
 
 // Valid reports whether the session is present, unexpired, and actually

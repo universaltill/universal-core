@@ -40,6 +40,10 @@ func (h *Handler) renderNav(r *http.Request, rc *httpx.RequestContext, locale st
 	}
 
 	if rc != nil {
+		// Feeds layout.go's htmx:configRequest hook: every HTMX call this
+		// page issues carries the tenant it was rendered for (ADR-0011's
+		// stale-tab guard).
+		view.TenantID = rc.TenantID
 		ts, err := h.scope(r.Context(), *rc)
 		if err != nil {
 			log.Printf("api: nav: resolve tenant scope: %v", err)
@@ -83,6 +87,21 @@ func (h *Handler) renderNav(r *http.Request, rc *httpx.RequestContext, locale st
 		if h.auth.Enabled() {
 			view.ShowLogout = true
 			view.LogoutLabel = h.catalog.T(locale, "nav.logout")
+			// The tenant switcher (#25, ADR-0011) — only when the session
+			// can actually access more than one tenant (SessionTenants
+			// returns nil otherwise), so single-tenant users never see it.
+			if opts := h.auth.SessionTenants(r); len(opts) > 0 {
+				view.SwitcherLabel = h.catalog.T(locale, "nav.tenant_switcher")
+				// RequestURI, not Path: switching from a filtered/sorted
+				// list page should land on the same view, not reset it.
+				view.SwitchReturnTo = r.URL.RequestURI()
+				for _, o := range opts {
+					view.Tenants = append(view.Tenants, navTenantOption{ID: o.ID, Name: o.Name, Active: o.Active})
+					if o.Active {
+						view.ActiveTenantName = o.Name
+					}
+				}
+			}
 		}
 	}
 
@@ -98,6 +117,7 @@ type navView struct {
 	Brand                   string
 	Locale                  string
 	CurrentPath             string
+	TenantID                string
 	Locales                 []string
 	Modules                 []moduleGroup
 	ShowApprovals           bool
@@ -110,10 +130,20 @@ type navView struct {
 	MembersLabel            string
 	ShowLogout              bool
 	LogoutLabel             string
+	SwitcherLabel           string
+	ActiveTenantName        string
+	SwitchReturnTo          string
+	Tenants                 []navTenantOption
+}
+
+type navTenantOption struct {
+	ID     string
+	Name   string
+	Active bool
 }
 
 var navTmpl = template.Must(template.New("nav").Parse(`
-<nav class="uc-nav">
+<nav class="uc-nav"{{if .TenantID}} data-uc-tenant="{{.TenantID}}"{{end}}>
 <a class="uc-nav-brand" href="/">{{.Brand}}</a>
 {{range .Modules}}<a class="uc-nav-link" href="/modules/{{.Key}}">{{.Name}}</a>{{end}}
 {{if .ShowApprovals}}<a class="uc-nav-link" href="/workflow-jobs">{{.ApprovalsLabel}}</a>{{end}}
@@ -121,6 +151,11 @@ var navTmpl = template.Must(template.New("nav").Parse(`
 {{if .ShowAIProviderSettings}}<a class="uc-nav-link" href="/settings/ai-provider">{{.AIProviderSettingsLabel}}</a>{{end}}
 {{if .ShowMembers}}<a class="uc-nav-link" href="/settings/members">{{.MembersLabel}}</a>{{end}}
 <span class="uc-nav-spacer"></span>
+{{if .Tenants}}<details class="uc-nav-tenant"><summary title="{{.SwitcherLabel}}">{{.ActiveTenantName}}</summary>
+<div class="uc-nav-tenant-menu">
+{{$rt := .SwitchReturnTo}}{{range .Tenants}}{{if not .Active}}<form method="post" action="/ui/auth/switch" class="uc-nav-tenant-form"><input type="hidden" name="tenant_id" value="{{.ID}}"><input type="hidden" name="returnTo" value="{{$rt}}"><button type="submit">{{.Name}}</button></form>{{end}}{{end}}
+</div>
+</details>{{end}}
 {{if .ShowLogout}}<a class="uc-nav-link" href="/ui/logout">{{.LogoutLabel}}</a>{{end}}
 {{$path := .CurrentPath}}
 {{$active := .Locale}}

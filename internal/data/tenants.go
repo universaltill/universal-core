@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // TenantRepo is the repository for the tenants table. Its only
@@ -28,14 +29,47 @@ func NewTenantRepo(db querier) *TenantRepo {
 // db_name. Use CreateWithDatabase against the control-plane schema.
 func (r *TenantRepo) Create(ctx context.Context, name, region string) (string, error) {
 	var id string
-	err := r.db.QueryRowContext(ctx,
-		`INSERT INTO tenants (name, region) VALUES ($1, $2) RETURNING id`,
-		name, region,
-	).Scan(&id)
+	err := r.withSlugRetry(name, func(slug string) error {
+		return r.db.QueryRowContext(ctx,
+			`INSERT INTO tenants (name, region, slug) VALUES ($1, $2, $3) RETURNING id`,
+			name, region, slug,
+		).Scan(&id)
+	})
 	if err != nil {
 		return "", fmt.Errorf("create tenant: %w", err)
 	}
 	return id, nil
+}
+
+// withSlugRetry runs insert with Slugify(name), then with -2..-9
+// suffixes on a slug-uniqueness violation — the DB's unique index is
+// the only collision authority (racing creates both pre-checking SELECT
+// would still collide). Ten same-named tenants exhausting the suffixes
+// is a "pick a different name" error, not a case to engineer around.
+// NOT transaction-safe: inside a *sql.Tx the first violation aborts the
+// transaction and every retry would fail with "current transaction is
+// aborted", masking the real error — callers must pass a plain *sql.DB
+// (both current ones do).
+func (r *TenantRepo) withSlugRetry(name string, insert func(slug string) error) error {
+	base := Slugify(name)
+	slug := base
+	for i := 2; ; i++ {
+		err := insert(slug)
+		if err == nil {
+			return nil
+		}
+		if i > 9 || !isSlugUniqueViolation(err) {
+			return err
+		}
+		slug = fmt.Sprintf("%s-%d", base, i)
+	}
+}
+
+// isSlugUniqueViolation matches the tenants_slug_key unique index by
+// name — narrower than matching any 23505, so a db_name collision (a
+// different bug) still surfaces as itself.
+func isSlugUniqueViolation(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "tenants_slug_key")
 }
 
 // CreateWithDatabase inserts a new tenant into the control-plane schema
@@ -45,16 +79,49 @@ func (r *TenantRepo) Create(ctx context.Context, name, region string) (string, e
 // migrates the returned db_name as a real Postgres database; this method
 // only writes the registry row.
 func (r *TenantRepo) CreateWithDatabase(ctx context.Context, name, region string) (id, dbName string, err error) {
-	err = r.db.QueryRowContext(ctx, `
-		INSERT INTO tenants (name, region, db_name)
-		VALUES ($1, $2, 'uc_tenant_' || replace(gen_random_uuid()::text, '-', ''))
-		RETURNING id, db_name`,
-		name, region,
-	).Scan(&id, &dbName)
+	err = r.withSlugRetry(name, func(slug string) error {
+		return r.db.QueryRowContext(ctx, `
+			INSERT INTO tenants (name, region, db_name, slug)
+			VALUES ($1, $2, 'uc_tenant_' || replace(gen_random_uuid()::text, '-', ''), $3)
+			RETURNING id, db_name`,
+			name, region, slug,
+		).Scan(&id, &dbName)
+	})
 	if err != nil {
 		return "", "", fmt.Errorf("create tenant: %w", err)
 	}
 	return id, dbName, nil
+}
+
+// GetBySlug resolves a URL slug (/t/{slug}/…, ADR-0011) to a tenant id.
+func (r *TenantRepo) GetBySlug(ctx context.Context, slug string) (string, error) {
+	var id string
+	err := r.db.QueryRowContext(ctx,
+		`SELECT id FROM tenants WHERE slug = $1`, slug,
+	).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("get tenant by slug: %w", err)
+	}
+	return id, nil
+}
+
+// SlugByID is GetBySlug's inverse — what the canonicalizing redirect
+// prefixes an un-prefixed browser URL with.
+func (r *TenantRepo) SlugByID(ctx context.Context, tenantID string) (string, error) {
+	var slug string
+	err := r.db.QueryRowContext(ctx,
+		`SELECT slug FROM tenants WHERE id = $1`, tenantID,
+	).Scan(&slug)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("get tenant slug: %w", err)
+	}
+	return slug, nil
 }
 
 // DBName resolves tenantID's own database name from the control-plane
@@ -136,6 +203,32 @@ func (r *TenantRepo) SetZitadelOrgID(ctx context.Context, tenantID, orgID string
 		return ErrNotFound
 	}
 	return nil
+}
+
+// NamesByIDs resolves display names for a set of tenant ids — the
+// tenant picker/switcher's one lookup (webauth choose.go, #25). Ids
+// with no row are simply absent from the map; callers skip them (a
+// tenant deleted since the session was sealed).
+func (r *TenantRepo) NamesByIDs(ctx context.Context, ids []string) (map[string]string, error) {
+	names := make(map[string]string, len(ids))
+	// One indexed point-lookup per id, not an ANY(array) bind: the set
+	// is a user's accessible tenants (a handful at most), and this repo
+	// has no array-parameter precedent to lean on — a wrong uuid[]/text[]
+	// cast here would fail only at runtime.
+	for _, id := range ids {
+		var name string
+		err := r.db.QueryRowContext(ctx,
+			`SELECT name FROM tenants WHERE id = $1`, id,
+		).Scan(&name)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("get tenant name: %w", err)
+		}
+		names[id] = name
+	}
+	return names, nil
 }
 
 // GetZitadelOrgID is SetZitadelOrgID's read side: which Zitadel org (if

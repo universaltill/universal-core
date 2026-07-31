@@ -4,10 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"testing"
+	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
@@ -42,7 +44,12 @@ func linkedTenant(t *testing.T, db *sql.DB) (tenantID, orgID string) {
 	t.Helper()
 	ctx := context.Background()
 	tenants := data.NewTenantRepo(db)
-	tenantID, err := tenants.Create(ctx, "Svcauth Test Tenant", "eu-west")
+	// Unique name per run: tenant slugs are UNIQUE (006_tenant_slug.sql)
+	// and only retry with -2..-9 suffixes, so a fixed literal here
+	// exhausts its slug space after ~9 runs against a persistent test
+	// database — same never-collide convention the zitadel_org_id below
+	// already follows.
+	tenantID, err := tenants.Create(ctx, fmt.Sprintf("Svcauth Test Tenant %d", time.Now().UnixNano()), "eu-west")
 	if err != nil {
 		t.Fatalf("create tenant: %v", err)
 	}

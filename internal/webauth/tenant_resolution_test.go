@@ -41,7 +41,7 @@ func TestOrgToTenantResolution(t *testing.T) {
 	ctx := context.Background()
 	tenants := data.NewTenantRepo(db)
 
-	tenantID, err := tenants.Create(ctx, "Acme Textiles", "eu-west")
+	tenantID, err := tenants.Create(ctx, uniqueTenantName("Acme Textiles"), "eu-west")
 	if err != nil {
 		t.Fatalf("create tenant: %v", err)
 	}
@@ -62,12 +62,12 @@ func TestOrgToTenantResolution(t *testing.T) {
 			"tenant_member": map[string]any{orgIDValue: "acme.id.universaltill.com"},
 		},
 	}
-	orgID, ok := orgIDFromClaims(claims)
-	if !ok {
-		t.Fatal("expected orgIDFromClaims to extract an org id")
+	orgIDs := orgIDsFromClaims(claims)
+	if len(orgIDs) != 1 {
+		t.Fatalf("expected exactly one org id from the claim, got %v", orgIDs)
 	}
 
-	resolved, err := tenants.GetByZitadelOrgID(ctx, orgID)
+	resolved, err := tenants.GetByZitadelOrgID(ctx, orgIDs[0])
 	if err != nil {
 		t.Fatalf("GetByZitadelOrgID: %v", err)
 	}

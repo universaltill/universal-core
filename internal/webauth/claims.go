@@ -1,5 +1,7 @@
 package webauth
 
+import "sort"
+
 // zitadelProjectRolesClaim carries {role_name: {org_id: org_domain}} in
 // the id_token, asserted by turning on project_role_assertion on
 // Universal Core's Zitadel project (see uc-infra/infra/terraform's
@@ -14,35 +16,48 @@ package webauth
 // proven to arrive in the id_token correctly.
 const zitadelProjectRolesClaim = "urn:zitadel:iam:org:project:roles"
 
-// orgIDFromClaims extracts a Zitadel organization id out of the
-// project-roles claim. Returns ok=false if the claim is absent or
-// empty — a real Zitadel user with zero role grants in Universal
-// Core's project (never added to any tenant) — Authenticator.
-// handleCallback treats that the same as "no matching tenant".
+// humanAccessRoles are the project roles that grant a human browser
+// session access to a tenant — the contract with uc-infra's
+// zitadel_project_role resources. tenant_integration is deliberately
+// absent (machine-to-machine only, see orgIDsFromClaims's filter).
+var humanAccessRoles = map[string]bool{"tenant_member": true}
+
+// orgIDsFromClaims extracts every distinct Zitadel organization id out
+// of the project-roles claim, sorted (stable across Go's randomized map
+// iteration — the predecessor of this function, orgIDFromClaims, had a
+// real bug from exactly that randomness before it learned to fail
+// closed on >1 org). Empty slice when the claim is absent, malformed,
+// or carries no orgs — a real Zitadel user with zero role grants in
+// Universal Core's project; handleCallback routes that to the
+// "no tenant linked" page.
 //
-// Also ok=false if MORE than one distinct org id is asserted (a user
-// legitimately granted tenant_member in two different customer orgs —
-// a shared accountant, say). Found by independent review: the original
-// version returned whichever org happened to come out of Go's
-// randomized map iteration first, so the same user could silently land
-// in a different customer's tenant on every other sign-in — not a
-// cross-tenant *leak* (they're authorized for both), but landing in
-// the wrong company's data with no warning is still a real bug.
-// Failing closed here (same "no matching tenant" page a zero-grant
-// user gets) is the safe default until there's an actual tenant-picker
-// UI to resolve the ambiguity explicitly; this package doesn't assume
-// away multi-org membership, it refuses to guess.
-func orgIDFromClaims(claims map[string]any) (orgID string, ok bool) {
+// Multiple orgs are now a first-class result, not a failure: the
+// fail-closed guard existed "until there's an actual tenant-picker UI
+// to resolve the ambiguity explicitly" (its own words), and
+// handleCallback + /ui/auth/choose are that UI (#25) — the shared
+// accountant with tenant_member in two customer orgs picks a tenant
+// instead of being unable to sign in at all.
+func orgIDsFromClaims(claims map[string]any) []string {
 	val, present := claims[zitadelProjectRolesClaim]
 	if !present {
-		return "", false
+		return nil
 	}
 	roles, isMap := val.(map[string]any)
 	if !isMap {
-		return "", false
+		return nil
 	}
 	found := make(map[string]bool)
-	for _, orgs := range roles {
+	for roleKey, orgs := range roles {
+		// Only HUMAN-access roles confer browser access to a tenant:
+		// tenant_integration is the machine/connector role, and
+		// internal/svcauth deliberately rejects a tenant_member-only
+		// token on the machine path — this is the same asymmetry
+		// enforced in the opposite direction (independent review,
+		// 2026-07-31: without this filter, a connector-role grant in a
+		// second org would put that whole tenant in a human's switcher).
+		if !humanAccessRoles[roleKey] {
+			continue
+		}
 		orgMap, isMap := orgs.(map[string]any)
 		if !isMap {
 			continue
@@ -51,13 +66,12 @@ func orgIDFromClaims(claims map[string]any) (orgID string, ok bool) {
 			found[id] = true
 		}
 	}
-	if len(found) != 1 {
-		return "", false
-	}
+	ids := make([]string, 0, len(found))
 	for id := range found {
-		return id, true
+		ids = append(ids, id)
 	}
-	return "", false // unreachable
+	sort.Strings(ids)
+	return ids
 }
 
 func stringClaim(claims map[string]any, key string) string {

@@ -130,6 +130,17 @@ var shellTmpl = template.Must(template.New("shell").Parse(fmt.Sprintf(`<!doctype
 </main>
 <script>
 (function() {
+  // Stamp every htmx request with the tenant this PAGE was rendered
+  // for (the nav's data-uc-tenant, set from the request context) so a
+  // stale tab can't silently mutate whichever tenant the shared
+  // session cookie has since switched to — the server refuses a
+  // mismatch with 409 (guardTenantHeader, ADR-0011 in uc-infra).
+  document.body.addEventListener("htmx:configRequest", function(evt) {
+    var nav = document.querySelector("[data-uc-tenant]");
+    if (nav) {
+      evt.detail.headers["X-UC-Tenant"] = nav.getAttribute("data-uc-tenant");
+    }
+  });
   var toastEl = null;
   function ensureToast() {
     if (toastEl) { return toastEl; }

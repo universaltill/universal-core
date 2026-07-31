@@ -288,3 +288,21 @@ func TestUniversalCore_MembersRoutes_RegisteredAndGated(t *testing.T) {
 		}
 	}
 }
+
+// TestUniversalCore_TenantPrefixRoute_RegisteredAndGated: the /t/{slug}/
+// subtree (#25, ADR-0011) is registered on the production mux and sits
+// behind the same fail-closed auth as everything else — 401 without
+// credentials, not a 404 (route missing) and not a 200 (auth bypass).
+func TestUniversalCore_TenantPrefixRoute_RegisteredAndGated(t *testing.T) {
+	controlDSN := testexec.FreshDatabase(t, "uc_test_server_control")
+	baseURL := startServer(t, controlDSN, "INSECURE_DEV_AUTH=true")
+
+	resp, err := http.Get(baseURL + "/t/some-tenant/records/Item")
+	if err != nil {
+		t.Fatalf("GET /t/…: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 (registered, auth-gated), got %d", resp.StatusCode)
+	}
+}

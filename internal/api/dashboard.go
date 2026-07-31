@@ -27,6 +27,24 @@ import (
 // is correct for API clients but not for a browser landing on the site.
 func (h *Handler) renderRoot(w http.ResponseWriter, r *http.Request) {
 	if rc, ok := h.sessionContext(r); ok {
+		// Canonicalize a real webauth browser session's dashboard to its
+		// /t/{slug}/ form (#25, ADR-0011) — same narrow conditions as
+		// canonicalPage (tenanturl.go), inlined here because this route
+		// deliberately sits outside the auth() chain. DevAuth sessions
+		// (TryContext misses, TryDevAuth hits) never redirect.
+		if !dispatchedViaPrefix(r.Context()) && h.tenants != nil && h.auth.Enabled() {
+			if _, viaWebauth := h.auth.TryContext(r); viaWebauth {
+				if slug, err := h.tenants.SlugByID(r.Context(), rc.TenantID); err == nil {
+					// RequestURI, not a bare "/": dropping the query here
+					// silently broke ?lang= on the dashboard for real
+					// logins (independent review, 2026-07-31) — the
+					// language switcher's links carry their locale as a
+					// query parameter.
+					http.Redirect(w, r, "/t/"+slug+r.URL.RequestURI(), http.StatusFound)
+					return
+				}
+			}
+		}
 		h.writeDashboard(w, r, rc)
 		return
 	}

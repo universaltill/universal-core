@@ -27,6 +27,12 @@ func (a *Authenticator) Guard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rc, ok := a.TryContext(r)
 		if !ok {
+			// An authenticated multi-tenant login that hasn't picked its
+			// active tenant is not "logged out" — it goes to the picker,
+			// not back through Zitadel (choose.go, #25).
+			if a.guardChoice(w, r) {
+				return
+			}
 			a.redirectToLogin(w, r)
 			return
 		}

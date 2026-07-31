@@ -238,7 +238,7 @@ func TestHandleCallback_HappyPath(t *testing.T) {
 	p := newFakeOIDCProvider(t)
 	a, tenants := newTestAuthenticator(t, p)
 
-	tenantID, err := tenants.Create(context.Background(), "Callback Test Tenant", "eu-west")
+	tenantID, err := tenants.Create(context.Background(), uniqueTenantName("Callback Test Tenant"), "eu-west")
 	if err != nil {
 		t.Fatalf("create tenant: %v", err)
 	}
