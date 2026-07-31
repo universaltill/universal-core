@@ -1357,6 +1357,41 @@ func (s *seeder) seedHR() {
 		"hire_date":       "2024-03-04",
 		"status_id":       s.statusID("employee_status", "active"),
 	})
+	if hasPublished(s.ctx, s.entityDefs, "AttendanceRecord") {
+		attDef := s.def("AttendanceRecord")
+		existing, err := s.crud.ListByField(s.ctx, attDef, "employee_id", employeeID)
+		if err != nil {
+			log.Fatalf("list existing attendance: %v", err)
+		}
+		seen := map[string]bool{}
+		for _, rec := range existing {
+			if d, ok := rec.Data["entry_date"].(string); ok {
+				seen[d] = true
+			}
+		}
+		for _, a := range []struct {
+			date   string
+			hours  float64
+			source string
+		}{
+			// One row per source, so the demo tenant exercises every
+			// enum value's translation rather than two-thirds of them.
+			{"2026-07-27", 7.5, "clock"},
+			{"2026-07-28", 8.0, "timesheet"},
+			{"2026-07-29", 4.0, "manual"},
+		} {
+			if seen[a.date] {
+				continue
+			}
+			if _, err := s.crud.Create(s.ctx, attDef, map[string]any{
+				"employee_id": employeeID, "entry_date": a.date,
+				"hours_worked": a.hours, "source": a.source,
+			}, s.actor); err != nil {
+				log.Fatalf("create AttendanceRecord %s: %v", a.date, err)
+			}
+		}
+	}
+
 	s.getOrCreate("LeaveRequest", "request_number", "LV-2026-001", map[string]any{
 		"request_number": "LV-2026-001",
 		"employee_id":    employeeID,

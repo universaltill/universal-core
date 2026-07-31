@@ -286,8 +286,21 @@ type ListPageOptions struct {
 	SortNumeric bool
 	FilterField string // "" = no filter
 	FilterValue string // substring match (ILIKE), only used when FilterField set
-	Limit       int
-	Offset      int
+	// FilterIn, when non-nil, replaces the substring match with an exact
+	// membership test against these values. It exists for filtering a
+	// FieldReference column: the stored value there is a target record's
+	// id, so an ILIKE against what a human typed matches nothing (a user
+	// searching an attendance list for "EMP-0001" got zero rows —
+	// independent review, board #17). The caller resolves the typed text
+	// to matching target ids and passes them here.
+	//
+	// An EMPTY non-nil slice means "resolved to no matches" and must
+	// return no rows — distinct from nil, which means "not a reference
+	// filter". Collapsing the two would turn a search with no hits into
+	// a search with no filter, which is the more dangerous default.
+	FilterIn []string
+	Limit    int
+	Offset   int
 }
 
 // CountFiltered is Count with the same optional filter ListPageFiltered
@@ -299,12 +312,22 @@ func (r *RecordRepo) CountFiltered(ctx context.Context, entityType string, opts 
 		return r.CountByEntityType(ctx, entityType)
 	}
 	var n int
-	err := r.db.QueryRowContext(ctx,
-		`SELECT count(*) FROM records
-		 WHERE entity_type = $1 AND deleted_at IS NULL
-		   AND data->>$2 ILIKE $3 ESCAPE '\'`,
-		entityType, opts.FilterField, "%"+escapeLike(opts.FilterValue)+"%",
-	).Scan(&n)
+	var err error
+	if opts.FilterIn != nil {
+		err = r.db.QueryRowContext(ctx,
+			`SELECT count(*) FROM records
+			 WHERE entity_type = $1 AND deleted_at IS NULL
+			   AND data->>$2 = ANY($3)`,
+			entityType, opts.FilterField, opts.FilterIn,
+		).Scan(&n)
+	} else {
+		err = r.db.QueryRowContext(ctx,
+			`SELECT count(*) FROM records
+			 WHERE entity_type = $1 AND deleted_at IS NULL
+			   AND data->>$2 ILIKE $3 ESCAPE '\'`,
+			entityType, opts.FilterField, "%"+escapeLike(opts.FilterValue)+"%",
+		).Scan(&n)
+	}
 	if err != nil {
 		return 0, fmt.Errorf("count filtered records: %w", err)
 	}
@@ -334,8 +357,13 @@ func (r *RecordRepo) ListPageFiltered(ctx context.Context, entityType string, op
 	args := []any{entityType}
 	where := "entity_type = $1 AND deleted_at IS NULL"
 	if opts.FilterField != "" {
-		args = append(args, opts.FilterField, "%"+escapeLike(opts.FilterValue)+"%")
-		where += fmt.Sprintf(` AND data->>$%d ILIKE $%d ESCAPE '\'`, len(args)-1, len(args))
+		if opts.FilterIn != nil {
+			args = append(args, opts.FilterField, opts.FilterIn)
+			where += fmt.Sprintf(` AND data->>$%d = ANY($%d)`, len(args)-1, len(args))
+		} else {
+			args = append(args, opts.FilterField, "%"+escapeLike(opts.FilterValue)+"%")
+			where += fmt.Sprintf(` AND data->>$%d ILIKE $%d ESCAPE '\'`, len(args)-1, len(args))
+		}
 	}
 
 	// created_at is a real column; a declared field sorts by its JSON

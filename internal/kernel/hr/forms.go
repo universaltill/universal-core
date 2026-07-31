@@ -75,10 +75,34 @@ func LeaveRequestForm() *form.Definition {
 	}
 }
 
+func AttendanceRecordForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "AttendanceRecord",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Attendance",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "employee_id", Label: "Employee"},
+					{Name: "entry_date", Label: "Date"},
+					{Name: "hours_worked", Label: "Hours Worked"},
+					{Name: "source", Label: "Source"},
+					{Name: "notes", Label: "Notes"},
+				},
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
+	}
+}
+
 // AllForms returns every Form Definition this module adds.
 func AllForms() []*form.Definition {
 	return []*form.Definition{
 		EmployeeForm(),
 		LeaveRequestForm(),
+		AttendanceRecordForm(),
 	}
 }

@@ -520,5 +520,14 @@
   "field.LeaveRequest.status_id.submitted": "مُقدَّم",
   "field.LeaveRequest.status_id.approved": "معتمد",
   "field.LeaveRequest.status_id.rejected": "مرفوض",
-  "field.LeaveRequest.status_id.cancelled": "ملغى"
+  "field.LeaveRequest.status_id.cancelled": "ملغى",
+  "entity.AttendanceRecord.name": "سجل حضور",
+  "field.AttendanceRecord.employee_id": "الموظف",
+  "field.AttendanceRecord.entry_date": "التاريخ",
+  "field.AttendanceRecord.hours_worked": "ساعات العمل",
+  "field.AttendanceRecord.source": "المصدر",
+  "field.AttendanceRecord.notes": "ملاحظات",
+  "field.AttendanceRecord.source.clock": "جهاز البصمة",
+  "field.AttendanceRecord.source.timesheet": "كشف الدوام",
+  "field.AttendanceRecord.source.manual": "يدوي"
 }

@@ -389,7 +389,7 @@ func TestProvisionTenant_HRModule(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	for _, et := range []string{"Employee", "LeaveRequest"} {
+	for _, et := range []string{"Employee", "LeaveRequest", "AttendanceRecord"} {
 		var count int
 		if err := tenantDB.QueryRowContext(ctx,
 			`SELECT count(*) FROM entity_definitions WHERE entity_type = $1 AND status = 'published'`, et,

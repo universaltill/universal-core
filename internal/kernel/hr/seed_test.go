@@ -109,10 +109,19 @@ func TestAllDefinitionsValid(t *testing.T) {
 			t.Errorf("Employee must not carry the person attribute %q — that lives on Party (ADR-0013)", forbidden)
 		}
 	}
-	// And LeaveRequest points at the EMPLOYMENT, not the person
-	// (ADR-0013 rule 4).
-	if f, ok := LeaveRequest().FieldByName("employee_id"); !ok || f.Target != "Employee" {
-		t.Errorf("LeaveRequest.employee_id must target Employee, got %+v", f)
+	// And the HR-domain records point at the EMPLOYMENT, not the person
+	// (ADR-0013 rule 4) — attendance is owed under an employment, so a
+	// person's two employments have two separate histories.
+	for _, def := range []*entity.Definition{LeaveRequest(), AttendanceRecord()} {
+		f, ok := def.FieldByName("employee_id")
+		if !ok || f.Target != "Employee" {
+			t.Errorf("%s.employee_id must target Employee (ADR-0013 rule 4), got %+v", def.EntityType, f)
+		}
+	}
+	// AttendanceRecord has no status graph on purpose: it records what
+	// happened, it is not a request anyone decides on.
+	if AttendanceRecord().StatusTypeCode != "" {
+		t.Error("AttendanceRecord should have no lifecycle — it is a record of fact, not a request")
 	}
 }
 
@@ -125,7 +134,7 @@ func TestPublish_PublishesEveryDefinition(t *testing.T) {
 	if err := PublishForms(ctx, tenantDB, humanActor()); err != nil {
 		t.Fatalf("PublishForms: %v", err)
 	}
-	for _, et := range []string{"Employee", "LeaveRequest"} {
+	for _, et := range []string{"Employee", "LeaveRequest", "AttendanceRecord"} {
 		if got := publishedDef(t, tenantDB, et); got.Module != "hr" {
 			t.Errorf("%s published with module %q", et, got.Module)
 		}
@@ -541,5 +550,83 @@ func TestPublishStatuses_Idempotent(t *testing.T) {
 		if len(rows) != want {
 			t.Errorf("%s: re-seed duplicated statuses: %d rows, want %d", code, len(rows), want)
 		}
+	}
+}
+
+// TestAttendanceRecord_BelongsToTheEmployment is ADR-0013 rule 4 for
+// attendance: two employments of the same person keep separate
+// histories, which is the whole reason attendance references Employee
+// rather than Party.
+func TestAttendanceRecord_BelongsToTheEmployment(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+	for _, step := range []struct {
+		name string
+		fn   func(context.Context, *sql.DB, audit.Actor) error
+	}{
+		{"foundation", foundation.Publish},
+		{"hr", Publish},
+		{"hr statuses", PublishStatuses},
+	} {
+		if err := step.fn(ctx, tenantDB, actor); err != nil {
+			t.Fatalf("publish %s: %v", step.name, err)
+		}
+	}
+	engine := crud.NewEngine(tenantDB)
+	types, _ := engine.ListByField(ctx, publishedDef(t, tenantDB, "StatusType"), "code", "employee_status")
+	rows, _ := engine.ListByField(ctx, publishedDef(t, tenantDB, "Status"), "status_type_id", types[0].ID)
+	var probation string
+	for _, r := range rows {
+		if c, _ := r.Data["code"].(string); c == "probation" {
+			probation = r.ID
+		}
+	}
+	person, _ := engine.Create(ctx, publishedDef(t, tenantDB, "Party"), map[string]any{
+		"party_type": "person", "name": "Demo Employee", "status": "active",
+	}, actor)
+
+	empDef := publishedDef(t, tenantDB, "Employee")
+	older, err := engine.Create(ctx, empDef, map[string]any{
+		"employee_number": "EMP-OLD", "party_id": person.ID,
+		"hire_date": "2019-01-07", "status_id": probation,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create first employment: %v", err)
+	}
+	current, err := engine.Create(ctx, empDef, map[string]any{
+		"employee_number": "EMP-NEW", "party_id": person.ID,
+		"hire_date": "2026-02-02", "status_id": probation,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create second employment: %v", err)
+	}
+
+	attDef := publishedDef(t, tenantDB, "AttendanceRecord")
+	if _, err := engine.Create(ctx, attDef, map[string]any{
+		"employee_id": current.ID, "entry_date": "2026-07-28",
+		"hours_worked": 8.0, "source": "clock",
+	}, actor); err != nil {
+		t.Fatalf("create AttendanceRecord: %v", err)
+	}
+
+	onOlder, err := engine.ListByField(ctx, attDef, "employee_id", older.ID)
+	if err != nil {
+		t.Fatalf("list attendance for the older employment: %v", err)
+	}
+	if len(onOlder) != 0 {
+		t.Errorf("attendance for the current employment leaked onto the previous one: %d rows", len(onOlder))
+	}
+	onCurrent, err := engine.ListByField(ctx, attDef, "employee_id", current.ID)
+	if err != nil || len(onCurrent) != 1 {
+		t.Fatalf("current employment's attendance: err=%v n=%d", err, len(onCurrent))
+	}
+
+	// The source enum is enforced; the hours value is not bounded (#80).
+	if _, err := engine.Create(ctx, attDef, map[string]any{
+		"employee_id": current.ID, "entry_date": "2026-07-29",
+		"hours_worked": 8.0, "source": "telepathy",
+	}, actor); err == nil {
+		t.Error("an undeclared attendance source must be rejected by the enum")
 	}
 }

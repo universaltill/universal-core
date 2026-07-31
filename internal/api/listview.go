@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"html/template"
 	"net/http"
@@ -108,6 +109,25 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 	if filterValue != "" && isVisibleColumn(columns, filterField) && sortFilterableField(def, filterField) {
 		opts.FilterField = filterField
 		opts.FilterValue = filterValue
+		// A reference column stores the target's id, so matching what a
+		// human typed against it finds nothing: searching an attendance
+		// list for "EMP-0001" returned zero rows even though the cells
+		// plainly showed EMP-0001, because the cell is a resolved label
+		// and the stored value is a UUID (independent review, board
+		// #17). Resolve the text against the target's own label field
+		// and filter by the ids it matches. Generic — it reads the
+		// Definition, never a specific entity type — so every
+		// reference-first list gets it, not just this one.
+		if f, ok := def.FieldByName(filterField); ok && f.Type == entity.FieldReference {
+			ids, err := h.referenceIDsMatching(r.Context(), ts, f.Target, filterValue)
+			if err != nil {
+				h.writeCrudPageError(w, r, &rc, locale, fmt.Sprintf("resolve %s filter", filterField), err)
+				return
+			}
+			// Non-nil even when empty: "no target matched" must return no
+			// rows, not silently drop the filter.
+			opts.FilterIn = ids
+		}
 	}
 
 	total, err := ts.crud.CountFiltered(r.Context(), def, opts)
@@ -304,6 +324,48 @@ func visibleFields(def *entity.Definition, redacted map[string]bool) []entity.Fi
 	}
 	return out
 }
+
+// referenceIDsMatching resolves free text typed into the filter box
+// into the ids of target records whose label matches it — the bridge
+// between what a list cell shows and what the column actually stores.
+// Uses the same label-field convention the picker and the cell renderer
+// use (referenceLabelFieldFor, which honours an explicit
+// Definition.LabelField), so the three always agree about what a record
+// is called.
+//
+// A target with no label field at all resolves to no matches rather
+// than to everything: silently widening a filter to the whole table is
+// worse than an empty result a user can see and correct.
+func (h *Handler) referenceIDsMatching(ctx context.Context, ts tenantScope, targetType, text string) ([]string, error) {
+	targetDef, err := ts.entityDef(ctx, targetType)
+	if err != nil {
+		return nil, fmt.Errorf("look up %s definition: %w", targetType, err)
+	}
+	labelField := referenceLabelFieldFor(targetDef)
+	if labelField == "" {
+		return []string{}, nil
+	}
+	matches, err := ts.crud.ListPageFiltered(ctx, targetDef, data.ListPageOptions{
+		FilterField: labelField,
+		FilterValue: text,
+		// Bounded like the reference picker's own search: a filter that
+		// matched thousands of targets would build an enormous IN list
+		// for no practical gain.
+		Limit: referenceFilterMatchLimit,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("search %s by %s: %w", targetType, labelField, err)
+	}
+	ids := make([]string, 0, len(matches))
+	for _, m := range matches {
+		ids = append(ids, m.ID)
+	}
+	return ids, nil
+}
+
+// referenceFilterMatchLimit caps how many target records one filter
+// term may resolve to.
+const referenceFilterMatchLimit = 500
 
 // cellText formats one list-row cell — a reference field resolves to
 // its target's label via referenceLabels (falling back to the raw

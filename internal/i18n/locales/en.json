@@ -520,5 +520,14 @@
   "field.LeaveRequest.status_id.submitted": "Submitted",
   "field.LeaveRequest.status_id.approved": "Approved",
   "field.LeaveRequest.status_id.rejected": "Rejected",
-  "field.LeaveRequest.status_id.cancelled": "Cancelled"
+  "field.LeaveRequest.status_id.cancelled": "Cancelled",
+  "entity.AttendanceRecord.name": "Attendance Record",
+  "field.AttendanceRecord.employee_id": "Employee",
+  "field.AttendanceRecord.entry_date": "Date",
+  "field.AttendanceRecord.hours_worked": "Hours Worked",
+  "field.AttendanceRecord.source": "Source",
+  "field.AttendanceRecord.notes": "Notes",
+  "field.AttendanceRecord.source.clock": "Clock",
+  "field.AttendanceRecord.source.timesheet": "Timesheet",
+  "field.AttendanceRecord.source.manual": "Manual"
 }

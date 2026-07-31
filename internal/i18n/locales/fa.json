@@ -520,5 +520,14 @@
   "field.LeaveRequest.status_id.submitted": "ارسال‌شده",
   "field.LeaveRequest.status_id.approved": "تأییدشده",
   "field.LeaveRequest.status_id.rejected": "ردشده",
-  "field.LeaveRequest.status_id.cancelled": "لغوشده"
+  "field.LeaveRequest.status_id.cancelled": "لغوشده",
+  "entity.AttendanceRecord.name": "ثبت حضور",
+  "field.AttendanceRecord.employee_id": "کارمند",
+  "field.AttendanceRecord.entry_date": "تاریخ",
+  "field.AttendanceRecord.hours_worked": "ساعات کارکرد",
+  "field.AttendanceRecord.source": "منبع",
+  "field.AttendanceRecord.notes": "یادداشت‌ها",
+  "field.AttendanceRecord.source.clock": "دستگاه حضور",
+  "field.AttendanceRecord.source.timesheet": "کاربرگ",
+  "field.AttendanceRecord.source.manual": "دستی"
 }

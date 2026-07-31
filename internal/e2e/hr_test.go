@@ -159,3 +159,138 @@ func TestHR_EmployeeIsLabelledNotAUUID(t *testing.T) {
 		t.Errorf("leave history rendered raw JSON or a Go map:\n%s", historyText)
 	}
 }
+
+// TestHR_AttendanceListIsFilterableByEmployee is the browser test board
+// #17 shipped without — the third card running to omit one, and again
+// the layer that would have caught the blocker.
+//
+// AttendanceRecord is deliberately NOT a related list on Employee, and
+// the justification in the module's own comment was that attendance is
+// "reachable from its own list page filtered by employee". That was
+// empirically false: the list filter does a substring match against the
+// STORED value, which for a reference column is a UUID, so typing the
+// employee number a user can plainly see in the cell returned nothing.
+// With 200 employees × 250 working days there is no way to find one
+// person's attendance at all. The filter is now reference-aware
+// generically; this asserts it in a real browser rather than trusting
+// the SQL.
+func TestHR_AttendanceListIsFilterableByEmployee(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, tenantDB := testServer(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	for _, step := range []struct {
+		name string
+		fn   func() error
+	}{
+		{"foundation", func() error { return foundation.Publish(ctx, tenantDB, actor) }},
+		{"foundation forms", func() error { return foundation.PublishForms(ctx, tenantDB, actor) }},
+		{"hr", func() error { return hr.Publish(ctx, tenantDB, actor) }},
+		{"hr forms", func() error { return hr.PublishForms(ctx, tenantDB, actor) }},
+		{"hr statuses", func() error { return hr.PublishStatuses(ctx, tenantDB, actor) }},
+	} {
+		if err := step.fn(); err != nil {
+			t.Fatalf("publish %s: %v", step.name, err)
+		}
+	}
+
+	engine := crud.NewEngine(tenantDB)
+	def := func(entityType string) *entity.Definition {
+		t.Helper()
+		v, err := data.NewEntityDefinitionRepo(tenantDB).GetPublished(ctx, entityType)
+		if err != nil {
+			t.Fatalf("GetPublished(%s): %v", entityType, err)
+		}
+		d, err := entity.Unmarshal(v.Definition)
+		if err != nil {
+			t.Fatalf("unmarshal %s: %v", entityType, err)
+		}
+		return d
+	}
+	activeStatus := func() string {
+		t.Helper()
+		types, _ := engine.ListByField(ctx, def("StatusType"), "code", "employee_status")
+		rows, _ := engine.ListByField(ctx, def("Status"), "status_type_id", types[0].ID)
+		for _, r := range rows {
+			if c, _ := r.Data["code"].(string); c == "active" {
+				return r.ID
+			}
+		}
+		t.Fatal("no active employee status")
+		return ""
+	}()
+
+	empDef := def("Employee")
+	attDef := def("AttendanceRecord")
+	for _, e := range []struct{ number, personName, date string }{
+		{"EMP-0001", "Demo Alice", "2026-07-27"},
+		{"EMP-0002", "Demo Bob", "2026-07-28"},
+	} {
+		person, err := engine.Create(ctx, def("Party"), map[string]any{
+			"party_type": "person", "name": e.personName, "status": "active",
+		}, actor)
+		if err != nil {
+			t.Fatalf("create Party %s: %v", e.personName, err)
+		}
+		emp, err := engine.Create(ctx, empDef, map[string]any{
+			"employee_number": e.number, "party_id": person.ID,
+			"hire_date": "2024-01-08", "status_id": activeStatus,
+		}, actor)
+		if err != nil {
+			t.Fatalf("create Employee %s: %v", e.number, err)
+		}
+		if _, err := engine.Create(ctx, attDef, map[string]any{
+			"employee_id": emp.ID, "entry_date": e.date,
+			"hours_worked": 8.0, "source": "clock",
+		}, actor); err != nil {
+			t.Fatalf("create AttendanceRecord for %s: %v", e.number, err)
+		}
+	}
+
+	browser := browserCtx(t, tenantID)
+
+	// Unfiltered: both rows, and the employee column resolves to
+	// employee numbers rather than the UUIDs it stores.
+	var all string
+	if err := chromedp.Run(browser,
+		chromedp.Navigate(srv.URL+"/records/AttendanceRecord"),
+		chromedp.WaitVisible(`table`, chromedp.ByQuery),
+		chromedp.Text(`table`, &all, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("render attendance list: %v", err)
+	}
+	if !strings.Contains(all, "EMP-0001") || !strings.Contains(all, "EMP-0002") {
+		t.Fatalf("attendance list does not resolve its employee references:\n%s", all)
+	}
+
+	// Filtered by what the user can actually see in the cell.
+	var filtered string
+	if err := chromedp.Run(browser,
+		chromedp.Navigate(srv.URL+"/records/AttendanceRecord?filter=employee_id&q=EMP-0001"),
+		chromedp.WaitVisible(`main`, chromedp.ByQuery),
+		chromedp.Text(`main`, &filtered, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("render filtered attendance list: %v", err)
+	}
+	if !strings.Contains(filtered, "EMP-0001") {
+		t.Errorf("filtering by an employee number found nothing — the number is what the cell shows:\n%s", filtered)
+	}
+	if strings.Contains(filtered, "EMP-0002") {
+		t.Errorf("the filter did not exclude the other employee's attendance:\n%s", filtered)
+	}
+
+	// A term that matches no employee must return no rows, not silently
+	// drop the filter and show everything.
+	var none string
+	if err := chromedp.Run(browser,
+		chromedp.Navigate(srv.URL+"/records/AttendanceRecord?filter=employee_id&q=EMP-NOBODY"),
+		chromedp.WaitVisible(`main`, chromedp.ByQuery),
+		chromedp.Text(`main`, &none, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("render no-match attendance list: %v", err)
+	}
+	if strings.Contains(none, "EMP-0001") || strings.Contains(none, "EMP-0002") {
+		t.Errorf("a filter matching no employee must return no rows, got:\n%s", none)
+	}
+}

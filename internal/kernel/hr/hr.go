@@ -1,5 +1,6 @@
 // Package hr is the HR/HCM module (reference-data-model.md §7,
-// BACKLOG.md R22) — Employee and LeaveRequest. A licensed module like
+// BACKLOG.md R22) — Employee, LeaveRequest and AttendanceRecord. A
+// licensed module like
 // purchasing/sales/assets/projects. Department and Position already
 // live in internal/kernel/foundation (shipped 2026-07-30 with the
 // org-chart work) and are referenced from here rather than moved:
@@ -16,7 +17,7 @@
 //
 // Read ADR-0013 before adding a reference to "the employee" from a new
 // module. Its rule 4 is the one that catches people out: HR-domain
-// records (LeaveRequest here, AttendanceRecord in #17, Payslip later)
+// records (LeaveRequest and AttendanceRecord here, Payslip later)
 // reference **Employee**, because they are about the employment
 // relationship; cross-domain records reference **Party**, because a
 // contractor who is not an employee can still log project time or be
@@ -28,32 +29,59 @@
 // covered — the independent review found four more beyond the three
 // this list originally had, every one of them accepted by the live
 // engine:
+//
 //   - the referenced Party actually holding the `employee` PartyRole;
+//
 //   - an Employee's department_id agreeing with its position's own;
+//
 //   - a Party having at most one ACTIVE employment at a time (two are
 //     accepted, which #16's own test relies on for the rehire case —
 //     but two SIMULTANEOUS active ones are equally accepted);
+//
 //   - employee_number being unique (nothing in entity.Field expresses
 //     uniqueness; "natural key" below is a convention, not a
 //     guarantee);
+//
 //   - `days` being positive, or agreeing with the start/end span: -99
-//     days and 500 days over a two-day span both save cleanly.
-//     entity.Field has no Min/Max — filed as #80, which #17's
-//     hours_worked will want too;
+//     days and 500 days over a two-day span both save cleanly. The
+//     same is true of AttendanceRecord.hours_worked — a negative or
+//     30-hour day saves. entity.Field has no Min/Max (#80);
+//
 //   - leave falling inside its employment's hire/end window: leave
 //     dated 2030 against an employment that ended in 2020 saves;
+//
 //   - employee_id pointing at an Employee that exists at all — a
 //     dangling reference is accepted (#78).
 //
-// What IS enforced: the leave_type enum, and both NotBefore date
-// chains (an employment ending before it started, or leave ending
-// before it starts, are rejected).
+//   - one attendance row per employment per day: two rows for the same
+//     (employee, date) are accepted, and silently double-count hours
+//     for anything that sums them;
 //
-// Deliberately NOT in this slice: PayrollRun/Payslip (§7's last row —
-// payroll calculation is explicitly out of R22's scoped-down phase, and
-// it is country-specific, so per jurisdiction it is plugin work),
-// AttendanceRecord (#17, reordered behind this card), and leave-balance
-// accrual — LeaveRequest records a request and its approval, and a
+//   - attendance falling inside its employment's hire/end window, or
+//     against an employment that has not been terminated: a 1999 row
+//     against a 2024 hire saves;
+//
+//   - entry_date not being in the future.
+//
+// What IS enforced: the leave_type and attendance source enums, and
+// both NotBefore date chains (an employment ending before it started,
+// or leave ending before it starts, are rejected).
+//
+// AttendanceRecord is deliberately NOT surfaced as a related list on
+// Employee, unlike LeaveRequest. Adding one would change Employee's
+// published Definition and therefore require a v2 — and #20 showed
+// that a version bump has to carry the FORM too or it silently
+// delivers nothing to existing tenants. That is real cost and churn
+// for a screen convenience, one card after Employee v1 shipped, and
+// this card's own brief says "minimal shape". Attendance is reachable
+// from its own list page filtered by employee. When Employee next
+// needs a version bump for a substantive reason, the attendance
+// related list should ride along with it.
+//
+// Deliberately NOT in this module yet: PayrollRun/Payslip (§7's last
+// row — payroll calculation is explicitly out of R22's scoped-down
+// phase, and it is country-specific, so per jurisdiction it is plugin
+// work), and leave-balance accrual — LeaveRequest records a request and its approval, and a
 // balance engine needs policy (carry-over, accrual rate, public
 // holidays) that is per-tenant and per-jurisdiction.
 package hr
@@ -150,10 +178,57 @@ func LeaveRequest() *entity.Definition {
 	}
 }
 
+// AttendanceRecord is one day's attendance for one employment
+// (reference-data-model.md §7) — the "clock in/out or timesheet
+// source" row, kept to the minimal shape this card asked for: no
+// payroll calculation engine, and no approval lifecycle, because
+// attendance is a record of what happened rather than a request
+// somebody decides on (LeaveRequest is the entity in this module that
+// has an approval chain, and the difference is deliberate).
+//
+// employee_id references Employee, not Party (ADR-0013 rule 4):
+// attendance is owed under an employment, so a person's two
+// employments have two separate attendance histories.
+//
+// `source` records where the row came from rather than modelling clock
+// times as fields. A minimal shape that stores hours_worked can be fed
+// by a badge reader, an imported timesheet or a manual correction, and
+// which of those it was matters for trusting the number; modelling
+// clock_in/clock_out properly needs a time-of-day type this kernel
+// does not have (FieldDate is a date), and faking it with strings
+// would be worse than leaving it out.
+//
+// hours_worked has no upper or lower bound: entity.Field cannot
+// express one yet (#80), so a negative or 30-hour day saves cleanly.
+// Listed in this package's "Not enforced" comment with the rest.
+func AttendanceRecord() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "AttendanceRecord",
+		Version:    1,
+		Module:     "hr",
+		// Like Employee, this has no name — ADR-0013's closing rule says
+		// such an entity must declare its own label rather than fall
+		// back to a raw id. Nothing references AttendanceRecord today,
+		// so there is no visible symptom yet; declaring it now costs a
+		// line and means the first thing that does reference it works.
+		LabelField: "entry_date",
+		Fields: []entity.Field{
+			{Name: "employee_id", Type: entity.FieldReference, Required: true, Target: "Employee"},
+			{Name: "entry_date", Type: entity.FieldDate, Required: true},
+			{Name: "hours_worked", Type: entity.FieldNumber, Required: true},
+			{Name: "source", Type: entity.FieldEnum, Required: true,
+				EnumValues: []string{"clock", "timesheet", "manual"},
+				Default:    "timesheet"},
+			{Name: "notes", Type: entity.FieldString},
+		},
+	}
+}
+
 // All returns every Definition this module adds.
 func All() []*entity.Definition {
 	return []*entity.Definition{
 		Employee(),
 		LeaveRequest(),
+		AttendanceRecord(),
 	}
 }

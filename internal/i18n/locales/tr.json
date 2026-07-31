@@ -520,5 +520,14 @@
   "field.LeaveRequest.status_id.submitted": "Gönderildi",
   "field.LeaveRequest.status_id.approved": "Onaylandı",
   "field.LeaveRequest.status_id.rejected": "Reddedildi",
-  "field.LeaveRequest.status_id.cancelled": "İptal Edildi"
+  "field.LeaveRequest.status_id.cancelled": "İptal Edildi",
+  "entity.AttendanceRecord.name": "Devam Kaydı",
+  "field.AttendanceRecord.employee_id": "Çalışan",
+  "field.AttendanceRecord.entry_date": "Tarih",
+  "field.AttendanceRecord.hours_worked": "Çalışılan Saat",
+  "field.AttendanceRecord.source": "Kaynak",
+  "field.AttendanceRecord.notes": "Notlar",
+  "field.AttendanceRecord.source.clock": "Kart Okuyucu",
+  "field.AttendanceRecord.source.timesheet": "Puantaj",
+  "field.AttendanceRecord.source.manual": "Manuel"
 }
