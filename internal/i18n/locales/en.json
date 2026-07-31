@@ -292,5 +292,6 @@
   "workflow_inbox.requires_role_in_department": "Needs the {role} role in this record's department",
   "list.filter_placeholder": "Filter…",
   "list.filter_button": "Filter",
-  "list.filter_clear": "Clear"
+  "list.filter_clear": "Clear",
+  "form.reference.search": "Search…"
 }

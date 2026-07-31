@@ -292,5 +292,6 @@
   "workflow_inbox.requires_role_in_department": "يتطلب دور {role} في قسم هذا السجل",
   "list.filter_placeholder": "تصفية…",
   "list.filter_button": "تصفية",
-  "list.filter_clear": "مسح"
+  "list.filter_clear": "مسح",
+  "form.reference.search": "بحث…"
 }

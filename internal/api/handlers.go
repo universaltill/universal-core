@@ -17,7 +17,6 @@ import (
 	"log"
 	"net/http"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -254,6 +253,8 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	mux.Handle("GET /api/records/{entityType}", auth(h.listRecords))
 	mux.Handle("POST /api/records/{entityType}", auth(h.createRecord))
 	mux.Handle("GET /api/records/{entityType}/{id}", auth(h.getRecord))
+	// Searchable reference-field picker source (#24) — see reference_search.go.
+	mux.Handle("GET /api/references/{entityType}", auth(h.searchReferenceOptions))
 	// POST, not PUT: formrender's own <form> tag always submits via
 	// hx-post regardless of new vs. existing record (see render.go's
 	// tmplSrc) — until this route existed at all, saving an existing
@@ -912,63 +913,77 @@ func (h *Handler) buildFormRenderData(ctx context.Context, ts tenantScope, entDe
 	if err != nil {
 		return formrender.Data{}, fmt.Errorf("resolve hidden fields for %s: %w", entDef.EntityType, err)
 	}
-	renderData := formrender.Data{
-		ReferenceOptions: h.loadReferenceOptions(ctx, ts, entDef),
-		RedactedFields:   redacted,
-	}
-	if id == "" {
-		return renderData, nil
-	}
-	rec, err := ts.crud.Get(ctx, entDef, id)
-	if err != nil {
-		return formrender.Data{}, err
-	}
-	renderData.RecordID = rec.ID
-	renderData.Version = rec.Version
-	renderData.Record = rec.Data
+	renderData := formrender.Data{RedactedFields: redacted}
+	if id != "" {
+		rec, err := ts.crud.Get(ctx, entDef, id)
+		if err != nil {
+			return formrender.Data{}, err
+		}
+		renderData.RecordID = rec.ID
+		renderData.Version = rec.Version
+		renderData.Record = rec.Data
 
-	children, err := h.loadMasterDetailChildren(ctx, ts, entDef, formDef, id)
-	if err != nil {
-		return formrender.Data{}, fmt.Errorf("load master-detail children: %w", err)
+		children, err := h.loadMasterDetailChildren(ctx, ts, entDef, formDef, id)
+		if err != nil {
+			return formrender.Data{}, fmt.Errorf("load master-detail children: %w", err)
+		}
+		renderData.Children = children
 	}
-	renderData.Children = children
+	// Resolved AFTER the record is loaded, because it depends on the
+	// record's current values: the combobox (#24) only needs each
+	// reference field's CURRENT selection labelled, so an existing record
+	// shows a name rather than a raw id on load. A new/unset field needs
+	// nothing pre-loaded — the picker fetches candidates on demand from
+	// /api/references. This is the whole point of the task: form render no
+	// longer lists every target record.
+	renderData.ReferenceOptions = h.loadCurrentReferenceLabels(ctx, ts, entDef, renderData.Record)
 	return renderData, nil
 }
 
-// loadReferenceOptions builds every FieldReference field's dropdown
-// options — the fix for a field that otherwise renders as a plain text
-// box the user has to type a raw record id into by hand (found true of
-// every reference field in the kernel today: PurchaseOrder.vendor_id,
-// POLine.item_id, Item.base_uom_id, and more — reference fields were
-// simply unusable for real data entry until this existed). One target
-// entity type is only ever fetched once per render even if multiple
-// fields reference it (e.g. PartyRelationship's party_id_from and
-// party_id_to both target Party).
+// loadCurrentReferenceLabels resolves ONLY the label of each reference
+// field's currently-selected value — one indexed Get per set reference,
+// not a full List of every candidate record. This is #24's actual scaling
+// fix: the reference field renders as a searchable combobox
+// (formrender's uc-ref) that fetches candidates on demand from
+// /api/references, so a form render must no longer load every target
+// record just to populate a <select> (which fell over at real
+// customer-list scale — Farshid, 2026-07-29). The only thing the server
+// still resolves eagerly is the current selection's human label, so an
+// existing record's picker shows a name instead of a raw id on load.
 //
-// A target entity/form lookup or record listing failure degrades to no
-// options for that field (logged, not surfaced) rather than failing the
-// whole form render — the same reasoning nav.go's renderNav already
-// applies to its own registry lookups: a broken reference target
-// shouldn't block viewing or editing the record that merely points at
-// it, and an empty dropdown is still a usable (if incomplete) form.
-func (h *Handler) loadReferenceOptions(ctx context.Context, ts tenantScope, entDef *entity.Definition) map[string][]formrender.ReferenceOption {
-	byTarget := map[string][]formrender.ReferenceOption{}
+// record == nil (a brand-new, unsaved form) needs nothing at all. A
+// target lookup failure — including this viewer legitimately lacking read
+// access to the referenced record — degrades to no pre-loaded label
+// (logged, not surfaced) rather than failing the whole form render: the
+// picker then simply opens empty, the same graceful degradation the old
+// full-list loader applied. Labels are cached per target+id so two fields
+// pointing at the same record resolve it once.
+func (h *Handler) loadCurrentReferenceLabels(ctx context.Context, ts tenantScope, entDef *entity.Definition, record map[string]any) map[string][]formrender.ReferenceOption {
+	if record == nil {
+		return nil
+	}
 	out := map[string][]formrender.ReferenceOption{}
+	cache := map[string]string{} // "target\x00id" -> label
 	for _, f := range entDef.Fields {
 		if f.Type != entity.FieldReference {
 			continue
 		}
-		opts, ok := byTarget[f.Target]
+		current, _ := record[f.Name].(string)
+		if current == "" {
+			continue
+		}
+		key := f.Target + "\x00" + current
+		label, ok := cache[key]
 		if !ok {
 			var err error
-			opts, err = h.referenceOptionsFor(ctx, ts, f.Target)
+			label, err = h.referenceLabelFor(ctx, ts, f.Target, current)
 			if err != nil {
-				log.Printf("api: load reference options for %s.%s -> %s: %v", entDef.EntityType, f.Name, f.Target, err)
-				opts = nil
+				log.Printf("api: resolve reference label for %s.%s -> %s(%s): %v", entDef.EntityType, f.Name, f.Target, current, err)
+				continue
 			}
-			byTarget[f.Target] = opts
+			cache[key] = label
 		}
-		out[f.Name] = opts
+		out[f.Name] = []formrender.ReferenceOption{{ID: current, Label: label}}
 	}
 	return out
 }
@@ -993,42 +1008,85 @@ func (h *Handler) loadReferenceOptions(ctx context.Context, ts tenantScope, entD
 // Definition happens to declare.
 var referenceLabelFieldCandidates = []string{"name", "title"}
 
-// referenceOptionsFor lists every record of targetType for tenantID,
-// labeled by the first field in referenceLabelFieldCandidates the target
-// entity declares, or its raw id if it declares none of them. Record
-// data itself is tenant-owned business data, not UI chrome — no i18n
-// applies to the label the way it does to entity/module type names (see
-// locale.go's entityDisplayName, a genuinely different concern:
-// translating "PurchaseOrder" the identifier, not translating one
-// specific vendor's name).
-func (h *Handler) referenceOptionsFor(ctx context.Context, ts tenantScope, targetType string) ([]formrender.ReferenceOption, error) {
-	targetDef, err := ts.entityDef(ctx, targetType)
-	if err != nil {
-		return nil, fmt.Errorf("look up target entity %s: %w", targetType, err)
-	}
-	records, err := ts.crud.List(ctx, targetDef)
-	if err != nil {
-		return nil, fmt.Errorf("list %s records: %w", targetType, err)
-	}
-	labelField := ""
+// referenceLabelFieldFor returns the field targetDef declares that should
+// label its records in a picker/list cell — the first of
+// referenceLabelFieldCandidates present, or "" if the entity declares
+// none of them (in which case callers fall back to the raw id).
+func referenceLabelFieldFor(targetDef *entity.Definition) string {
 	for _, candidate := range referenceLabelFieldCandidates {
 		if _, ok := targetDef.FieldByName(candidate); ok {
-			labelField = candidate
-			break
+			return candidate
 		}
 	}
-	opts := make([]formrender.ReferenceOption, len(records))
-	for i, rec := range records {
-		label := rec.ID
-		if labelField != "" {
-			if s, ok := rec.Data[labelField].(string); ok && s != "" {
-				label = s
+	return ""
+}
+
+// referenceLabelFor resolves ONE referenced record's human label by id —
+// an indexed Get, not a full-table List. Labeled by the first field in
+// referenceLabelFieldCandidates the target entity declares, or its raw id
+// if it declares none (or the label field is empty). Record data itself is
+// tenant-owned business data, not UI chrome — no i18n applies to the label
+// the way it does to entity/module type names (see locale.go's
+// entityDisplayName, a genuinely different concern: translating
+// "PurchaseOrder" the identifier, not translating one vendor's name).
+func (h *Handler) referenceLabelFor(ctx context.Context, ts tenantScope, targetType, id string) (string, error) {
+	targetDef, err := ts.entityDef(ctx, targetType)
+	if err != nil {
+		return "", fmt.Errorf("look up target entity %s: %w", targetType, err)
+	}
+	rec, err := ts.crud.Get(ctx, targetDef, id)
+	if err != nil {
+		return "", fmt.Errorf("get %s record %s: %w", targetType, id, err)
+	}
+	if labelField := referenceLabelFieldFor(targetDef); labelField != "" {
+		if s, ok := rec.Data[labelField].(string); ok && s != "" {
+			return s, nil
+		}
+	}
+	return rec.ID, nil
+}
+
+// pageReferenceLabels resolves the labels of just the reference ids that
+// actually appear in `records` (one list page) — field -> id -> label. Like
+// the form combobox (#24), this deliberately does NOT list every target
+// record: a page of 20 purchase orders resolves at most 20 distinct vendor
+// ids, not the whole vendor table, so the list view scales with page size
+// rather than with the referenced entity's total row count. A label that
+// can't be resolved (dangling id, or this viewer lacking read access to
+// the target) is simply omitted; the cell renderer falls back to the raw
+// id — visible-but-broken beats silently hiding a dangling reference.
+func (h *Handler) pageReferenceLabels(ctx context.Context, ts tenantScope, def *entity.Definition, records []data.Record) map[string]map[string]string {
+	out := map[string]map[string]string{}
+	cache := map[string]string{} // "target\x00id" -> label
+	for _, f := range def.Fields {
+		if f.Type != entity.FieldReference {
+			continue
+		}
+		byID := map[string]string{}
+		for _, rec := range records {
+			id, _ := rec.Data[f.Name].(string)
+			if id == "" {
+				continue
 			}
+			if _, done := byID[id]; done {
+				continue
+			}
+			key := f.Target + "\x00" + id
+			label, ok := cache[key]
+			if !ok {
+				var err error
+				label, err = h.referenceLabelFor(ctx, ts, f.Target, id)
+				if err != nil {
+					log.Printf("api: resolve list reference label for %s.%s -> %s(%s): %v", def.EntityType, f.Name, f.Target, id, err)
+					continue
+				}
+				cache[key] = label
+			}
+			byID[id] = label
 		}
-		opts[i] = formrender.ReferenceOption{ID: rec.ID, Label: label}
+		out[f.Name] = byID
 	}
-	sort.Slice(opts, func(i, j int) bool { return opts[i].Label < opts[j].Label })
-	return opts, nil
+	return out
 }
 
 // loadMasterDetailChildren fetches the child rows for every

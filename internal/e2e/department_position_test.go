@@ -4,6 +4,7 @@ import (
 	"context"
 	"path"
 	"regexp"
+	"strconv"
 	"testing"
 
 	"github.com/chromedp/chromedp"
@@ -35,15 +36,76 @@ func savedRecordID(t *testing.T, ctx context.Context, entityType string) string 
 	return path.Base(href)
 }
 
+// pickReference drives the searchable reference combobox (#24) that
+// replaced the old <select> for reference fields. The real user gesture is
+// now: type a query into the field's search box, wait for the debounced
+// async /api/references results to render as .uc-ref-option divs, then
+// click the option whose label matches. chromedp.SetValue on a <select>
+// no longer applies because a reference field is no longer a <select> —
+// this helper is what every reference interaction in this package now goes
+// through, exercising the endpoint + JS + DOM the way a person would.
+func pickReference(t *testing.T, ctx context.Context, field, query, label string) {
+	t.Helper()
+	scope := `.uc-ref[data-field="` + cssAttr(field) + `"]`
+	searchSel := scope + ` .uc-ref-search`
+	optionSel := scope + ` .uc-ref-option`
+	// find(...).click() — a missing match throws a clear TypeError that
+	// surfaces as the Evaluate error below, rather than silently picking
+	// nothing and letting a later "field didn't persist" assertion take
+	// the blame.
+	clickJS := `Array.prototype.find.call(` +
+		`document.querySelectorAll(` + strconv.Quote(optionSel) + `),` +
+		`function(e){return e.textContent===` + strconv.Quote(label) + `;}).click()`
+	if err := chromedp.Run(ctx,
+		chromedp.SendKeys(searchSel, query, chromedp.ByQuery),
+		chromedp.WaitVisible(optionSel, chromedp.ByQuery),
+		chromedp.Evaluate(clickJS, nil),
+	); err != nil {
+		t.Fatalf("pick reference %s=%q (query %q): %v", field, label, query, err)
+	}
+}
+
+// cssAttr escapes a field name for safe interpolation into a CSS attribute
+// selector. Field names in this kernel are plain identifiers, so this is
+// belt-and-braces, not a live concern — but a selector built by string
+// concatenation should never assume its input.
+func cssAttr(s string) string {
+	out := make([]rune, 0, len(s))
+	for _, r := range s {
+		if r == '"' || r == '\\' {
+			out = append(out, '\\')
+		}
+		out = append(out, r)
+	}
+	return string(out)
+}
+
+// referenceHiddenValue reads the id a reference combobox actually holds —
+// the hidden input the form submits, not the visible search text. This is
+// the equivalent of the old chromedp.Value(select) read, now that the id
+// lives in a hidden input beside the search box.
+func referenceHiddenValue(t *testing.T, ctx context.Context, field string) string {
+	t.Helper()
+	var v string
+	sel := `.uc-ref[data-field="` + cssAttr(field) + `"] input[type="hidden"]`
+	if err := chromedp.Run(ctx,
+		chromedp.WaitVisible(`form.uc-form`, chromedp.ByQuery),
+		chromedp.Value(sel, &v, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("read reference hidden value for %s: %v", field, err)
+	}
+	return v
+}
+
 // TestDepartmentPosition_RealBrowser drives the generated Department and
 // Position forms through a real headless browser — the org-chart entities
 // added alongside Party in foundation.All()/AllForms() (`erp/BACKLOG-
 // TASKS.md`'s "Department/org-chart model" task). A rendered-HTML-string
-// test would prove the form markup exists; this proves the real <select>
-// reference pickers (Department.parent_department_id,
-// Position.department_id) actually resolve to real records created
-// moments earlier and persist across a fresh page load, the same bar
-// TestFormSaveButton_RealBrowser already set for Item.
+// test would prove the form markup exists; this proves the real reference
+// pickers (Department.parent_department_id, Position.department_id) — now
+// the searchable combobox from #24 — actually resolve to real records
+// created moments earlier and persist across a fresh page load, the same
+// bar TestFormSaveButton_RealBrowser already set for Item.
 //
 // testServer() only publishes purchasing's forms by default (its own doc
 // comment) — foundation.PublishForms is called explicitly here so
@@ -71,17 +133,19 @@ func TestDepartmentPosition_RealBrowser(t *testing.T) {
 	parentDeptID := savedRecordID(t, ctx, "Department")
 
 	// Create a child Department that references the parent through the
-	// real <select> self-reference picker — not a hardcoded id, the one
-	// this browser session actually created above.
+	// real combobox self-reference picker — not a hardcoded id, the one
+	// this browser session actually created above, found by typing.
 	if err := chromedp.Run(ctx,
 		chromedp.Navigate(srv.URL+"/forms/Department/new"),
 		chromedp.WaitVisible(`form.uc-form`, chromedp.ByQuery),
 		chromedp.SetValue(`input[name="code"]`, "fin", chromedp.ByQuery),
 		chromedp.SetValue(`input[name="name"]`, "Finance", chromedp.ByQuery),
-		chromedp.SetValue(`select[name="parent_department_id"]`, parentDeptID, chromedp.ByQuery),
-		submitForm(),
 	); err != nil {
-		t.Fatalf("fill + save child Department: %v", err)
+		t.Fatalf("fill child Department: %v", err)
+	}
+	pickReference(t, ctx, "parent_department_id", "Company", "Company")
+	if err := chromedp.Run(ctx, submitForm()); err != nil {
+		t.Fatalf("save child Department: %v", err)
 	}
 	departmentID := savedRecordID(t, ctx, "Department")
 
@@ -91,27 +155,33 @@ func TestDepartmentPosition_RealBrowser(t *testing.T) {
 	if err := chromedp.Run(ctx, chromedp.Navigate(srv.URL+"/forms/Department/"+departmentID)); err != nil {
 		t.Fatalf("re-navigate to saved child Department: %v", err)
 	}
-	var reloadedParentID string
-	if err := chromedp.Run(ctx,
-		chromedp.WaitVisible(`form.uc-form`, chromedp.ByQuery),
-		chromedp.Value(`select[name="parent_department_id"]`, &reloadedParentID, chromedp.ByQuery),
-	); err != nil {
-		t.Fatalf("read parent_department_id after reload: %v", err)
+	if got := referenceHiddenValue(t, ctx, "parent_department_id"); got != parentDeptID {
+		t.Fatalf("expected the Department's parent_department_id to persist as %q across a fresh page load, got %q", parentDeptID, got)
 	}
-	if reloadedParentID != parentDeptID {
-		t.Fatalf("expected the Department's parent_department_id to persist as %q across a fresh page load, got %q", parentDeptID, reloadedParentID)
+	// And the picker must show the parent's NAME, not a bare id, on load —
+	// the CurrentLabel resolution #24 relies on for an existing record.
+	var reloadedLabel string
+	if err := chromedp.Run(ctx,
+		chromedp.Value(`.uc-ref[data-field="parent_department_id"] .uc-ref-search`, &reloadedLabel, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("read parent_department_id label after reload: %v", err)
+	}
+	if reloadedLabel != "Company" {
+		t.Fatalf("expected the reloaded picker to show the parent's name %q, got %q", "Company", reloadedLabel)
 	}
 
 	// Create a Position that references the Finance Department through
-	// the real <select> reference picker.
+	// the real combobox reference picker.
 	if err := chromedp.Run(ctx,
 		chromedp.Navigate(srv.URL+"/forms/Position/new"),
 		chromedp.WaitVisible(`form.uc-form`, chromedp.ByQuery),
 		chromedp.SetValue(`input[name="title"]`, "Finance Manager", chromedp.ByQuery),
-		chromedp.SetValue(`select[name="department_id"]`, departmentID, chromedp.ByQuery),
-		submitForm(),
 	); err != nil {
-		t.Fatalf("fill + save new Position: %v", err)
+		t.Fatalf("fill new Position: %v", err)
+	}
+	pickReference(t, ctx, "department_id", "Finance", "Finance")
+	if err := chromedp.Run(ctx, submitForm()); err != nil {
+		t.Fatalf("save new Position: %v", err)
 	}
 	managerID := savedRecordID(t, ctx, "Position")
 
@@ -120,42 +190,30 @@ func TestDepartmentPosition_RealBrowser(t *testing.T) {
 	if err := chromedp.Run(ctx, chromedp.Navigate(srv.URL+"/forms/Position/"+managerID)); err != nil {
 		t.Fatalf("re-navigate to saved Position: %v", err)
 	}
-	var reloadedDeptID string
-	if err := chromedp.Run(ctx,
-		chromedp.WaitVisible(`form.uc-form`, chromedp.ByQuery),
-		chromedp.Value(`select[name="department_id"]`, &reloadedDeptID, chromedp.ByQuery),
-	); err != nil {
-		t.Fatalf("read department_id after reload: %v", err)
-	}
-	if reloadedDeptID != departmentID {
-		t.Fatalf("expected the Position's department_id to persist as %q across a fresh page load, got %q", departmentID, reloadedDeptID)
+	if got := referenceHiddenValue(t, ctx, "department_id"); got != departmentID {
+		t.Fatalf("expected the Position's department_id to persist as %q across a fresh page load, got %q", departmentID, got)
 	}
 
 	// A second Position, reporting to the Finance Manager just created,
-	// through the real reports_to_position_id <select> picker.
+	// through the real reports_to_position_id combobox picker.
 	if err := chromedp.Run(ctx,
 		chromedp.Navigate(srv.URL+"/forms/Position/new"),
 		chromedp.WaitVisible(`form.uc-form`, chromedp.ByQuery),
 		chromedp.SetValue(`input[name="title"]`, "Accountant", chromedp.ByQuery),
-		chromedp.SetValue(`select[name="department_id"]`, departmentID, chromedp.ByQuery),
-		chromedp.SetValue(`select[name="reports_to_position_id"]`, managerID, chromedp.ByQuery),
-		submitForm(),
 	); err != nil {
-		t.Fatalf("fill + save reporting Position: %v", err)
+		t.Fatalf("fill reporting Position: %v", err)
+	}
+	pickReference(t, ctx, "department_id", "Finance", "Finance")
+	pickReference(t, ctx, "reports_to_position_id", "Finance Manager", "Finance Manager")
+	if err := chromedp.Run(ctx, submitForm()); err != nil {
+		t.Fatalf("save reporting Position: %v", err)
 	}
 	reportID := savedRecordID(t, ctx, "Position")
 	if err := chromedp.Run(ctx, chromedp.Navigate(srv.URL+"/forms/Position/"+reportID)); err != nil {
 		t.Fatalf("re-navigate to saved reporting Position: %v", err)
 	}
-	var reloadedManagerID string
-	if err := chromedp.Run(ctx,
-		chromedp.WaitVisible(`form.uc-form`, chromedp.ByQuery),
-		chromedp.Value(`select[name="reports_to_position_id"]`, &reloadedManagerID, chromedp.ByQuery),
-	); err != nil {
-		t.Fatalf("read reports_to_position_id after reload: %v", err)
-	}
-	if reloadedManagerID != managerID {
-		t.Fatalf("expected the Position's reports_to_position_id to persist as %q across a fresh page load, got %q", managerID, reloadedManagerID)
+	if got := referenceHiddenValue(t, ctx, "reports_to_position_id"); got != managerID {
+		t.Fatalf("expected the Position's reports_to_position_id to persist as %q across a fresh page load, got %q", managerID, got)
 	}
 
 	// department_id must stay genuinely optional — a company-level
@@ -177,14 +235,7 @@ func TestDepartmentPosition_RealBrowser(t *testing.T) {
 	if err := chromedp.Run(ctx, chromedp.Navigate(srv.URL+"/forms/Position/"+cfoID)); err != nil {
 		t.Fatalf("re-navigate to saved CFO Position: %v", err)
 	}
-	var reloadedCFODept string
-	if err := chromedp.Run(ctx,
-		chromedp.WaitVisible(`form.uc-form`, chromedp.ByQuery),
-		chromedp.Value(`select[name="department_id"]`, &reloadedCFODept, chromedp.ByQuery),
-	); err != nil {
-		t.Fatalf("read department_id after reload for department-less Position: %v", err)
-	}
-	if reloadedCFODept != "" {
-		t.Fatalf("expected the department-less Position's department_id to stay empty across a fresh page load, got %q", reloadedCFODept)
+	if got := referenceHiddenValue(t, ctx, "department_id"); got != "" {
+		t.Fatalf("expected the department-less Position's department_id to stay empty across a fresh page load, got %q", got)
 	}
 }

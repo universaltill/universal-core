@@ -122,26 +122,18 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Reference columns show the target record's own label (the same
-	// resolution the form's dropdown already uses, see
-	// loadReferenceOptions's own doc comment), not the raw id every
-	// list row used to show before this — a page of GUIDs a user can't
-	// tell apart is exactly the gap Farshid pointed out after the
+	// Reference columns show the target record's own label, not the raw id
+	// every list row used to show before this — a page of GUIDs a user
+	// can't tell apart is exactly the gap Farshid pointed out after the
 	// reference-dropdown fix only fixed the form view, not the list.
-	// referenceLabels indexes each reference field's options by id for
-	// O(1) lookup per cell; a stale id with no matching option (the
-	// target record was deleted after this one referenced it) falls
-	// back to showing the raw id — visible-but-broken beats silently
-	// hiding that the reference is dangling.
-	refOptions := h.loadReferenceOptions(r.Context(), ts, def)
-	referenceLabels := make(map[string]map[string]string, len(refOptions))
-	for field, opts := range refOptions {
-		byID := make(map[string]string, len(opts))
-		for _, opt := range opts {
-			byID[opt.ID] = opt.Label
-		}
-		referenceLabels[field] = byID
-	}
+	// Resolves labels for only the reference ids actually on THIS page
+	// (#24) — not every target record — so the list scales with page size,
+	// not the referenced table's total size; indexed field -> id -> label
+	// for O(1) lookup per cell. A stale id with no resolvable label (the
+	// target was deleted, or is not readable by this viewer) falls back to
+	// showing the raw id in the cell renderer — visible-but-broken beats
+	// silently hiding that the reference is dangling.
+	referenceLabels := h.pageReferenceLabels(r.Context(), ts, def, records)
 
 	view := recordListView{
 		Name:        h.entityDisplayName(locale, entityType),

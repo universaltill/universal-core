@@ -292,5 +292,6 @@
   "workflow_inbox.requires_role_in_department": "Bu kaydın departmanında {role} rolü gerekiyor",
   "list.filter_placeholder": "Filtrele…",
   "list.filter_button": "Filtrele",
-  "list.filter_clear": "Temizle"
+  "list.filter_clear": "Temizle",
+  "form.reference.search": "Ara…"
 }

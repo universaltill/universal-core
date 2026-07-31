@@ -54,15 +54,16 @@ type Data struct {
 	Version  int
 	Record   map[string]any
 	Children map[string][]map[string]any
-	// ReferenceOptions holds every FieldReference field's picker options,
-	// keyed by field name (not target entity type — two fields could
-	// reference the same target with different filtering someday, the
-	// same forward-looking reasoning Children's own doc comment gives
-	// for keying by Target today). A field with no entry here (e.g. the
-	// target entity has no records yet, or its lookup failed and was
-	// skipped rather than failing the whole render — see
-	// internal/api's loadReferenceOptions) simply renders an empty
-	// dropdown, not an error.
+	// ReferenceOptions carries only the label of each FieldReference
+	// field's CURRENT value, keyed by field name — enough to show a name
+	// instead of a raw id on an existing record's combobox (#24). It is no
+	// longer the full candidate list: the searchable picker fetches
+	// candidates on demand from internal/api's /api/references endpoint, so
+	// a form render never loads every target record. A field with no entry
+	// here (a new/unset field, or the current value's label couldn't be
+	// resolved and was skipped rather than failing the whole render — see
+	// internal/api's loadCurrentReferenceLabels) simply renders an empty
+	// search box, not an error.
 	ReferenceOptions map[string][]ReferenceOption
 	// RedactedFields names the entity fields this form's viewer may not
 	// see (internal/kernel/authz's FieldPermission rules, resolved by the
@@ -122,13 +123,14 @@ type viewModel struct {
 	// whole entity at once) would silently wipe every field it doesn't
 	// show on every save, since the record-write path is a full
 	// replacement, not a merge.
-	HiddenFields      []hiddenFieldView
-	Sections          []sectionView
-	Actions           []actionView
-	RequiredSuffix    string
-	RelatedListEmpty  string
-	MasterDetailEmpty string
-	MasterDetailAdd   string
+	HiddenFields         []hiddenFieldView
+	Sections             []sectionView
+	Actions              []actionView
+	RequiredSuffix       string
+	RelatedListEmpty     string
+	MasterDetailEmpty    string
+	MasterDetailAdd      string
+	RefSearchPlaceholder string
 	// WorkflowStartVals is the pre-built JSON body for every workflow.start
 	// action's hx-vals. Built once via encoding/json (never by
 	// hand-concatenating field values into a JSON-looking string) so a
@@ -171,6 +173,14 @@ type fieldView struct {
 	Value    any
 	Checked  bool         // FieldBool only
 	Options  []optionView // FieldEnum and FieldReference only
+	// RefTarget is the referenced entity type — set only for
+	// FieldReference, and it turns the field into a searchable combobox
+	// backed by GET /api/references/{RefTarget} instead of a <select> of
+	// every record. CurrentLabel is the label of the currently-selected
+	// record, so an existing value shows its name, not a raw id, before
+	// the user searches.
+	RefTarget    string
+	CurrentLabel string
 }
 
 // optionView is one <option> — Label and Value differ for
@@ -183,17 +193,25 @@ type optionView struct {
 	Selected bool
 }
 
-// ReferenceOption is one selectable target record for a FieldReference
-// field — ID is what's actually stored (the referenced record's id),
-// Label is what the picker shows a human. Built by the caller (see
-// internal/api's loadReferenceOptions) since fetching the target
-// entity's records needs the registry/crud engine, which this package
-// deliberately has no access to (Render only ever works with data
-// already handed to it — same separation Data.Children already keeps
-// for master-detail rows).
+// ReferenceOption is one target record for a FieldReference field — ID is
+// what's actually stored (the referenced record's id), Label is what the
+// picker shows a human. Used two ways: the caller pre-loads just the
+// CURRENT value's option so an existing record's combobox shows a name on
+// load (see internal/api's loadCurrentReferenceLabels), and the same type
+// is the JSON shape internal/api's /api/references search endpoint returns
+// for on-demand candidates. Either way it's built by the caller, since
+// fetching target records needs the registry/crud engine this package
+// deliberately has no access to (Render only ever works with data already
+// handed to it — same separation Data.Children keeps for master-detail
+// rows).
 type ReferenceOption struct {
-	ID    string
-	Label string
+	// JSON tags are load-bearing: this type is marshalled directly by the
+	// reference-search endpoint (internal/api/reference_search.go) and the
+	// combobox JS reads o.id / o.label. Without the tags Go would emit
+	// ID/Label and the picker would render blank options with no value.
+	// snake_case also matches this repo's API convention (CLAUDE.md).
+	ID    string `json:"id"`
+	Label string `json:"label"`
 }
 
 type childRowView struct {
@@ -228,16 +246,17 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 	}
 
 	vm := viewModel{
-		EntityType:        def.EntityType,
-		RecordID:          data.RecordID,
-		Version:           data.Version,
-		VersionKnown:      data.RecordID != "",
-		PostHref:          postHref,
-		RequiredSuffix:    r.i18n.T(locale, "form.field.required_suffix"),
-		RelatedListEmpty:  r.i18n.T(locale, "form.related_list.empty"),
-		MasterDetailEmpty: r.i18n.T(locale, "form.master_detail.empty"),
-		MasterDetailAdd:   r.i18n.T(locale, "form.master_detail.add"),
-		WorkflowStartVals: string(valsJSON),
+		EntityType:           def.EntityType,
+		RecordID:             data.RecordID,
+		Version:              data.Version,
+		VersionKnown:         data.RecordID != "",
+		PostHref:             postHref,
+		RequiredSuffix:       r.i18n.T(locale, "form.field.required_suffix"),
+		RelatedListEmpty:     r.i18n.T(locale, "form.related_list.empty"),
+		MasterDetailEmpty:    r.i18n.T(locale, "form.master_detail.empty"),
+		MasterDetailAdd:      r.i18n.T(locale, "form.master_detail.add"),
+		RefSearchPlaceholder: r.i18n.T(locale, "form.reference.search"),
+		WorkflowStartVals:    string(valsJSON),
 	}
 
 	// Roll-ups are computed in a first pass, before any fields section is
@@ -488,26 +507,24 @@ func (r *Renderer) buildFields(s form.Section, ent *entity.Definition, record ma
 				fv.Options = append(fv.Options, optionView{Value: ev, Label: label, Selected: ev == current})
 			}
 		case entity.FieldReference:
+			// A reference now renders as a searchable combobox (#24) backed
+			// by GET /api/references/{RefTarget}, not a <select> of every
+			// record — so no option list is built here. The only thing the
+			// server still needs to resolve is the CURRENT value's label, so
+			// an existing record's picker shows the human-readable name
+			// rather than a bare id on load; the caller pre-loads just that
+			// one record's option in referenceOptions. Value (the id) is
+			// already set from FormatFieldValue above and drives the hidden
+			// input. An empty current value simply renders an empty search
+			// box with an empty hidden id — the combobox's own empty state,
+			// no synthetic blank <option> needed.
 			current, _ := record[ff.Name].(string)
-			if current == "" {
-				// An unset reference must stay a real, selectable choice
-				// — without this, the browser's own <select> default
-				// (whatever option happens to render first) would look
-				// selected on an untouched new-record form even though
-				// no value was actually chosen, and submitting it would
-				// silently write that first option's id. Unconditional
-				// on Required now (was only added for optional fields
-				// originally): a *required* reference with no value is
-				// exactly the case that most needs a real empty state,
-				// so the browser's native validation can actually catch
-				// an unmade choice instead of silently accepting
-				// whichever option rendered first (found by review after
-				// this field type first shipped as a usable dropdown —
-				// see uc-infra's 2026-07-20 reference-dropdowns review).
-				fv.Options = append(fv.Options, optionView{Value: "", Label: "", Selected: true})
-			}
+			fv.RefTarget = ef.Target
 			for _, opt := range referenceOptions[ff.Name] {
-				fv.Options = append(fv.Options, optionView{Value: opt.ID, Label: opt.Label, Selected: opt.ID == current})
+				if opt.ID == current {
+					fv.CurrentLabel = opt.Label
+					break
+				}
 			}
 		}
 
@@ -551,7 +568,12 @@ const tmplSrc = `<form class="uc-form" data-entity-type="{{.EntityType}}" hx-pos
 <div class="uc-field">
 <label for="{{.Name}}">{{.Label}}{{if .Required}}{{$.RequiredSuffix}}{{end}}</label>
 {{if eq .Type "bool"}}<input type="hidden" name="{{.Name}}" value="false"><input type="checkbox" id="{{.Name}}" name="{{.Name}}" value="true" {{if .Checked}}checked{{end}}{{if .Required}} required{{end}}>
-{{else if or (eq .Type "enum") (eq .Type "reference")}}<select id="{{.Name}}" name="{{.Name}}"{{if .Required}} required{{end}}>
+{{else if eq .Type "reference"}}<div class="uc-ref" data-target="{{.RefTarget}}" data-field="{{.Name}}">
+<input type="hidden" name="{{.Name}}" value="{{.Value}}">
+<input type="text" id="{{.Name}}" class="uc-ref-search" autocomplete="off" value="{{.CurrentLabel}}" placeholder="{{$.RefSearchPlaceholder}}"{{if .Required}} required{{end}}>
+<div class="uc-ref-results" hidden></div>
+</div>
+{{else if eq .Type "enum"}}<select id="{{.Name}}" name="{{.Name}}"{{if .Required}} required{{end}}>
 {{range .Options}}<option value="{{.Value}}" {{if .Selected}}selected{{end}}>{{.Label}}</option>{{end}}
 </select>
 {{else if eq .Type "date"}}<input type="date" id="{{.Name}}" name="{{.Name}}" value="{{.Value}}"{{if .Required}} required{{end}}>

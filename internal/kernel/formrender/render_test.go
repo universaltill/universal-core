@@ -69,24 +69,19 @@ func purchaseOrderForm() *form.Definition {
 	}
 }
 
-// TestRender_ReferenceFieldRendersAsTextInput pins down current behaviour
-// for entity.FieldReference: buildFields' type switch only special-cases
-// FieldBool/FieldEnum, so a reference field (e.g. a vendor picker) falls
-// into the generic text-input branch rather than a picker widget. Fine as
-// a spike default — this test exists so a future picker-widget change is
-// a deliberate decision against a known baseline, not an unnoticed drift.
-// TestRender_ReferenceFieldRendersAsSelectWithLabels is the regression
-// test for a real usability gap: a FieldReference field used to render
-// as a plain text input, meaning the only way to fill it in was typing
-// a target record's raw id (a UUID) from memory — every reference
-// field in the whole kernel (PurchaseOrder.vendor_id, POLine.item_id,
-// Item.base_uom_id, ...) was effectively unusable for real data entry.
-// Now it's a <select> populated from Data.ReferenceOptions (built by
-// internal/api's loadReferenceOptions, which this package has no
-// access to itself — see ReferenceOption's own doc comment), showing
-// each option's human label, not its id, with the record's current
-// value pre-selected.
-func TestRender_ReferenceFieldRendersAsSelectWithLabels(t *testing.T) {
+// TestRender_ReferenceFieldRendersAsSearchableCombobox is the regression
+// test for #24's scaling fix. A FieldReference field first rendered as a
+// plain text input (fillable only by typing a raw UUID from memory), then
+// as a <select> of every target record — which fell over at real
+// customer-list scale. It now renders as a searchable combobox
+// (.uc-ref: a hidden id input the form submits, a visible search box, and
+// an async results div) that fetches candidates on demand from
+// internal/api's /api/references endpoint. Data.ReferenceOptions no longer
+// carries every candidate — only the CURRENT value's label, pre-loaded by
+// internal/api's loadCurrentReferenceLabels so an existing record shows a
+// name rather than a raw id on load (see ReferenceOption's own doc
+// comment; this package has no registry/crud access itself).
+func TestRender_ReferenceFieldRendersAsSearchableCombobox(t *testing.T) {
 	r := testRenderer(t)
 	ent := &entity.Definition{
 		EntityType: "PurchaseOrder",
@@ -113,14 +108,26 @@ func TestRender_ReferenceFieldRendersAsSelectWithLabels(t *testing.T) {
 		t.Fatalf("render: %v", err)
 	}
 	body := buf.String()
-	if !strings.Contains(body, `<select id="vendor_id" name="vendor_id" required>`) {
-		t.Fatalf("expected reference field to render as a required select, got:\n%s", body)
+	// A searchable combobox targeting the referenced entity, not a
+	// <select> of every record (#24 — the full-list select doesn't scale).
+	if !strings.Contains(body, `class="uc-ref" data-target="Party" data-field="vendor_id"`) {
+		t.Fatalf("expected a reference combobox targeting Party, got:\n%s", body)
 	}
-	if !strings.Contains(body, `<option value="vendor-1" >Acme Textiles</option>`) {
-		t.Fatalf("expected an unselected option with a human label, not a raw id, got:\n%s", body)
+	// The actual submitted value is the id, in a hidden input. `required`
+	// is NOT on the hidden input — HTML5 constraint validation ignores
+	// hidden inputs, so `required` there is inert; it belongs on the
+	// visible search box (asserted below).
+	if !strings.Contains(body, `<input type="hidden" name="vendor_id" value="vendor-42">`) {
+		t.Fatalf("expected the id in a plain hidden input (no inert required), got:\n%s", body)
 	}
-	if !strings.Contains(body, `<option value="vendor-42" selected>Beta Supplies</option>`) {
-		t.Fatalf("expected the current value's option to be selected, got:\n%s", body)
+	// The visible search box shows the current record's LABEL, not its id,
+	// carries id="vendor_id" so the field's <label for> associates with it,
+	// and carries `required` where the browser actually enforces it.
+	if !strings.Contains(body, `<input type="text" id="vendor_id" class="uc-ref-search" autocomplete="off" value="Beta Supplies" placeholder="Search…" required>`) {
+		t.Fatalf("expected a required, id'd search box showing the current label, got:\n%s", body)
+	}
+	if strings.Contains(body, "vendor-42\">Beta") { // no leftover <option>
+		t.Fatalf("reference field should no longer render <option>s:\n%s", body)
 	}
 }
 
@@ -130,32 +137,29 @@ func TestRender_ReferenceFieldRendersAsSelectWithLabels(t *testing.T) {
 // (whichever option renders first) would look selected on an untouched
 // new-record form even though nothing was actually chosen, and
 // submitting it would silently write that first option's id.
-func TestRender_UnsetOptionalReferenceFieldGetsEmptyOption(t *testing.T) {
+func TestRender_UnsetOptionalReferenceFieldGetsEmptyCombobox(t *testing.T) {
 	r := testRenderer(t)
 	ent := &entity.Definition{
-		EntityType: "Item",
-		Fields:     []entity.Field{{Name: "base_uom_id", Type: entity.FieldReference, Target: "UnitOfMeasure"}},
+		EntityType: "PurchaseOrder",
+		Fields:     []entity.Field{{Name: "vendor_id", Type: entity.FieldReference, Target: "Party"}},
 	}
 	def := &form.Definition{
-		EntityType: "Item",
-		Sections: []form.Section{{
-			Title: "Header", Component: form.ComponentFields,
-			Fields: []form.FormField{{Name: "base_uom_id", Label: "Unit"}},
-		}},
-	}
-	data := Data{
-		Record: map[string]any{},
-		ReferenceOptions: map[string][]ReferenceOption{
-			"base_uom_id": {{ID: "uom-1", Label: "Each"}},
-		},
+		EntityType: "PurchaseOrder",
+		Sections: []form.Section{{Title: "H", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "vendor_id", Label: "Vendor"}}}},
 	}
 	var buf strings.Builder
-	if err := r.Render(&buf, def, ent, data, "en"); err != nil {
+	if err := r.Render(&buf, def, ent, Data{ReferenceOptions: map[string][]ReferenceOption{}}, "en"); err != nil {
 		t.Fatalf("render: %v", err)
 	}
 	body := buf.String()
-	if !strings.Contains(body, `<option value="" selected></option>`) {
-		t.Fatalf("expected a selected empty option on an unset optional reference field, got:\n%s", body)
+	// Unset, optional: an empty hidden id (no `required`) and a blank
+	// search box.
+	if !strings.Contains(body, `<input type="hidden" name="vendor_id" value="">`) {
+		t.Fatalf("unset optional reference should have an empty, non-required hidden id, got:\n%s", body)
+	}
+	if strings.Contains(body, `name="vendor_id" value="" required`) {
+		t.Fatalf("an OPTIONAL reference must not be required:\n%s", body)
 	}
 }
 
@@ -169,7 +173,7 @@ func TestRender_UnsetOptionalReferenceFieldGetsEmptyOption(t *testing.T) {
 // never actually blocked submitting an unmade choice. Same fix now
 // applies uniformly regardless of Required: the empty option only
 // disappears once a real value exists.
-func TestRender_UnsetRequiredReferenceFieldGetsEmptyOptionToo(t *testing.T) {
+func TestRender_UnsetRequiredReferenceFieldComboboxIsRequired(t *testing.T) {
 	r := testRenderer(t)
 	ent := &entity.Definition{
 		EntityType: "PurchaseOrder",
@@ -177,24 +181,24 @@ func TestRender_UnsetRequiredReferenceFieldGetsEmptyOptionToo(t *testing.T) {
 	}
 	def := &form.Definition{
 		EntityType: "PurchaseOrder",
-		Sections: []form.Section{{
-			Title: "Header", Component: form.ComponentFields,
-			Fields: []form.FormField{{Name: "vendor_id", Label: "Vendor"}},
-		}},
-	}
-	data := Data{
-		Record: map[string]any{},
-		ReferenceOptions: map[string][]ReferenceOption{
-			"vendor_id": {{ID: "vendor-1", Label: "Acme Textiles"}},
-		},
+		Sections: []form.Section{{Title: "H", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "vendor_id", Label: "Vendor"}}}},
 	}
 	var buf strings.Builder
-	if err := r.Render(&buf, def, ent, data, "en"); err != nil {
+	if err := r.Render(&buf, def, ent, Data{ReferenceOptions: map[string][]ReferenceOption{}}, "en"); err != nil {
 		t.Fatalf("render: %v", err)
 	}
+	// A required reference with no value: the hidden id is empty (and
+	// plain — `required` on a hidden input is inert), while the visible
+	// search box carries `required` so the browser actually blocks submit
+	// until the user picks an option (which fills the hidden id via the
+	// combobox JS). The server still enforces the requirement regardless.
 	body := buf.String()
-	if !strings.Contains(body, `<select id="vendor_id" name="vendor_id" required>`+"\n"+`<option value="" selected></option>`) {
-		t.Fatalf("expected a required select to still start with a selected empty option when unset, got:\n%s", body)
+	if !strings.Contains(body, `<input type="hidden" name="vendor_id" value="">`) {
+		t.Fatalf("unset required reference should have an empty plain hidden id, got:\n%s", body)
+	}
+	if !strings.Contains(body, `class="uc-ref-search" autocomplete="off" value="" placeholder="Search…" required>`) {
+		t.Fatalf("unset required reference should mark the VISIBLE search box required, got:\n%s", body)
 	}
 }
 
@@ -393,11 +397,13 @@ func TestRender_UntranslatedFieldLabelFallsBackToDeclaredLabel(t *testing.T) {
 	}
 }
 
-// TestRender_ReferenceFieldWithNoOptionsRendersEmptySelect confirms a
-// missing/broken target (internal/api's loadReferenceOptions degrades
-// to no entry rather than failing the whole render) still produces a
-// usable, if incomplete, form — not a render error.
-func TestRender_ReferenceFieldWithNoOptionsRendersEmptySelect(t *testing.T) {
+// TestRender_ReferenceFieldWithNoOptionsStillRendersCombobox confirms a
+// reference field with no pre-loaded current-value label (a new/unset
+// field, or a target whose label lookup degraded to no entry rather than
+// failing the whole render — see internal/api's loadCurrentReferenceLabels)
+// still produces a usable combobox with an empty search box, not a render
+// error.
+func TestRender_ReferenceFieldWithNoOptionsStillRendersCombobox(t *testing.T) {
 	r := testRenderer(t)
 	ent := &entity.Definition{
 		EntityType: "PurchaseOrder",
@@ -405,18 +411,17 @@ func TestRender_ReferenceFieldWithNoOptionsRendersEmptySelect(t *testing.T) {
 	}
 	def := &form.Definition{
 		EntityType: "PurchaseOrder",
-		Sections: []form.Section{{
-			Title: "Header", Component: form.ComponentFields,
-			Fields: []form.FormField{{Name: "vendor_id", Label: "Vendor"}},
-		}},
+		Sections: []form.Section{{Title: "H", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "vendor_id", Label: "Vendor"}}}},
 	}
-	data := Data{Record: map[string]any{}}
 	var buf strings.Builder
-	if err := r.Render(&buf, def, ent, data, "en"); err != nil {
+	// No ReferenceOptions at all — the combobox still renders (it searches
+	// the endpoint on demand; it never needed the options preloaded).
+	if err := r.Render(&buf, def, ent, Data{}, "en"); err != nil {
 		t.Fatalf("render: %v", err)
 	}
-	if !strings.Contains(buf.String(), `<select id="vendor_id" name="vendor_id">`) {
-		t.Fatalf("expected an empty but valid select, got:\n%s", buf.String())
+	if !strings.Contains(buf.String(), `class="uc-ref" data-target="Party"`) {
+		t.Fatalf("a reference with no preloaded options should still render a combobox, got:\n%s", buf.String())
 	}
 }
 

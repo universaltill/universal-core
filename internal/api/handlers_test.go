@@ -1500,58 +1500,57 @@ func orderFormDefWithVendorReference() *form.Definition {
 	}
 }
 
-// TestAPI_RenderForm_ReferenceFieldShowsTargetRecordsAsDropdown is the
-// end-to-end regression test for the actual usability fix (formrender's
-// own tests cover the template logic in isolation): a real published
-// Vendor record's name shows up as a selectable option on a real
-// PurchaseOrder-shaped form's vendor_id field, sourced by
-// internal/api's loadReferenceOptions — not a text box requiring the
-// vendor's raw id.
-func TestAPI_RenderForm_ReferenceFieldShowsTargetRecordsAsDropdown(t *testing.T) {
+// TestAPI_RenderForm_ReferenceFieldRendersComboboxNotFullList is the
+// end-to-end regression test for #24's actual scaling fix (formrender's
+// own tests cover the template logic in isolation): a reference field
+// renders as a searchable combobox targeting the referenced entity, and
+// the new-record form must NOT pre-load every target record — that
+// full-<select> behaviour is exactly what fell over at real
+// customer-list scale. The candidate records are instead served on
+// demand by /api/references/{target} (covered by reference_search_test.go).
+func TestAPI_RenderForm_ReferenceFieldRendersComboboxNotFullList(t *testing.T) {
 	router := newTestRouter(t)
 	withDevAuthEnabled(t)
 	tenantID, db := newTestTenant(t, router)
 	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
 	publishEntityAndForm(t, db, orderEntityDefWithVendorReference(), orderFormDefWithVendorReference())
 
-	createReq := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{"name":"Acme Textiles"}`))
-	createRec := httptest.NewRecorder()
 	mux := http.NewServeMux()
 	testHandler(t, router).Routes(mux)
+
+	createReq := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{"name":"Acme Textiles"}`))
+	createRec := httptest.NewRecorder()
 	mux.ServeHTTP(createRec, createReq)
 	if createRec.Code != http.StatusCreated {
 		t.Fatalf("expected 201 creating the Vendor, got %d: %s", createRec.Code, createRec.Body.String())
-	}
-	var created struct {
-		Data struct {
-			ID string `json:"id"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
-		t.Fatalf("unmarshal create response: %v", err)
 	}
 
 	req := newRequest("GET", "/forms/Order/new", tenantID, "farshid", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
-
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, `<select id="vendor_id" name="vendor_id">`) {
-		t.Fatalf("expected vendor_id to render as a select, got:\n%s", body)
+	if !strings.Contains(body, `class="uc-ref" data-target="Vendor" data-field="vendor_id"`) {
+		t.Fatalf("expected vendor_id to render as a combobox targeting Vendor, got:\n%s", body)
 	}
-	if !strings.Contains(body, `<option value="`+created.Data.ID+`" >Acme Textiles</option>`) {
-		t.Fatalf("expected the Vendor's name as an option label (not its raw id), got:\n%s", body)
+	if strings.Contains(body, `<select id="vendor_id"`) {
+		t.Fatalf("reference field must no longer render as a full <select>, got:\n%s", body)
+	}
+	// The scaling guarantee: a new form must NOT ship the target records'
+	// data. If "Acme Textiles" appears in the new-form HTML, the old
+	// preload-everything path is back.
+	if strings.Contains(body, "Acme Textiles") {
+		t.Fatalf("new form must not pre-load target records (found a vendor name in the body), got:\n%s", body)
 	}
 }
 
-// TestAPI_RenderForm_ReferenceFieldWithoutNameFieldFallsBackToID
-// confirms a target entity with no "name" field still produces a
-// usable (if less friendly) dropdown, labeled by id, rather than an
-// error or an empty option.
-func TestAPI_RenderForm_ReferenceFieldWithoutNameFieldFallsBackToID(t *testing.T) {
+// TestAPI_ReferenceSearch_WithoutNameFieldFallsBackToID confirms the
+// search endpoint labels a target entity with no "name" field by its raw
+// id, rather than an error or an empty label. The label-fallback chain
+// (name -> title -> id) now lives in searchReferenceOptions.
+func TestAPI_ReferenceSearch_WithoutNameFieldFallsBackToID(t *testing.T) {
 	router := newTestRouter(t)
 	withDevAuthEnabled(t)
 	tenantID, db := newTestTenant(t, router)
@@ -1566,7 +1565,6 @@ func TestAPI_RenderForm_ReferenceFieldWithoutNameFieldFallsBackToID(t *testing.T
 		Sections:   []form.Section{{Title: "Details", Component: form.ComponentFields, Fields: []form.FormField{{Name: "code", Label: "Code"}}}},
 	}
 	publishEntityAndForm(t, db, noNameEntDef, noNameFormDef)
-	publishEntityAndForm(t, db, orderEntityDefWithVendorReference(), orderFormDefWithVendorReference())
 
 	mux := http.NewServeMux()
 	testHandler(t, router).Routes(mux)
@@ -1586,28 +1584,25 @@ func TestAPI_RenderForm_ReferenceFieldWithoutNameFieldFallsBackToID(t *testing.T
 		t.Fatalf("unmarshal create response: %v", err)
 	}
 
-	req := newRequest("GET", "/forms/Order/new", tenantID, "farshid", nil)
+	req := newRequest("GET", "/api/references/Vendor", tenantID, "farshid", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
-
-	if !strings.Contains(rec.Body.String(), `<option value="`+created.Data.ID+`" >`+created.Data.ID+`</option>`) {
-		t.Fatalf("expected the option labeled by id when the target has no name field, got:\n%s", rec.Body.String())
+	opts := decodeRefOptions(t, rec.Body.Bytes())
+	if len(opts) != 1 || opts[0].Label != created.Data.ID {
+		t.Fatalf("expected the option labelled by id when the target has no name field, got %+v", opts)
 	}
 }
 
-// TestAPI_RenderForm_ReferenceFieldFallsBackToTitleField is the
-// regression test for the Position.reports_to_position_id picker (and
-// any other entity with a "title" field but no "name" field, e.g.
-// IssueReport): referenceOptionsFor's label-field fallback chain
-// (name -> title -> id) was previously name-only, which rendered every
-// option in such a picker as a raw UUID — real usability bug, found by
-// this feature's own independent review, since Position has no "name"
-// field per reference-data-model.md §7's own spec (title is its label).
-// Deliberately does NOT extend to a "code" fallback (see
-// referenceLabelFieldCandidates' own doc comment) — this test's sibling
-// TestAPI_RenderForm_ReferenceFieldWithoutNameFieldFallsBackToID pins
+// TestAPI_ReferenceSearch_FallsBackToTitleField is the regression test
+// for the Position.reports_to_position_id picker (and any other entity
+// with a "title" field but no "name" field, e.g. IssueReport): the
+// label-field fallback chain (name -> title -> id) must resolve to
+// "title", since Position has no "name" field per reference-data-model.md
+// §7's own spec (title is its label). Deliberately does NOT extend to a
+// "code" fallback (see referenceLabelFieldCandidates' own doc comment) —
+// its sibling TestAPI_ReferenceSearch_WithoutNameFieldFallsBackToID pins
 // that a code-only entity still falls back to id.
-func TestAPI_RenderForm_ReferenceFieldFallsBackToTitleField(t *testing.T) {
+func TestAPI_ReferenceSearch_FallsBackToTitleField(t *testing.T) {
 	router := newTestRouter(t)
 	withDevAuthEnabled(t)
 	tenantID, db := newTestTenant(t, router)
@@ -1622,7 +1617,6 @@ func TestAPI_RenderForm_ReferenceFieldFallsBackToTitleField(t *testing.T) {
 		Sections:   []form.Section{{Title: "Details", Component: form.ComponentFields, Fields: []form.FormField{{Name: "title", Label: "Title"}}}},
 	}
 	publishEntityAndForm(t, db, titleOnlyEntDef, titleOnlyFormDef)
-	publishEntityAndForm(t, db, orderEntityDefWithVendorReference(), orderFormDefWithVendorReference())
 
 	mux := http.NewServeMux()
 	testHandler(t, router).Routes(mux)
@@ -1633,21 +1627,13 @@ func TestAPI_RenderForm_ReferenceFieldFallsBackToTitleField(t *testing.T) {
 	if createRec.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %s", createRec.Code, createRec.Body.String())
 	}
-	var created struct {
-		Data struct {
-			ID string `json:"id"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
-		t.Fatalf("unmarshal create response: %v", err)
-	}
 
-	req := newRequest("GET", "/forms/Order/new", tenantID, "farshid", nil)
+	req := newRequest("GET", "/api/references/Vendor", tenantID, "farshid", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
-
-	if !strings.Contains(rec.Body.String(), `<option value="`+created.Data.ID+`" >Regional Manager</option>`) {
-		t.Fatalf("expected the option labeled by its title field (not its raw id), got:\n%s", rec.Body.String())
+	opts := decodeRefOptions(t, rec.Body.Bytes())
+	if len(opts) != 1 || opts[0].Label != "Regional Manager" {
+		t.Fatalf("expected the option labelled by its title field (not its raw id), got %+v", opts)
 	}
 }
 

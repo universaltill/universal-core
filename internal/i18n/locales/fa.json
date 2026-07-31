@@ -292,5 +292,6 @@
   "workflow_inbox.requires_role_in_department": "نیازمند نقش {role} در بخش این رکورد",
   "list.filter_placeholder": "فیلتر…",
   "list.filter_button": "فیلتر",
-  "list.filter_clear": "پاک کردن"
+  "list.filter_clear": "پاک کردن",
+  "form.reference.search": "جستجو…"
 }

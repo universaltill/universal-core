@@ -32,9 +32,9 @@ import (
 // stored Definition, a DB error listing names) is logged and otherwise
 // ignored, never surfaced as a failure of the create/update itself: the
 // record write already succeeded, and "your save failed" would be a lie
-// the same way a broken reference-option lookup degrading silently
-// (loadReferenceOptions) is a deliberate choice elsewhere in this file,
-// not an oversight.
+// the same way a broken reference-label lookup degrading silently
+// (loadCurrentReferenceLabels) is a deliberate choice elsewhere in this
+// file, not an oversight.
 //
 // O(published workflow count) per create/update — reads every published
 // workflow Definition for the tenant and checks its Trigger in Go, since

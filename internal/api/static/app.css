@@ -471,3 +471,18 @@ button.uc-btn:hover {
 }
 th a.uc-sort { color: inherit; text-decoration: none; display: inline-block; }
 th a.uc-sort:hover { text-decoration: underline; }
+
+/* Searchable reference-field combobox (#24). */
+.uc-ref { position: relative; }
+.uc-ref-search {
+  width: 100%; padding: 0.4rem 0.6rem; border: 1px solid var(--uc-border);
+  border-radius: 4px; font-size: 0.95rem;
+}
+.uc-ref-results {
+  position: absolute; z-index: 5; left: 0; right: 0; top: 100%;
+  background: #fff; border: 1px solid var(--uc-border); border-top: none;
+  border-radius: 0 0 4px 4px; max-height: 14rem; overflow-y: auto;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+}
+.uc-ref-option { padding: 0.4rem 0.6rem; cursor: pointer; font-size: 0.9rem; }
+.uc-ref-option:hover { background: var(--uc-bg); }

@@ -166,6 +166,68 @@ var shellTmpl = template.Must(template.New("shell").Parse(fmt.Sprintf(`<!doctype
   document.body.addEventListener("htmx:sendError", function() {
     showToast({{.ToastNetworkError}});
   });
+
+  // Searchable reference-field combobox (#24). A reference field renders
+  // as .uc-ref { hidden input (the id), text input (the search), results
+  // div }. Typing queries /api/references/{target}; clicking an option
+  // sets the hidden id and the visible label. Delegated from the body so
+  // it works for fields swapped in by htmx too, and debounced so a fast
+  // typist doesn't fire a request per keystroke.
+  var refTimers = new WeakMap();
+  // refSeq gives each search box a monotonic request counter. Every fetch
+  // captures the counter's value at dispatch and its response is applied
+  // only if it is still the latest — so a slow earlier request can't
+  // overwrite a fresher one's results with stale ones, and picking an
+  // option (which bumps the counter) discards any still-in-flight fetch
+  // rather than letting it reopen the dropdown a moment later.
+  var refSeq = new WeakMap();
+  document.body.addEventListener("input", function(evt) {
+    var search = evt.target;
+    if (!search.classList.contains("uc-ref-search")) { return; }
+    var box = search.closest(".uc-ref");
+    var hidden = box.querySelector('input[type="hidden"]');
+    // Editing the search text invalidates any previously chosen id until
+    // a new option is clicked — otherwise the label and the id could
+    // disagree and the form would submit a stale reference.
+    hidden.value = "";
+    window.clearTimeout(refTimers.get(search));
+    refTimers.set(search, window.setTimeout(function() {
+      var mySeq = (refSeq.get(search) || 0) + 1;
+      refSeq.set(search, mySeq);
+      var url = "/api/references/" + encodeURIComponent(box.dataset.target)
+              + "?q=" + encodeURIComponent(search.value);
+      fetch(url, { headers: { "Accept": "application/json" } })
+        .then(function(r) { return r.json(); })
+        .then(function(env) {
+          if (refSeq.get(search) !== mySeq) { return; } // superseded
+          var results = box.querySelector(".uc-ref-results");
+          var opts = (env && env.data) || [];
+          results.innerHTML = "";
+          opts.forEach(function(o) {
+            var el = document.createElement("div");
+            el.className = "uc-ref-option";
+            el.textContent = o.label;
+            el.setAttribute("data-id", o.id);
+            results.appendChild(el);
+          });
+          results.hidden = opts.length === 0;
+        })
+        .catch(function() { /* a failed search leaves the last results up */ });
+    }, 200));
+  });
+  document.body.addEventListener("click", function(evt) {
+    var opt = evt.target;
+    if (!opt.classList.contains("uc-ref-option")) { return; }
+    var box = opt.closest(".uc-ref");
+    var search = box.querySelector(".uc-ref-search");
+    // Cancel any pending/in-flight search for this box so it can't reopen
+    // the results right after a selection.
+    window.clearTimeout(refTimers.get(search));
+    refSeq.set(search, (refSeq.get(search) || 0) + 1);
+    box.querySelector('input[type="hidden"]').value = opt.getAttribute("data-id");
+    search.value = opt.textContent;
+    box.querySelector(".uc-ref-results").hidden = true;
+  });
 })();
 </script>
 </body>
