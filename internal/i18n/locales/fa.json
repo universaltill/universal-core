@@ -289,5 +289,8 @@
   "workflow_inbox.column_action": "اقدام",
   "workflow_inbox.requires_role": "نیازمند نقش {role}",
   "workflow_inbox.unavailable": "در دسترس نیست",
-  "workflow_inbox.requires_role_in_department": "نیازمند نقش {role} در بخش این رکورد"
+  "workflow_inbox.requires_role_in_department": "نیازمند نقش {role} در بخش این رکورد",
+  "list.filter_placeholder": "فیلتر…",
+  "list.filter_button": "فیلتر",
+  "list.filter_clear": "پاک کردن"
 }

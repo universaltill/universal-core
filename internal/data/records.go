@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 var ErrNotFound = errors.New("data: record not found")
@@ -244,6 +245,132 @@ func (r *RecordRepo) ListPage(ctx context.Context, entityType string, limit, off
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list records page: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Record
+	for rows.Next() {
+		var id string
+		var raw []byte
+		var version int
+		if err := rows.Scan(&id, &raw, &version); err != nil {
+			return nil, fmt.Errorf("scan record: %w", err)
+		}
+		var data map[string]any
+		if err := json.Unmarshal(raw, &data); err != nil {
+			return nil, fmt.Errorf("unmarshal record data: %w", err)
+		}
+		out = append(out, Record{ID: id, EntityType: entityType, Data: data, Version: version})
+	}
+	return out, rows.Err()
+}
+
+// ListPageOptions describes an optional sort and single-field filter for
+// ListPageFiltered. Zero value == ListPage's behaviour (created_at order,
+// no filter), so the plain paginated path is unchanged.
+//
+// SortField/FilterField are JSON keys inside the data blob. The CALLER
+// (internal/api) must validate them against the entity Definition's real
+// fields before passing them here — an unknown field is a caller bug, not
+// a query-structure risk: both are bound as parameters to the ->>
+// operator, never concatenated into the SQL, so even an unvalidated value
+// cannot alter the query. Validation exists so a typo'd sort field is a
+// clean "unknown field" rather than a silently-empty ORDER BY key.
+type ListPageOptions struct {
+	SortField string // "" = created_at (the stable default)
+	SortDesc  bool
+	// SortNumeric sorts the field as a number, not text — set by the
+	// caller for FieldNumber fields so "10" sorts after "9". A JSON text
+	// extraction sorts lexically otherwise, which is wrong for any amount
+	// or quantity.
+	SortNumeric bool
+	FilterField string // "" = no filter
+	FilterValue string // substring match (ILIKE), only used when FilterField set
+	Limit       int
+	Offset      int
+}
+
+// CountFiltered is Count with the same optional filter ListPageFiltered
+// applies, so the pager's total-pages math matches the rows actually
+// returned. Without it, filtering to 3 rows would still show "Page 1 of
+// 40".
+func (r *RecordRepo) CountFiltered(ctx context.Context, entityType string, opts ListPageOptions) (int, error) {
+	if opts.FilterField == "" {
+		return r.CountByEntityType(ctx, entityType)
+	}
+	var n int
+	err := r.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM records
+		 WHERE entity_type = $1 AND deleted_at IS NULL
+		   AND data->>$2 ILIKE $3 ESCAPE '\'`,
+		entityType, opts.FilterField, "%"+escapeLike(opts.FilterValue)+"%",
+	).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count filtered records: %w", err)
+	}
+	return n, nil
+}
+
+// escapeLike neutralises LIKE/ILIKE wildcards in a user filter value so a
+// literal "%" or "_" matches itself, not "anything". Pairs with the
+// ESCAPE '\' clause on the queries. Backslash first, so it does not
+// double-escape the escapes it adds.
+func escapeLike(s string) string {
+	s = strings.ReplaceAll(s, "\\", "\\\\")
+	s = strings.ReplaceAll(s, "%", "\\%")
+	s = strings.ReplaceAll(s, "_", "\\_")
+	return s
+}
+
+// ListPageFiltered is ListPage with an optional sort and substring filter.
+//
+// The sort DIRECTION is chosen from opts.SortDesc as a SQL literal
+// (ASC/DESC), never interpolated from caller text — direction is the one
+// part of an ORDER BY that cannot be a bind parameter, so it must come
+// from a closed set. The sort KEY and filter key/value are all bound
+// parameters. `id` stays the final tiebreaker so a page boundary is
+// deterministic even when many rows share the sort value.
+func (r *RecordRepo) ListPageFiltered(ctx context.Context, entityType string, opts ListPageOptions) ([]Record, error) {
+	args := []any{entityType}
+	where := "entity_type = $1 AND deleted_at IS NULL"
+	if opts.FilterField != "" {
+		args = append(args, opts.FilterField, "%"+escapeLike(opts.FilterValue)+"%")
+		where += fmt.Sprintf(` AND data->>$%d ILIKE $%d ESCAPE '\'`, len(args)-1, len(args))
+	}
+
+	// created_at is a real column; a declared field sorts by its JSON
+	// value. NULLS LAST keeps records missing the sort field from
+	// dominating the first page of a descending sort.
+	orderBy := "created_at"
+	if opts.SortField != "" {
+		args = append(args, opts.SortField)
+		// A numeric field cast to numeric, so "10" sorts after "9" rather
+		// than before it (text order) — wrong for money/qty is not a
+		// cosmetic nit on an accounting product. The cast is guarded so a
+		// non-numeric value in the field can't error the whole query
+		// (data is JSON: a field could hold anything a bad import wrote).
+		if opts.SortNumeric {
+			orderBy = fmt.Sprintf(`(CASE WHEN data->>$%d ~ '^-?[0-9]+(\.[0-9]+)?$' THEN (data->>$%d)::numeric END)`, len(args), len(args))
+		} else {
+			orderBy = fmt.Sprintf("data->>$%d", len(args))
+		}
+	}
+	dir := "ASC"
+	if opts.SortDesc {
+		dir = "DESC"
+	}
+
+	args = append(args, opts.Limit, opts.Offset)
+	query := fmt.Sprintf(
+		`SELECT id, data, version FROM records
+		 WHERE %s
+		 ORDER BY %s %s NULLS LAST, id
+		 LIMIT $%d OFFSET $%d`,
+		where, orderBy, dir, len(args)-1, len(args))
+
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list filtered records page: %w", err)
 	}
 	defer rows.Close()
 

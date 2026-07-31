@@ -289,5 +289,8 @@
   "workflow_inbox.column_action": "الإجراء",
   "workflow_inbox.requires_role": "يتطلب دور {role}",
   "workflow_inbox.unavailable": "غير متاح",
-  "workflow_inbox.requires_role_in_department": "يتطلب دور {role} في قسم هذا السجل"
+  "workflow_inbox.requires_role_in_department": "يتطلب دور {role} في قسم هذا السجل",
+  "list.filter_placeholder": "تصفية…",
+  "list.filter_button": "تصفية",
+  "list.filter_clear": "مسح"
 }

@@ -289,5 +289,8 @@
   "workflow_inbox.column_action": "İşlem",
   "workflow_inbox.requires_role": "{role} rolü gerekiyor",
   "workflow_inbox.unavailable": "Kullanılamıyor",
-  "workflow_inbox.requires_role_in_department": "Bu kaydın departmanında {role} rolü gerekiyor"
+  "workflow_inbox.requires_role_in_department": "Bu kaydın departmanında {role} rolü gerekiyor",
+  "list.filter_placeholder": "Filtrele…",
+  "list.filter_button": "Filtrele",
+  "list.filter_clear": "Temizle"
 }

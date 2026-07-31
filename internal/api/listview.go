@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
+	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/formrender"
 )
@@ -55,11 +57,6 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	total, err := ts.crud.Count(r.Context(), def)
-	if err != nil {
-		h.writeCrudPageError(w, r, &rc, locale, fmt.Sprintf("count %s records for list page", entityType), err)
-		return
-	}
 	// The guarded engine already strips hidden fields from the rows
 	// below, but a column has to disappear too: a header for a field
 	// whose every cell is blank tells a user exactly which fields are
@@ -71,6 +68,42 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	columns := visibleFields(def, redacted)
+
+	// Sort/filter come from the URL and are VALIDATED against the visible
+	// columns before reaching the query: an unknown or hidden field is
+	// dropped, not passed through. The repo binds them as parameters
+	// regardless (so structure is safe either way), but validating here
+	// means a typo'd or hidden field silently falls back to the default
+	// ordering rather than erroring or leaking that the field exists.
+	opts := data.ListPageOptions{Limit: listPageSize}
+	if sf := r.URL.Query().Get("sort"); sf != "" && isVisibleColumn(columns, sf) {
+		opts.SortField = sf
+		opts.SortDesc = r.URL.Query().Get("dir") == "desc"
+		// A number field sorts numerically, not as text — otherwise a
+		// list of purchase orders by total puts 100 before 90.
+		if f, ok := def.FieldByName(sf); ok && f.Type == entity.FieldNumber {
+			opts.SortNumeric = true
+		}
+	}
+	filterField := r.URL.Query().Get("filter")
+	if filterField == "" && len(columns) > 0 {
+		// No explicit field: search the first visible column. A
+		// single-box filter with no column picker (the current UI) needs a
+		// default target, and the first column — conventionally name — is
+		// the one a user means by "filter this list".
+		filterField = columns[0].Name
+	}
+	filterValue := r.URL.Query().Get("q")
+	if filterValue != "" && isVisibleColumn(columns, filterField) {
+		opts.FilterField = filterField
+		opts.FilterValue = filterValue
+	}
+
+	total, err := ts.crud.CountFiltered(r.Context(), def, opts)
+	if err != nil {
+		h.writeCrudPageError(w, r, &rc, locale, fmt.Sprintf("count %s records for list page", entityType), err)
+		return
+	}
 	totalPages := (total + listPageSize - 1) / listPageSize
 	if totalPages < 1 {
 		totalPages = 1
@@ -82,7 +115,8 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 	if page > totalPages {
 		page = totalPages
 	}
-	records, err := ts.crud.ListPage(r.Context(), def, listPageSize, (page-1)*listPageSize)
+	opts.Offset = (page - 1) * listPageSize
+	records, err := ts.crud.ListPageFiltered(r.Context(), def, opts)
 	if err != nil {
 		h.writeCrudPageError(w, r, &rc, locale, fmt.Sprintf("list %s records for list page", entityType), err)
 		return
@@ -110,38 +144,86 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	view := recordListView{
-		Name:       h.entityDisplayName(locale, entityType),
-		Code:       entityType,
-		NewHref:    "/forms/" + entityType + "/new",
-		ImportHref: "/import/" + entityType,
-		ExportHref: "/export/" + entityType,
-		NewLabel:   h.catalog.T(locale, "dashboard.new_link"),
-		ImportLink: h.catalog.T(locale, "dashboard.import_link"),
-		ExportLink: h.catalog.T(locale, "dashboard.export_link"),
-		Empty:      h.catalog.T(locale, "list.empty"),
+		Name:        h.entityDisplayName(locale, entityType),
+		Code:        entityType,
+		NewHref:     "/forms/" + entityType + "/new",
+		ImportHref:  "/import/" + entityType,
+		ExportHref:  "/export/" + entityType,
+		NewLabel:    h.catalog.T(locale, "dashboard.new_link"),
+		ImportLink:  h.catalog.T(locale, "dashboard.import_link"),
+		ExportLink:  h.catalog.T(locale, "dashboard.export_link"),
+		Empty:       h.catalog.T(locale, "list.empty"),
+		FilterField: opts.FilterField,
+		FilterValue: opts.FilterValue,
+		FilterHref:  "/records/" + entityType,
+		FilterLabel: h.catalog.T(locale, "list.filter_placeholder"),
+		FilterGo:    h.catalog.T(locale, "list.filter_button"),
+		FilterClear: h.catalog.T(locale, "list.filter_clear"),
+	}
+	// keepQuery preserves the active filter across sort and page links, so
+	// sorting a filtered list doesn't silently clear the filter.
+	keepQuery := func(extra url.Values) string {
+		q := url.Values{}
+		if opts.FilterField != "" {
+			q.Set("filter", opts.FilterField)
+			q.Set("q", opts.FilterValue)
+		}
+		for k, vs := range extra {
+			for _, v := range vs {
+				q.Set(k, v)
+			}
+		}
+		if len(q) == 0 {
+			return "/records/" + entityType
+		}
+		return "/records/" + entityType + "?" + q.Encode()
 	}
 	if totalPages > 1 {
-		listHref := "/records/" + entityType
 		pageLabel := h.catalog.T(locale, "list.page_of")
 		pageLabel = strings.ReplaceAll(pageLabel, "{page}", strconv.Itoa(page))
 		pageLabel = strings.ReplaceAll(pageLabel, "{total}", strconv.Itoa(totalPages))
 		view.PageLabel = pageLabel
+		sortParams := func(base url.Values) url.Values {
+			if opts.SortField != "" {
+				base.Set("sort", opts.SortField)
+				if opts.SortDesc {
+					base.Set("dir", "desc")
+				}
+			}
+			return base
+		}
 		if page > 1 {
-			view.PrevHref = fmt.Sprintf("%s?page=%d", listHref, page-1)
+			view.PrevHref = keepQuery(sortParams(url.Values{"page": {strconv.Itoa(page - 1)}}))
 			view.PrevLabel = h.catalog.T(locale, "list.prev")
 		}
 		if page < totalPages {
-			view.NextHref = fmt.Sprintf("%s?page=%d", listHref, page+1)
+			view.NextHref = keepQuery(sortParams(url.Values{"page": {strconv.Itoa(page + 1)}}))
 			view.NextLabel = h.catalog.T(locale, "list.next")
 		}
 	}
 	for _, f := range columns {
-		// Same "field.{EntityType}.{FieldName}" convention formrender
-		// uses for form labels (falls back to the raw field name when no
-		// translation exists yet) — previously every list page showed
-		// raw snake_case column headers regardless of locale (QUEUE.md,
-		// flagged "not built yet" on 2026-07-20).
-		view.Columns = append(view.Columns, h.catalog.TOrDefault(locale, "field."+entityType+"."+f.Name, f.Name))
+		// A header is a sort link: clicking it sorts by that column, and
+		// clicking the already-sorted column flips the direction. The
+		// arrow shows the current sort so the ordering is legible, not a
+		// mystery the user has to test by reading rows.
+		label := h.catalog.TOrDefault(locale, "field."+entityType+"."+f.Name, f.Name)
+		nextDesc := opts.SortField == f.Name && !opts.SortDesc
+		params := url.Values{"sort": {f.Name}}
+		if nextDesc {
+			params.Set("dir", "desc")
+		}
+		arrow := ""
+		if opts.SortField == f.Name {
+			arrow = " ↑"
+			if opts.SortDesc {
+				arrow = " ↓"
+			}
+		}
+		view.Columns = append(view.Columns, columnView{
+			Label: label,
+			Href:  keepQuery(params),
+			Arrow: arrow,
+		})
 	}
 	for _, rec := range records {
 		row := recordRowView{Href: "/forms/" + entityType + "/" + rec.ID}
@@ -171,6 +253,20 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 //
 // Returns def.Fields unchanged (no copy) in the overwhelmingly common
 // case of nothing redacted.
+// isVisibleColumn reports whether name is one of the columns this viewer
+// may see — the gate on any sort/filter field before it reaches the
+// query. A field the viewer can't see must not be sortable/filterable
+// (the guarded engine refuses it too, but rejecting it here keeps the
+// page working instead of erroring).
+func isVisibleColumn(cols []entity.Field, name string) bool {
+	for _, c := range cols {
+		if c.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 func visibleFields(def *entity.Definition, redacted map[string]bool) []entity.Field {
 	if len(redacted) == 0 {
 		return def.Fields
@@ -209,18 +305,30 @@ func (h *Handler) cellText(entityType string, f entity.Field, value any, referen
 	return formrender.FormatFieldValue(value)
 }
 
+type columnView struct {
+	Label string
+	Href  string
+	Arrow string
+}
+
 type recordListView struct {
-	Name       string
-	Code       string
-	Columns    []string
-	Rows       []recordRowView
-	NewHref    string
-	ImportHref string
-	ExportHref string
-	NewLabel   string
-	ImportLink string
-	ExportLink string
-	Empty      string
+	Name        string
+	Code        string
+	Columns     []columnView
+	Rows        []recordRowView
+	NewHref     string
+	ImportHref  string
+	ExportHref  string
+	NewLabel    string
+	ImportLink  string
+	ExportLink  string
+	Empty       string
+	FilterField string
+	FilterValue string
+	FilterHref  string
+	FilterLabel string
+	FilterGo    string
+	FilterClear string
 	// PageLabel is "" when there's only one page (no pager to show) —
 	// PrevHref/NextHref are independently "" at whichever boundary has
 	// no such page (first/last), so the template can render each link
@@ -242,11 +350,17 @@ var recordListTmpl = template.Must(template.New("recordList").Parse(`
 <h1>{{.Name}} <span class="uc-menu-item-code">{{.Code}}</span></h1>
 <div><a href="{{.NewHref}}">{{.NewLabel}}</a> · <a href="{{.ImportHref}}">{{.ImportLink}}</a> · <a href="{{.ExportHref}}">{{.ExportLink}}</a></div>
 </div>
+<form class="uc-list-filter" method="get" action="{{.FilterHref}}">
+{{if .FilterField}}<input type="hidden" name="filter" value="{{.FilterField}}">{{end}}
+<input type="search" name="q" value="{{.FilterValue}}" placeholder="{{.FilterLabel}}" aria-label="{{.FilterLabel}}">
+<button type="submit">{{.FilterGo}}</button>
+{{if .FilterValue}}<a href="{{.FilterHref}}">{{.FilterClear}}</a>{{end}}
+</form>
 {{if not .Rows}}
 <p class="uc-empty">{{.Empty}}</p>
 {{else}}
 <table class="uc-table">
-<thead><tr>{{range .Columns}}<th>{{.}}</th>{{end}}</tr></thead>
+<thead><tr>{{range .Columns}}<th><a class="uc-sort" href="{{.Href}}">{{.Label}}{{.Arrow}}</a></th>{{end}}</tr></thead>
 <tbody>
 {{range .Rows}}
 {{$row := .}}
