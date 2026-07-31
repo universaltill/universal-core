@@ -108,7 +108,7 @@ type viewModel struct {
 	Version      int
 	VersionKnown bool
 	// PostHref is the form's own hx-post target, pre-built via
-	// url.PathEscape the same way AddHref/RelatedListHref/WorkflowHref/
+	// url.PathEscape the same way AddHref/WorkflowHref/
 	// ReportHref are — EntityType/RecordID must not be interpolated
 	// directly into the template's hx-post, since hx-post isn't a
 	// URL-context attribute html/template auto-escapes for that purpose
@@ -149,13 +149,12 @@ type sectionView struct {
 	Children    []childRowView
 	RollUpLabel string
 	RollUpTotal string // empty when the section has no roll-up
-	// AddHref and RelatedListHref are pre-built via net/url so a Target
+	// AddHref is pre-built via net/url so a Target
 	// name or record ID containing "&", "?", or similar can't get
 	// interpreted as URL/query structure once the browser HTML-decodes the
 	// attribute value (html/template doesn't URL-encode non-standard hx-*
 	// attributes the way it does href/src).
-	AddHref         string
-	RelatedListHref string
+	AddHref string
 }
 
 // hiddenFieldView is one entDef field the form doesn't visibly show —
@@ -332,10 +331,15 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 			}
 
 		case form.ComponentRelatedList:
+			// Rendered server-side from Children, exactly like
+			// master-detail. It previously carried an hx-get lazy-load
+			// instead; that endpoint ignores the ref filter, so the
+			// trigger replaced the section with a JSON dump of every
+			// record of the target type. Removed rather than fixed at
+			// the endpoint: the rows are already here, and a lazy-load
+			// that fires on every form render is a request this page
+			// does not need (independent review, board #20).
 			sv.Children = buildChildRows(data.Children[s.Target])
-			q := url.Values{}
-			q.Set("ref", def.EntityType+":"+data.RecordID)
-			sv.RelatedListHref = "/api/records/" + url.PathEscape(s.Target) + "?" + q.Encode()
 		}
 
 		vm.Sections = append(vm.Sections, sv)
@@ -624,7 +628,7 @@ const tmplSrc = `<form class="uc-form" data-entity-type="{{.EntityType}}" hx-pos
 {{if .RollUpTotal}}<p class="uc-rollup" data-field="{{.RollUpLabel}}">{{.RollUpLabel}}: {{.RollUpTotal}}</p>{{end}}
 <button type="button" hx-get="{{.AddHref}}" hx-target="closest table" hx-swap="beforeend">{{$.MasterDetailAdd}}</button>
 {{else if eq .Component "related_list"}}
-<div class="uc-related-list" hx-get="{{.RelatedListHref}}" hx-trigger="load" hx-swap="innerHTML">
+<div class="uc-related-list">
 {{if not .Children}}<p class="uc-empty">{{$.RelatedListEmpty}}</p>{{end}}
 {{range .Children}}<div class="uc-related-row">{{range .Cells}}<span data-field="{{.Field}}">{{.Value}}</span>{{end}}</div>{{end}}
 </div>

@@ -138,7 +138,7 @@ func main() {
 	soIDs := s.seedSalesOrders(customers, currencies, items)
 	s.seedCustomerInvoices(customers, currencies, soIDs)
 	if hasPublished(s.ctx, s.entityDefs, "FixedAsset") {
-		s.seedFixedAssets(currencies, accounts)
+		s.seedFixedAssets(currencies, accounts, vendors)
 	}
 
 	log.Printf("demo data seeded for tenant %s (%d currencies, %d units, %d vendors, %d customers, %d items)",
@@ -317,7 +317,7 @@ func (s *seeder) seedFinance() map[string]string {
 // distribution included (FA-1003's base does not divide evenly, and its
 // term is short enough that the step-down is visible in the seeded
 // rows).
-func (s *seeder) seedFixedAssets(currencies, accounts map[string]string) {
+func (s *seeder) seedFixedAssets(currencies, accounts, vendors map[string]string) {
 	scheduleDef := s.def("DepreciationSchedule")
 
 	// The currency's own minor_unit drives the conversion — FixedAsset
@@ -410,6 +410,64 @@ func (s *seeder) seedFixedAssets(currencies, accounts map[string]string) {
 				log.Fatalf("create DepreciationSchedule %s/%d: %v", a.number, p.Sequence, err)
 			}
 		}
+	}
+
+	s.seedMaintenanceOrders(currencies, vendors)
+}
+
+// seedMaintenanceOrders gives the demo tenant a maintenance history to
+// look at on the asset form's related list — one completed job with a
+// real cost and one still scheduled, so both halves of the lifecycle
+// are visible rather than just the happy end state.
+func (s *seeder) seedMaintenanceOrders(currencies, vendors map[string]string) {
+	// Self-sufficient against a tenant provisioned before this entity
+	// existed — the same reasoning the sales/assets status publishing
+	// above uses. Without this, re-running the seeder on the demo tenant
+	// before it is re-provisioned aborts the whole run at s.def, after
+	// assets and schedules are already written.
+	if !hasPublished(s.ctx, s.entityDefs, "MaintenanceOrder") {
+		return
+	}
+	assetDef := s.def("FixedAsset")
+	assetID := func(number string) string {
+		recs, err := s.crud.ListByField(s.ctx, assetDef, "asset_number", number)
+		if err != nil || len(recs) == 0 {
+			log.Fatalf("look up FixedAsset %s for maintenance seeding: %v (n=%d)", number, err, len(recs))
+		}
+		return recs[0].ID
+	}
+	// Named, not "whichever the map yields first": Go randomizes map
+	// iteration, so an arbitrary pick meant a fresh seed could attribute
+	// a brake-disc replacement to a textile mill, and two environments
+	// got different demo data (independent review). A missing key is
+	// fine — vendor_id is optional.
+	vendorID := vendors["Anatolia Parts Co."]
+
+	for _, m := range []struct {
+		number, asset, mType, desc, scheduled, completed, status string
+		cost                                                     float64
+	}{
+		{"MO-2001", "FA-1001", "preventive", "12,000 km service", "2026-04-10", "2026-04-10", "completed", 450},
+		{"MO-2002", "FA-1001", "corrective", "Replace brake discs", "2026-08-15", "", "scheduled", 0},
+		{"MO-2003", "FA-1002", "inspection", "Annual racking safety inspection", "2026-06-01", "", "scheduled", 0},
+	} {
+		fields := map[string]any{
+			"order_number":     m.number,
+			"asset_id":         assetID(m.asset),
+			"maintenance_type": m.mType,
+			"description":      map[string]any{"en": m.desc},
+			"scheduled_date":   m.scheduled,
+			"cost":             m.cost,
+			"currency_id":      currencies["USD"],
+			"status_id":        s.statusID("maintenance_order_status", m.status),
+		}
+		if m.completed != "" {
+			fields["completed_date"] = m.completed
+		}
+		if vendorID != "" {
+			fields["vendor_id"] = vendorID
+		}
+		s.getOrCreate("MaintenanceOrder", "order_number", m.number, fields)
 	}
 }
 

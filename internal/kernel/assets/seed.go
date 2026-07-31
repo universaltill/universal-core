@@ -127,5 +127,29 @@ func PublishStatuses(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 	); err != nil {
 		return fmt.Errorf("seed fixed_asset_status: %w", err)
 	}
+
+	// maintenance_order_status: scheduled -> in_progress -> completed is
+	// the happy path. cancelled is reachable from either live state but
+	// not from completed — work that was actually done cannot be
+	// un-done by a status edit; reversing its cost is a credit note,
+	// the same reasoning sales.PublishStatuses gives for a paid invoice.
+	if _, err := statusgraph.Seed(ctx, engine, statusTypeDef, statusDef, transitionDef,
+		"MaintenanceOrder", "maintenance_order_status", "Maintenance Order Status",
+		[]statusgraph.Spec{
+			{Code: "scheduled", Name: "Scheduled", Sequence: 1, IsInitial: true},
+			{Code: "in_progress", Name: "In Progress", Sequence: 2},
+			{Code: "completed", Name: "Completed", Sequence: 3, IsTerminal: true},
+			{Code: "cancelled", Name: "Cancelled", Sequence: 4, IsTerminal: true},
+		},
+		[][2]string{
+			{"scheduled", "in_progress"},
+			{"in_progress", "completed"},
+			{"scheduled", "cancelled"},
+			{"in_progress", "cancelled"},
+		},
+		actor,
+	); err != nil {
+		return fmt.Errorf("seed maintenance_order_status: %w", err)
+	}
 	return nil
 }

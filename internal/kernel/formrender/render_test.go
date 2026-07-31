@@ -773,13 +773,14 @@ func TestRender_RecordIDCannotBreakHxAttributes(t *testing.T) {
 		t.Fatalf("expected hx-post record ID to round-trip exactly, got %q want %q", gotPostRecordID, data.RecordID)
 	}
 
-	// The related_list hx-get URL must percent-encode the record ID, not
-	// emit a literal unescaped "&" that would parse as an extra query param.
-	if strings.Contains(out, `ref=PurchaseOrder:1&admin=true`) {
-		t.Fatalf("record ID's '&' leaked into the query string unescaped, got:\n%s", out)
-	}
-	if !strings.Contains(out, url.QueryEscape(data.RecordID)) {
-		t.Fatalf("expected the related_list href to contain the percent-encoded record ID, got:\n%s", out)
+	// A related_list section no longer emits a lazy-load URL at all —
+	// its rows are rendered server-side (board #20: the endpoint that
+	// href pointed at ignored the ref filter and returned every record
+	// of the target type, so an asset's history listed other assets'
+	// work). Assert the href is gone, so a future change can't quietly
+	// reintroduce an unfiltered fetch.
+	if strings.Contains(out, "uc-related-list\" hx-get") || strings.Contains(out, "ref=PurchaseOrder") {
+		t.Fatalf("related_list must not lazy-load from an unfiltered endpoint, got:\n%s", out)
 	}
 
 	// The workflow.start hx-vals JSON must come from json.Marshal, so an
@@ -1039,5 +1040,44 @@ func TestRender_I18nTextRendersOneInputPerLocale(t *testing.T) {
 	}
 	if strings.Contains(body, `name="label.tr" value="Adet" autocomplete="off" aria-label="label tr" required>`) {
 		t.Fatalf("required must NOT be on a non-fallback locale input, got:\n%s", body)
+	}
+}
+
+// TestRender_RelatedListIsServerRenderedNotLazyLoaded is the regression
+// test for board #20's second blocker. The section used to render empty
+// with hx-trigger="load", and the endpoint it fetched ignored the ref
+// filter — so an asset's "Maintenance History" was replaced on load by
+// a JSON dump of every record of that type in the tenant, other
+// assets' work orders included. Rows must now come from the server,
+// already filtered, with no fetch at all.
+func TestRender_RelatedListIsServerRenderedNotLazyLoaded(t *testing.T) {
+	r := testRenderer(t)
+	data := Data{
+		RecordID: "po-1",
+		Record:   map[string]any{"payment_method": "Wire"},
+		Children: map[string][]map[string]any{
+			"PurchaseOrder": {{"id": "po-mine", "status": "mine-only"}},
+		},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "mine-only") {
+		t.Fatalf("related row must be rendered server-side, got:\n%s", out)
+	}
+	// No load-triggered fetch anywhere in the related-list markup: one
+	// would swap the correct rows out for whatever the endpoint returns.
+	relatedIdx := strings.Index(out, "uc-related-list")
+	if relatedIdx < 0 {
+		t.Fatalf("no related list rendered:\n%s", out)
+	}
+	segment := out[relatedIdx:]
+	if end := strings.Index(segment, "</div>"); end > 0 {
+		segment = segment[:end]
+	}
+	if strings.Contains(segment, "hx-trigger=\"load\"") || strings.Contains(segment, "hx-get") {
+		t.Fatalf("related list must not fetch on load, got:\n%s", segment)
 	}
 }

@@ -13,7 +13,14 @@ import "github.com/universaltill/universal-core/internal/kernel/form"
 func FixedAssetForm() *form.Definition {
 	return &form.Definition{
 		EntityType: "FixedAsset",
-		Version:    1,
+		// Version 2, in lockstep with the entity (assets.go): the
+		// maintenance section changed this form's content, and
+		// moduleseed skips a (key, version) that is already published —
+		// so editing v1 in place would have silently delivered nothing
+		// to every tenant provisioned by the previous release, with no
+		// error to notice. A Definition whose serialized content changes
+		// gets a new version, form or entity (independent review).
+		Version: 2,
 		Sections: []form.Section{
 			{
 				Title:     "Asset",
@@ -51,6 +58,14 @@ func FixedAssetForm() *form.Definition {
 				Component: form.ComponentMasterDetail,
 				Target:    "DepreciationSchedule",
 			},
+			{
+				// Read-only history: maintenance orders are independent
+				// records with their own lifecycle, so the asset form
+				// shows them rather than owning them.
+				Title:     "Maintenance History",
+				Component: form.ComponentRelatedList,
+				Target:    "MaintenanceOrder",
+			},
 		},
 		Actions: []form.Action{
 			{Label: "Save", Op: form.OpSave},
@@ -86,10 +101,51 @@ func DepreciationScheduleForm() *form.Definition {
 	}
 }
 
+// MaintenanceOrderForm keeps the plan and the outcome visually
+// separate: what was scheduled, then what actually happened and what
+// it cost. No roll-up into FixedAsset — maintenance spend is not part
+// of an asset's depreciable cost (capitalising a repair is a
+// deliberate accounting decision, not an automatic one), so summing it
+// onto the asset would quietly misstate the balance sheet.
+func MaintenanceOrderForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "MaintenanceOrder",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Work",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "order_number", Label: "Order Number"},
+					{Name: "asset_id", Label: "Asset"},
+					{Name: "maintenance_type", Label: "Type"},
+					{Name: "description", Label: "Description"},
+					{Name: "status_id", Label: "Status"},
+				},
+			},
+			{
+				Title:     "Schedule and Cost",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "scheduled_date", Label: "Scheduled Date"},
+					{Name: "completed_date", Label: "Completed Date"},
+					{Name: "vendor_id", Label: "Service Provider"},
+					{Name: "currency_id", Label: "Currency"},
+					{Name: "cost", Label: "Cost"},
+				},
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
+	}
+}
+
 // AllForms returns every Form Definition this module adds.
 func AllForms() []*form.Definition {
 	return []*form.Definition{
 		FixedAssetForm(),
 		DepreciationScheduleForm(),
+		MaintenanceOrderForm(),
 	}
 }

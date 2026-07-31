@@ -1205,7 +1205,17 @@ func (h *Handler) pageReferenceLabels(ctx context.Context, ts tenantScope, def *
 func (h *Handler) loadMasterDetailChildren(ctx context.Context, ts tenantScope, entDef *entity.Definition, formDef *form.Definition, recordID string) (map[string][]map[string]any, error) {
 	children := make(map[string][]map[string]any)
 	for _, section := range formDef.Sections {
-		if section.Component != form.ComponentMasterDetail {
+		// Both component kinds resolve their rows the same way — parent
+		// id matched against the child's ParentField. They differ in what
+		// the RENDERER does with them (master-detail is editable and
+		// rolls up; a related list is read-only), not in how they are
+		// found. Related lists were previously skipped here, which left
+		// the section empty and let its lazy-load fall through to an
+		// endpoint that ignores the ref filter and returned every record
+		// of the target type in the tenant — an asset's "Maintenance
+		// History" listing other assets' work orders (independent
+		// review, board #20).
+		if section.Component != form.ComponentMasterDetail && section.Component != form.ComponentRelatedList {
 			continue
 		}
 		var rel *entity.Relationship

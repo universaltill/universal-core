@@ -258,7 +258,7 @@ func TestProvisionTenant_AssetsModule(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	for _, et := range []string{"FixedAsset", "DepreciationSchedule"} {
+	for _, et := range []string{"FixedAsset", "DepreciationSchedule", "MaintenanceOrder"} {
 		var count int
 		if err := tenantDB.QueryRowContext(ctx,
 			`SELECT count(*) FROM entity_definitions WHERE entity_type = $1 AND status = 'published'`, et,
@@ -293,5 +293,22 @@ func TestProvisionTenant_AssetsModule(t *testing.T) {
 	}
 	if statuses != 5 {
 		t.Errorf("expected 5 seeded fixed_asset_status rows, got %d", statuses)
+	}
+
+	// The module seeds TWO status graphs (asset lifecycle + maintenance
+	// order); a second Seed call in the same PublishStatuses is exactly
+	// where a code-collision bug would surface, so count it separately.
+	var maintenance int
+	if err := tenantDB.QueryRowContext(ctx,
+		`SELECT count(*) FROM records r
+		 WHERE r.entity_type = 'Status' AND r.deleted_at IS NULL
+		   AND r.data->>'status_type_id' IN (
+		     SELECT id::text FROM records
+		     WHERE entity_type = 'StatusType' AND data->>'code' = 'maintenance_order_status' AND deleted_at IS NULL)`,
+	).Scan(&maintenance); err != nil {
+		t.Fatalf("count maintenance statuses: %v", err)
+	}
+	if maintenance != 4 {
+		t.Errorf("expected 4 seeded maintenance_order_status rows, got %d", maintenance)
 	}
 }

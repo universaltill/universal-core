@@ -3,6 +3,7 @@ package assets
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/audit"
 	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
+	"github.com/universaltill/universal-core/internal/kernel/form"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
 )
 
@@ -119,7 +121,7 @@ func TestPublish_PublishesEveryDefinition(t *testing.T) {
 	if err := PublishForms(ctx, tenantDB, humanActor()); err != nil {
 		t.Fatalf("PublishForms: %v", err)
 	}
-	for _, et := range []string{"FixedAsset", "DepreciationSchedule"} {
+	for _, et := range []string{"FixedAsset", "DepreciationSchedule", "MaintenanceOrder"} {
 		if got := publishedDef(t, tenantDB, et); got.Module != "assets" {
 			t.Errorf("%s published with module %q", et, got.Module)
 		}
@@ -330,5 +332,204 @@ func TestPublish_RejectsInvalidDefinition(t *testing.T) {
 		if err := def.Validate(); err != nil {
 			t.Fatalf("shipped definition %s is invalid: %v", def.EntityType, err)
 		}
+	}
+}
+
+// TestFixedAsset_UpgradeFromV1 is the regression test for the
+// independent review's first blocker. The previous release published
+// FixedAsset entity v1 and form v1; this release changed BOTH. The
+// entity was correctly re-versioned, the form was edited in place — and
+// moduleseed skips a (key, version) that is already published, so an
+// already-provisioned tenant silently received no new form at all: no
+// error, no log line, just a missing section.
+//
+// So this test does what the old one only claimed to: it publishes the
+// PRIOR versions first, then upgrades, then asserts both rows exist,
+// GetPublished serves the newer one, and the form the user actually
+// opens carries the new section.
+func TestFixedAsset_UpgradeFromV1(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	// Stand in for the previous release: the same definitions at v1,
+	// without the maintenance additions.
+	priorEntity := FixedAsset()
+	priorEntity.Version = 1
+	priorEntity.Relationships = priorEntity.Relationships[:1] // schedule only
+	priorForm := FixedAssetForm()
+	priorForm.Version = 1
+	priorForm.Sections = priorForm.Sections[:len(priorForm.Sections)-1] // no maintenance section
+
+	entRepo := data.NewEntityDefinitionRepo(tenantDB)
+	formRepo := data.NewFormDefinitionRepo(tenantDB)
+	publishPrior := func(repo moduleseedRepo, key string, version int, v any) {
+		t.Helper()
+		raw, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("marshal prior %s: %v", key, err)
+		}
+		if _, err := repo.CreateDraft(ctx, key, version, raw, actor); err != nil {
+			t.Fatalf("draft prior %s: %v", key, err)
+		}
+		if err := repo.Approve(ctx, key, version, actor); err != nil {
+			t.Fatalf("approve prior %s: %v", key, err)
+		}
+		if err := repo.Publish(ctx, key, version, actor); err != nil {
+			t.Fatalf("publish prior %s: %v", key, err)
+		}
+	}
+	publishPrior(entRepo, "FixedAsset", 1, priorEntity)
+	publishPrior(formRepo, "FixedAsset", 1, priorForm)
+
+	// Now upgrade, exactly as provision-tenant would.
+	if err := Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("Publish (upgrade): %v", err)
+	}
+	if err := PublishForms(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("PublishForms (upgrade): %v", err)
+	}
+
+	def := publishedDef(t, tenantDB, "FixedAsset")
+	if def.Version != 2 {
+		t.Errorf("entity: GetPublished returned v%d, want v2", def.Version)
+	}
+	var hasRelated bool
+	for _, r := range def.Relationships {
+		if r.Target == "MaintenanceOrder" {
+			hasRelated = true
+			if r.Kind != entity.RelationRelatedList {
+				t.Errorf("maintenance relationship kind = %q, want related_list", r.Kind)
+			}
+			if r.ParentField != "asset_id" {
+				t.Errorf("ParentField = %q, want asset_id", r.ParentField)
+			}
+		}
+	}
+	if !hasRelated {
+		t.Error("upgraded entity is missing the maintenance related list")
+	}
+
+	// The form is the half that silently no-opped before.
+	fv, err := formRepo.GetPublished(ctx, "FixedAsset")
+	if err != nil {
+		t.Fatalf("GetPublished form: %v", err)
+	}
+	if fv.Version != 2 {
+		t.Fatalf("form: GetPublished returned v%d, want v2 — an in-place edit of a published version delivers nothing to an existing tenant", fv.Version)
+	}
+	fd, err := form.Unmarshal(fv.Definition)
+	if err != nil {
+		t.Fatalf("unmarshal upgraded form: %v", err)
+	}
+	var hasSection bool
+	for _, sec := range fd.Sections {
+		if sec.Component == form.ComponentRelatedList && sec.Target == "MaintenanceOrder" {
+			hasSection = true
+		}
+	}
+	if !hasSection {
+		t.Error("upgraded form is missing the maintenance related-list section")
+	}
+}
+
+// moduleseedRepo is the subset both definition repos share, so the
+// upgrade test above can publish a prior version through either.
+type moduleseedRepo interface {
+	CreateDraft(ctx context.Context, key string, version int, definition []byte, actor audit.Actor) (data.DefinitionVersion, error)
+	Approve(ctx context.Context, key string, version int, actor audit.Actor) error
+	Publish(ctx context.Context, key string, version int, actor audit.Actor) error
+}
+
+// TestMaintenanceOrder_UsableEndToEnd drives a real work order through
+// its lifecycle against a real asset — including the transition the
+// graph forbids.
+func TestMaintenanceOrder_UsableEndToEnd(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+	for _, step := range []struct {
+		name string
+		fn   func(context.Context, *sql.DB, audit.Actor) error
+	}{
+		{"foundation", foundation.Publish},
+		{"assets", Publish},
+		{"assets statuses", PublishStatuses},
+	} {
+		if err := step.fn(ctx, tenantDB, actor); err != nil {
+			t.Fatalf("publish %s: %v", step.name, err)
+		}
+	}
+	engine := crud.NewEngine(tenantDB)
+	status := func(typeCode, code string) string {
+		t.Helper()
+		types, err := engine.ListByField(ctx, publishedDef(t, tenantDB, "StatusType"), "code", typeCode)
+		if err != nil || len(types) == 0 {
+			t.Fatalf("StatusType %s: %v", typeCode, err)
+		}
+		rows, err := engine.ListByField(ctx, publishedDef(t, tenantDB, "Status"), "status_type_id", types[0].ID)
+		if err != nil {
+			t.Fatalf("statuses for %s: %v", typeCode, err)
+		}
+		for _, r := range rows {
+			if c, _ := r.Data["code"].(string); c == code {
+				return r.ID
+			}
+		}
+		t.Fatalf("no %q status for %s", code, typeCode)
+		return ""
+	}
+
+	asset, err := engine.Create(ctx, publishedDef(t, tenantDB, "FixedAsset"), map[string]any{
+		"asset_number": "FA-M1", "name": map[string]any{"en": "Test Asset"},
+		"acquisition_date": "2026-01-01", "cost": 1000.0, "useful_life_months": 12.0,
+		"depreciation_method": "straight_line", "status_id": status("fixed_asset_status", "in_service"),
+	}, actor)
+	if err != nil {
+		t.Fatalf("create FixedAsset: %v", err)
+	}
+
+	moDef := publishedDef(t, tenantDB, "MaintenanceOrder")
+	mo, err := engine.Create(ctx, moDef, map[string]any{
+		"order_number": "MO-1", "asset_id": asset.ID, "maintenance_type": "preventive",
+		"scheduled_date": "2026-05-01", "cost": 250.0,
+		"status_id": status("maintenance_order_status", "scheduled"),
+	}, actor)
+	if err != nil {
+		t.Fatalf("create MaintenanceOrder: %v", err)
+	}
+
+	// The related list resolves: this is the query the asset form runs.
+	found, err := engine.ListByField(ctx, moDef, "asset_id", asset.ID)
+	if err != nil || len(found) != 1 {
+		t.Fatalf("asset's maintenance related list: err=%v n=%d", err, len(found))
+	}
+
+	// scheduled -> completed skips in_progress and must be rejected;
+	// scheduled -> in_progress is legal. Completion may predate the
+	// scheduled date — finishing early is a good outcome, not an error.
+	base := map[string]any{
+		"order_number": "MO-1", "asset_id": asset.ID, "maintenance_type": "preventive",
+		"scheduled_date": "2026-05-01", "cost": 250.0,
+	}
+	withStatus := func(code string) map[string]any {
+		f := map[string]any{}
+		for k, v := range base {
+			f[k] = v
+		}
+		f["status_id"] = status("maintenance_order_status", code)
+		return f
+	}
+	version := mo.Version
+	if err := engine.ValidateStatusTransition(ctx, moDef, mo.ID, withStatus("completed"), false, &version); err == nil {
+		t.Error("scheduled->completed should be rejected: work cannot complete without starting")
+	}
+	if err := engine.ValidateStatusTransition(ctx, moDef, mo.ID, withStatus("in_progress"), false, &version); err != nil {
+		t.Errorf("scheduled->in_progress should be legal: %v", err)
+	}
+	early := withStatus("in_progress")
+	early["completed_date"] = "2026-04-20" // before the scheduled date
+	if _, err := engine.Update(ctx, moDef, mo.ID, early, &version, actor); err != nil {
+		t.Errorf("completing ahead of schedule must be allowed: %v", err)
 	}
 }

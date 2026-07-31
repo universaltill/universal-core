@@ -11,9 +11,6 @@
 // a display bug.
 //
 // Deliberately NOT in this slice, each for its own reason:
-//   - **MaintenanceOrder** (board #20): a real entity in §9, but it
-//     references FixedAsset and this card is that reference's target.
-//     Filed separately and reordered behind this one.
 //   - **Posting depreciation to the ledger**: the schedule this module
 //     generates is the input a periodic posting run would consume
 //     (debit depreciation expense, credit accumulated depreciation),
@@ -45,8 +42,13 @@ import "github.com/universaltill/universal-core/internal/kernel/entity"
 // scale to convert them without guessing that everything is 2dp.
 func FixedAsset() *entity.Definition {
 	return &entity.Definition{
-		EntityType:     "FixedAsset",
-		Version:        1,
+		EntityType: "FixedAsset",
+		// Version 2 (board #20): gained the maintenance related list
+		// below. The registry is append-only, so this is a new published
+		// version rather than an edit to v1 — moduleseed publishes it
+		// alongside the old one and GetPublished takes the highest, which
+		// is the designed upgrade path for a module that ships again.
+		Version:        2,
 		Module:         "assets",
 		StatusTypeCode: "fixed_asset_status",
 		Fields: []entity.Field{
@@ -82,6 +84,14 @@ func FixedAsset() *entity.Definition {
 			// loadMasterDetailChildren looks up for the form's
 			// master-detail section.
 			{Name: "schedule", Kind: entity.RelationComposition, Target: "DepreciationSchedule", ParentField: "fixed_asset_id"},
+			// Related list, NOT composition: a maintenance order exists
+			// independently of the asset's own lifecycle (it has its own
+			// status, its own cost, and survives the asset being fully
+			// depreciated), so the asset form shows its history read-only
+			// rather than owning and cascading it. This is exactly the
+			// reference/composition/related-list distinction R11a says to
+			// make explicitly rather than default.
+			{Name: "maintenance", Kind: entity.RelationRelatedList, Target: "MaintenanceOrder", ParentField: "asset_id"},
 		},
 	}
 }
@@ -121,11 +131,54 @@ func DepreciationSchedule() *entity.Definition {
 	}
 }
 
+// MaintenanceOrder is service or repair work against an asset
+// (reference-data-model.md §9). §9's row names asset_id,
+// scheduled_date, status and cost; this Definition adds an
+// order_number natural key (every document entity in this kernel has
+// one), a maintenance_type, a completed_date, a description, and a
+// vendor_id — a service order that cannot record who performed the
+// work is not usable in practice, and Party already models exactly
+// that (the same Party-Role pattern purchasing's vendor_id uses).
+//
+// completed_date deliberately carries NO NotBefore constraint against
+// scheduled_date: work finished ahead of schedule is a good outcome,
+// not a validation error. The staged-timestamp NotBefore chain on
+// PurchaseOrder models a strict physical sequence; this is a plan
+// versus an actual, which is a different thing.
+//
+// Predictive maintenance (BACKLOG.md R10) is explicitly not built
+// here — this entity is the history such a model would learn from,
+// which is why completed_date and cost are first-class rather than
+// free text.
+func MaintenanceOrder() *entity.Definition {
+	return &entity.Definition{
+		EntityType:     "MaintenanceOrder",
+		Version:        1,
+		Module:         "assets",
+		StatusTypeCode: "maintenance_order_status",
+		Fields: []entity.Field{
+			{Name: "order_number", Type: entity.FieldString, Required: true},
+			{Name: "asset_id", Type: entity.FieldReference, Required: true, Target: "FixedAsset"},
+			{Name: "maintenance_type", Type: entity.FieldEnum, Required: true,
+				EnumValues: []string{"preventive", "corrective", "inspection"},
+				Default:    "corrective"},
+			{Name: "description", Type: entity.FieldI18nText},
+			{Name: "scheduled_date", Type: entity.FieldDate, Required: true},
+			{Name: "completed_date", Type: entity.FieldDate},
+			{Name: "vendor_id", Type: entity.FieldReference, Target: "Party"},
+			{Name: "cost", Type: entity.FieldNumber, Default: float64(0)},
+			{Name: "currency_id", Type: entity.FieldReference, Target: "Currency"},
+			{Name: "status_id", Type: entity.FieldReference, Required: true, Target: "Status"},
+		},
+	}
+}
+
 // All returns every Definition this module adds — the set a tenant gets
 // once Assets is one of their licensed modules (seed.go's Publish).
 func All() []*entity.Definition {
 	return []*entity.Definition{
 		FixedAsset(),
 		DepreciationSchedule(),
+		MaintenanceOrder(),
 	}
 }
