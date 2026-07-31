@@ -610,21 +610,37 @@ func (s *seeder) seedPurchaseOrders(vendors, currencies, items map[string]string
 			log.Fatalf("list PurchaseOrder by po_number: %v", err)
 		}
 		if len(existing) > 0 {
-			// Stage backfill (#29): a PO seeded before the stage fields
-			// existed keeps its identity but gains the timestamps —
-			// re-running the seeder against the live tenant is the
-			// standing convention for exactly this. Idempotent: a PO
-			// that already has sourced_at is left alone entirely.
+			// Stage backfill (#29, converged for #30): a PO seeded before
+			// the current stage table keeps its identity but gains any
+			// stage it's missing — per-stage, not all-or-nothing. The
+			// first version skipped the whole PO once sourced_at was set,
+			// which stranded the live tenant between two seed versions:
+			// #29's reseed gave PO-2026-0001 a four-stage prefix, so
+			// #30's extension of that same PO to a full received chain
+			// (the review's fix for "the demo never shows a per-vendor
+			// quantile") was silently skipped on the one tenant that
+			// matters. Idempotent as before — a stage that already holds
+			// any value is never overwritten — and a PO needing nothing
+			// writes nothing. One consequence of filling a HOLE between
+			// existing stages: the fill becomes a new NotBefore
+			// comparison point, so a live PO whose existing stages
+			// contradict the seed table's values aborts this run with the
+			// validation error (log.Fatalf below) — clear or correct the
+			// offending stage by hand; the seeder deliberately refuses to
+			// overwrite it, and refusing beats writing a reversed chain.
 			rec := existing[0]
-			if len(o.stages) == 0 {
-				continue
-			}
-			if v, _ := rec.Data["sourced_at"].(string); v != "" {
-				continue
-			}
-			fields := make(map[string]any, len(rec.Data)+len(o.stages))
-			maps.Copy(fields, rec.Data)
+			missing := map[string]string{}
 			for k, v := range o.stages {
+				if cur, _ := rec.Data[k].(string); cur == "" {
+					missing[k] = v
+				}
+			}
+			if len(missing) == 0 {
+				continue
+			}
+			fields := make(map[string]any, len(rec.Data)+len(missing))
+			maps.Copy(fields, rec.Data)
+			for k, v := range missing {
 				fields[k] = v
 			}
 			expectedVersion := rec.Version

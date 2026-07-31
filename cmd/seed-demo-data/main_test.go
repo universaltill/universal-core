@@ -328,8 +328,9 @@ func TestSeedDemoData_SeedsSampleRecordsAndIsIdempotent(t *testing.T) {
 	if got := countJournalEntries(t, tenantDB); got != journalEntryCount {
 		t.Fatalf("journal entry count changed after re-running seed-demo-data: had %d, now %d (not idempotent — a hook may have double-posted)", journalEntryCount, got)
 	}
-	// #29's backfill must also be idempotent: a PO that already has
-	// sourced_at is left alone entirely (no Update, so no version bump).
+	// The backfill must also be idempotent: a PO missing no stage is
+	// left alone entirely (no Update, so no version bump) — PO-2026-0004
+	// already carries all six.
 	_, poDataAfter, poVersionAfter := purchaseOrderByNumber(t, tenantDB, "PO-2026-0004")
 	if poVersionAfter != poVersion {
 		t.Fatalf("PO-2026-0004 version changed after re-run: had %d, now %d (stage backfill re-ran on a PO that already had stages)", poVersion, poVersionAfter)
@@ -572,4 +573,99 @@ func countJournalEntries(t *testing.T, tenantDB *sql.DB) int {
 		t.Fatalf("count journal_entries: %v", err)
 	}
 	return n
+}
+
+// TestSeedDemoData_ExtendsPartialStagePrefix pins the live-tenant
+// scenario the original all-or-nothing backfill guard missed (#30
+// DevOps): a PO backfilled by an OLDER seed version holds a four-stage
+// prefix (exactly what #29's reseed left on the live tenant), and the
+// newer seed table extends that same PO to a full received chain. The
+// converged backfill must fill ONLY the missing stages and never touch
+// ones that already hold a value.
+func TestSeedDemoData_ExtendsPartialStagePrefix(t *testing.T) {
+	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance")
+	control := testexec.Open(t, controlDSN)
+	router, err := tenantdb.NewRouter(control, controlDSN)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+	t.Cleanup(func() { router.Close() })
+	ctx := context.Background()
+	tenantDB, err := router.Get(ctx, id)
+	if err != nil {
+		t.Fatalf("router.Get: %v", err)
+	}
+
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "smoke-test-setup"}
+	entityDefs := data.NewEntityDefinitionRepo(tenantDB)
+	def := func(entityType string) *entity.Definition {
+		v, err := entityDefs.GetPublished(ctx, entityType)
+		if err != nil {
+			t.Fatalf("GetPublished(%s): %v", entityType, err)
+		}
+		d, err := entity.Unmarshal(v.Definition)
+		if err != nil {
+			t.Fatalf("unmarshal %s: %v", entityType, err)
+		}
+		return d
+	}
+	engine := crud.NewEngine(tenantDB)
+	vendor, err := engine.Create(ctx, def("Party"), map[string]any{
+		"party_type": "organization", "name": "Partial Prefix Vendor Co", "status": "active",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create Party: %v", err)
+	}
+	statusTypes, err := engine.ListByField(ctx, def("StatusType"), "code", "purchase_order_status")
+	if err != nil || len(statusTypes) == 0 {
+		t.Fatalf("list purchase_order_status StatusType: %v (n=%d)", err, len(statusTypes))
+	}
+	statuses, err := engine.ListByField(ctx, def("Status"), "status_type_id", statusTypes[0].ID)
+	if err != nil {
+		t.Fatalf("list Status: %v", err)
+	}
+	var approvedID string
+	for _, st := range statuses {
+		if code, _ := st.Data["code"].(string); code == "approved" {
+			approvedID = st.ID
+		}
+	}
+	if approvedID == "" {
+		t.Fatal("no approved Status seeded for purchase_order_status")
+	}
+	pre, err := engine.Create(ctx, def("PurchaseOrder"), map[string]any{
+		"po_number": "PO-2026-0001", "vendor_id": vendor.ID,
+		"order_date": "2026-07-01", "status_id": approvedID,
+		// Deliberately OFFSET from the seed table's values (which are
+		// 07-04/07-08/07-18/07-22): if the backfill blindly overwrote
+		// existing stages, byte-identical dates couldn't tell — the
+		// review of this fix caught exactly that vacuous assertion.
+		"sourced_at": "2026-07-03", "production_start_at": "2026-07-07",
+		"production_ready_at": "2026-07-17", "shipped_at": "2026-07-21",
+	}, actor)
+	if err != nil {
+		t.Fatalf("pre-create partially-staged PurchaseOrder: %v", err)
+	}
+
+	_, stderr, code := run(t, []string{"DATABASE_URL=" + controlDSN}, "-tenant-id="+id, "-actor-id=smoke-test")
+	if code != 0 {
+		t.Fatalf("seed run: exit %d, stderr: %s", code, stderr)
+	}
+
+	gotID, gotData, _ := purchaseOrderByNumber(t, tenantDB, "PO-2026-0001")
+	if gotID != pre.ID {
+		t.Fatalf("expected in-place extension, got a different record (had %s, now %s)", pre.ID, gotID)
+	}
+	for field, want := range map[string]string{
+		"sourced_at": "2026-07-03", "production_start_at": "2026-07-07",
+		"production_ready_at": "2026-07-17", "shipped_at": "2026-07-21",
+		"customs_cleared_at": "2026-07-24", "received_at": "2026-07-26",
+	} {
+		if got, _ := gotData[field].(string); got != want {
+			t.Errorf("%s = %q, want %q (existing stages must survive untouched, missing ones filled from the seed table)", field, got, want)
+		}
+	}
+	if got, _ := gotData["status_id"].(string); got != approvedID {
+		t.Errorf("status_id changed during partial backfill: had %s, got %s", approvedID, got)
+	}
 }
