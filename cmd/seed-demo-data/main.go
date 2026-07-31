@@ -15,12 +15,14 @@ import (
 	"flag"
 	"log"
 	"maps"
+	"math"
 	"os"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/universaltill/universal-core/internal/data"
+	"github.com/universaltill/universal-core/internal/kernel/assets"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
 	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
@@ -101,10 +103,21 @@ func main() {
 	if err := sales.PublishStatuses(context.Background(), sqlDB, s.actor); err != nil {
 		log.Fatalf("publish sales statuses: %v", err)
 	}
+	// Assets: statuses ONLY, exactly like purchasing/sales above. An
+	// earlier draft also called assets.Publish/PublishForms here, which
+	// would have installed an entire module into tenants that never
+	// licensed it — the seeder seeds data, cmd/provision-tenant decides
+	// entitlement (independent review). A tenant without the module
+	// simply has no FixedAsset Definition, and seedFixedAssets skips.
+	if hasPublished(context.Background(), s.entityDefs, "FixedAsset") {
+		if err := assets.PublishStatuses(context.Background(), sqlDB, s.actor); err != nil {
+			log.Fatalf("publish assets statuses: %v", err)
+		}
+	}
 
 	currencies := s.seedCurrencies()
 	uoms := s.seedUnitsOfMeasure()
-	s.seedFinance()
+	accounts := s.seedFinance()
 	s.seedRoles()
 	s.seedOrgChart()
 	// gl_accounts (the ledger core's own typed chart, ADR-0004) is a
@@ -124,6 +137,9 @@ func main() {
 	s.seedVendorInvoices(vendors, currencies)
 	soIDs := s.seedSalesOrders(customers, currencies, items)
 	s.seedCustomerInvoices(customers, currencies, soIDs)
+	if hasPublished(s.ctx, s.entityDefs, "FixedAsset") {
+		s.seedFixedAssets(currencies, accounts)
+	}
 
 	log.Printf("demo data seeded for tenant %s (%d currencies, %d units, %d vendors, %d customers, %d items)",
 		*tenantID, len(currencies), len(uoms), len(vendors), len(customers), len(items))
@@ -135,6 +151,15 @@ type seeder struct {
 	entityDefs *data.EntityDefinitionRepo
 	crud       *crud.Engine
 	defs       map[string]*entity.Definition // cached per entity type, this run
+}
+
+// hasPublished reports whether an entity type is published for this
+// tenant — the "is this module licensed here" check the assets seeding
+// is gated on. A lookup miss is a definitive no, not an error: an
+// unlicensed module is the normal case for most tenants.
+func hasPublished(ctx context.Context, repo *data.EntityDefinitionRepo, entityType string) bool {
+	_, err := repo.GetPublished(ctx, entityType)
+	return err == nil
 }
 
 func (s *seeder) def(entityType string) *entity.Definition {
@@ -210,7 +235,7 @@ func (s *seeder) seedUnitsOfMeasure() map[string]string {
 // of TaxCodes/CostCenters shaped for the UK+GCC launch markets (BACKLOG.md
 // R1), same reasoning seedParties' own doc comment gives for its vendor/
 // customer names.
-func (s *seeder) seedFinance() {
+func (s *seeder) seedFinance() map[string]string {
 	accounts := []struct {
 		code, name, accountType, parentCode string
 	}{
@@ -218,6 +243,10 @@ func (s *seeder) seedFinance() {
 		{"1100", "Cash and Bank", "asset", "1000"},
 		{"1200", "Accounts Receivable", "asset", "1000"},
 		{"1300", "Inventory", "asset", "1000"},
+		{"1400", "Fixed Assets", "asset", "1000"},
+		// Accumulated depreciation is a contra-asset: it lives under
+		// Assets and carries a credit balance that offsets 1400.
+		{"1450", "Accumulated Depreciation", "asset", "1000"},
 		{"2000", "Liabilities", "liability", ""},
 		{"2100", "Accounts Payable", "liability", "2000"},
 		{"3000", "Equity", "equity", ""},
@@ -227,6 +256,7 @@ func (s *seeder) seedFinance() {
 		{"5000", "Expenses", "expense", ""},
 		{"5100", "Cost of Goods Sold", "expense", "5000"},
 		{"5200", "Operating Expenses", "expense", "5000"},
+		{"5300", "Depreciation Expense", "expense", "5000"},
 	}
 	accountIDs := map[string]string{}
 	for _, a := range accounts {
@@ -277,6 +307,128 @@ func (s *seeder) seedFinance() {
 			"code": c.code, "name": c.name, "type": c.ccType,
 		})
 	}
+	return accountIDs
+}
+
+// seedFixedAssets registers three representative assets and generates
+// each one's real depreciation schedule through assets.Build — not a
+// hand-written table of plausible-looking rows, so the demo tenant
+// shows exactly what the shipped arithmetic produces, remainder
+// distribution included (FA-1003's base does not divide evenly, and its
+// term is short enough that the step-down is visible in the seeded
+// rows).
+func (s *seeder) seedFixedAssets(currencies, accounts map[string]string) {
+	scheduleDef := s.def("DepreciationSchedule")
+
+	// The currency's own minor_unit drives the conversion — FixedAsset
+	// carries currency_id precisely so the scale is never guessed, and
+	// an earlier draft hardcoded 2 anyway (independent review). The demo
+	// chart seeds four currencies, so "it's all USD" was never true.
+	usdID := currencies["USD"]
+	scale := s.currencyMinorUnit(usdID)
+	div := math.Pow(10, float64(scale))
+
+	for _, a := range []struct {
+		number, name, location, acquired string
+		cost, salvage                    float64
+		months                           int
+	}{
+		{"FA-1001", "Delivery Van", "Main Depot", "2026-01-15", 48000, 6000, 60},
+		{"FA-1002", "Warehouse Racking", "Main Depot", "2026-02-01", 12500, 0, 120},
+		// A term whose base does NOT divide evenly, short enough that the
+		// step-down from 833.34 to 833.33 lands inside the seeded rows —
+		// so the demo tenant actually exhibits the remainder distribution
+		// rather than merely claiming to.
+		{"FA-1003", "Forklift Battery", "Main Depot", "2026-03-01", 10000, 0, 12},
+	} {
+		costMinor, err := assets.MinorUnits(a.cost, scale)
+		if err != nil {
+			log.Fatalf("convert cost for %s: %v", a.number, err)
+		}
+		salvageMinor, err := assets.MinorUnits(a.salvage, scale)
+		if err != nil {
+			log.Fatalf("convert salvage for %s: %v", a.number, err)
+		}
+
+		assetID := s.getOrCreate("FixedAsset", "asset_number", a.number, map[string]any{
+			"asset_number":                        a.number,
+			"name":                                map[string]any{"en": a.name},
+			"location":                            a.location,
+			"acquisition_date":                    a.acquired,
+			"cost":                                a.cost,
+			"salvage_value":                       a.salvage,
+			"useful_life_months":                  float64(a.months),
+			"depreciation_method":                 "straight_line",
+			"currency_id":                         usdID,
+			"status_id":                           s.statusID("fixed_asset_status", "in_service"),
+			"asset_account_id":                    accounts["1400"],
+			"accumulated_depreciation_account_id": accounts["1450"],
+			"depreciation_expense_account_id":     accounts["5300"],
+		})
+
+		periods, err := assets.Build(assets.Input{
+			Method:           assets.MethodStraightLine,
+			AcquisitionDate:  a.acquired,
+			CostMinor:        costMinor,
+			SalvageMinor:     salvageMinor,
+			UsefulLifeMonths: a.months,
+		})
+		if err != nil {
+			log.Fatalf("build depreciation schedule for %s: %v", a.number, err)
+		}
+
+		// Idempotency is per SEQUENCE, not per asset: an interrupted run
+		// leaves a partial schedule, and "this asset already has some
+		// rows" would strand it there forever. Same extend-the-prefix
+		// discipline seedPurchaseOrders already applies to stage dates
+		// (independent review caught this file shipping below its own
+		// established bar).
+		existing, err := s.crud.ListByField(s.ctx, scheduleDef, "fixed_asset_id", assetID)
+		if err != nil {
+			log.Fatalf("list existing schedule for %s: %v", a.number, err)
+		}
+		seeded := make(map[int]bool, len(existing))
+		for _, row := range existing {
+			if seq, ok := row.Data["sequence"].(float64); ok {
+				seeded[int(seq)] = true
+			}
+		}
+		// Only the first year of each schedule is seeded: 60 or 120 rows
+		// per asset would bury the rest of the demo data without showing
+		// anything the first twelve don't.
+		for _, p := range periods[:min(12, len(periods))] {
+			if seeded[p.Sequence] {
+				continue
+			}
+			if _, err := s.crud.Create(s.ctx, scheduleDef, map[string]any{
+				"fixed_asset_id":      assetID,
+				"sequence":            float64(p.Sequence),
+				"period_end":          p.PeriodEnd,
+				"depreciation_amount": float64(p.DepreciationMinor) / div,
+				"book_value":          float64(p.BookValueMinor) / div,
+			}, s.actor); err != nil {
+				log.Fatalf("create DepreciationSchedule %s/%d: %v", a.number, p.Sequence, err)
+			}
+		}
+	}
+}
+
+// currencyMinorUnit reads a Currency record's scale, defaulting to the
+// entity's own default of 2 when the record is missing or malformed —
+// the same value foundation.Currency() declares, so the fallback can
+// never disagree with the schema.
+func (s *seeder) currencyMinorUnit(currencyID string) int {
+	if currencyID == "" {
+		return 2
+	}
+	rec, err := s.crud.Get(s.ctx, s.def("Currency"), currencyID)
+	if err != nil {
+		return 2
+	}
+	if v, ok := rec.Data["minor_unit"].(float64); ok {
+		return int(v)
+	}
+	return 2
 }
 
 // seedRoles gives a tenant reference-data example Roles (foundation.Role,

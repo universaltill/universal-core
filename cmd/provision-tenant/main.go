@@ -37,6 +37,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/universaltill/universal-core/internal/db"
+	"github.com/universaltill/universal-core/internal/kernel/assets"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
 	"github.com/universaltill/universal-core/internal/kernel/finance"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
@@ -64,6 +65,7 @@ var modulePublishers = map[string]struct {
 	"purchasing": {purchasing.Publish, purchasing.PublishForms, purchasing.PublishStatuses},
 	"sales":      {sales.Publish, sales.PublishForms, sales.PublishStatuses},
 	"finance":    {finance.Publish, finance.PublishForms, nil},
+	"assets":     {assets.Publish, assets.PublishForms, assets.PublishStatuses},
 }
 
 func main() {
@@ -76,7 +78,7 @@ func main() {
 	region := flag.String("region", "eu-west", "tenant region, only used when creating a new tenant")
 	tenantID := flag.String("tenant-id", "", "reuse an existing tenant id instead of creating a new one")
 	actorID := flag.String("actor-id", "", "audit actor id for every Definition this provisions (required)")
-	modulesFlag := flag.String("modules", "", "comma-separated modules to publish besides foundation (available: purchasing, sales, finance)")
+	modulesFlag := flag.String("modules", "", "comma-separated modules to publish besides foundation (available: purchasing, sales, finance, assets)")
 	flag.Parse()
 
 	if *actorID == "" {
@@ -95,7 +97,7 @@ func main() {
 		seen := make(map[string]bool)
 		for m := range strings.SplitSeq(*modulesFlag, ",") {
 			if _, ok := modulePublishers[m]; !ok {
-				log.Fatalf("unknown module %q (available: purchasing, sales, finance)", m)
+				log.Fatalf("unknown module %q (available: purchasing, sales, finance, assets)", m)
 			}
 			if !seen[m] {
 				seen[m] = true

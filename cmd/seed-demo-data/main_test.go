@@ -16,6 +16,7 @@ import (
 
 	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/db"
+	"github.com/universaltill/universal-core/internal/kernel/assets"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
 	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
@@ -55,6 +56,7 @@ var moduleSeeds = map[string]moduleSeed{
 	"purchasing": {purchasing.Publish, purchasing.PublishForms, purchasing.PublishStatuses},
 	"sales":      {sales.Publish, sales.PublishForms, sales.PublishStatuses},
 	"finance":    {finance.Publish, finance.PublishForms, nil},
+	"assets":     {assets.Publish, assets.PublishForms, assets.PublishStatuses},
 }
 
 // provisionedTenant creates a fresh control database plus a new tenant
@@ -126,7 +128,7 @@ func TestSeedDemoData_MissingDatabaseURL_FailsFast(t *testing.T) {
 }
 
 func TestSeedDemoData_MissingTenantID_FailsFast(t *testing.T) {
-	controlDSN, _ := provisionedTenant(t, "purchasing", "sales", "finance")
+	controlDSN, _ := provisionedTenant(t, "purchasing", "sales", "finance", "assets")
 	_, stderr, code := run(t, []string{"DATABASE_URL=" + controlDSN}, "-actor-id=a")
 	if code == 0 {
 		t.Fatal("expected non-zero exit with -tenant-id unset")
@@ -137,7 +139,7 @@ func TestSeedDemoData_MissingTenantID_FailsFast(t *testing.T) {
 }
 
 func TestSeedDemoData_MissingActorID_FailsFast(t *testing.T) {
-	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance")
+	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance", "assets")
 	_, stderr, code := run(t, []string{"DATABASE_URL=" + controlDSN}, "-tenant-id="+id)
 	if code == 0 {
 		t.Fatal("expected non-zero exit with -actor-id unset")
@@ -163,7 +165,7 @@ func TestSeedDemoData_UnprovisionedModule_FailsCleanly(t *testing.T) {
 }
 
 func TestSeedDemoData_SeedsSampleRecordsAndIsIdempotent(t *testing.T) {
-	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance")
+	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance", "assets")
 
 	_, stderr, code := run(t, []string{"DATABASE_URL=" + controlDSN}, "-tenant-id="+id, "-actor-id=smoke-test")
 	if code != 0 {
@@ -185,6 +187,7 @@ func TestSeedDemoData_SeedsSampleRecordsAndIsIdempotent(t *testing.T) {
 	for _, entityType := range []string{
 		"Party", "Item", "PurchaseOrder", "SalesOrder", "CustomerInvoice",
 		"Account", "FiscalYear", "Period", "TaxCode", "CostCenter", "ReorderRule",
+		"FixedAsset", "DepreciationSchedule",
 	} {
 		counts[entityType] = countRecords(t, tenantDB, entityType)
 		if counts[entityType] == 0 {
@@ -351,7 +354,7 @@ func TestSeedDemoData_SeedsSampleRecordsAndIsIdempotent(t *testing.T) {
 // untouched. This is the "re-run the seeder against the live Demo
 // Organization tenant" convention working on a real pre-#29 row.
 func TestSeedDemoData_BackfillsStagesOnPreexistingPurchaseOrder(t *testing.T) {
-	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance")
+	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance", "assets")
 	control := testexec.Open(t, controlDSN)
 	router, err := tenantdb.NewRouter(control, controlDSN)
 	if err != nil {
@@ -583,7 +586,7 @@ func countJournalEntries(t *testing.T, tenantDB *sql.DB) int {
 // converged backfill must fill ONLY the missing stages and never touch
 // ones that already hold a value.
 func TestSeedDemoData_ExtendsPartialStagePrefix(t *testing.T) {
-	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance")
+	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance", "assets")
 	control := testexec.Open(t, controlDSN)
 	router, err := tenantdb.NewRouter(control, controlDSN)
 	if err != nil {
@@ -667,5 +670,53 @@ func TestSeedDemoData_ExtendsPartialStagePrefix(t *testing.T) {
 	}
 	if got, _ := gotData["status_id"].(string); got != approvedID {
 		t.Errorf("status_id changed during partial backfill: had %s, got %s", approvedID, got)
+	}
+}
+
+// TestSeedDemoData_RepairsPartialDepreciationSchedule: an interrupted
+// first run leaves an asset with only some of its schedule rows, and
+// re-running must fill in the missing ones. The earlier draft keyed
+// idempotency on "does this asset have ANY rows", which stranded a
+// truncated schedule permanently — the independent review demonstrated
+// it, and this repo had already set the opposite bar with
+// TestSeedDemoData_ExtendsPartialStagePrefix.
+func TestSeedDemoData_RepairsPartialDepreciationSchedule(t *testing.T) {
+	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance", "assets")
+	seed := func(label string) {
+		t.Helper()
+		if _, stderr, code := run(t, []string{"DATABASE_URL=" + controlDSN}, "-tenant-id="+id, "-actor-id=smoke-test"); code != 0 {
+			t.Fatalf("%s: exit %d: %s", label, code, stderr)
+		}
+	}
+	seed("first seed")
+
+	control := testexec.Open(t, controlDSN)
+	router, err := tenantdb.NewRouter(control, controlDSN)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+	t.Cleanup(func() { router.Close() })
+	tenantDB, err := router.Get(context.Background(), id)
+	if err != nil {
+		t.Fatalf("router.Get: %v", err)
+	}
+	full := countRecords(t, tenantDB, "DepreciationSchedule")
+	if full == 0 {
+		t.Fatal("expected seeded schedule rows")
+	}
+
+	// Truncate every asset's schedule the way an interrupted run would.
+	if _, err := tenantDB.Exec(
+		`DELETE FROM records WHERE entity_type = 'DepreciationSchedule' AND (data->>'sequence')::numeric > 3`,
+	); err != nil {
+		t.Fatalf("truncate schedules: %v", err)
+	}
+	if partial := countRecords(t, tenantDB, "DepreciationSchedule"); partial >= full {
+		t.Fatalf("expected a truncated schedule, got %d of %d", partial, full)
+	}
+
+	seed("repair seed")
+	if repaired := countRecords(t, tenantDB, "DepreciationSchedule"); repaired != full {
+		t.Errorf("re-run left the schedule short: %d rows, want %d", repaired, full)
 	}
 }

@@ -288,6 +288,7 @@ var moduleIcons = map[string]string{
 	"inventory":     "📦",
 	"warehouse":     "🏬",
 	"supplychain":   "🚚",
+	"assets":        "🏗️",
 	"crm":           "🤝",
 	"projects":      "📋",
 	"hr":            "👥",

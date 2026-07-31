@@ -234,3 +234,64 @@ func assertPublished(t *testing.T, tenantDB *sql.DB, table, entityType string, w
 		t.Fatalf("%s.%s published = %v, want %v", table, entityType, exists, wantPublished)
 	}
 }
+
+// TestProvisionTenant_AssetsModule is the smoke layer for the Assets
+// module (universaltill/uc-infra#19): the real compiled binary
+// publishes its entities, forms AND status graph into a real tenant
+// database — the third module to exercise the non-nil publishStatuses
+// path, and the first whose status graph models an asset's life rather
+// than a document's approval.
+func TestProvisionTenant_AssetsModule(t *testing.T) {
+	dsn := freshControlDB(t)
+
+	stdout, stderr, code := run(t, []string{"DATABASE_URL=" + dsn}, "-name=Assets Smoke Test", "-actor-id=smoke-test", "-modules=assets")
+	if code != 0 {
+		t.Fatalf("run: exit %d, stderr: %s", code, stderr)
+	}
+	id := strings.TrimSpace(stdout)
+	testexec.DropTenantDatabase(t, testexec.Open(t, dsn), id)
+
+	router := openRouter(t, dsn)
+	tenantDB, err := router.Get(context.Background(), id)
+	if err != nil {
+		t.Fatalf("resolve tenant database: %v", err)
+	}
+	ctx := context.Background()
+
+	for _, et := range []string{"FixedAsset", "DepreciationSchedule"} {
+		var count int
+		if err := tenantDB.QueryRowContext(ctx,
+			`SELECT count(*) FROM entity_definitions WHERE entity_type = $1 AND status = 'published'`, et,
+		).Scan(&count); err != nil {
+			t.Fatalf("count published %s: %v", et, err)
+		}
+		if count != 1 {
+			t.Errorf("expected 1 published %s definition, got %d", et, count)
+		}
+		if err := tenantDB.QueryRowContext(ctx,
+			`SELECT count(*) FROM form_definitions WHERE entity_type = $1 AND status = 'published'`, et,
+		).Scan(&count); err != nil {
+			t.Fatalf("count published %s form: %v", et, err)
+		}
+		if count != 1 {
+			t.Errorf("expected 1 published %s form, got %d", et, count)
+		}
+	}
+
+	// The status graph is real tenant DATA, not registry metadata — so
+	// it has to be counted in the records table, and its absence is
+	// exactly what would make a FixedAsset uncreatable.
+	var statuses int
+	if err := tenantDB.QueryRowContext(ctx,
+		`SELECT count(*) FROM records r
+		 WHERE r.entity_type = 'Status' AND r.deleted_at IS NULL
+		   AND r.data->>'status_type_id' IN (
+		     SELECT id::text FROM records
+		     WHERE entity_type = 'StatusType' AND data->>'code' = 'fixed_asset_status' AND deleted_at IS NULL)`,
+	).Scan(&statuses); err != nil {
+		t.Fatalf("count seeded statuses: %v", err)
+	}
+	if statuses != 5 {
+		t.Errorf("expected 5 seeded fixed_asset_status rows, got %d", statuses)
+	}
+}
