@@ -68,6 +68,10 @@ jobs:
       # build+vet. Branch pushes skip it here because ci.yml already runs
       # the identical suite for them in parallel; running it twice would
       # only slow :latest down. (Independent review flagged the gap.)
+      - name: Install xmllint for SAF-T XSD validation (release builds)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxml2-utils
+
       - name: Run the full test suite (release builds)
         if: startsWith(github.ref, 'refs/tags/v')
         env:

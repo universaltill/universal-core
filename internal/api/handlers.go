@@ -309,6 +309,13 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	// The exporter half of Farshid's original "importer exporter
 	// plugins" ask — see export.go's own doc comment.
 	mux.Handle("GET /export/{entityType}", auth(h.exportRecordsCSV))
+	// SAF-T statutory export (saftexport.go). The literal "saft"
+	// segment outranks the {entityType} wildcard above under the mux's
+	// most-specific-pattern-wins rule, so no CSV export for an entity
+	// type that happens to be named "saft" — an acceptable collision:
+	// PascalCase entity type names can never be the lowercase "saft".
+	mux.Handle("GET /export/saft", auth(h.exportSAFT))
+	mux.Handle("GET /export/saft/form", authPage(h.saftExportPage))
 	// The in-app issue logger — see issuereport.go's own doc comment.
 	// Not entity-scoped: IssueReport is one fixed foundation entity, not
 	// a generic-per-entity-type route the way /import is.

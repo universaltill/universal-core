@@ -296,13 +296,13 @@ func TestSyncGLAccounts_CreatesMatchingGLAccountsRows(t *testing.T) {
 	).Scan(&name, &accountType, &currency, &isActive); err != nil {
 		t.Fatalf("read gl_account: %v", err)
 	}
-	if name != "Assets" || accountType != "asset" || currency != defaultGLCurrency || !isActive {
+	if name != "Assets" || accountType != "asset" || currency != DefaultGLCurrency || !isActive {
 		t.Fatalf("unexpected gl_account: name=%q type=%q currency=%q active=%v", name, accountType, currency, isActive)
 	}
 }
 
 // TestSyncGLAccounts_ResolvesRealCurrencyCode confirms the sync doesn't
-// just always fall back to defaultGLCurrency — when an Account really
+// just always fall back to DefaultGLCurrency — when an Account really
 // does set currency_id, the synced gl_accounts row gets that currency's
 // actual code, not the fallback.
 func TestSyncGLAccounts_ResolvesRealCurrencyCode(t *testing.T) {

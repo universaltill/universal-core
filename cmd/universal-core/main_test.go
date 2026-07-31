@@ -24,6 +24,7 @@ import (
 
 	"github.com/universaltill/universal-core/internal/db"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
+	"github.com/universaltill/universal-core/internal/kernel/finance"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
 	"github.com/universaltill/universal-core/internal/tenantdb"
 	"github.com/universaltill/universal-core/internal/testexec"
@@ -304,5 +305,82 @@ func TestUniversalCore_TenantPrefixRoute_RegisteredAndGated(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected 401 (registered, auth-gated), got %d", resp.StatusCode)
+	}
+}
+
+// TestUniversalCore_SAFTExportRoutes_ServedByRealBinary is the smoke
+// layer for the SAF-T export (universaltill/uc-infra#28): the real
+// compiled binary registers GET /export/saft (an actual XML audit file
+// for a provisioned tenant with foundation + finance published) and its
+// /export/saft/form page — not just the httptest-level wiring
+// internal/api's own tests cover.
+func TestUniversalCore_SAFTExportRoutes_ServedByRealBinary(t *testing.T) {
+	controlDSN := testexec.FreshDatabase(t, "uc_test_server_control")
+
+	control := testexec.Open(t, controlDSN)
+	ctx := context.Background()
+	if err := db.ApplyControl(ctx, control); err != nil {
+		t.Fatalf("ApplyControl: %v", err)
+	}
+	router, err := tenantdb.NewRouter(control, controlDSN)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+	defer router.Close()
+	tenantID, err := router.Create(ctx, "Server Smoke Test", "eu-west")
+	if err != nil {
+		t.Fatalf("router.Create: %v", err)
+	}
+	testexec.DropTenantDatabase(t, testexec.Open(t, controlDSN), tenantID)
+	tenantDB, err := router.Get(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("router.Get: %v", err)
+	}
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "smoke-test-setup"}
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := finance.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("finance.Publish: %v", err)
+	}
+	router.Close()
+	control.Close()
+
+	baseURL := startServer(t, controlDSN, "INSECURE_DEV_AUTH=true")
+
+	get := func(path string) (*http.Response, string) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, baseURL+path, nil)
+		if err != nil {
+			t.Fatalf("build request %s: %v", path, err)
+		}
+		req.Header.Set("X-Tenant-ID", tenantID)
+		req.Header.Set("X-Actor-ID", "smoke-test")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return resp, string(body)
+	}
+
+	resp, body := get("/export/saft?from=2026-01-01&to=2026-12-31")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from /export/saft, got %d: %s", resp.StatusCode, body)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/xml") {
+		t.Fatalf("expected application/xml from /export/saft, got %q", ct)
+	}
+	if !strings.HasPrefix(body, "<?xml") || !strings.Contains(body, "<AuditFile") {
+		t.Fatalf("expected a SAF-T XML document, got: %.200s", body)
+	}
+
+	formResp, formBody := get("/export/saft/form")
+	if formResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from /export/saft/form, got %d: %s", formResp.StatusCode, formBody)
+	}
+	if !strings.Contains(formBody, `action="/export/saft"`) {
+		t.Fatalf("expected the export form on the page, got: %.300s", formBody)
 	}
 }

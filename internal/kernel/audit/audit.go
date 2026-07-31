@@ -46,6 +46,13 @@ const (
 	ActionCreate Action = "create"
 	ActionUpdate Action = "update"
 	ActionDelete Action = "delete"
+	// ActionExport records a bulk disclosure rather than a mutation —
+	// a statutory audit-file export (SAF-T) is a deliberate handover of
+	// a tenant's whole ledger, which is exactly the kind of act ADR-0001
+	// §14's actor accountability exists for even though no row changed.
+	// Added with migrations/tenant/0004_audit_action_export.sql (the
+	// audit_log CHECK constraint enumerates actions).
+	ActionExport Action = "export"
 )
 
 // Actor identifies who or what made a change.

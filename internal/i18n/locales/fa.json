@@ -360,5 +360,11 @@
   "members.assign_role": "اختصاص",
   "members.revoke_role": "لغو نقش",
   "members.role_assigned": "نقش اختصاص یافت.",
-  "members.role_revoked": "نقش لغو شد."
+  "members.role_revoked": "نقش لغو شد.",
+  "saft.nav_label": "برون‌بری SAF-T",
+  "saft.heading": "برون‌بری مالی SAF-T",
+  "saft.intro": "دفتر کل این سازمان را برای بازهٔ تاریخی انتخاب‌شده به‌صورت پروندهٔ حسابرسی SAF-T Financial (نسخهٔ نروژی ۱٫۳۰) دانلود کنید.",
+  "saft.from_label": "از تاریخ",
+  "saft.to_label": "تا تاریخ",
+  "saft.download_button": "دانلود پروندهٔ SAF-T"
 }

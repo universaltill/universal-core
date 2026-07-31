@@ -14,7 +14,7 @@ import "math"
 // not per-currency-aware. A real 0-decimal (JPY-style) or 3-decimal
 // (KWD/BHD-style) currency would round wrong here. Revisit once a
 // currency-aware money type actually exists — tracked in
-// erp/BACKLOG-TASKS.md alongside finance.defaultGLCurrency, the same
+// erp/BACKLOG-TASKS.md alongside finance.DefaultGLCurrency, the same
 // category of known gap.
 func ToMinorUnits(amount float64) int64 {
 	return int64(math.Round(amount * 100))

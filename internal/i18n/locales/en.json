@@ -360,5 +360,11 @@
   "members.assign_role": "Assign",
   "members.revoke_role": "Revoke role",
   "members.role_assigned": "Role assigned.",
-  "members.role_revoked": "Role revoked."
+  "members.role_revoked": "Role revoked.",
+  "saft.nav_label": "SAF-T export",
+  "saft.heading": "SAF-T financial export",
+  "saft.intro": "Download this tenant's general ledger as a SAF-T Financial audit file (Norwegian SAF-T v1.30) for the selected date range.",
+  "saft.from_label": "From date",
+  "saft.to_label": "To date",
+  "saft.download_button": "Download SAF-T file"
 }

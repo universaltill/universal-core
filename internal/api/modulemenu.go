@@ -211,6 +211,7 @@ var moduleReportLinks = map[string][]struct {
 	RequiredRead   []string
 }{
 	"purchasing": {{"report.purchasing.nav_label", "/reports/purchasing", purchasingReportEntityTypes}},
+	"finance":    {{"saft.nav_label", "/export/saft/form", saftEntityTypes}},
 }
 
 type moduleMenuView struct {

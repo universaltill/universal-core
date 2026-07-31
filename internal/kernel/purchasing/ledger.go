@@ -27,7 +27,7 @@ var ErrVendorInvoiceMatchFailed = errors.New("vendor invoice match failed")
 // "2100 Accounts Payable"). A tenant that customizes its chart of
 // accounts away from these exact codes needs matching ones for this
 // posting to keep resolving — a real, documented limitation of this
-// first slice (same category of known gap as finance.defaultGLCurrency),
+// first slice (same category of known gap as finance.DefaultGLCurrency),
 // not a hidden assumption.
 const (
 	glAccountInventory = "1300"

@@ -57,7 +57,7 @@ func PublishForms(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 	return moduleseed.PublishAll(ctx, repo, items, actor)
 }
 
-// defaultGLCurrency is the fallback ISO 4217 code SyncGLAccounts uses
+// DefaultGLCurrency is the fallback ISO 4217 code SyncGLAccounts uses
 // when a finance.Account record has no currency_id set — gl_accounts.
 // currency is NOT NULL, but Account.currency_id is optional (an account
 // isn't required to declare one, and cmd/seed-demo-data's sample chart
@@ -67,7 +67,7 @@ func PublishForms(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 // known, narrow simplification for this first slice, not a hidden
 // assumption: revisit once a tenant-level base currency is actually
 // modeled, per erp/BACKLOG-TASKS.md.
-const defaultGLCurrency = "USD"
+const DefaultGLCurrency = "USD"
 
 // SyncGLAccounts brings gl_accounts (the ledger core's own typed chart of
 // accounts, ADR-0004) up to date with every published finance.Account
@@ -112,7 +112,7 @@ func SyncGLAccounts(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 		accountType, _ := acc.Data["type"].(string)
 		isActive, _ := acc.Data["is_active"].(bool)
 
-		currency := defaultGLCurrency
+		currency := DefaultGLCurrency
 		usedFallback := true
 		if currencyID, _ := acc.Data["currency_id"].(string); currencyID != "" {
 			usedFallback = false
@@ -130,12 +130,12 @@ func SyncGLAccounts(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 			}
 		}
 		if usedFallback {
-			// Not a hidden assumption (see defaultGLCurrency's own doc
+			// Not a hidden assumption (see DefaultGLCurrency's own doc
 			// comment), but it should be observable, not silent — a
 			// GBP-only tenant whose accounts never set currency_id would
 			// otherwise get every gl_account silently labeled USD with no
 			// trace anywhere (a real gap independent review caught).
-			log.Printf("finance: SyncGLAccounts: Account %s has no currency_id set, defaulting gl_accounts.currency to %s", code, defaultGLCurrency)
+			log.Printf("finance: SyncGLAccounts: Account %s has no currency_id set, defaulting gl_accounts.currency to %s", code, DefaultGLCurrency)
 		}
 
 		if _, err := glAccounts.UpsertByCode(ctx, code, name, accountType, currency, isActive); err != nil {

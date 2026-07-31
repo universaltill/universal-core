@@ -1,0 +1,382 @@
+package api
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"encoding/xml"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/universaltill/universal-core/internal/data"
+	"github.com/universaltill/universal-core/internal/kernel/finance"
+	"github.com/universaltill/universal-core/internal/kernel/foundation"
+	"github.com/universaltill/universal-core/internal/kernel/saft"
+)
+
+// setupSAFTTenant publishes the foundation + finance modules (the SAF-T
+// export's entity-type surface) into an already-provisioned tenant, then
+// seeds one customer and one supplier Party, a TaxCode, and a small
+// posted ledger: two accounts and one balanced 2026-03-15 journal entry
+// of 125.50.
+func setupSAFTTenant(t *testing.T, tenantID string, db *sql.DB, mux *http.ServeMux) {
+	t.Helper()
+	ctx := context.Background()
+	actor := humanActor()
+	if err := foundation.Publish(ctx, db, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := foundation.PublishForms(ctx, db, actor); err != nil {
+		t.Fatalf("foundation.PublishForms: %v", err)
+	}
+	if err := finance.Publish(ctx, db, actor); err != nil {
+		t.Fatalf("finance.Publish: %v", err)
+	}
+	if err := finance.PublishForms(ctx, db, actor); err != nil {
+		t.Fatalf("finance.PublishForms: %v", err)
+	}
+
+	post := func(path string, body string) map[string]any {
+		t.Helper()
+		req := newRequest("POST", path, tenantID, "farshid", []byte(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("POST %s: expected 201, got %d: %s", path, rec.Code, rec.Body.String())
+		}
+		var envelope struct {
+			Data map[string]any `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+			t.Fatalf("decode %s response: %v", path, err)
+		}
+		return envelope.Data
+	}
+
+	customer := post("/api/records/Party", `{"party_type":"organization","name":"Customer GmbH","tax_id":"C-111"}`)
+	supplier := post("/api/records/Party", `{"party_type":"organization","name":"Supplier LLC"}`)
+	post("/api/records/PartyRole", `{"party_id":"`+customer["id"].(string)+`","role_type":"customer"}`)
+	post("/api/records/PartyRole", `{"party_id":"`+supplier["id"].(string)+`","role_type":"vendor"}`)
+	post("/api/records/TaxCode", `{"code":"VAT5","name":"VAT 5%","rate":5,"tax_type":"vat","jurisdiction":"NO"}`)
+
+	// Ledger: dedicated typed tables, seeded via the repos (the same
+	// write path finance.SyncGLAccounts/ledger.Post own in production).
+	ctx = context.Background()
+	accounts := data.NewGLAccountRepo(db)
+	bankID, err := accounts.UpsertByCode(ctx, "1100", "Bank", "asset", "USD", true)
+	if err != nil {
+		t.Fatalf("upsert bank: %v", err)
+	}
+	revID, err := accounts.UpsertByCode(ctx, "3000", "Revenue", "income", "USD", true)
+	if err != nil {
+		t.Fatalf("upsert revenue: %v", err)
+	}
+	// Two entries, not one: a single-entry fixture is the exact shape
+	// that masked the eager-load aliasing bug (#28's independent
+	// review) — a multi-entry range is the representative case.
+	for _, e := range []struct {
+		date, desc string
+		amt        int64
+	}{
+		{"2026-03-15", "Invoice INV-1", 125_50},
+		{"2026-05-20", "Invoice INV-2", 74_50},
+	} {
+		tx, err := db.Begin()
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		if _, err := data.NewJournalEntryRepo(db).CreateTx(ctx, tx, e.date, e.desc, "CustomerInvoice", "",
+			[]string{bankID, revID}, []int64{e.amt, 0}, []int64{0, e.amt}); err != nil {
+			t.Fatalf("create journal entry %s: %v", e.date, err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("commit %s: %v", e.date, err)
+		}
+	}
+}
+
+// validateSAFTAgainstXSD checks payload against the vendored Skatteetaten
+// 1.30 schema (internal/kernel/saft/testdata) via xmllint — the same
+// validation the saft package's own unit tests run, applied here to the
+// HANDLER's real output: real UUIDs, real tenant names and seeded
+// records exercise value shapes a hand-written serializer fixture never
+// does. Skips without xmllint locally; CI installs libxml2-utils.
+func validateSAFTAgainstXSD(t *testing.T, payload []byte) {
+	t.Helper()
+	if _, err := exec.LookPath("xmllint"); err != nil {
+		t.Skip("xmllint not installed; XSD validation runs in CI")
+	}
+	path := filepath.Join(t.TempDir(), "audit.xml")
+	if err := os.WriteFile(path, payload, 0o600); err != nil {
+		t.Fatalf("write temp audit file: %v", err)
+	}
+	out, err := exec.Command("xmllint", "--noout",
+		"--schema", "../kernel/saft/testdata/Norwegian_SAF-T_Financial_Schema_v_1.30.xsd", path).CombinedOutput()
+	if err != nil {
+		t.Fatalf("handler output does not validate against the SAF-T 1.30 XSD: %v\n%s\n---\n%s", err, out, payload)
+	}
+}
+
+func TestSAFTExport_RequiresAuth(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	req := httptest.NewRequest("GET", "/export/saft?from=2026-01-01&to=2026-12-31", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with no auth headers, got %d", rec.Code)
+	}
+}
+
+func TestSAFTExport_RejectsBadDates(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, _ := newTestTenant(t, router)
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	for _, q := range []string{
+		"from=2026-01-01",               // missing to
+		"from=01/01/2026&to=2026-12-31", // wrong format
+		"from=2026-12-31&to=2026-01-01", // inverted
+		"from=2026-13-40&to=2026-12-31", // impossible date
+	} {
+		req := newRequest("GET", "/export/saft?"+q, tenantID, "farshid", nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("query %q: expected 400, got %d: %s", q, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+// TestSAFTExport_ProducesValidFileAndAuditRow is the core proof: real
+// tenant, real published modules, real ledger rows → one XML document
+// that parses back into the saft document model with the right master
+// data, totals, and a recorded export audit row.
+func TestSAFTExport_ProducesValidFileAndAuditRow(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+	setupSAFTTenant(t, tenantID, db, mux)
+
+	req := newRequest("GET", "/export/saft?from=2026-01-01&to=2026-12-31", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/xml") {
+		t.Fatalf("expected application/xml, got %q", ct)
+	}
+	if cd := rec.Header().Get("Content-Disposition"); cd != `attachment; filename="saft_2026-01-01_2026-12-31.xml"` {
+		t.Fatalf("unexpected Content-Disposition %q", cd)
+	}
+
+	var file saft.AuditFile
+	if err := xml.Unmarshal(rec.Body.Bytes(), &file); err != nil {
+		t.Fatalf("response is not parseable SAF-T XML: %v\n%s", err, rec.Body.String())
+	}
+	if file.Header.DefaultCurrencyCode != "USD" {
+		t.Errorf("DefaultCurrencyCode = %q, want USD (single-currency chart)", file.Header.DefaultCurrencyCode)
+	}
+	if file.MasterFiles == nil {
+		t.Fatal("expected MasterFiles")
+	}
+	if n := len(file.MasterFiles.GeneralLedgerAccounts.Accounts); n != 2 {
+		t.Errorf("expected 2 accounts, got %d", n)
+	}
+	if n := len(file.MasterFiles.Customers.Customers); n != 1 || file.MasterFiles.Customers.Customers[0].Name != "Customer GmbH" {
+		t.Errorf("customers wrong: %+v", file.MasterFiles.Customers)
+	}
+	if file.MasterFiles.Customers.Customers[0].RegistrationNumber != "C-111" {
+		t.Errorf("customer tax_id should map to RegistrationNumber, got %+v", file.MasterFiles.Customers.Customers[0])
+	}
+	if n := len(file.MasterFiles.Suppliers.Suppliers); n != 1 || file.MasterFiles.Suppliers.Suppliers[0].Name != "Supplier LLC" {
+		t.Errorf("suppliers wrong: %+v", file.MasterFiles.Suppliers)
+	}
+	if file.MasterFiles.TaxTable == nil || len(file.MasterFiles.TaxTable.Entries[0].TaxCodeDetails) != 1 {
+		t.Errorf("tax table wrong: %+v", file.MasterFiles.TaxTable)
+	}
+	gle := file.GeneralLedgerEntries
+	// 125.50 + 74.50 across two transactions: the totals must sum BOTH
+	// entries' lines, and every transaction must keep its own two lines
+	// — the aliasing-bug regression assertions at the HTTP layer.
+	if gle.NumberOfEntries != 2 || gle.TotalDebit != "200.00" || gle.TotalCredit != "200.00" {
+		t.Errorf("GL totals wrong: %+v", gle)
+	}
+	if len(gle.Journals) != 1 || len(gle.Journals[0].Transactions) != 2 {
+		t.Fatalf("expected 1 journal with 2 transactions, got %+v", gle.Journals)
+	}
+	for i, tx := range gle.Journals[0].Transactions {
+		if len(tx.Lines) != 2 {
+			t.Errorf("transaction %d (%s) lost its lines: got %d, want 2", i, tx.TransactionDate, len(tx.Lines))
+		}
+		if tx.VoucherType != "CustomerInvoice" {
+			t.Errorf("transaction %d should carry its source as VoucherType, got %q", i, tx.VoucherType)
+		}
+	}
+
+	// The real handler output — real UUIDs, real tenant name, real
+	// seeded data, not a hand-written fixture — must itself validate
+	// against the vendored Skatteetaten XSD. Skips without xmllint
+	// locally; CI installs libxml2-utils so it always runs there.
+	validateSAFTAgainstXSD(t, rec.Body.Bytes())
+
+	// The export itself must be on the audit trail (ADR-0001 §14), with
+	// the dev-auth human actor attributed.
+	var action, actorType, actorID string
+	var diff []byte
+	if err := db.QueryRow(`SELECT action, actor_type, actor_id, diff FROM audit_log WHERE entity_type = 'SAFTExport'`).
+		Scan(&action, &actorType, &actorID, &diff); err != nil {
+		t.Fatalf("expected exactly one SAFTExport audit row: %v", err)
+	}
+	if action != "export" || actorType != "human" || actorID != "farshid" {
+		t.Errorf("audit row wrong: action=%q actor=%s/%s", action, actorType, actorID)
+	}
+	var d map[string]any
+	if err := json.Unmarshal(diff, &d); err != nil || d["from"] != "2026-01-01" || d["entries"] != float64(2) {
+		t.Errorf("audit diff wrong: %s (err %v)", diff, err)
+	}
+}
+
+// TestSAFTExport_EmptyTenantStillValidFile: a tenant with the modules
+// published but no data at all still gets a well-formed file — the
+// zero-entries shape the XSD explicitly allows.
+func TestSAFTExport_EmptyTenantStillValidFile(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+	ctx := context.Background()
+	if err := foundation.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := finance.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("finance.Publish: %v", err)
+	}
+
+	req := newRequest("GET", "/export/saft?from=2026-01-01&to=2026-12-31", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var file saft.AuditFile
+	if err := xml.Unmarshal(rec.Body.Bytes(), &file); err != nil {
+		t.Fatalf("unparseable: %v", err)
+	}
+	if file.GeneralLedgerEntries.NumberOfEntries != 0 {
+		t.Errorf("expected zero entries, got %d", file.GeneralLedgerEntries.NumberOfEntries)
+	}
+	validateSAFTAgainstXSD(t, rec.Body.Bytes())
+}
+
+// TestSAFTExport_RBACDenied: once any Permission row exists for an
+// entity type the file discloses, an actor without that grant gets a
+// 403 — the whole-file gate, mirroring the purchasing report's.
+func TestSAFTExport_RBACDenied(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+	setupSAFTTenant(t, tenantID, db, mux)
+
+	// Close "Account" to a role the requesting clerk does not hold.
+	seedRBAC(t, db,
+		map[string][]string{"accountant": {"user-accountant"}},
+		[]map[string]any{{"role": "accountant", "entity_type": "Account", "can_read": true}})
+
+	req := newRequest("GET", "/export/saft?from=2026-01-01&to=2026-12-31", tenantID, "user-clerk", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for an actor without Account read, got %d: %s", rec.Code, rec.Body.String())
+	}
+	// The form page runs the same gate (denyPageUnless → localized 403
+	// page) — a denied actor must not see the form either.
+	formReq := newRequest("GET", "/export/saft/form", tenantID, "user-clerk", nil)
+	formRec := httptest.NewRecorder()
+	mux.ServeHTTP(formRec, formReq)
+	if formRec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 from the form page for a denied actor, got %d: %s", formRec.Code, formRec.Body.String())
+	}
+	// The granted actor still gets the file.
+	req = newRequest("GET", "/export/saft?from=2026-01-01&to=2026-12-31", tenantID, "user-accountant", nil)
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for the granted actor, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestSAFTExport_TenantIsolation: tenant B's file never carries tenant
+// A's ledger — two genuinely separate databases (ADR-0003), same proof
+// shape as the CSV export's isolation test.
+func TestSAFTExport_TenantIsolation(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantA, dbA := newTestTenant(t, router)
+	tenantB, dbB := newTestTenant(t, router)
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+	setupSAFTTenant(t, tenantA, dbA, mux)
+	ctx := context.Background()
+	if err := foundation.Publish(ctx, dbB, humanActor()); err != nil {
+		t.Fatalf("foundation.Publish B: %v", err)
+	}
+	if err := finance.Publish(ctx, dbB, humanActor()); err != nil {
+		t.Fatalf("finance.Publish B: %v", err)
+	}
+
+	req := newRequest("GET", "/export/saft?from=2026-01-01&to=2026-12-31", tenantB, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, leaked := range []string{"Customer GmbH", "Supplier LLC", "Invoice INV-1", "1100"} {
+		if strings.Contains(body, leaked) {
+			t.Errorf("tenant B's export leaked tenant A's %q:\n%s", leaked, body)
+		}
+	}
+}
+
+func TestSAFTExportForm_RendersDateInputs(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+	ctx := context.Background()
+	if err := foundation.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+
+	req := newRequest("GET", "/export/saft/form", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{`action="/export/saft"`, `name="from"`, `name="to"`, `type="date"`, "SAF-T"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("form page missing %q", want)
+		}
+	}
+}

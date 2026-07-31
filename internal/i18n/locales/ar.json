@@ -360,5 +360,11 @@
   "members.assign_role": "تعيين",
   "members.revoke_role": "إلغاء الدور",
   "members.role_assigned": "تم تعيين الدور.",
-  "members.role_revoked": "تم إلغاء الدور."
+  "members.role_revoked": "تم إلغاء الدور.",
+  "saft.nav_label": "تصدير SAF-T",
+  "saft.heading": "التصدير المالي SAF-T",
+  "saft.intro": "نزِّل دفتر الأستاذ العام لهذه المؤسسة كملف تدقيق SAF-T Financial (النسخة النرويجية 1.30) للفترة الزمنية المحددة.",
+  "saft.from_label": "من تاريخ",
+  "saft.to_label": "إلى تاريخ",
+  "saft.download_button": "تنزيل ملف SAF-T"
 }

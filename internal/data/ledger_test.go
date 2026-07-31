@@ -2,7 +2,9 @@ package data
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
 	"testing"
 )
 
@@ -228,5 +230,190 @@ func TestJournalEntryRepo_List_EmptyWhenNoEntries(t *testing.T) {
 	}
 	if len(list) != 0 {
 		t.Fatalf("expected no entries, got %d", len(list))
+	}
+}
+
+// seedSAFTLedger creates two accounts and three balanced journal entries
+// (before, inside, and after a March-2026 reporting window) — the shared
+// fixture for the ListRange/BalancesForRange tests below.
+func seedSAFTLedger(t *testing.T, db *sql.DB) (bankID, revenueID string) {
+	t.Helper()
+	ctx := context.Background()
+	accounts := NewGLAccountRepo(db)
+	var err error
+	bankID, err = accounts.UpsertByCode(ctx, "1100", "Bank", "asset", "USD", true)
+	if err != nil {
+		t.Fatalf("upsert bank account: %v", err)
+	}
+	revenueID, err = accounts.UpsertByCode(ctx, "3000", "Revenue", "income", "USD", true)
+	if err != nil {
+		t.Fatalf("upsert revenue account: %v", err)
+	}
+	entries := NewJournalEntryRepo(db)
+	for _, e := range []struct {
+		date string
+		amt  int64
+	}{
+		{"2026-02-10", 100_00}, // before the window
+		{"2026-03-15", 25_50},  // inside it
+		{"2026-04-01", 7_00},   // after it
+	} {
+		tx, err := db.Begin()
+		if err != nil {
+			t.Fatalf("begin tx: %v", err)
+		}
+		if _, err := entries.CreateTx(ctx, tx, e.date, "entry "+e.date, "", "",
+			[]string{bankID, revenueID}, []int64{e.amt, 0}, []int64{0, e.amt}); err != nil {
+			t.Fatalf("create journal entry %s: %v", e.date, err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("commit journal entry %s: %v", e.date, err)
+		}
+	}
+	return bankID, revenueID
+}
+
+func TestJournalEntryRepo_ListRange_FiltersAndOrdersOldestFirst(t *testing.T) {
+	db := freshTenantDB(t)
+	seedSAFTLedger(t, db)
+	ctx := context.Background()
+
+	got, err := NewJournalEntryRepo(db).ListRange(ctx, "2026-03-01", "2026-03-31")
+	if err != nil {
+		t.Fatalf("ListRange: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected exactly the in-window entry, got %d entries", len(got))
+	}
+	e := got[0]
+	if e.EntryDate != "2026-03-15" || e.Description != "entry 2026-03-15" {
+		t.Fatalf("wrong entry returned: %+v", e)
+	}
+	if e.PostedAt == "" {
+		t.Fatal("ListRange must populate PostedAt (SystemEntryDate source)")
+	}
+	if len(e.Lines) != 2 {
+		t.Fatalf("expected the entry's 2 lines eager-loaded, got %d", len(e.Lines))
+	}
+	if e.Lines[0].AccountCode != "1100" || e.Lines[0].DebitMinor != 25_50 {
+		t.Fatalf("wrong first line: %+v", e.Lines[0])
+	}
+
+	// A wider window returns all three, oldest first (audit-file order).
+	all, err := NewJournalEntryRepo(db).ListRange(ctx, "2026-01-01", "2026-12-31")
+	if err != nil {
+		t.Fatalf("ListRange (wide): %v", err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(all))
+	}
+	if all[0].EntryDate != "2026-02-10" || all[2].EntryDate != "2026-04-01" {
+		t.Fatalf("expected oldest-first ordering, got %s ... %s", all[0].EntryDate, all[2].EntryDate)
+	}
+	// EVERY entry must keep its lines in a multi-entry result — the
+	// regression assertion for the append-reallocation aliasing bug
+	// (#28's independent review): with element pointers instead of
+	// index-based attachment, all but the last entry came back
+	// line-less, and a single-entry fixture can never notice.
+	for i, e := range all {
+		if len(e.Lines) != 2 {
+			t.Fatalf("entry %d (%s) lost its lines in a multi-entry ListRange: got %d, want 2", i, e.EntryDate, len(e.Lines))
+		}
+	}
+
+	// An empty window is an empty, non-error result.
+	none, err := NewJournalEntryRepo(db).ListRange(ctx, "2020-01-01", "2020-12-31")
+	if err != nil {
+		t.Fatalf("ListRange (empty): %v", err)
+	}
+	if len(none) != 0 {
+		t.Fatalf("expected no entries, got %d", len(none))
+	}
+}
+
+func TestGLAccountRepo_BalancesForRange_OpeningExcludesClosingIncludes(t *testing.T) {
+	db := freshTenantDB(t)
+	seedSAFTLedger(t, db)
+	ctx := context.Background()
+	// A third account with no activity at all must still appear (an
+	// audit file lists the whole chart).
+	if _, err := NewGLAccountRepo(db).UpsertByCode(ctx, "9999", "Dormant", "expense", "USD", true); err != nil {
+		t.Fatalf("upsert dormant account: %v", err)
+	}
+
+	balances, err := NewGLAccountRepo(db).BalancesForRange(ctx, "2026-03-01", "2026-03-31")
+	if err != nil {
+		t.Fatalf("BalancesForRange: %v", err)
+	}
+	byCode := map[string]GLAccountBalance{}
+	for _, b := range balances {
+		byCode[b.Code] = b
+	}
+	if len(balances) != 3 {
+		t.Fatalf("expected all 3 accounts, got %d", len(balances))
+	}
+	bank := byCode["1100"]
+	// Opening: only the Feb entry (100.00 debit). Closing: Feb + Mar
+	// (125.50 debit) — the April entry is outside the window on both.
+	if bank.OpeningMinor != 100_00 || bank.ClosingMinor != 125_50 {
+		t.Fatalf("bank balances wrong: %+v", bank)
+	}
+	rev := byCode["3000"]
+	if rev.OpeningMinor != -100_00 || rev.ClosingMinor != -125_50 {
+		t.Fatalf("revenue balances wrong (should be credit-side/negative nets): %+v", rev)
+	}
+	dormant := byCode["9999"]
+	if dormant.OpeningMinor != 0 || dormant.ClosingMinor != 0 || dormant.AccountType != "expense" {
+		t.Fatalf("dormant account wrong: %+v", dormant)
+	}
+}
+
+func TestGLAccountRepo_DistinctCurrencies(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewGLAccountRepo(db)
+
+	got, err := repo.DistinctCurrencies(ctx)
+	if err != nil {
+		t.Fatalf("DistinctCurrencies (empty): %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected no currencies on an empty chart, got %v", got)
+	}
+
+	for i, c := range []string{"USD", "USD", "QAR"} {
+		if _, err := repo.UpsertByCode(ctx, fmt.Sprintf("%d000", i+1), "Acct", "asset", c, true); err != nil {
+			t.Fatalf("upsert account %d: %v", i, err)
+		}
+	}
+	got, err = repo.DistinctCurrencies(ctx)
+	if err != nil {
+		t.Fatalf("DistinctCurrencies: %v", err)
+	}
+	if len(got) != 2 || got[0] != "QAR" || got[1] != "USD" {
+		t.Fatalf("expected [QAR USD], got %v", got)
+	}
+}
+
+// TestJournalEntryRepo_List_MultiEntryKeepsAllLines is List's own
+// regression test for the same aliasing bug ListRange's wide-window
+// assertion covers — List had the identical element-pointer pattern
+// (pre-existing, caught in #28's independent review) and its original
+// test seeded exactly one entry, the one shape that can't expose it.
+func TestJournalEntryRepo_List_MultiEntryKeepsAllLines(t *testing.T) {
+	db := freshTenantDB(t)
+	seedSAFTLedger(t, db)
+
+	entries, err := NewJournalEntryRepo(db).List(context.Background())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(entries))
+	}
+	for i, e := range entries {
+		if len(e.Lines) != 2 {
+			t.Fatalf("entry %d (%s) lost its lines in a multi-entry List: got %d, want 2", i, e.EntryDate, len(e.Lines))
+		}
 	}
 }
