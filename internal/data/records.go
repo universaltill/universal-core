@@ -401,7 +401,7 @@ func (r *RecordRepo) ListByField(ctx context.Context, entityType, fieldName, val
 	rows, err := r.db.QueryContext(ctx,
 		`SELECT id, data, version FROM records
 		 WHERE entity_type = $1 AND data->>$2 = $3 AND deleted_at IS NULL
-		 ORDER BY created_at`,
+		 ORDER BY created_at, id`,
 		entityType, fieldName, value,
 	)
 	if err != nil {

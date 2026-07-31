@@ -316,6 +316,9 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	// PascalCase entity type names can never be the lowercase "saft".
 	mux.Handle("GET /export/saft", auth(h.exportSAFT))
 	mux.Handle("GET /export/saft/form", authPage(h.saftExportPage))
+	// UBL 2.1 single-document export (ublexport.go). Three path
+	// segments, so no overlap with the two CSV/SAF-T patterns above.
+	mux.Handle("GET /export/{entityType}/{id}/ubl", auth(h.exportUBL))
 	// The in-app issue logger — see issuereport.go's own doc comment.
 	// Not entity-scoped: IssueReport is one fixed foundation entity, not
 	// a generic-per-entity-type route the way /import is.

@@ -22,10 +22,14 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/db"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
+	"github.com/universaltill/universal-core/internal/kernel/crud"
+	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/finance"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
+	"github.com/universaltill/universal-core/internal/kernel/purchasing"
 	"github.com/universaltill/universal-core/internal/tenantdb"
 	"github.com/universaltill/universal-core/internal/testexec"
 )
@@ -382,5 +386,123 @@ func TestUniversalCore_SAFTExportRoutes_ServedByRealBinary(t *testing.T) {
 	}
 	if !strings.Contains(formBody, `action="/export/saft"`) {
 		t.Fatalf("expected the export form on the page, got: %.300s", formBody)
+	}
+}
+
+// The smoke layer for the UBL export (universaltill/uc-infra#27): the
+// real compiled binary serves GET /export/{entityType}/{id}/ubl with a
+// real UBL Order document for a real PurchaseOrder — and the handler
+// (not the mux) answers for unsupported entity types.
+func TestUniversalCore_UBLExportRoute_ServedByRealBinary(t *testing.T) {
+	controlDSN := testexec.FreshDatabase(t, "uc_test_server_control")
+
+	control := testexec.Open(t, controlDSN)
+	ctx := context.Background()
+	if err := db.ApplyControl(ctx, control); err != nil {
+		t.Fatalf("ApplyControl: %v", err)
+	}
+	router, err := tenantdb.NewRouter(control, controlDSN)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+	defer router.Close()
+	tenantID, err := router.Create(ctx, "UBL Smoke Test", "eu-west")
+	if err != nil {
+		t.Fatalf("router.Create: %v", err)
+	}
+	testexec.DropTenantDatabase(t, testexec.Open(t, controlDSN), tenantID)
+	tenantDB, err := router.Get(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("router.Get: %v", err)
+	}
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "smoke-test-setup"}
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := purchasing.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("purchasing.Publish: %v", err)
+	}
+	if err := purchasing.PublishStatuses(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("purchasing.PublishStatuses: %v", err)
+	}
+
+	defs := data.NewEntityDefinitionRepo(tenantDB)
+	def := func(entityType string) *entity.Definition {
+		v, err := defs.GetPublished(ctx, entityType)
+		if err != nil {
+			t.Fatalf("GetPublished(%s): %v", entityType, err)
+		}
+		d, err := entity.Unmarshal(v.Definition)
+		if err != nil {
+			t.Fatalf("unmarshal %s: %v", entityType, err)
+		}
+		return d
+	}
+	engine := crud.NewEngine(tenantDB)
+	create := func(entityType string, fields map[string]any) string {
+		t.Helper()
+		rec, err := engine.Create(ctx, def(entityType), fields, actor)
+		if err != nil {
+			t.Fatalf("create %s: %v", entityType, err)
+		}
+		return rec.ID
+	}
+	vendorID := create("Party", map[string]any{"party_type": "organization", "name": "Smoke Vendor", "status": "active"})
+	currencyID := create("Currency", map[string]any{"code": "USD", "name": "US Dollar", "minor_unit": 2.0})
+	itemID := create("Item", map[string]any{"sku": "SMOKE-1", "name": "Smoke Widget", "item_type": "stock"})
+	statusTypes, err := engine.ListByField(ctx, def("StatusType"), "code", "purchase_order_status")
+	if err != nil || len(statusTypes) == 0 {
+		t.Fatalf("list purchase_order_status StatusType: %v (n=%d)", err, len(statusTypes))
+	}
+	statuses, err := engine.ListByField(ctx, def("Status"), "status_type_id", statusTypes[0].ID)
+	if err != nil || len(statuses) == 0 {
+		t.Fatalf("list Status: %v (n=%d)", err, len(statuses))
+	}
+	poID := create("PurchaseOrder", map[string]any{
+		"po_number": "PO-SMOKE-1", "vendor_id": vendorID, "order_date": "2026-07-01",
+		"currency_id": currencyID, "status_id": statuses[0].ID, "total": 10.0,
+	})
+	create("POLine", map[string]any{
+		"purchase_order_id": poID, "item_id": itemID, "qty": 1.0, "unit_price": 10.0, "line_total": 10.0,
+	})
+	router.Close()
+	control.Close()
+
+	baseURL := startServer(t, controlDSN, "INSECURE_DEV_AUTH=true")
+
+	get := func(path string) (*http.Response, string) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, baseURL+path, nil)
+		if err != nil {
+			t.Fatalf("build request %s: %v", path, err)
+		}
+		req.Header.Set("X-Tenant-ID", tenantID)
+		req.Header.Set("X-Actor-ID", "smoke-test")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return resp, string(body)
+	}
+
+	resp, body := get("/export/PurchaseOrder/" + poID + "/ubl")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from UBL export, got %d: %s", resp.StatusCode, body)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/xml") {
+		t.Fatalf("expected application/xml, got %q", ct)
+	}
+	if !strings.HasPrefix(body, "<?xml") || !strings.Contains(body, "<Order") || !strings.Contains(body, "PO-SMOKE-1") {
+		t.Fatalf("expected a UBL Order document, got: %.300s", body)
+	}
+
+	// An unsupported entity type is answered by the handler's own 404
+	// message — proof the route pattern reached exportUBL, not the mux's
+	// generic not-found.
+	unsupResp, unsupBody := get("/export/Party/" + vendorID + "/ubl")
+	if unsupResp.StatusCode != http.StatusNotFound || !strings.Contains(unsupBody, "UBL export is not available") {
+		t.Fatalf("expected handler 404 for unsupported type, got %d: %s", unsupResp.StatusCode, unsupBody)
 	}
 }
