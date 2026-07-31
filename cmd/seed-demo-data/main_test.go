@@ -6,9 +6,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
@@ -18,6 +20,7 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/finance"
+	"github.com/universaltill/universal-core/internal/kernel/forecast"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
 	"github.com/universaltill/universal-core/internal/kernel/purchasing"
 	"github.com/universaltill/universal-core/internal/kernel/sales"
@@ -181,7 +184,7 @@ func TestSeedDemoData_SeedsSampleRecordsAndIsIdempotent(t *testing.T) {
 	counts := map[string]int{}
 	for _, entityType := range []string{
 		"Party", "Item", "PurchaseOrder", "SalesOrder", "CustomerInvoice",
-		"Account", "FiscalYear", "Period", "TaxCode", "CostCenter",
+		"Account", "FiscalYear", "Period", "TaxCode", "CostCenter", "ReorderRule",
 	} {
 		counts[entityType] = countRecords(t, tenantDB, entityType)
 		if counts[entityType] == 0 {
@@ -230,6 +233,82 @@ func TestSeedDemoData_SeedsSampleRecordsAndIsIdempotent(t *testing.T) {
 	_, draftData, _ := purchaseOrderByNumber(t, tenantDB, "PO-2026-0003")
 	if v, ok := draftData["sourced_at"]; ok && v != "" {
 		t.Errorf("PO-2026-0003 (draft) should have no stages, got sourced_at=%v", v)
+	}
+
+	// #30: pin the SKU-1004 reorder signal's exact numbers against the
+	// seeded state, through the same repo queries + forecast math the
+	// report page composes (internal/api/reporting.go): exactly the
+	// three received POs feed the lead-time stats (25, 9, and 11 days ->
+	// overall P50 11, P90 = 11 + 0.8*(25-11) = 22.2; Acme's own pair
+	// [9, 25] -> per-vendor P50 17, P90 23.4), SKU-1004's position is
+	// its on-hand 80 alone (its only PO is received, so nothing is on
+	// order), and 80 <= 150+50 fires the rule seedReorderRules declares
+	// for it.
+	if got := countRecords(t, tenantDB, "ReorderRule"); got != 3 {
+		t.Fatalf("expected 3 seeded ReorderRules, got %d", got)
+	}
+	reporting := data.NewReportingRepo(tenantDB)
+	ctx := context.Background()
+	leadTimes, err := reporting.CompletedPOLeadTimes(ctx)
+	if err != nil {
+		t.Fatalf("CompletedPOLeadTimes: %v", err)
+	}
+	if len(leadTimes) != 3 {
+		t.Fatalf("expected exactly the 3 received POs as completed lead-time rows, got %d: %+v", len(leadTimes), leadTimes)
+	}
+	samples := make([]forecast.LeadTimeSample, 0, len(leadTimes))
+	for _, row := range leadTimes {
+		ordered, err := time.Parse("2006-01-02", row.OrderDate)
+		if err != nil {
+			t.Fatalf("parse order date %q: %v", row.OrderDate, err)
+		}
+		receivedAt, err := time.Parse("2006-01-02", row.ReceivedDate)
+		if err != nil {
+			t.Fatalf("parse received date %q: %v", row.ReceivedDate, err)
+		}
+		samples = append(samples, forecast.LeadTimeSample{VendorID: row.VendorID, OrderDate: ordered, ReceivedDate: receivedAt})
+	}
+	stats := forecast.Compute(samples)
+	if stats.Overall.N != 3 || !stats.Overall.Sufficient() {
+		t.Fatalf("overall lead-time stats = %+v, want N=3 sufficient", stats.Overall)
+	}
+	if stats.Overall.P50Days != 11 || math.Abs(stats.Overall.P90Days-22.2) > 1e-9 {
+		t.Fatalf("overall P50/P90 = %v/%v, want 11/22.2 (received_at wins over the +5d GoodsReceipt fallback)", stats.Overall.P50Days, stats.Overall.P90Days)
+	}
+	// Acme Textiles now has two completed orders (PO-2026-0001 25d,
+	// PO-2026-0004 9d) -> a real per-vendor row on the live demo report:
+	// P50 17, P90 = 9 + 0.9*(25-9) = 23.4.
+	acmeID := partyIDByName(t, tenantDB, "Acme Textiles")
+	acme, ok := stats.ByVendor[acmeID]
+	if !ok || acme.N != 2 || !acme.Sufficient() {
+		t.Fatalf("Acme Textiles lead-time stats = %+v (ok=%v), want N=2 sufficient", acme, ok)
+	}
+	if acme.P50Days != 17 || math.Abs(acme.P90Days-23.4) > 1e-9 {
+		t.Fatalf("Acme P50/P90 = %v/%v, want 17/23.4", acme.P50Days, acme.P90Days)
+	}
+	onOrder, err := reporting.OnOrderQtyByItem(ctx)
+	if err != nil {
+		t.Fatalf("OnOrderQtyByItem: %v", err)
+	}
+	sku1004 := itemIDBySKU(t, tenantDB, "SKU-1004")
+	if qty := onOrder[sku1004]; qty != 0 {
+		t.Fatalf("SKU-1004 on-order = %v, want 0 (its only PO is received)", qty)
+	}
+	onHand := inventoryOnHand(t, tenantDB, sku1004)
+	if onHand != 80 {
+		t.Fatalf("SKU-1004 on-hand = %v, want 80", onHand)
+	}
+	rule := reorderRuleByItem(t, tenantDB, sku1004)
+	point, _ := rule["reorder_point"].(float64)
+	safety, _ := rule["safety_stock"].(float64)
+	if point != 150 || safety != 50 {
+		t.Fatalf("SKU-1004 rule = point %v safety %v, want 150/50", point, safety)
+	}
+	if conf, _ := rule["target_lead_time_confidence"].(string); conf != "p90" {
+		t.Fatalf("SKU-1004 confidence = %q, want p90", conf)
+	}
+	if position := onHand + onOrder[sku1004]; position > point+safety {
+		t.Fatalf("SKU-1004 position %v must fire against threshold %v", position, point+safety)
 	}
 
 	// Re-run: must be idempotent (getOrCreate, per this binary's own
@@ -338,22 +417,20 @@ func TestSeedDemoData_BackfillsStagesOnPreexistingPurchaseOrder(t *testing.T) {
 	if gotID != pre.ID {
 		t.Fatalf("expected the pre-existing PO-2026-0001 to be backfilled in place, got a different record (had %s, now %s)", pre.ID, gotID)
 	}
-	// PO-2026-0001 is an in-flight PO in the seed table: exactly the
-	// first four stages, no customs_cleared_at/received_at.
+	// PO-2026-0001 is a fully received PO in the seed table (#30's
+	// review flipped it so Acme Textiles has two completed orders):
+	// the backfill adds its complete six-stage chain.
 	wantStages := map[string]string{
 		"sourced_at":          "2026-07-04",
 		"production_start_at": "2026-07-08",
 		"production_ready_at": "2026-07-18",
 		"shipped_at":          "2026-07-22",
+		"customs_cleared_at":  "2026-07-24",
+		"received_at":         "2026-07-26",
 	}
 	for name, want := range wantStages {
 		if got, _ := gotData[name].(string); got != want {
 			t.Errorf("backfilled stage %q: expected %q, got %q", name, want, got)
-		}
-	}
-	for _, absent := range []string{"customs_cleared_at", "received_at"} {
-		if v, ok := gotData[absent]; ok && v != "" {
-			t.Errorf("stage %q must not be backfilled onto an in-flight PO, got %v", absent, v)
 		}
 	}
 	// The rest of the record rides along unchanged — the backfill copies
@@ -396,6 +473,76 @@ func purchaseOrderByNumber(t *testing.T, tenantDB *sql.DB, poNumber string) (rec
 		t.Fatalf("expected exactly one PurchaseOrder with po_number %s, got %d", poNumber, n)
 	}
 	return recordID, recordData, version
+}
+
+// partyIDByName resolves a seeded Party's record id by its name.
+func partyIDByName(t *testing.T, tenantDB *sql.DB, name string) string {
+	t.Helper()
+	var id string
+	if err := tenantDB.QueryRowContext(context.Background(),
+		`SELECT id FROM records WHERE entity_type = 'Party' AND data->>'name' = $1 AND deleted_at IS NULL`, name,
+	).Scan(&id); err != nil {
+		t.Fatalf("look up Party %s: %v", name, err)
+	}
+	return id
+}
+
+// itemIDBySKU resolves a seeded Item's record id by its SKU natural key.
+func itemIDBySKU(t *testing.T, tenantDB *sql.DB, sku string) string {
+	t.Helper()
+	var id string
+	if err := tenantDB.QueryRowContext(context.Background(),
+		`SELECT id FROM records WHERE entity_type = 'Item' AND data->>'sku' = $1 AND deleted_at IS NULL`, sku,
+	).Scan(&id); err != nil {
+		t.Fatalf("look up Item %s: %v", sku, err)
+	}
+	return id
+}
+
+// inventoryOnHand reads the single seeded InventoryItem row's
+// qty_on_hand for an item.
+func inventoryOnHand(t *testing.T, tenantDB *sql.DB, itemID string) float64 {
+	t.Helper()
+	var qty float64
+	if err := tenantDB.QueryRowContext(context.Background(),
+		`SELECT (data->>'qty_on_hand')::numeric FROM records
+		 WHERE entity_type = 'InventoryItem' AND data->>'item_id' = $1 AND deleted_at IS NULL`, itemID,
+	).Scan(&qty); err != nil {
+		t.Fatalf("look up InventoryItem for %s: %v", itemID, err)
+	}
+	return qty
+}
+
+// reorderRuleByItem fetches the single seeded ReorderRule for an item —
+// and fails on duplicates, which doubles as seedReorderRules' own
+// one-rule-per-item dedup assertion.
+func reorderRuleByItem(t *testing.T, tenantDB *sql.DB, itemID string) map[string]any {
+	t.Helper()
+	rows, err := tenantDB.QueryContext(context.Background(),
+		`SELECT data FROM records WHERE entity_type = 'ReorderRule' AND data->>'item_id' = $1 AND deleted_at IS NULL`, itemID)
+	if err != nil {
+		t.Fatalf("query ReorderRule for %s: %v", itemID, err)
+	}
+	defer rows.Close()
+	var out map[string]any
+	n := 0
+	for rows.Next() {
+		n++
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			t.Fatalf("scan ReorderRule: %v", err)
+		}
+		if err := json.Unmarshal(raw, &out); err != nil {
+			t.Fatalf("unmarshal ReorderRule data: %v", err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate ReorderRule rows: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected exactly one ReorderRule for item %s, got %d", itemID, n)
+	}
+	return out
 }
 
 func countRecords(t *testing.T, tenantDB *sql.DB, entityType string) int {

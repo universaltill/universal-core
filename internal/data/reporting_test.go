@@ -181,6 +181,267 @@ func TestTopVendorsBySpend_RanksDescendingAndExcludesMalformedRefs(t *testing.T)
 	}
 }
 
+// TestCompletedPOLeadTimes_ReceivedAtWithGoodsReceiptFallback covers
+// #30's query-time receipt derivation: a PO's own received_at wins when
+// present, the EARLIEST GoodsReceipt.received_date fills in when it
+// isn't, and a PO with neither (in-flight/draft) is excluded entirely.
+// A PO whose vendor_id is malformed or dangling is still RETURNED —
+// with an empty VendorID — because its lead time is real evidence for
+// the overall distribution even when it can't be attributed to a
+// vendor (see CompletedPOLeadTimes' own doc comment).
+func TestCompletedPOLeadTimes_ReceivedAtWithGoodsReceiptFallback(t *testing.T) {
+	ctx := context.Background()
+	tenantDB := freshTenantDB(t)
+	records := data.NewRecordRepo(tenantDB)
+	reporting := data.NewReportingRepo(tenantDB)
+
+	vendor, err := records.Create(ctx, "Party", map[string]any{"name": "Lead Time Vendor", "party_type": "organization"})
+	if err != nil {
+		t.Fatalf("create Party: %v", err)
+	}
+
+	mustCreatePO := func(fields map[string]any) string {
+		t.Helper()
+		rec, err := records.Create(ctx, "PurchaseOrder", fields)
+		if err != nil {
+			t.Fatalf("create PurchaseOrder: %v", err)
+		}
+		return rec.ID
+	}
+	mustCreateGR := func(poID, receivedDate string) {
+		t.Helper()
+		if _, err := records.Create(ctx, "GoodsReceipt", map[string]any{
+			"purchase_order_id": poID, "received_date": receivedDate,
+		}); err != nil {
+			t.Fatalf("create GoodsReceipt: %v", err)
+		}
+	}
+
+	// PO with its own received_at AND a later GoodsReceipt — the stored
+	// stage must win over the fallback.
+	stamped := mustCreatePO(map[string]any{
+		"po_number": "PO-STAMPED", "vendor_id": vendor.ID,
+		"order_date": "2026-07-01", "sourced_at": "2026-07-03", "received_at": "2026-07-10",
+	})
+	mustCreateGR(stamped, "2026-07-12")
+
+	// PO with NO received_at but two GoodsReceipts (partial deliveries) —
+	// the EARLIEST received_date is the fallback receipt time.
+	fallback := mustCreatePO(map[string]any{
+		"po_number": "PO-FALLBACK", "vendor_id": vendor.ID, "order_date": "2026-07-05",
+	})
+	mustCreateGR(fallback, "2026-07-20")
+	mustCreateGR(fallback, "2026-07-17")
+
+	// In-flight PO: neither received_at nor any GoodsReceipt — excluded.
+	mustCreatePO(map[string]any{
+		"po_number": "PO-OPEN", "vendor_id": vendor.ID,
+		"order_date": "2026-07-08", "sourced_at": "2026-07-09",
+	})
+	// Malformed vendor_id — still a completed PO, returned with an empty
+	// VendorID (counts toward overall stats), not a query-aborting cast
+	// error and not silently dropped.
+	badVendor := mustCreatePO(map[string]any{
+		"po_number": "PO-BADVENDOR", "vendor_id": "not-a-uuid",
+		"order_date": "2026-07-02", "received_at": "2026-07-09",
+	})
+	// A GoodsReceipt whose purchase_order_id is malformed must neither
+	// error the query nor attach anywhere.
+	if _, err := records.Create(ctx, "GoodsReceipt", map[string]any{
+		"purchase_order_id": "not-a-uuid", "received_date": "2026-07-01",
+	}); err != nil {
+		t.Fatalf("create malformed GoodsReceipt: %v", err)
+	}
+
+	got, err := reporting.CompletedPOLeadTimes(ctx)
+	if err != nil {
+		t.Fatalf("CompletedPOLeadTimes: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("got %d completed POs, want 3 (incl. the vendorless one): %+v", len(got), got)
+	}
+	// Ordered by order_date: PO-STAMPED (07-01), PO-BADVENDOR (07-02),
+	// PO-FALLBACK (07-05).
+	if got[0].POID != stamped || got[0].ReceivedDate != "2026-07-10" {
+		t.Errorf("row 0 = %+v, want PO-STAMPED with its own received_at 2026-07-10", got[0])
+	}
+	if got[0].VendorID != vendor.ID || got[0].VendorName != "Lead Time Vendor" {
+		t.Errorf("row 0 vendor = %s/%s, want the seeded vendor", got[0].VendorID, got[0].VendorName)
+	}
+	if got[0].OrderDate != "2026-07-01" || got[0].SourcedAt != "2026-07-03" {
+		t.Errorf("row 0 dates = order %q sourced %q, want 2026-07-01/2026-07-03", got[0].OrderDate, got[0].SourcedAt)
+	}
+	if got[0].ShippedAt != "" {
+		t.Errorf("row 0 shipped_at = %q, want empty for an unrecorded stage", got[0].ShippedAt)
+	}
+	if got[1].POID != badVendor || got[1].VendorID != "" || got[1].VendorName != "" {
+		t.Errorf("row 1 = %+v, want PO-BADVENDOR with empty vendor id/name", got[1])
+	}
+	if got[1].ReceivedDate != "2026-07-09" {
+		t.Errorf("row 1 received = %q, want 2026-07-09", got[1].ReceivedDate)
+	}
+	if got[2].POID != fallback || got[2].ReceivedDate != "2026-07-17" {
+		t.Errorf("row 2 = %+v, want PO-FALLBACK with earliest GoodsReceipt date 2026-07-17", got[2])
+	}
+}
+
+// TestOnOrderQtyByItem_SumsOpenStatusesOnly pins R3's on-order
+// definition: submitted + approved POs count, drafts and terminal
+// statuses (received, cancelled) don't, and quantities sum across lines
+// and orders per item.
+func TestOnOrderQtyByItem_SumsOpenStatusesOnly(t *testing.T) {
+	ctx := context.Background()
+	tenantDB := freshTenantDB(t)
+	records := data.NewRecordRepo(tenantDB)
+	reporting := data.NewReportingRepo(tenantDB)
+
+	statusIDs := map[string]string{}
+	for _, code := range []string{"draft", "submitted", "approved", "received", "cancelled"} {
+		rec, err := records.Create(ctx, "Status", map[string]any{"code": code, "name": code})
+		if err != nil {
+			t.Fatalf("create Status: %v", err)
+		}
+		statusIDs[code] = rec.ID
+	}
+	item, err := records.Create(ctx, "Item", map[string]any{"sku": "SKU-OO", "name": "On Order Widget", "item_type": "stock"})
+	if err != nil {
+		t.Fatalf("create Item: %v", err)
+	}
+	otherItem, err := records.Create(ctx, "Item", map[string]any{"sku": "SKU-NONE", "name": "Never Ordered", "item_type": "stock"})
+	if err != nil {
+		t.Fatalf("create Item: %v", err)
+	}
+
+	mustCreatePOWithLine := func(poNumber, status, itemID string, qty float64) {
+		t.Helper()
+		po, err := records.Create(ctx, "PurchaseOrder", map[string]any{
+			"po_number": poNumber, "order_date": "2026-07-01", "status_id": statusIDs[status],
+		})
+		if err != nil {
+			t.Fatalf("create PurchaseOrder: %v", err)
+		}
+		if _, err := records.Create(ctx, "POLine", map[string]any{
+			"purchase_order_id": po.ID, "item_id": itemID, "qty": qty, "unit_price": 1.0,
+		}); err != nil {
+			t.Fatalf("create POLine: %v", err)
+		}
+	}
+	mustCreatePOWithLine("PO-SUB", "submitted", item.ID, 100)
+	mustCreatePOWithLine("PO-APP", "approved", item.ID, 40)
+	mustCreatePOWithLine("PO-DRAFT", "draft", item.ID, 999)
+	mustCreatePOWithLine("PO-RCVD", "received", item.ID, 999)
+	mustCreatePOWithLine("PO-CANC", "cancelled", item.ID, 999)
+	// Malformed refs are excluded, not fatal.
+	if _, err := records.Create(ctx, "POLine", map[string]any{
+		"purchase_order_id": "not-a-uuid", "item_id": item.ID, "qty": 999.0, "unit_price": 1.0,
+	}); err != nil {
+		t.Fatalf("create malformed POLine: %v", err)
+	}
+
+	got, err := reporting.OnOrderQtyByItem(ctx)
+	if err != nil {
+		t.Fatalf("OnOrderQtyByItem: %v", err)
+	}
+	if qty := got[item.ID]; qty != 140 {
+		t.Errorf("on-order for item = %v, want 140 (submitted 100 + approved 40 only)", qty)
+	}
+	if _, ok := got[otherItem.ID]; ok {
+		t.Errorf("item with no open PO must have no entry, got %v", got[otherItem.ID])
+	}
+}
+
+// TestOnHandQtyByItem sums qty_on_hand per item across every
+// InventoryItem row, skipping rows with no item_id.
+func TestOnHandQtyByItem(t *testing.T) {
+	ctx := context.Background()
+	tenantDB := freshTenantDB(t)
+	records := data.NewRecordRepo(tenantDB)
+	reporting := data.NewReportingRepo(tenantDB)
+
+	itemA, err := records.Create(ctx, "Item", map[string]any{"sku": "SKU-OH-A", "name": "On Hand A", "item_type": "stock"})
+	if err != nil {
+		t.Fatalf("create Item: %v", err)
+	}
+	itemB, err := records.Create(ctx, "Item", map[string]any{"sku": "SKU-OH-B", "name": "On Hand B", "item_type": "stock"})
+	if err != nil {
+		t.Fatalf("create Item: %v", err)
+	}
+	mustCreateInv := func(fields map[string]any) {
+		t.Helper()
+		if _, err := records.Create(ctx, "InventoryItem", fields); err != nil {
+			t.Fatalf("create InventoryItem: %v", err)
+		}
+	}
+	// Two rows for itemA — sums, matching StockSummary's treatment of
+	// multiple rows per item.
+	mustCreateInv(map[string]any{"item_id": itemA.ID, "qty_on_hand": 30, "qty_available_to_promise": 30})
+	mustCreateInv(map[string]any{"item_id": itemA.ID, "qty_on_hand": 12, "qty_available_to_promise": 12})
+	mustCreateInv(map[string]any{"item_id": itemB.ID, "qty_on_hand": 7, "qty_available_to_promise": 7})
+	// No item_id — skipped, not an empty-string map key.
+	mustCreateInv(map[string]any{"qty_on_hand": 99, "qty_available_to_promise": 99})
+
+	got, err := reporting.OnHandQtyByItem(ctx)
+	if err != nil {
+		t.Fatalf("OnHandQtyByItem: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d items, want 2: %v", len(got), got)
+	}
+	if got[itemA.ID] != 42 {
+		t.Errorf("itemA on-hand = %v, want 42 (30+12)", got[itemA.ID])
+	}
+	if got[itemB.ID] != 7 {
+		t.Errorf("itemB on-hand = %v, want 7", got[itemB.ID])
+	}
+}
+
+// TestLatestPOVendorByItem picks the vendor of the most recent PO per
+// item, regardless of status — see the method's own doc comment.
+func TestLatestPOVendorByItem(t *testing.T) {
+	ctx := context.Background()
+	tenantDB := freshTenantDB(t)
+	records := data.NewRecordRepo(tenantDB)
+	reporting := data.NewReportingRepo(tenantDB)
+
+	oldVendor, err := records.Create(ctx, "Party", map[string]any{"name": "Old Vendor", "party_type": "organization"})
+	if err != nil {
+		t.Fatalf("create Party: %v", err)
+	}
+	newVendor, err := records.Create(ctx, "Party", map[string]any{"name": "New Vendor", "party_type": "organization"})
+	if err != nil {
+		t.Fatalf("create Party: %v", err)
+	}
+	item, err := records.Create(ctx, "Item", map[string]any{"sku": "SKU-VND", "name": "Vendored Widget", "item_type": "stock"})
+	if err != nil {
+		t.Fatalf("create Item: %v", err)
+	}
+
+	mustCreatePOWithLine := func(poNumber, vendorID, orderDate string) {
+		t.Helper()
+		po, err := records.Create(ctx, "PurchaseOrder", map[string]any{
+			"po_number": poNumber, "vendor_id": vendorID, "order_date": orderDate,
+		})
+		if err != nil {
+			t.Fatalf("create PurchaseOrder: %v", err)
+		}
+		if _, err := records.Create(ctx, "POLine", map[string]any{
+			"purchase_order_id": po.ID, "item_id": item.ID, "qty": 1.0, "unit_price": 1.0,
+		}); err != nil {
+			t.Fatalf("create POLine: %v", err)
+		}
+	}
+	mustCreatePOWithLine("PO-OLD", oldVendor.ID, "2026-06-01")
+	mustCreatePOWithLine("PO-NEW", newVendor.ID, "2026-07-15")
+
+	got, err := reporting.LatestPOVendorByItem(ctx)
+	if err != nil {
+		t.Fatalf("LatestPOVendorByItem: %v", err)
+	}
+	if got[item.ID] != newVendor.ID {
+		t.Errorf("latest vendor = %s, want the 2026-07-15 order's vendor %s", got[item.ID], newVendor.ID)
+	}
+}
+
 func TestStockSummaryAndStockoutRiskItems(t *testing.T) {
 	ctx := context.Background()
 	tenantDB := freshTenantDB(t)

@@ -177,6 +177,228 @@ type StockoutRiskItem struct {
 	QtyATP    float64
 }
 
+// CompletedPOLeadTime is one completed PurchaseOrder's observed lead
+// time, plus whichever of #29's intermediate stage timestamps it
+// recorded (empty string where a stage was never filled in — an
+// in-flight prefix is realistic censored data, see purchasing.
+// PurchaseOrder's own doc comment). All dates are the ISO-8601 strings
+// exactly as stored in the record JSONB — parsing (and tolerating noisy
+// values, per issue #29's review note on chronology being data hygiene,
+// not ledger-grade) is the caller's job, keeping this repo a plain
+// fetch.
+type CompletedPOLeadTime struct {
+	POID string
+	// VendorID/VendorName are empty when the PO's vendor_id doesn't
+	// resolve to a live Party (malformed, dangling, or absent) — the
+	// row still counts toward the OVERALL lead-time distribution, it
+	// just can't be attributed to a vendor bucket
+	// (forecast.Compute's own documented handling of "").
+	VendorID          string
+	VendorName        string
+	OrderDate         string
+	SourcedAt         string
+	ProductionStartAt string
+	ProductionReadyAt string
+	ShippedAt         string
+	CustomsClearedAt  string
+	// ReceivedDate is COALESCE(received_at, MIN(GoodsReceipt.
+	// received_date)) — never empty; a PO with neither is not
+	// "completed" and isn't returned at all.
+	ReceivedDate string
+}
+
+// CompletedPOLeadTimes returns every PurchaseOrder with a known receipt
+// time: its own received_at stage if recorded, else the earliest
+// GoodsReceipt.received_date posted against it. This query-time
+// derivation is the deliberate resolution of the decision inherited
+// from #29 (see issue #30's first comment): the forecast is the only
+// consumer of "when did this PO actually arrive", so deriving it here
+// makes a stored auto-stamp on the PO — and the cross-record crud.Hook
+// machinery it would have required — redundant.
+//
+// MIN over the ISO-8601 date strings is a correct "earliest" because
+// the format sorts lexicographically. The vendor join is a LEFT JOIN on
+// purpose: a completed PO whose vendor_id is malformed, dangling, or
+// absent still holds real lead-time evidence for the OVERALL
+// distribution, so it's returned with an empty VendorID rather than
+// excluded (independent review of #30 — dropping it silently biased the
+// overall quantiles). The join compares id::text against the stored
+// value instead of ::uuid-casting the stored value, so no uuidPattern
+// guard is even needed on this hop — a malformed vendor_id simply
+// matches nothing; the GoodsReceipt back-reference inside the lateral
+// keeps the usual cast guard. Ordered by order date then id for a
+// deterministic result.
+func (r *ReportingRepo) CompletedPOLeadTimes(ctx context.Context) ([]CompletedPOLeadTime, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT po.id, coalesce(v.id::text, ''), coalesce(v.data->>'name', v.id::text, ''),
+		        coalesce(po.data->>'order_date', ''),
+		        coalesce(po.data->>'sourced_at', ''),
+		        coalesce(po.data->>'production_start_at', ''),
+		        coalesce(po.data->>'production_ready_at', ''),
+		        coalesce(po.data->>'shipped_at', ''),
+		        coalesce(po.data->>'customs_cleared_at', ''),
+		        coalesce(nullif(po.data->>'received_at', ''), gr.first_received)
+		 FROM records po
+		 LEFT JOIN records v
+		   ON v.entity_type = 'Party'
+		  AND v.deleted_at IS NULL
+		  AND v.id::text = po.data->>'vendor_id'
+		 LEFT JOIN LATERAL (
+		   SELECT min(g.data->>'received_date') AS first_received
+		   FROM records g
+		   WHERE g.entity_type = 'GoodsReceipt'
+		     AND g.deleted_at IS NULL
+		     AND g.data->>'purchase_order_id' ~ $1
+		     AND (g.data->>'purchase_order_id')::uuid = po.id
+		     AND coalesce(g.data->>'received_date', '') <> ''
+		 ) gr ON true
+		 WHERE po.entity_type = 'PurchaseOrder'
+		   AND po.deleted_at IS NULL
+		   AND coalesce(po.data->>'order_date', '') <> ''
+		   AND coalesce(nullif(po.data->>'received_at', ''), gr.first_received) IS NOT NULL
+		 ORDER BY po.data->>'order_date', po.id`,
+		uuidPattern,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("completed po lead times: %w", err)
+	}
+	defer rows.Close()
+
+	var out []CompletedPOLeadTime
+	for rows.Next() {
+		var row CompletedPOLeadTime
+		if err := rows.Scan(&row.POID, &row.VendorID, &row.VendorName, &row.OrderDate,
+			&row.SourcedAt, &row.ProductionStartAt, &row.ProductionReadyAt,
+			&row.ShippedAt, &row.CustomsClearedAt, &row.ReceivedDate); err != nil {
+			return nil, fmt.Errorf("scan completed po lead time row: %w", err)
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+// OnOrderQtyByItem sums POLine.qty per item over PurchaseOrders whose
+// status code is submitted or approved — the "on order" half of an
+// inventory position (issue #30's BA note R3). Deliberately kept
+// simple, per the Architect design: received and cancelled orders are
+// excluded wholesale (their goods either already count in qty_on_hand
+// or are never coming), drafts too (nothing is committed yet), and no
+// per-line received-qty netting is attempted — partial receipt against
+// a still-open PO is beyond this first worked example. Returned as a
+// map (item id -> qty) because every caller is a lookup, not a table.
+// Items with no open PO simply have no entry. Same uuidPattern guard as
+// every other join in this file, on all three reference hops.
+func (r *ReportingRepo) OnOrderQtyByItem(ctx context.Context) (map[string]float64, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT l.data->>'item_id', coalesce(sum((l.data->>'qty')::numeric), 0)
+		 FROM records l
+		 JOIN records po
+		   ON po.entity_type = 'PurchaseOrder'
+		  AND po.deleted_at IS NULL
+		  AND po.id = (l.data->>'purchase_order_id')::uuid
+		 JOIN records st
+		   ON st.entity_type = 'Status'
+		  AND st.deleted_at IS NULL
+		  AND st.id = (po.data->>'status_id')::uuid
+		 WHERE l.entity_type = 'POLine'
+		   AND l.deleted_at IS NULL
+		   AND l.data->>'purchase_order_id' ~ $1
+		   AND l.data->>'item_id' ~ $1
+		   AND po.data->>'status_id' ~ $1
+		   AND st.data->>'code' IN ('submitted', 'approved')
+		 GROUP BY l.data->>'item_id'`,
+		uuidPattern,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("on-order qty by item: %w", err)
+	}
+	defer rows.Close()
+
+	out := map[string]float64{}
+	for rows.Next() {
+		var itemID string
+		var qty float64
+		if err := rows.Scan(&itemID, &qty); err != nil {
+			return nil, fmt.Errorf("scan on-order qty row: %w", err)
+		}
+		out[itemID] = qty
+	}
+	return out, rows.Err()
+}
+
+// OnHandQtyByItem sums InventoryItem.qty_on_hand per item — the other
+// half of the inventory position OnOrderQtyByItem's doc comment
+// describes. An aggregate here rather than a guarded-engine List over
+// every InventoryItem record in the report handler (independent review
+// of #30): the report only ever needs the per-item sums, and every
+// other number on the page already comes from this repo's aggregates.
+// Summing (not first-row-wins) matches StockSummary's own treatment of
+// multiple rows per item. Rows with no item_id are skipped — they can
+// never match a ReorderRule's item.
+func (r *ReportingRepo) OnHandQtyByItem(ctx context.Context) (map[string]float64, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT data->>'item_id', coalesce(sum((data->>'qty_on_hand')::numeric), 0)
+		 FROM records
+		 WHERE entity_type = 'InventoryItem'
+		   AND deleted_at IS NULL
+		   AND coalesce(data->>'item_id', '') <> ''
+		 GROUP BY data->>'item_id'`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("on-hand qty by item: %w", err)
+	}
+	defer rows.Close()
+
+	out := map[string]float64{}
+	for rows.Next() {
+		var itemID string
+		var qty float64
+		if err := rows.Scan(&itemID, &qty); err != nil {
+			return nil, fmt.Errorf("scan on-hand qty row: %w", err)
+		}
+		out[itemID] = qty
+	}
+	return out, rows.Err()
+}
+
+// LatestPOVendorByItem maps each item to the vendor of its most recent
+// PurchaseOrder (by order_date, any status — a received order is still
+// the best evidence of who supplies this item). Items have no direct
+// vendor link in the model (issue #30's Architect design), so this
+// POLine->PurchaseOrder hop is how a reorder signal picks whose lead
+// time to show. Ties on order_date break deterministically by PO id.
+func (r *ReportingRepo) LatestPOVendorByItem(ctx context.Context) (map[string]string, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT DISTINCT ON (l.data->>'item_id') l.data->>'item_id', po.data->>'vendor_id'
+		 FROM records l
+		 JOIN records po
+		   ON po.entity_type = 'PurchaseOrder'
+		  AND po.deleted_at IS NULL
+		  AND po.id = (l.data->>'purchase_order_id')::uuid
+		 WHERE l.entity_type = 'POLine'
+		   AND l.deleted_at IS NULL
+		   AND l.data->>'purchase_order_id' ~ $1
+		   AND l.data->>'item_id' ~ $1
+		   AND po.data->>'vendor_id' ~ $1
+		 ORDER BY l.data->>'item_id', po.data->>'order_date' DESC NULLS LAST, po.id`,
+		uuidPattern,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("latest po vendor by item: %w", err)
+	}
+	defer rows.Close()
+
+	out := map[string]string{}
+	for rows.Next() {
+		var itemID, vendorID string
+		if err := rows.Scan(&itemID, &vendorID); err != nil {
+			return nil, fmt.Errorf("scan latest po vendor row: %w", err)
+		}
+		out[itemID] = vendorID
+	}
+	return out, rows.Err()
+}
+
 // StockoutRiskItems returns Items with qty_available_to_promise <= 0,
 // most-negative first, capped at limit. Same malformed-reference guard
 // as TopVendorsBySpend.

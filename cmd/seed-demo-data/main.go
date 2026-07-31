@@ -118,6 +118,7 @@ func main() {
 	vendors, customers := s.seedParties()
 	items := s.seedItems(uoms)
 	s.seedInventory(items)
+	s.seedReorderRules(items)
 	s.seedPurchaseOrders(vendors, currencies, items)
 	s.seedGoodsReceipts()
 	s.seedVendorInvoices(vendors, currencies)
@@ -449,6 +450,59 @@ func (s *seeder) seedInventory(items map[string]string) {
 	}
 }
 
+// seedReorderRules gives three demo items a ReorderRule (#30), chosen
+// against seedInventory's levels and seedPurchaseOrders' open orders so
+// the purchasing report's reorder-signal section actually demonstrates
+// the position math, not just an empty state:
+//
+//   - SKU-1004 (on-hand 80, no open PO): position 80 <= 150+50 -> FIRES,
+//     with the P90 expected-days context (its lead-time history comes
+//     from overall stats — its only PO's vendor has one completed order,
+//     below forecast.MinSamples).
+//   - SKU-1010 (on-hand 60, 90 on order via PO-2026-0006): position 150
+//     <= 200 -> FIRES, with the P50 context this rule opts into.
+//   - SKU-1001 (on-hand 500, 2000 on order via PO-2026-0002): on-hand
+//     alone is below the 600 reorder point, but position 2500 is not ->
+//     does NOT fire — the live demo of BA acceptance #4 (a huge open PO
+//     holds the position up; the goods are already coming).
+//
+// Dedups on item_id — a ReorderRule has no natural key of its own, and
+// one rule per item is this simplified, warehouse-less model's whole
+// shape (see purchasing.ReorderRule's doc comment on the #12 deferral).
+func (s *seeder) seedReorderRules(items map[string]string) {
+	def := s.def("ReorderRule")
+	rules := []struct {
+		sku                       string
+		reorderPoint, safetyStock float64
+		confidence                string
+	}{
+		{"SKU-1004", 150, 50, "p90"},
+		{"SKU-1010", 200, 0, "p50"},
+		{"SKU-1001", 600, 0, "p90"},
+	}
+	for _, r := range rules {
+		itemID, ok := items[r.sku]
+		if !ok {
+			log.Fatalf("seedReorderRules: no seeded item for %s", r.sku)
+		}
+		existing, err := s.crud.ListByField(s.ctx, def, "item_id", itemID)
+		if err != nil {
+			log.Fatalf("list ReorderRule by item_id: %v", err)
+		}
+		if len(existing) > 0 {
+			continue
+		}
+		if _, err := s.crud.Create(s.ctx, def, map[string]any{
+			"item_id":                     itemID,
+			"reorder_point":               r.reorderPoint,
+			"safety_stock":                r.safetyStock,
+			"target_lead_time_confidence": r.confidence,
+		}, s.actor); err != nil {
+			log.Fatalf("create ReorderRule for %s: %v", r.sku, err)
+		}
+	}
+}
+
 // seedPurchaseOrders dedups on po_number, the same getOrCreate-style
 // natural-key pattern used everywhere else in this seeder — now that
 // PurchaseOrder actually has one (BACKLOG.md/QUEUE.md, 2026-07-21; it
@@ -518,8 +572,12 @@ func (s *seeder) seedPurchaseOrders(vendors, currencies, items map[string]string
 		stages   map[string]string
 		lines    []line
 	}{
-		{"PO-2026-0001", "Acme Textiles", "USD", "2026-07-01", "approved",
-			map[string]string{"sourced_at": "2026-07-04", "production_start_at": "2026-07-08", "production_ready_at": "2026-07-18", "shipped_at": "2026-07-22"},
+		// Received (#30 review): a second completed Acme Textiles order —
+		// 25 days against PO-2026-0004's 9 — gives the live demo a vendor
+		// with n>=2, so the report shows a real per-vendor P50/P90 row
+		// (Acme P50 17 / P90 23.4), not only insufficient-history rows.
+		{"PO-2026-0001", "Acme Textiles", "USD", "2026-07-01", "received",
+			map[string]string{"sourced_at": "2026-07-04", "production_start_at": "2026-07-08", "production_ready_at": "2026-07-18", "shipped_at": "2026-07-22", "customs_cleared_at": "2026-07-24", "received_at": "2026-07-26"},
 			[]line{{"SKU-1002", 40, 18.5}}},
 		{"PO-2026-0002", "Gulf Steel Supply", "QAR", "2026-07-10", "submitted",
 			map[string]string{"sourced_at": "2026-07-14"},
@@ -625,7 +683,8 @@ func (s *seeder) seedPurchaseOrders(vendors, currencies, items map[string]string
 }
 
 // seedGoodsReceipts gives every already-"received" PurchaseOrder
-// (PO-2026-0004, PO-2026-0005 in seedPurchaseOrders' own table above) a
+// (PO-2026-0001, PO-2026-0004, PO-2026-0005 in seedPurchaseOrders' own
+// table above) a
 // real GoodsReceipt + one GoodsReceiptLine per POLine, received in full
 // 5 days after the order date — sample data that actually demonstrates
 // the entity purchasing.GoodsReceipt exists for, the same reasoning

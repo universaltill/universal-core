@@ -178,6 +178,7 @@ var entityIcons = map[string]string{
 	"InventoryItem":        "🗄️",
 	"GoodsReceipt":         "🚚",
 	"GoodsReceiptLine":     "📥",
+	"ReorderRule":          "🔔",
 	"SalesOrder":           "🧮",
 	"SOLine":               "📃",
 	"CustomerInvoice":      "💳",

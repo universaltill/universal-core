@@ -118,6 +118,35 @@ func AllForms() []*form.Definition {
 	return []*form.Definition{
 		ItemForm(), PurchaseOrderForm(), POLineForm(), InventoryItemForm(),
 		GoodsReceiptForm(), GoodsReceiptLineForm(), VendorInvoiceForm(),
+		ReorderRuleForm(),
+	}
+}
+
+// ReorderRuleForm is a plain single-section form, same shape as
+// InventoryItemForm — a ReorderRule is a small policy record, usually
+// reached from the purchasing report's reorder-signal table rather than
+// navigated to directly, but the generic /forms/ReorderRule/new route
+// works for it the same as every other entity (this file's own top doc
+// comment). Labels localize via the field.ReorderRule.* catalog keys.
+func ReorderRuleForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "ReorderRule",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Details",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "item_id", Label: "Item"},
+					{Name: "reorder_point", Label: "Reorder Point"},
+					{Name: "safety_stock", Label: "Safety Stock"},
+					{Name: "target_lead_time_confidence", Label: "Lead-Time Confidence"},
+				},
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
 	}
 }
 

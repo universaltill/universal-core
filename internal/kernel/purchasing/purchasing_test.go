@@ -18,7 +18,7 @@ func TestAllPurchasingDefinitionsAreValid(t *testing.T) {
 func TestAllPurchasingFormsAreValid(t *testing.T) {
 	forms := []*form.Definition{
 		ItemForm(), PurchaseOrderForm(), POLineForm(), InventoryItemForm(),
-		GoodsReceiptForm(), GoodsReceiptLineForm(),
+		GoodsReceiptForm(), GoodsReceiptLineForm(), ReorderRuleForm(),
 	}
 	for _, f := range forms {
 		if err := f.Validate(); err != nil {
@@ -292,6 +292,71 @@ func TestPurchaseOrderForm_LeadTimeStagesSectionListsAllSixStages(t *testing.T) 
 		if stagesSection.Fields[i].Name != name {
 			t.Errorf("section field %d: expected %q, got %q", i, name, stagesSection.Fields[i].Name)
 		}
+	}
+}
+
+// TestReorderRule_ShapeMatchesBAContract pins #30's R2 field contract:
+// item_id a Required reference to Item, reorder_point a Required
+// number, safety_stock optional defaulting to 0, and
+// target_lead_time_confidence a p50|p90 enum defaulting to p90 (the
+// conservative choice — see the Definition's own doc comment). Also the
+// deliberate ABSENCE of warehouse_id: reference-data-model.md's
+// ReorderRule row includes it, but Warehouse is card #12 and adding the
+// field now would reference an entity that doesn't exist.
+func TestReorderRule_ShapeMatchesBAContract(t *testing.T) {
+	def := ReorderRule()
+	if def.Module != "purchasing" {
+		t.Fatalf("expected module purchasing, got %q", def.Module)
+	}
+
+	itemField, ok := def.FieldByName("item_id")
+	if !ok || itemField.Type != entity.FieldReference || itemField.Target != "Item" || !itemField.Required {
+		t.Fatalf("expected a Required item_id FieldReference targeting Item, got %+v", itemField)
+	}
+	pointField, ok := def.FieldByName("reorder_point")
+	if !ok || pointField.Type != entity.FieldNumber || !pointField.Required {
+		t.Fatalf("expected a Required reorder_point FieldNumber, got %+v", pointField)
+	}
+	safetyField, ok := def.FieldByName("safety_stock")
+	if !ok || safetyField.Type != entity.FieldNumber || safetyField.Required {
+		t.Fatalf("expected an optional safety_stock FieldNumber, got %+v", safetyField)
+	}
+	if safetyField.Default != float64(0) {
+		t.Fatalf("expected safety_stock default 0, got %v", safetyField.Default)
+	}
+	confField, ok := def.FieldByName("target_lead_time_confidence")
+	if !ok || confField.Type != entity.FieldEnum {
+		t.Fatalf("expected a target_lead_time_confidence FieldEnum, got %+v", confField)
+	}
+	if len(confField.EnumValues) != 2 || confField.EnumValues[0] != "p50" || confField.EnumValues[1] != "p90" {
+		t.Fatalf("expected enum values [p50 p90], got %v", confField.EnumValues)
+	}
+	if confField.Default != "p90" {
+		t.Fatalf("expected default confidence p90, got %v", confField.Default)
+	}
+	if _, ok := def.FieldByName("warehouse_id"); ok {
+		t.Fatal("warehouse_id must stay deferred to #12 — InventoryItem is item-keyed today")
+	}
+}
+
+func TestReorderRule_MissingRequiredFields(t *testing.T) {
+	def := ReorderRule()
+	if err := entity.ValidateRecord(def, map[string]any{"reorder_point": float64(10)}); err == nil {
+		t.Fatal("expected error for missing required item_id")
+	}
+	if err := entity.ValidateRecord(def, map[string]any{"item_id": "item-1"}); err == nil {
+		t.Fatal("expected error for missing required reorder_point")
+	}
+}
+
+func TestReorderRule_RejectsUnknownConfidence(t *testing.T) {
+	def := ReorderRule()
+	data := map[string]any{
+		"item_id": "item-1", "reorder_point": float64(10),
+		"target_lead_time_confidence": "p99",
+	}
+	if err := entity.ValidateRecord(def, data); err == nil {
+		t.Fatal("expected error for a confidence outside the p50|p90 enum")
 	}
 }
 

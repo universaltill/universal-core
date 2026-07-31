@@ -283,6 +283,46 @@ func VendorInvoice() *entity.Definition {
 	}
 }
 
+// ReorderRule is the per-item replenishment policy behind the
+// purchasing report's reorder signals (universal-core#30,
+// reference-data-model.md § ReorderRule): when the item's inventory
+// position (qty_on_hand + open-PO on-order qty) falls to
+// reorder_point + safety_stock or below, the report tells the buyer to
+// order now, with the supplier's P50 or P90 lead time — per
+// target_lead_time_confidence — as the "how long until it arrives"
+// context (internal/kernel/forecast). The rule itself is pure data; all
+// signal math lives in the report composition (internal/api/
+// reporting.go) and the stats kernel, so this stays an ordinary generic
+// Definition with no entity-specific engine code.
+//
+// Deliberately WITHOUT reference-data-model.md's warehouse_id:
+// Warehouse/Facility is card #12 and InventoryItem is item-keyed today
+// (one global stock row per Item — see InventoryItem's own doc
+// comment), so a warehouse-scoped rule would reference an entity that
+// doesn't exist yet and scope a quantity that isn't scoped. Add the
+// field (Version bump) when #12 lands, the same grow-don't-guess
+// discipline as every other deferral in this file.
+func ReorderRule() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "ReorderRule",
+		Version:    1,
+		Module:     "purchasing",
+		Fields: []entity.Field{
+			{Name: "item_id", Type: entity.FieldReference, Required: true, Target: "Item"},
+			{Name: "reorder_point", Type: entity.FieldNumber, Required: true},
+			// safety_stock defaults to 0 rather than being required —
+			// "no buffer" is a legitimate policy and the signal math
+			// treats a missing value as 0 anyway (issue #30's design).
+			{Name: "safety_stock", Type: entity.FieldNumber, Default: float64(0)},
+			// p90 default: the conservative choice — a buyer who never
+			// touches this field gets "order early enough that 90% of
+			// history would have arrived in time", not the coin-flip P50.
+			{Name: "target_lead_time_confidence", Type: entity.FieldEnum, Required: true,
+				EnumValues: []string{"p50", "p90"}, Default: "p90"},
+		},
+	}
+}
+
 // All returns every Definition this module adds — the set a tenant gets
 // once Purchasing is one of their licensed modules (seed.go's Publish).
 func All() []*entity.Definition {
@@ -294,5 +334,6 @@ func All() []*entity.Definition {
 		GoodsReceipt(),
 		GoodsReceiptLine(),
 		VendorInvoice(),
+		ReorderRule(),
 	}
 }

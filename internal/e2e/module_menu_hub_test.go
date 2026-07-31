@@ -26,8 +26,8 @@ import (
 func TestModuleMenu_RendersAsSearchableHubGraphic(t *testing.T) {
 	withDevAuthEnabled(t)
 	// testServer already publishes purchasing: Item, PurchaseOrder,
-	// POLine, InventoryItem, GoodsReceipt, GoodsReceiptLine, VendorInvoice
-	// (7 entities).
+	// POLine, InventoryItem, GoodsReceipt, GoodsReceiptLine,
+	// VendorInvoice, ReorderRule (8 entities).
 	srv, tenantID, _ := testServer(t)
 	ctx := browserCtx(t, tenantID)
 
@@ -44,8 +44,8 @@ func TestModuleMenu_RendersAsSearchableHubGraphic(t *testing.T) {
 	)); err != nil {
 		t.Fatalf("count hub nodes: %v", err)
 	}
-	if nodeCount != 7 {
-		t.Fatalf("expected 7 entity hub nodes (Item, PurchaseOrder, POLine, InventoryItem, GoodsReceipt, GoodsReceiptLine, VendorInvoice), got %d", nodeCount)
+	if nodeCount != 8 {
+		t.Fatalf("expected 8 entity hub nodes (Item, PurchaseOrder, POLine, InventoryItem, GoodsReceipt, GoodsReceiptLine, VendorInvoice, ReorderRule), got %d", nodeCount)
 	}
 
 	// Real, non-overlapping graphical positioning — not just that a
@@ -62,8 +62,8 @@ func TestModuleMenu_RendersAsSearchableHubGraphic(t *testing.T) {
 	)); err != nil {
 		t.Fatalf("read hub node bounding boxes: %v", err)
 	}
-	if len(centers) != 7 {
-		t.Fatalf("expected 7 node centers, got %d", len(centers))
+	if len(centers) != 8 {
+		t.Fatalf("expected 8 node centers, got %d", len(centers))
 	}
 	for i := range centers {
 		for j := i + 1; j < len(centers); j++ {
@@ -74,7 +74,7 @@ func TestModuleMenu_RendersAsSearchableHubGraphic(t *testing.T) {
 	}
 
 	// Search: typing a term matching only Item/InventoryItem's
-	// data-search must hide the other 4 entities' real DOM nodes, not
+	// data-search must hide the other entities' real DOM nodes, not
 	// just leave everything visible with a filter that only exists on
 	// paper.
 	if err := chromedp.Run(ctx,
@@ -112,8 +112,8 @@ func TestModuleMenu_RendersAsSearchableHubGraphic(t *testing.T) {
 	)); err != nil {
 		t.Fatalf("count hidden spoke lines: %v", err)
 	}
-	if hiddenLines != 5 {
-		t.Fatalf("expected exactly 5 spoke lines hidden (matching the 5 filtered-out nodes: PurchaseOrder, POLine, GoodsReceipt, GoodsReceiptLine, VendorInvoice — none of their SearchKeys contain \"item\"), got %d", hiddenLines)
+	if hiddenLines != 6 {
+		t.Fatalf("expected exactly 6 spoke lines hidden (matching the 6 filtered-out nodes: PurchaseOrder, POLine, GoodsReceipt, GoodsReceiptLine, VendorInvoice, ReorderRule — none of their SearchKeys contain \"item\"), got %d", hiddenLines)
 	}
 }
 

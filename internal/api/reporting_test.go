@@ -12,6 +12,7 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/form"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
+	"github.com/universaltill/universal-core/internal/kernel/purchasing"
 )
 
 // The purchasing report reads straight off the records table
@@ -142,6 +143,240 @@ func TestAPI_PurchasingReport_StockoutRiskAndEmptyStates(t *testing.T) {
 	if !strings.Contains(body, "No purchase orders yet.") {
 		t.Errorf("expected the vendor-empty-state message (no POs seeded for this tenant):\n%s", body)
 	}
+	// #30's no-data states: no completed POs -> lead-time empty state; no
+	// ReorderRule Definition even published for this tenant (purchasing
+	// module absent) -> the reorder section degrades to its empty state
+	// rather than erroring the whole report.
+	if !strings.Contains(body, "No completed purchase orders yet.") {
+		t.Errorf("expected the lead-time empty state:\n%s", body)
+	}
+	if !strings.Contains(body, "No reorder signals right now.") {
+		t.Errorf("expected the reorder-signal empty state:\n%s", body)
+	}
+}
+
+// TestAPI_PurchasingReport_LeadTimeAndReorderSections (#30) drives both
+// new sections end to end against a hand-computed fixture: two
+// completed POs for one vendor (9 and 11 days -> per-vendor P50 10,
+// P90 10.8 by exact type-7 interpolation), one of them proving the
+// GoodsReceipt-fallback receipt time, a second vendor with a single
+// 20-day completed PO (insufficient on its own; overall becomes
+// [9, 11, 20] -> P50 11, P90 18.2), an open PO whose lines feed the
+// on-order quantities, and three ReorderRules — one firing with its
+// vendor's own lead-time context, one whose vendor has insufficient
+// history and must show the DISTINCT "(all suppliers)" overall string
+// (never the plain per-vendor one), and one that must NOT fire despite
+// low on-hand because a big open PO holds its position up (BA
+// acceptance criterion 4, the position-math regression case).
+func TestAPI_PurchasingReport_LeadTimeAndReorderSections(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	// buildReorderSignals reads ReorderRule/InventoryItem/Item through
+	// the guarded engine, which needs their published Definitions — the
+	// real purchasing module publish, same as provision-tenant runs.
+	if err := purchasing.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("purchasing.Publish: %v", err)
+	}
+	records := data.NewRecordRepo(db)
+
+	mustCreate := func(entityType string, fields map[string]any) string {
+		t.Helper()
+		rec, err := records.Create(ctx, entityType, fields)
+		if err != nil {
+			t.Fatalf("create %s: %v", entityType, err)
+		}
+		return rec.ID
+	}
+
+	approved := mustCreate("Status", map[string]any{"code": "approved", "name": "Approved"})
+	received := mustCreate("Status", map[string]any{"code": "received", "name": "Received"})
+	vendor := mustCreate("Party", map[string]any{"name": "Acme LT", "party_type": "organization"})
+	soloVendor := mustCreate("Party", map[string]any{"name": "Solo Vendor", "party_type": "organization"})
+
+	widgetA := mustCreate("Item", map[string]any{"sku": "SKU-A", "name": "Widget A", "item_type": "stock"})
+	widgetB := mustCreate("Item", map[string]any{"sku": "SKU-B", "name": "Widget B", "item_type": "stock"})
+	widgetC := mustCreate("Item", map[string]any{"sku": "SKU-C", "name": "Widget C", "item_type": "stock"})
+	mustCreate("InventoryItem", map[string]any{"item_id": widgetA, "qty_on_hand": 5, "qty_available_to_promise": 5})
+	mustCreate("InventoryItem", map[string]any{"item_id": widgetB, "qty_on_hand": 5, "qty_available_to_promise": 5})
+	mustCreate("InventoryItem", map[string]any{"item_id": widgetC, "qty_on_hand": 2, "qty_available_to_promise": 2})
+
+	// Completed PO #1: 9 days via its own received_at stage.
+	mustCreate("PurchaseOrder", map[string]any{
+		"po_number": "PO-LT-1", "vendor_id": vendor, "status_id": received,
+		"order_date": "2026-07-01", "received_at": "2026-07-10",
+	})
+	// Completed PO #2: 11 days via the earliest GoodsReceipt fallback —
+	// no received_at on the PO itself.
+	poLT2 := mustCreate("PurchaseOrder", map[string]any{
+		"po_number": "PO-LT-2", "vendor_id": vendor, "status_id": received,
+		"order_date": "2026-07-05",
+	})
+	mustCreate("GoodsReceipt", map[string]any{"purchase_order_id": poLT2, "received_date": "2026-07-16"})
+
+	// Solo Vendor's single completed PO (20 days) — insufficient history
+	// for a per-vendor quantile, but real evidence in the overall
+	// distribution; its POLine also makes Solo Vendor Widget C's
+	// most-recent-PO vendor.
+	poSolo := mustCreate("PurchaseOrder", map[string]any{
+		"po_number": "PO-SOLO-1", "vendor_id": soloVendor, "status_id": received,
+		"order_date": "2026-07-02", "received_at": "2026-07-22",
+	})
+	mustCreate("POLine", map[string]any{"purchase_order_id": poSolo, "item_id": widgetC, "qty": 10, "unit_price": 2.0})
+
+	// Open (approved) PO: 20 of Widget A and 100 of Widget B on order.
+	// Also the most recent PO touching both items -> their signal vendor.
+	openPO := mustCreate("PurchaseOrder", map[string]any{
+		"po_number": "PO-OPEN-1", "vendor_id": vendor, "status_id": approved,
+		"order_date": "2026-07-20", "total": 0,
+	})
+	mustCreate("POLine", map[string]any{"purchase_order_id": openPO, "item_id": widgetA, "qty": 20, "unit_price": 1.0})
+	mustCreate("POLine", map[string]any{"purchase_order_id": openPO, "item_id": widgetB, "qty": 100, "unit_price": 1.0})
+
+	// Widget A: position 5 + 20 = 25 <= 30 + 0 -> fires, P90 context.
+	mustCreate("ReorderRule", map[string]any{
+		"item_id": widgetA, "reorder_point": 30, "safety_stock": 0, "target_lead_time_confidence": "p90",
+	})
+	// Widget B: on-hand 5 is way below the same reorder point, but
+	// position 5 + 100 = 105 > 30 -> must NOT fire (BA acceptance #4).
+	mustCreate("ReorderRule", map[string]any{
+		"item_id": widgetB, "reorder_point": 30, "safety_stock": 0, "target_lead_time_confidence": "p90",
+	})
+	// Widget C: position 2 + 0 = 2 <= 10 -> fires; its vendor (Solo, n=1)
+	// is insufficient, so the context must be the disclosed overall
+	// string, never the plain per-vendor one.
+	mustCreate("ReorderRule", map[string]any{
+		"item_id": widgetC, "reorder_point": 10, "safety_stock": 0, "target_lead_time_confidence": "p90",
+	})
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+	rec := getAs(t, mux, "/reports/purchasing", tenantID, "farshid")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+
+	if !strings.Contains(body, "Supplier Lead Times") || !strings.Contains(body, "Reorder Signals") {
+		t.Fatalf("expected both #30 section headings:\n%s", body)
+	}
+	// Exact vendor row: n=2, P50 = 10, P90 = 9 + 0.9*(11-9) = 10.8.
+	if !strings.Contains(body, "<tr><td>Acme LT</td><td>2</td><td>10</td><td>10.8</td></tr>") {
+		t.Errorf("expected the Acme LT lead-time row with P50 10 / P90 10.8:\n%s", body)
+	}
+	// Solo Vendor's single sample: n=1, insufficient in both quantile
+	// cells — never a fabricated number.
+	if !strings.Contains(body, "<tr><td>Solo Vendor</td><td>1</td><td>Insufficient history</td><td>Insufficient history</td></tr>") {
+		t.Errorf("expected the Solo Vendor row to say insufficient at n=1:\n%s", body)
+	}
+	// Overall row across all three samples [9, 11, 20]: P50 11,
+	// P90 = 11 + 0.8*(20-11) = 18.2.
+	if !strings.Contains(body, "<tr><td>All vendors</td><td>3</td><td>11</td><td>18.2</td></tr>") {
+		t.Errorf("expected the all-vendors summary row with P50 11 / P90 18.2:\n%s", body)
+	}
+	// Exact firing signal row for Widget A: on-hand 5, on-order 20,
+	// position 25, reorder point 30, the PER-VENDOR P90 context (Acme LT
+	// has sufficient history of its own — no "(all suppliers)" suffix).
+	wantSignal := "<tr><td><a href=\"/forms/Item/" + widgetA + "\">Widget A</a></td><td>5</td><td>20</td><td>25</td><td>30</td><td>Order now — expect ~10.8 days</td></tr>"
+	if !strings.Contains(body, wantSignal) {
+		t.Errorf("expected the Widget A reorder signal row %q:\n%s", wantSignal, body)
+	}
+	if strings.Contains(body, "Widget B") {
+		t.Errorf("Widget B must not fire — position (105) is held up by its open PO even though on-hand (5) is below the reorder point:\n%s", body)
+	}
+	// Widget C's vendor has insufficient history -> overall stats via the
+	// DISTINCT disclosed string (overall P90 18.2), never the plain
+	// per-vendor wording.
+	wantOverallSignal := "<tr><td><a href=\"/forms/Item/" + widgetC + "\">Widget C</a></td><td>2</td><td>0</td><td>2</td><td>10</td><td>Order now — expect ~18.2 days (all suppliers)</td></tr>"
+	if !strings.Contains(body, wantOverallSignal) {
+		t.Errorf("expected the Widget C signal row with the disclosed all-suppliers context %q:\n%s", wantOverallSignal, body)
+	}
+	if strings.Contains(body, "expect ~18.2 days</td>") {
+		t.Errorf("overall-derived context must always carry the (all suppliers) disclosure:\n%s", body)
+	}
+
+	// Localized render (the en assertions above would pass even if the
+	// catalog were bypassed, since Go fallbacks match the en strings —
+	// same tautology the #29 review flagged): the Turkish page must carry
+	// the tr headings and signal context.
+	recTR := getAs(t, mux, "/reports/purchasing?lang=tr", tenantID, "farshid")
+	if recTR.Code != http.StatusOK {
+		t.Fatalf("expected 200 for ?lang=tr, got %d: %s", recTR.Code, recTR.Body.String())
+	}
+	bodyTR := recTR.Body.String()
+	for _, want := range []string{
+		"Tedarikçi Tedarik Süreleri",
+		"Yeniden Sipariş Sinyalleri",
+		"Şimdi sipariş verin — yaklaşık 10.8 gün içinde gelir",
+		"Şimdi sipariş verin — yaklaşık 18.2 gün içinde gelir (tüm tedarikçiler)",
+	} {
+		if !strings.Contains(bodyTR, want) {
+			t.Errorf("expected localized string %q on the tr report:\n%s", want, bodyTR)
+		}
+	}
+}
+
+// TestAPI_PurchasingReport_InsufficientHistoryStates (#30, BA R1's
+// minimum-sample rule at the surface): with a single completed PO the
+// vendor and overall rows must say "insufficient" rather than fabricate
+// a quantile from one observation, and a firing reorder signal must
+// carry the insufficient-lead-time text instead of an expected-days
+// number.
+func TestAPI_PurchasingReport_InsufficientHistoryStates(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := purchasing.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("purchasing.Publish: %v", err)
+	}
+	records := data.NewRecordRepo(db)
+
+	mustCreate := func(entityType string, fields map[string]any) string {
+		t.Helper()
+		rec, err := records.Create(ctx, entityType, fields)
+		if err != nil {
+			t.Fatalf("create %s: %v", entityType, err)
+		}
+		return rec.ID
+	}
+
+	vendor := mustCreate("Party", map[string]any{"name": "Lone Order Vendor", "party_type": "organization"})
+	mustCreate("PurchaseOrder", map[string]any{
+		"po_number": "PO-LONE-1", "vendor_id": vendor,
+		"order_date": "2026-07-01", "received_at": "2026-07-09",
+	})
+	item := mustCreate("Item", map[string]any{"sku": "SKU-LOW", "name": "Low Widget", "item_type": "stock"})
+	mustCreate("InventoryItem", map[string]any{"item_id": item, "qty_on_hand": 2, "qty_available_to_promise": 2})
+	mustCreate("ReorderRule", map[string]any{
+		"item_id": item, "reorder_point": 10, "safety_stock": 5, "target_lead_time_confidence": "p90",
+	})
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+	rec := getAs(t, mux, "/reports/purchasing", tenantID, "farshid")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+
+	// One sample: the vendor row and overall row both show N=1 and the
+	// insufficient text in both quantile cells.
+	if !strings.Contains(body, "<tr><td>Lone Order Vendor</td><td>1</td><td>Insufficient history</td><td>Insufficient history</td></tr>") {
+		t.Errorf("expected the single-sample vendor row to say insufficient, not a fabricated quantile:\n%s", body)
+	}
+	// The signal fires (position 2 <= 10+5) but must show the
+	// insufficient-lead-time context.
+	if !strings.Contains(body, "Low Widget") {
+		t.Errorf("expected the Low Widget signal to fire:\n%s", body)
+	}
+	if !strings.Contains(body, "Insufficient lead-time history") {
+		t.Errorf("expected the insufficient-lead-time context on the signal row:\n%s", body)
+	}
+	if strings.Contains(body, "expect ~") {
+		t.Errorf("no expected-days figure may be shown with one lead-time sample:\n%s", body)
+	}
 }
 
 // TestAPI_PurchasingReport_EntityTypeListMatchesTheActualQueries pins
@@ -155,12 +390,22 @@ func TestAPI_PurchasingReport_StockoutRiskAndEmptyStates(t *testing.T) {
 // all and would pass silently forever. This test is what actually
 // catches that class of drift.
 func TestAPI_PurchasingReport_EntityTypeListMatchesTheActualQueries(t *testing.T) {
-	// Independently re-derived from internal/data/reporting.go's SQL, not
+	// Independently re-derived from internal/data/reporting.go's SQL plus
+	// the guarded-engine reads in reporting.go's buildReorderSignals, not
 	// copied from purchasingReportEntityTypes: PurchaseOrderStatusBreakdown
 	// reads PurchaseOrder and joins Status; TopVendorsBySpend reads
 	// PurchaseOrder and joins Party; StockSummary reads InventoryItem;
-	// StockoutRiskItems reads InventoryItem and joins Item.
-	want := map[string]bool{"PurchaseOrder": true, "Status": true, "Party": true, "InventoryItem": true, "Item": true}
+	// StockoutRiskItems reads InventoryItem and joins Item;
+	// CompletedPOLeadTimes (#30) reads PurchaseOrder and joins Party and
+	// GoodsReceipt; OnOrderQtyByItem reads POLine joined to PurchaseOrder
+	// and Status; OnHandQtyByItem reads InventoryItem;
+	// LatestPOVendorByItem reads POLine joined to PurchaseOrder;
+	// buildReorderSignals reads ReorderRule and Item through the guarded
+	// engine.
+	want := map[string]bool{
+		"PurchaseOrder": true, "Status": true, "Party": true, "InventoryItem": true, "Item": true,
+		"POLine": true, "GoodsReceipt": true, "ReorderRule": true,
+	}
 	got := make(map[string]bool, len(purchasingReportEntityTypes))
 	for _, et := range purchasingReportEntityTypes {
 		got[et] = true

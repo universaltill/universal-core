@@ -1,0 +1,125 @@
+package e2e
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/chromedp/chromedp"
+
+	"github.com/universaltill/universal-core/internal/kernel/crud"
+	"github.com/universaltill/universal-core/internal/kernel/foundation"
+	"github.com/universaltill/universal-core/internal/kernel/purchasing"
+)
+
+// TestPurchasingReport_LeadTimeAndReorderSections_RealBrowser (#30):
+// /reports/purchasing renders the two new sections — "Supplier Lead
+// Times" and "Reorder Signals" — in a real headless Chrome, with a
+// reorder signal actually firing against seeded inventory + open-PO
+// state and carrying the P90 expected-days context computed from two
+// completed POs (9 and 11 days -> P90 10.8, exact type-7
+// interpolation; see internal/kernel/forecast). The internal/api tests
+// already pin the row markup; this proves the page a buyer actually
+// loads carries both sections through the real server + browser stack,
+// same reasoning as every other e2e in this package.
+func TestPurchasingReport_LeadTimeAndReorderSections_RealBrowser(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, tenantDB := testServer(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	// testServer publishes entities/forms but not the status graph —
+	// PurchaseOrder.status_id needs real Status records to point at
+	// (idempotent, same call cmd/provision-tenant makes; same setup as
+	// form_save_test.go's reversed-dates test).
+	if err := purchasing.PublishStatuses(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("PublishStatuses: %v", err)
+	}
+	engine := crud.NewEngine(tenantDB)
+
+	vendor, err := engine.Create(ctx, foundation.Party(), map[string]any{
+		"name": "Report Vendor Co", "party_type": "organization", "status": "active",
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed vendor: %v", err)
+	}
+	receivedID := publishedStatusID(t, tenantDB, "purchase_order_status", "received")
+	approvedID := publishedStatusID(t, tenantDB, "purchase_order_status", "approved")
+
+	// Two completed POs: 9 days and 11 days -> P50 10 / P90 10.8.
+	for _, po := range []struct{ number, ordered, received string }{
+		{"PO-E2E-1", "2026-07-01", "2026-07-10"},
+		{"PO-E2E-2", "2026-07-05", "2026-07-16"},
+	} {
+		if _, err := engine.Create(ctx, purchasing.PurchaseOrder(), map[string]any{
+			"po_number": po.number, "vendor_id": vendor.ID, "order_date": po.ordered,
+			"status_id": receivedID, "received_at": po.received,
+		}, actor); err != nil {
+			t.Fatalf("seed completed PO %s: %v", po.number, err)
+		}
+	}
+
+	item, err := engine.Create(ctx, purchasing.Item(), map[string]any{
+		"sku": "SKU-E2E-LOW", "name": "E2E Reorder Widget", "item_type": "stock",
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed Item: %v", err)
+	}
+	if _, err := engine.Create(ctx, purchasing.InventoryItem(), map[string]any{
+		"item_id": item.ID, "qty_on_hand": 5, "qty_available_to_promise": 5,
+	}, actor); err != nil {
+		t.Fatalf("seed InventoryItem: %v", err)
+	}
+	openPO, err := engine.Create(ctx, purchasing.PurchaseOrder(), map[string]any{
+		"po_number": "PO-E2E-OPEN", "vendor_id": vendor.ID, "order_date": "2026-07-20",
+		"status_id": approvedID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed open PO: %v", err)
+	}
+	if _, err := engine.Create(ctx, purchasing.POLine(), map[string]any{
+		"purchase_order_id": openPO.ID, "item_id": item.ID, "qty": 20, "unit_price": 1.5,
+	}, actor); err != nil {
+		t.Fatalf("seed POLine: %v", err)
+	}
+	// Position 5 + 20 = 25 <= 30 -> the signal fires.
+	if _, err := engine.Create(ctx, purchasing.ReorderRule(), map[string]any{
+		"item_id": item.ID, "reorder_point": 30, "safety_stock": 0,
+		"target_lead_time_confidence": "p90",
+	}, actor); err != nil {
+		t.Fatalf("seed ReorderRule: %v", err)
+	}
+
+	bctx := browserCtx(t, tenantID)
+	var bodyText string
+	if err := chromedp.Run(bctx,
+		chromedp.Navigate(srv.URL+"/reports/purchasing"),
+		chromedp.WaitVisible(`table.uc-table`, chromedp.ByQuery),
+		chromedp.Text(`body`, &bodyText, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("open /reports/purchasing: %v", err)
+	}
+
+	for _, want := range []string{
+		"Supplier Lead Times",
+		"Reorder Signals",
+		"Report Vendor Co", // the vendor's lead-time row
+		"10.8",             // P90 from the two completed POs
+		"E2E Reorder Widget",
+		"Order now — expect ~10.8 days",
+	} {
+		if !strings.Contains(bodyText, want) {
+			t.Errorf("report page missing %q; body text:\n%s", want, bodyText)
+		}
+	}
+
+	// The signal row's item links to the real Item form — clicking is the
+	// buyer's next step, so the anchor must resolve, not 404.
+	var href string
+	var ok bool
+	if err := chromedp.Run(bctx,
+		chromedp.AttributeValue(`a[href="/forms/Item/`+item.ID+`"]`, "href", &href, &ok, chromedp.ByQuery),
+	); err != nil || !ok {
+		t.Fatalf("signal row's item link missing (err=%v ok=%v)", err, ok)
+	}
+}
