@@ -1,0 +1,108 @@
+{
+  "format": "erp_module/v1",
+  "module": "library",
+  "name": "Library",
+  "entities": [
+    {
+      "entity_type": "LibraryBook",
+      "version": 1,
+      "module": "library",
+      "fields": [
+        {"name": "isbn", "type": "string", "required": true},
+        {"name": "title", "type": "i18n_text", "required": true},
+        {"name": "author", "type": "string"},
+        {"name": "copies", "type": "number", "default": 1}
+      ]
+    },
+    {
+      "entity_type": "LibraryLoan",
+      "version": 1,
+      "module": "library",
+      "status_type_code": "library_loan_status",
+      "fields": [
+        {"name": "loan_number", "type": "string", "required": true},
+        {"name": "borrower_id", "type": "reference", "required": true, "target": "Party"},
+        {"name": "loan_date", "type": "date", "required": true},
+        {"name": "due_date", "type": "date", "not_before": "loan_date"},
+        {"name": "status_id", "type": "reference", "required": true, "target": "Status"},
+        {"name": "total_items", "type": "number", "default": 0}
+      ],
+      "relationships": [
+        {"name": "lines", "kind": "composition", "target": "LibraryLoanLine", "parent_field": "library_loan_id"}
+      ]
+    },
+    {
+      "entity_type": "LibraryLoanLine",
+      "version": 1,
+      "module": "library",
+      "fields": [
+        {"name": "library_loan_id", "type": "reference", "required": true, "target": "LibraryLoan"},
+        {"name": "book_id", "type": "reference", "required": true, "target": "LibraryBook"},
+        {"name": "qty", "type": "number", "required": true}
+      ]
+    }
+  ],
+  "forms": [
+    {
+      "entity_type": "LibraryBook",
+      "version": 1,
+      "sections": [
+        {
+          "title": "Book",
+          "component": "fields",
+          "fields": [
+            {"name": "isbn", "label": "ISBN"},
+            {"name": "title", "label": "Title"},
+            {"name": "author", "label": "Author"},
+            {"name": "copies", "label": "Copies"}
+          ]
+        }
+      ],
+      "actions": [{"label": "Save", "op": "save"}]
+    },
+    {
+      "entity_type": "LibraryLoan",
+      "version": 1,
+      "sections": [
+        {
+          "title": "Loan",
+          "component": "fields",
+          "fields": [
+            {"name": "loan_number", "label": "Loan Number"},
+            {"name": "borrower_id", "label": "Borrower"},
+            {"name": "loan_date", "label": "Loan Date"},
+            {"name": "due_date", "label": "Due Date"},
+            {"name": "status_id", "label": "Status"},
+            {"name": "total_items", "label": "Total Items"}
+          ]
+        },
+        {
+          "title": "Items",
+          "component": "master_detail",
+          "target": "LibraryLoanLine",
+          "roll_up": "qty",
+          "roll_up_target": "total_items"
+        }
+      ],
+      "actions": [{"label": "Save", "op": "save"}]
+    }
+  ],
+  "status_graphs": [
+    {
+      "entity_type": "LibraryLoan",
+      "status_type_code": "library_loan_status",
+      "status_type_name": "Library Loan Status",
+      "statuses": [
+        {"code": "draft", "name": "Draft", "sequence": 1, "is_initial": true, "is_terminal": false},
+        {"code": "out", "name": "Out", "sequence": 2, "is_initial": false, "is_terminal": false},
+        {"code": "returned", "name": "Returned", "sequence": 3, "is_initial": false, "is_terminal": true},
+        {"code": "lost", "name": "Lost", "sequence": 4, "is_initial": false, "is_terminal": true}
+      ],
+      "transitions": [
+        {"from": "draft", "to": "out"},
+        {"from": "out", "to": "returned"},
+        {"from": "out", "to": "lost"}
+      ]
+    }
+  ]
+}
