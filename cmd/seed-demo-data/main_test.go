@@ -23,6 +23,7 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/finance"
 	"github.com/universaltill/universal-core/internal/kernel/forecast"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
+	"github.com/universaltill/universal-core/internal/kernel/projects"
 	"github.com/universaltill/universal-core/internal/kernel/purchasing"
 	"github.com/universaltill/universal-core/internal/kernel/sales"
 	"github.com/universaltill/universal-core/internal/tenantdb"
@@ -57,6 +58,7 @@ var moduleSeeds = map[string]moduleSeed{
 	"sales":      {sales.Publish, sales.PublishForms, sales.PublishStatuses},
 	"finance":    {finance.Publish, finance.PublishForms, nil},
 	"assets":     {assets.Publish, assets.PublishForms, assets.PublishStatuses},
+	"projects":   {projects.Publish, projects.PublishForms, projects.PublishStatuses},
 }
 
 // provisionedTenant creates a fresh control database plus a new tenant
@@ -128,7 +130,7 @@ func TestSeedDemoData_MissingDatabaseURL_FailsFast(t *testing.T) {
 }
 
 func TestSeedDemoData_MissingTenantID_FailsFast(t *testing.T) {
-	controlDSN, _ := provisionedTenant(t, "purchasing", "sales", "finance", "assets")
+	controlDSN, _ := provisionedTenant(t, "purchasing", "sales", "finance", "assets", "projects")
 	_, stderr, code := run(t, []string{"DATABASE_URL=" + controlDSN}, "-actor-id=a")
 	if code == 0 {
 		t.Fatal("expected non-zero exit with -tenant-id unset")
@@ -139,7 +141,7 @@ func TestSeedDemoData_MissingTenantID_FailsFast(t *testing.T) {
 }
 
 func TestSeedDemoData_MissingActorID_FailsFast(t *testing.T) {
-	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance", "assets")
+	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance", "assets", "projects")
 	_, stderr, code := run(t, []string{"DATABASE_URL=" + controlDSN}, "-tenant-id="+id)
 	if code == 0 {
 		t.Fatal("expected non-zero exit with -actor-id unset")
@@ -165,7 +167,7 @@ func TestSeedDemoData_UnprovisionedModule_FailsCleanly(t *testing.T) {
 }
 
 func TestSeedDemoData_SeedsSampleRecordsAndIsIdempotent(t *testing.T) {
-	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance", "assets")
+	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance", "assets", "projects")
 
 	_, stderr, code := run(t, []string{"DATABASE_URL=" + controlDSN}, "-tenant-id="+id, "-actor-id=smoke-test")
 	if code != 0 {
@@ -188,6 +190,7 @@ func TestSeedDemoData_SeedsSampleRecordsAndIsIdempotent(t *testing.T) {
 		"Party", "Item", "PurchaseOrder", "SalesOrder", "CustomerInvoice",
 		"Account", "FiscalYear", "Period", "TaxCode", "CostCenter", "ReorderRule",
 		"FixedAsset", "DepreciationSchedule", "MaintenanceOrder",
+		"Project", "Task", "TimeEntry",
 	} {
 		counts[entityType] = countRecords(t, tenantDB, entityType)
 		if counts[entityType] == 0 {
@@ -354,7 +357,7 @@ func TestSeedDemoData_SeedsSampleRecordsAndIsIdempotent(t *testing.T) {
 // untouched. This is the "re-run the seeder against the live Demo
 // Organization tenant" convention working on a real pre-#29 row.
 func TestSeedDemoData_BackfillsStagesOnPreexistingPurchaseOrder(t *testing.T) {
-	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance", "assets")
+	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance", "assets", "projects")
 	control := testexec.Open(t, controlDSN)
 	router, err := tenantdb.NewRouter(control, controlDSN)
 	if err != nil {
@@ -586,7 +589,7 @@ func countJournalEntries(t *testing.T, tenantDB *sql.DB) int {
 // converged backfill must fill ONLY the missing stages and never touch
 // ones that already hold a value.
 func TestSeedDemoData_ExtendsPartialStagePrefix(t *testing.T) {
-	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance", "assets")
+	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance", "assets", "projects")
 	control := testexec.Open(t, controlDSN)
 	router, err := tenantdb.NewRouter(control, controlDSN)
 	if err != nil {
@@ -681,7 +684,7 @@ func TestSeedDemoData_ExtendsPartialStagePrefix(t *testing.T) {
 // it, and this repo had already set the opposite bar with
 // TestSeedDemoData_ExtendsPartialStagePrefix.
 func TestSeedDemoData_RepairsPartialDepreciationSchedule(t *testing.T) {
-	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance", "assets")
+	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance", "assets", "projects")
 	seed := func(label string) {
 		t.Helper()
 		if _, stderr, code := run(t, []string{"DATABASE_URL=" + controlDSN}, "-tenant-id="+id, "-actor-id=smoke-test"); code != 0 {

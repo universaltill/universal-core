@@ -1081,3 +1081,73 @@ func TestRender_RelatedListIsServerRenderedNotLazyLoaded(t *testing.T) {
 		t.Fatalf("related list must not fetch on load, got:\n%s", segment)
 	}
 }
+
+// TestRender_ChildRowsResolveI18nAndAlignColumns is the regression test
+// for board #18's blocker. A child entity with an i18n_text field
+// (Task.title is the repo's first) previously rendered the raw stored
+// map — "map[en:Design tr:Tasarım]" — identical in every locale: Go
+// internals shown to a user. And because columns were derived from each
+// row's own keys, a row with an optional field set got an extra cell,
+// shifting every column after it out of alignment with its neighbours.
+func TestRender_ChildRowsResolveI18nAndAlignColumns(t *testing.T) {
+	r := testRenderer(t)
+	childDef := &entity.Definition{
+		EntityType: "Sub", Version: 1,
+		Fields: []entity.Field{
+			{Name: "title", Type: entity.FieldI18nText, Required: true},
+			{Name: "parent_id", Type: entity.FieldReference, Target: "Sub"},
+			{Name: "hours", Type: entity.FieldNumber},
+		},
+	}
+	data := Data{
+		Record: map[string]any{"payment_method": "Wire"},
+		Children: map[string][]map[string]any{
+			// Deliberately ragged: only the second row has parent_id.
+			"POLine": {
+				{"title": map[string]any{"en": "Design", "tr": "Tasarım"}, "hours": 8.0},
+				{"title": map[string]any{"en": "Sub", "tr": "Alt"}, "parent_id": "t1", "hours": 2.0},
+			},
+		},
+		ChildDefs: map[string]*entity.Definition{"POLine": childDef},
+	}
+
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if strings.Contains(out, "map[") {
+		t.Errorf("a raw Go map leaked into the rendered page:\n%s", out)
+	}
+	if !strings.Contains(out, ">Design<") {
+		t.Errorf("i18n child cell not resolved to the viewer's locale:\n%s", out)
+	}
+
+	// Same data, Turkish viewer: the cell must actually differ.
+	var tr strings.Builder
+	if err := r.Render(&tr, purchaseOrderForm(), purchaseOrderEntity(), data, "tr"); err != nil {
+		t.Fatalf("render tr: %v", err)
+	}
+	if !strings.Contains(tr.String(), ">Tasarım<") {
+		t.Errorf("Turkish viewer did not get the Turkish title:\n%s", tr.String())
+	}
+
+	// Every row has one cell per declared column, in Definition order,
+	// so a missing optional value cannot shift its neighbours.
+	rows := strings.Count(out, "<tr>") - strings.Count(out, "<thead><tr>")
+	if rows < 2 {
+		t.Fatalf("expected two child rows, got %d:\n%s", rows, out)
+	}
+	for _, want := range []string{
+		`<td data-field="title">Design</td><td data-field="parent_id"></td><td data-field="hours">8</td>`,
+		`<td data-field="title">Sub</td><td data-field="parent_id">t1</td><td data-field="hours">2</td>`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected aligned row %q in:\n%s", want, out)
+		}
+	}
+	// And the columns are labelled, which they never were before.
+	if !strings.Contains(out, `<th data-field="title">`) {
+		t.Errorf("child table has no header row:\n%s", out)
+	}
+}

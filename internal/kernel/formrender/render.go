@@ -54,6 +54,12 @@ type Data struct {
 	Version  int
 	Record   map[string]any
 	Children map[string][]map[string]any
+	// ChildDefs is each child entity type's published Definition, keyed
+	// the same way as Children. Needed so a child table's columns come
+	// from the Definition's field order and its i18n_text cells resolve
+	// to the viewer's locale rather than printing a raw map — see
+	// buildChildRows. A missing entry degrades to per-row keys.
+	ChildDefs map[string]*entity.Definition
 	// ReferenceOptions carries only the label of each FieldReference
 	// field's CURRENT value, keyed by field name — enough to show a name
 	// instead of a raw id on an existing record's combobox (#24). It is no
@@ -142,11 +148,14 @@ type viewModel struct {
 }
 
 type sectionView struct {
-	Title       string
-	Component   form.Component
-	Fields      []fieldView
-	Target      string
-	Children    []childRowView
+	Title     string
+	Component form.Component
+	Fields    []fieldView
+	Target    string
+	Children  []childRowView
+	// Columns is the child table's column order, from the child
+	// Definition — see buildChildRows on why it can't come per row.
+	Columns     []string
 	RollUpLabel string
 	RollUpTotal string // empty when the section has no roll-up
 	// AddHref is pre-built via net/url so a Target
@@ -323,7 +332,7 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 			}
 
 		case form.ComponentMasterDetail:
-			sv.Children = buildChildRows(data.Children[s.Target])
+			sv.Children, sv.Columns = buildChildRows(data.Children[s.Target], data.ChildDefs[s.Target], r.i18n, locale)
 			sv.AddHref = "/api/records/" + url.PathEscape(s.Target) + "/new"
 			if s.RollUp != "" {
 				sv.RollUpLabel = s.RollUpTarget
@@ -339,7 +348,7 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 			// the endpoint: the rows are already here, and a lazy-load
 			// that fires on every form render is a request this page
 			// does not need (independent review, board #20).
-			sv.Children = buildChildRows(data.Children[s.Target])
+			sv.Children, sv.Columns = buildChildRows(data.Children[s.Target], data.ChildDefs[s.Target], r.i18n, locale)
 		}
 
 		vm.Sections = append(vm.Sections, sv)
@@ -566,26 +575,90 @@ func (r *Renderer) buildFields(s form.Section, ent *entity.Definition, record ma
 	return out, nil
 }
 
-// buildChildRows renders each child record's fields sorted by name for
-// deterministic output — map iteration order in Go is randomized, and
-// this render must be stable across calls (tested, and a stable diff for
-// anyone reviewing rendered output).
-func buildChildRows(children []map[string]any) []childRowView {
+// buildChildRows renders a child table's rows.
+//
+// Columns come from the child DEFINITION's field order, not from each
+// row's own keys. Deriving them per row (the original approach, sorted
+// alphabetically for determinism) produced ragged tables the moment an
+// optional field was set on some rows and not others: the row with a
+// value got an extra cell and every column after it shifted, so one
+// row's "project" sat under the next row's "status". Optional fields
+// are normal — Task.parent_task_id is set on exactly the subset of rows
+// that are subtasks — so this was guaranteed, not an edge case
+// (independent review, board #18). A row missing a value now emits an
+// empty cell in the right column instead.
+//
+// i18n_text values are resolved to the viewer's locale here for the
+// same reason internal/api's list view resolves them: the stored value
+// is a per-locale JSON object (ADR-0009), and printing it raw leaks
+// "map[en:Design tr:Tasarım]" into the page — Go internals shown to a
+// user, identical in every language. No child entity in this repo had
+// an i18n field until Task.title, which is why nothing caught it
+// before.
+//
+// childDef may be nil (a Definition mismatch the caller already
+// tolerates); the per-row key fallback keeps such a section rendering
+// something rather than nothing.
+func buildChildRows(children []map[string]any, childDef *entity.Definition, catalog *i18n.Catalog, locale string) ([]childRowView, []string) {
+	columns := childColumns(children, childDef)
 	rows := make([]childRowView, 0, len(children))
 	for _, child := range children {
-		names := make([]string, 0, len(child))
-		for k := range child {
-			names = append(names, k)
-		}
-		sort.Strings(names)
-
-		row := childRowView{Cells: make([]cellView, 0, len(names))}
-		for _, name := range names {
-			row.Cells = append(row.Cells, cellView{Field: name, Value: child[name]})
+		row := childRowView{Cells: make([]cellView, 0, len(columns))}
+		for _, name := range columns {
+			row.Cells = append(row.Cells, cellView{
+				Field: name,
+				Value: childCellValue(child, name, childDef, catalog, locale),
+			})
 		}
 		rows = append(rows, row)
 	}
-	return rows
+	return rows, columns
+}
+
+// childColumns is the child Definition's declared field order, falling
+// back to the union of the rows' own keys (sorted, so output stays
+// deterministic — Go map iteration is randomized) when no Definition is
+// available.
+func childColumns(children []map[string]any, childDef *entity.Definition) []string {
+	if childDef != nil && len(childDef.Fields) > 0 {
+		cols := make([]string, 0, len(childDef.Fields))
+		for _, f := range childDef.Fields {
+			cols = append(cols, f.Name)
+		}
+		return cols
+	}
+	seen := map[string]bool{}
+	var cols []string
+	for _, child := range children {
+		for k := range child {
+			if !seen[k] {
+				seen[k] = true
+				cols = append(cols, k)
+			}
+		}
+	}
+	sort.Strings(cols)
+	return cols
+}
+
+func childCellValue(child map[string]any, name string, childDef *entity.Definition, catalog *i18n.Catalog, locale string) any {
+	v, present := child[name]
+	if !present {
+		return nil
+	}
+	if childDef == nil || catalog == nil {
+		return v
+	}
+	if f, ok := childDef.FieldByName(name); ok && f.Type == entity.FieldI18nText {
+		if s, ok := catalog.ResolveLocalized(v, locale); ok {
+			return s
+		}
+		// An unresolvable i18n value renders blank rather than as a raw
+		// map — a missing translation is not something to show as Go
+		// syntax.
+		return nil
+	}
+	return v
 }
 
 const tmplSrc = `<form class="uc-form" data-entity-type="{{.EntityType}}" hx-post="{{.PostHref}}" hx-target="this" hx-swap="outerHTML">
@@ -620,6 +693,7 @@ const tmplSrc = `<form class="uc-form" data-entity-type="{{.EntityType}}" hx-pos
 {{end}}
 {{else if eq .Component "master_detail"}}
 <table class="uc-master-detail" data-target="{{.Target}}">
+<thead><tr>{{range .Columns}}<th data-field="{{.}}">{{.}}</th>{{end}}</tr></thead>
 <tbody>
 {{range .Children}}<tr>{{range .Cells}}<td data-field="{{.Field}}">{{.Value}}</td>{{end}}</tr>{{end}}
 </tbody>

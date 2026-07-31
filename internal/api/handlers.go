@@ -1008,11 +1008,12 @@ func (h *Handler) buildFormRenderData(ctx context.Context, ts tenantScope, entDe
 		renderData.Version = rec.Version
 		renderData.Record = rec.Data
 
-		children, err := h.loadMasterDetailChildren(ctx, ts, entDef, formDef, id)
+		children, childDefs, err := h.loadMasterDetailChildren(ctx, ts, entDef, formDef, id)
 		if err != nil {
 			return formrender.Data{}, fmt.Errorf("load master-detail children: %w", err)
 		}
 		renderData.Children = children
+		renderData.ChildDefs = childDefs
 	}
 	// Resolved AFTER the record is loaded, because it depends on the
 	// record's current values: the combobox (#24) only needs each
@@ -1202,8 +1203,12 @@ func (h *Handler) pageReferenceLabels(ctx context.Context, ts tenantScope, def *
 // children", the same as an explicitly empty slice) rather than erroring
 // — a Definition mismatch here is a data-modeling bug to fix in the
 // Definition, not something that should 500 every form render for it.
-func (h *Handler) loadMasterDetailChildren(ctx context.Context, ts tenantScope, entDef *entity.Definition, formDef *form.Definition, recordID string) (map[string][]map[string]any, error) {
+func (h *Handler) loadMasterDetailChildren(ctx context.Context, ts tenantScope, entDef *entity.Definition, formDef *form.Definition, recordID string) (map[string][]map[string]any, map[string]*entity.Definition, error) {
 	children := make(map[string][]map[string]any)
+	// The child Definitions travel with the rows: the renderer needs
+	// them for column order and to resolve i18n_text cells to the
+	// viewer's locale (formrender.buildChildRows).
+	childDefs := make(map[string]*entity.Definition)
 	for _, section := range formDef.Sections {
 		// Both component kinds resolve their rows the same way — parent
 		// id matched against the child's ParentField. They differ in what
@@ -1230,19 +1235,20 @@ func (h *Handler) loadMasterDetailChildren(ctx context.Context, ts tenantScope, 
 		}
 		childDef, err := ts.entityDef(ctx, section.Target)
 		if err != nil {
-			return nil, fmt.Errorf("look up %s definition for master-detail section: %w", section.Target, err)
+			return nil, nil, fmt.Errorf("look up %s definition for master-detail section: %w", section.Target, err)
 		}
 		records, err := ts.crud.ListByField(ctx, childDef, rel.ParentField, recordID)
 		if err != nil {
-			return nil, fmt.Errorf("list %s children: %w", section.Target, err)
+			return nil, nil, fmt.Errorf("list %s children: %w", section.Target, err)
 		}
 		rows := make([]map[string]any, len(records))
 		for i, rec := range records {
 			rows[i] = rec.Data
 		}
 		children[section.Target] = rows
+		childDefs[section.Target] = childDef
 	}
-	return children, nil
+	return children, childDefs, nil
 }
 
 func writeDefinitionLookupError(w http.ResponseWriter, entityType string, err error) {

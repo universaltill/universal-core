@@ -27,6 +27,7 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/finance"
+	"github.com/universaltill/universal-core/internal/kernel/projects"
 	"github.com/universaltill/universal-core/internal/kernel/purchasing"
 	"github.com/universaltill/universal-core/internal/kernel/sales"
 	"github.com/universaltill/universal-core/internal/tenantdb"
@@ -139,6 +140,12 @@ func main() {
 	s.seedCustomerInvoices(customers, currencies, soIDs)
 	if hasPublished(s.ctx, s.entityDefs, "FixedAsset") {
 		s.seedFixedAssets(currencies, accounts, vendors)
+	}
+	if hasPublished(s.ctx, s.entityDefs, "Project") {
+		if err := projects.PublishStatuses(context.Background(), sqlDB, s.actor); err != nil {
+			log.Fatalf("publish projects statuses: %v", err)
+		}
+		s.seedProjects(currencies, customers)
 	}
 
 	log.Printf("demo data seeded for tenant %s (%d currencies, %d units, %d vendors, %d customers, %d items)",
@@ -1195,6 +1202,125 @@ func (s *seeder) seedCustomerInvoices(customers, currencies, soIDs map[string]st
 				log.Fatalf("update CustomerInvoice %s to %s: %v", inv.invoiceNumber, status, err)
 			}
 			version = newVersion
+		}
+	}
+}
+
+// seedProjects gives the demo tenant a project with a real task
+// hierarchy and logged time — a subtask included, because
+// parent_task_id being set on only some rows is exactly the shape that
+// used to render a ragged task table (board #18's review), and demo
+// data that never exercises it would hide a regression.
+func (s *seeder) seedProjects(currencies, customers map[string]string) {
+	if !hasPublished(s.ctx, s.entityDefs, "Task") || !hasPublished(s.ctx, s.entityDefs, "TimeEntry") {
+		return
+	}
+	taskDef := s.def("Task")
+	timeDef := s.def("TimeEntry")
+
+	// The "employee" is a Party carrying the employee PartyRole — the
+	// module has no Employee entity, see its package comment.
+	engineer := s.getOrCreate("Party", "name", "Demo Engineer", map[string]any{
+		"party_type": "person", "name": "Demo Engineer", "status": "active",
+	})
+	s.getOrCreate("PartyRole", "party_id", engineer, map[string]any{
+		"party_id": engineer, "role_type": "employee",
+	})
+
+	var customerID string
+	for _, name := range []string{"Doha Retail Group", "Gulf Trading LLC"} {
+		if id, ok := customers[name]; ok {
+			customerID = id
+			break
+		}
+	}
+
+	projectID := s.getOrCreate("Project", "project_code", "PRJ-2026-001", map[string]any{
+		"project_code": "PRJ-2026-001",
+		"name":         map[string]any{"en": "ERP Rollout", "tr": "ERP Kurulumu"},
+		"customer_id":  customerID,
+		"start_date":   "2026-02-01",
+		"end_date":     "2026-08-31",
+		"budget":       75000.0,
+		"currency_id":  currencies["USD"],
+		"status_id":    s.statusID("project_status", "active"),
+	})
+
+	// Task has no single-field natural key — its title is an i18n map,
+	// so getOrCreate's field lookup can't address it (an earlier draft
+	// tried, matched nothing, and duplicated every task on re-run; the
+	// idempotency test caught it). Index this project's existing tasks
+	// by their English title instead, which repairs a partial run rather
+	// than skipping wholesale.
+	existingTasks, err := s.crud.ListByField(s.ctx, taskDef, "project_id", projectID)
+	if err != nil {
+		log.Fatalf("list existing tasks: %v", err)
+	}
+	taskByTitle := map[string]string{}
+	for _, rec := range existingTasks {
+		if title, ok := rec.Data["title"].(map[string]any); ok {
+			if en, ok := title["en"].(string); ok {
+				taskByTitle[en] = rec.ID
+			}
+		}
+	}
+	task := func(en string, fields map[string]any) string {
+		if id, ok := taskByTitle[en]; ok {
+			return id
+		}
+		rec, err := s.crud.Create(s.ctx, taskDef, fields, s.actor)
+		if err != nil {
+			log.Fatalf("create Task %q: %v", en, err)
+		}
+		taskByTitle[en] = rec.ID
+		return rec.ID
+	}
+
+	parentID := task("Discovery", map[string]any{
+		"project_id":      projectID,
+		"title":           map[string]any{"en": "Discovery", "tr": "Keşif"},
+		"assignee_id":     engineer,
+		"estimated_hours": 40.0,
+		"due_date":        "2026-03-15",
+		"status_id":       s.statusID("task_status", "in_progress"),
+	})
+	// A subtask: the row that has parent_task_id set where its sibling
+	// does not — the shape that used to render a ragged task table.
+	subID := task("Stakeholder interviews", map[string]any{
+		"project_id":      projectID,
+		"parent_task_id":  parentID,
+		"title":           map[string]any{"en": "Stakeholder interviews", "tr": "Paydaş görüşmeleri"},
+		"assignee_id":     engineer,
+		"estimated_hours": 12.0,
+		"status_id":       s.statusID("task_status", "todo"),
+	})
+
+	loggedFor, err := s.crud.ListByField(s.ctx, timeDef, "task_id", parentID)
+	if err != nil {
+		log.Fatalf("list existing time entries: %v", err)
+	}
+	if len(loggedFor) > 0 {
+		return
+	}
+	for _, e := range []struct {
+		task  string
+		date  string
+		hours float64
+		note  string
+	}{
+		{parentID, "2026-02-03", 6.5, "Kickoff and current-state review"},
+		{parentID, "2026-02-04", 4.0, "Process mapping"},
+		{subID, "2026-02-05", 3.25, "Finance team interview"},
+	} {
+		if _, err := s.crud.Create(s.ctx, timeDef, map[string]any{
+			"task_id":     e.task,
+			"employee_id": engineer,
+			"entry_date":  e.date,
+			"hours":       e.hours,
+			"billable":    true,
+			"notes":       e.note,
+		}, s.actor); err != nil {
+			log.Fatalf("create TimeEntry: %v", err)
 		}
 	}
 }
