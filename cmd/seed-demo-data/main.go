@@ -14,6 +14,7 @@ import (
 	"database/sql"
 	"flag"
 	"log"
+	"maps"
 	"os"
 	"time"
 
@@ -502,24 +503,48 @@ func (s *seeder) seedPurchaseOrders(vendors, currencies, items map[string]string
 		qty      float64
 		unitCost float64
 	}
+	// stages (#29): the six R10 lead-time timestamps, chronological per
+	// PO and deliberately varied in duration — this is #30's forecast
+	// demo data, so the spread matters more than the individual values.
+	// Received POs carry the full chain; in-flight ones a realistic
+	// prefix (censored data the forecast has to handle); drafts and the
+	// cancelled PO none.
 	orders := []struct {
 		poNumber string
 		vendor   string
 		currency string
 		date     string
 		status   string
+		stages   map[string]string
 		lines    []line
 	}{
-		{"PO-2026-0001", "Acme Textiles", "USD", "2026-07-01", "approved", []line{{"SKU-1002", 40, 18.5}}},
-		{"PO-2026-0002", "Gulf Steel Supply", "QAR", "2026-07-10", "submitted", []line{{"SKU-1001", 2000, 0.35}}},
-		{"PO-2026-0003", "Anatolia Parts Co.", "TRY", "2026-07-15", "draft", []line{{"SKU-1003", 150, 4.2}, {"SKU-2001", 8, 120}}},
-		{"PO-2026-0004", "Acme Textiles", "USD", "2026-07-18", "received", []line{{"SKU-1005", 60, 22}, {"SKU-1006", 30, 9.5}}},
-		{"PO-2026-0005", "Doha Fasteners LLC", "QAR", "2026-07-19", "received", []line{{"SKU-1004", 3000, 0.42}, {"SKU-1009", 5000, 0.08}}},
-		{"PO-2026-0006", "Istanbul Weaving Mills", "TRY", "2026-07-19", "approved", []line{{"SKU-1010", 90, 26.5}}},
-		{"PO-2026-0007", "Manchester Packaging Ltd", "GBP", "2026-07-20", "submitted", []line{{"SKU-1007", 400, 3.1}, {"SKU-1008", 250, 5.75}}},
-		{"PO-2026-0008", "Gulf Steel Supply", "QAR", "2026-07-20", "cancelled", []line{{"SKU-1001", 500, 0.35}}},
-		{"PO-2026-0009", "Anatolia Parts Co.", "TRY", "2026-07-21", "draft", []line{{"SKU-2002", 4, 90}}},
-		{"PO-2026-0010", "Doha Fasteners LLC", "QAR", "2026-07-21", "approved", []line{{"SKU-1009", 8000, 0.08}}},
+		{"PO-2026-0001", "Acme Textiles", "USD", "2026-07-01", "approved",
+			map[string]string{"sourced_at": "2026-07-04", "production_start_at": "2026-07-08", "production_ready_at": "2026-07-18", "shipped_at": "2026-07-22"},
+			[]line{{"SKU-1002", 40, 18.5}}},
+		{"PO-2026-0002", "Gulf Steel Supply", "QAR", "2026-07-10", "submitted",
+			map[string]string{"sourced_at": "2026-07-14"},
+			[]line{{"SKU-1001", 2000, 0.35}}},
+		{"PO-2026-0003", "Anatolia Parts Co.", "TRY", "2026-07-15", "draft", nil,
+			[]line{{"SKU-1003", 150, 4.2}, {"SKU-2001", 8, 120}}},
+		{"PO-2026-0004", "Acme Textiles", "USD", "2026-07-18", "received",
+			map[string]string{"sourced_at": "2026-07-19", "production_start_at": "2026-07-20", "production_ready_at": "2026-07-23", "shipped_at": "2026-07-24", "customs_cleared_at": "2026-07-26", "received_at": "2026-07-27"},
+			[]line{{"SKU-1005", 60, 22}, {"SKU-1006", 30, 9.5}}},
+		{"PO-2026-0005", "Doha Fasteners LLC", "QAR", "2026-07-19", "received",
+			map[string]string{"sourced_at": "2026-07-20", "production_start_at": "2026-07-22", "production_ready_at": "2026-07-25", "shipped_at": "2026-07-26", "customs_cleared_at": "2026-07-28", "received_at": "2026-07-30"},
+			[]line{{"SKU-1004", 3000, 0.42}, {"SKU-1009", 5000, 0.08}}},
+		{"PO-2026-0006", "Istanbul Weaving Mills", "TRY", "2026-07-19", "approved",
+			map[string]string{"sourced_at": "2026-07-21", "production_start_at": "2026-07-24"},
+			[]line{{"SKU-1010", 90, 26.5}}},
+		{"PO-2026-0007", "Manchester Packaging Ltd", "GBP", "2026-07-20", "submitted",
+			map[string]string{"sourced_at": "2026-07-23"},
+			[]line{{"SKU-1007", 400, 3.1}, {"SKU-1008", 250, 5.75}}},
+		{"PO-2026-0008", "Gulf Steel Supply", "QAR", "2026-07-20", "cancelled", nil,
+			[]line{{"SKU-1001", 500, 0.35}}},
+		{"PO-2026-0009", "Anatolia Parts Co.", "TRY", "2026-07-21", "draft", nil,
+			[]line{{"SKU-2002", 4, 90}}},
+		{"PO-2026-0010", "Doha Fasteners LLC", "QAR", "2026-07-21", "approved",
+			map[string]string{"sourced_at": "2026-07-23", "production_start_at": "2026-07-26", "production_ready_at": "2026-07-30"},
+			[]line{{"SKU-1009", 8000, 0.08}}},
 	}
 	for _, o := range orders {
 		existing, err := s.crud.ListByField(s.ctx, poDef, "po_number", o.poNumber)
@@ -527,16 +552,41 @@ func (s *seeder) seedPurchaseOrders(vendors, currencies, items map[string]string
 			log.Fatalf("list PurchaseOrder by po_number: %v", err)
 		}
 		if len(existing) > 0 {
+			// Stage backfill (#29): a PO seeded before the stage fields
+			// existed keeps its identity but gains the timestamps —
+			// re-running the seeder against the live tenant is the
+			// standing convention for exactly this. Idempotent: a PO
+			// that already has sourced_at is left alone entirely.
+			rec := existing[0]
+			if len(o.stages) == 0 {
+				continue
+			}
+			if v, _ := rec.Data["sourced_at"].(string); v != "" {
+				continue
+			}
+			fields := make(map[string]any, len(rec.Data)+len(o.stages))
+			maps.Copy(fields, rec.Data)
+			for k, v := range o.stages {
+				fields[k] = v
+			}
+			expectedVersion := rec.Version
+			if _, err := s.crud.Update(s.ctx, poDef, rec.ID, fields, &expectedVersion, s.actor); err != nil {
+				log.Fatalf("backfill stages on %s: %v", o.poNumber, err)
+			}
 			continue
 		}
 
-		poID, err := s.crud.Create(s.ctx, poDef, map[string]any{
+		createFields := map[string]any{
 			"po_number":   o.poNumber,
 			"vendor_id":   vendors[o.vendor],
 			"currency_id": currencies[o.currency],
 			"order_date":  o.date,
 			"status_id":   s.statusID("purchase_order_status", o.status),
-		}, s.actor)
+		}
+		for k, v := range o.stages {
+			createFields[k] = v
+		}
+		poID, err := s.crud.Create(s.ctx, poDef, createFields, s.actor)
 		if err != nil {
 			log.Fatalf("create PurchaseOrder for %s: %v", o.vendor, err)
 		}
@@ -559,10 +609,16 @@ func (s *seeder) seedPurchaseOrders(vendors, currencies, items map[string]string
 		// passed here) — po_number has to be repeated even though it's
 		// unchanged, same as every other field already was.
 		expectedVersion := poID.Version
-		if _, err := s.crud.Update(s.ctx, poDef, poID.ID, map[string]any{
+		totalFields := map[string]any{
 			"po_number": o.poNumber, "vendor_id": vendors[o.vendor], "currency_id": currencies[o.currency],
 			"order_date": o.date, "status_id": s.statusID("purchase_order_status", o.status), "total": total,
-		}, &expectedVersion, s.actor); err != nil {
+		}
+		// Full-replacement semantics (see comment above): the stages set
+		// at create time must ride along or this update would drop them.
+		for k, v := range o.stages {
+			totalFields[k] = v
+		}
+		if _, err := s.crud.Update(s.ctx, poDef, poID.ID, totalFields, &expectedVersion, s.actor); err != nil {
 			log.Fatalf("update PurchaseOrder total: %v", err)
 		}
 	}

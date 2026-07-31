@@ -213,6 +213,88 @@ func TestInventoryItem_MissingRequiredItemID(t *testing.T) {
 	}
 }
 
+// TestPurchaseOrder_StagedLeadTimeStages pins #29's six staged lead-time
+// timestamps: exactly these six fields carry a NotBefore chain, declared
+// in reference-data-model.md §2's stage order, each a plain optional
+// FieldDate (an in-flight PO has only a prefix filled in — deliberately
+// censored data for #30's forecast), chained to its predecessor with
+// sourced_at anchored on order_date.
+func TestPurchaseOrder_StagedLeadTimeStages(t *testing.T) {
+	def := PurchaseOrder()
+	want := []struct{ name, notBefore string }{
+		{"sourced_at", "order_date"},
+		{"production_start_at", "sourced_at"},
+		{"production_ready_at", "production_start_at"},
+		{"shipped_at", "production_ready_at"},
+		{"customs_cleared_at", "shipped_at"},
+		{"received_at", "customs_cleared_at"},
+	}
+	// Collect every chained field in declaration order — this asserts
+	// both "exactly six" and "declared in reference-model order" at once.
+	var staged []entity.Field
+	for _, f := range def.Fields {
+		if f.NotBefore != "" {
+			staged = append(staged, f)
+		}
+	}
+	if len(staged) != len(want) {
+		t.Fatalf("expected exactly %d NotBefore-chained stage fields, got %d: %+v", len(want), len(staged), staged)
+	}
+	for i, w := range want {
+		f := staged[i]
+		if f.Name != w.name {
+			t.Fatalf("stage %d: expected %q (reference-model order), got %q", i, w.name, f.Name)
+		}
+		if f.Type != entity.FieldDate {
+			t.Errorf("stage %q: expected FieldDate, got %q", f.Name, f.Type)
+		}
+		if f.Required {
+			t.Errorf("stage %q must be optional — an in-flight PO has only a prefix of stages", f.Name)
+		}
+		if f.NotBefore != w.notBefore {
+			t.Errorf("stage %q: expected NotBefore %q, got %q", f.Name, w.notBefore, f.NotBefore)
+		}
+	}
+	// The chain passes the same publish-time validation the registry runs
+	// (Definition.Validate's NotBefore second pass).
+	if err := def.Validate(); err != nil {
+		t.Fatalf("PurchaseOrder with staged lead-time chain must validate: %v", err)
+	}
+}
+
+// TestPurchaseOrderForm_LeadTimeStagesSectionListsAllSixStages: the form
+// (v4) surfaces #29's stages in their own "Lead-time stages" section, all
+// six, in the same order the entity declares them — a stage missing here
+// would make its timestamp uncapturable from the UI (the generated form
+// is the only write path a demo user has).
+func TestPurchaseOrderForm_LeadTimeStagesSectionListsAllSixStages(t *testing.T) {
+	f := PurchaseOrderForm()
+	var stagesSection *form.Section
+	for i := range f.Sections {
+		if f.Sections[i].Title == "Lead-time stages" {
+			stagesSection = &f.Sections[i]
+		}
+	}
+	if stagesSection == nil {
+		t.Fatal("expected a section titled \"Lead-time stages\"")
+	}
+	if stagesSection.Component != form.ComponentFields {
+		t.Fatalf("expected a plain fields section, got component %q", stagesSection.Component)
+	}
+	want := []string{
+		"sourced_at", "production_start_at", "production_ready_at",
+		"shipped_at", "customs_cleared_at", "received_at",
+	}
+	if len(stagesSection.Fields) != len(want) {
+		t.Fatalf("expected the section to list exactly the %d stages, got %d: %+v", len(want), len(stagesSection.Fields), stagesSection.Fields)
+	}
+	for i, name := range want {
+		if stagesSection.Fields[i].Name != name {
+			t.Errorf("section field %d: expected %q, got %q", i, name, stagesSection.Fields[i].Name)
+		}
+	}
+}
+
 // TestGoodsReceipt_ReferencesPurchaseOrder confirms GoodsReceipt links
 // back to the PurchaseOrder it's receiving against — the whole point of
 // this entity existing rather than just a status flag (this package's

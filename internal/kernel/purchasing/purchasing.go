@@ -79,7 +79,7 @@ func Item() *entity.Definition {
 func PurchaseOrder() *entity.Definition {
 	return &entity.Definition{
 		EntityType:     "PurchaseOrder",
-		Version:        4,
+		Version:        5,
 		Module:         "purchasing",
 		StatusTypeCode: "purchase_order_status",
 		Fields: []entity.Field{
@@ -98,6 +98,24 @@ func PurchaseOrder() *entity.Definition {
 			{Name: "currency_id", Type: entity.FieldReference, Target: "Currency"},
 			{Name: "status_id", Type: entity.FieldReference, Required: true, Target: "Status"},
 			{Name: "total", Type: entity.FieldNumber, Default: float64(0)},
+			// Staged lead-time timestamps (#29) — reference-data-model.md
+			// §2's six stages, in order; the raw material for R10's
+			// P50/P90 lead-time forecast (#30). All optional (an
+			// in-flight PO has only a prefix filled in — realistic
+			// censored data the forecast has to live with), each chained
+			// to its predecessor via NotBefore so a form submission
+			// can't record a stage before the one it follows.
+			// received_at is entered manually for now: auto-stamping it
+			// from the first GoodsReceipt was considered and deferred to
+			// #30's cycle (see the issue's design comment — the forecast
+			// may derive actual receipt time from GoodsReceipt data
+			// instead, making a stored stamp redundant).
+			{Name: "sourced_at", Type: entity.FieldDate, NotBefore: "order_date"},
+			{Name: "production_start_at", Type: entity.FieldDate, NotBefore: "sourced_at"},
+			{Name: "production_ready_at", Type: entity.FieldDate, NotBefore: "production_start_at"},
+			{Name: "shipped_at", Type: entity.FieldDate, NotBefore: "production_ready_at"},
+			{Name: "customs_cleared_at", Type: entity.FieldDate, NotBefore: "shipped_at"},
+			{Name: "received_at", Type: entity.FieldDate, NotBefore: "customs_cleared_at"},
 		},
 		Relationships: []entity.Relationship{
 			// ParentField ("purchase_order_id") is what

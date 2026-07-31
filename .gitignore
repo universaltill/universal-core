@@ -7,3 +7,12 @@
 # ignored here so an accidental `git add -A` can never re-introduce them.
 /docs/
 /infra/
+
+# Locally-built cmd binaries (go build ./cmd/... in the repo root) — a
+# 13 MB seed-demo-data binary was one git add -A away from the public
+# history once (independent review, 2026-07-31).
+/seed-demo-data
+/provision-tenant
+/migrate
+/universal-core
+/backfill-purchase-order-status

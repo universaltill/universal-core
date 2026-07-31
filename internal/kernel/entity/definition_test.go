@@ -1,6 +1,9 @@
 package entity
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestDefinitionValidate(t *testing.T) {
 	cases := []struct {
@@ -119,6 +122,65 @@ func TestDefinitionValidate(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			// NotBefore only means anything for a date-vs-date comparison
+			// (validateNotBefore time.Parses both sides) — declaring it on
+			// any other type is schema drift to fail loud on.
+			name: "not_before on a non-date field",
+			def: Definition{
+				EntityType: "Shipment",
+				Fields: []Field{
+					{Name: "ordered_at", Type: FieldDate},
+					{Name: "qty", Type: FieldNumber, NotBefore: "ordered_at"},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "not_before referencing a nonexistent field",
+			def: Definition{
+				EntityType: "Shipment",
+				Fields: []Field{
+					{Name: "shipped_at", Type: FieldDate, NotBefore: "orderd_at"},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "not_before referencing a non-date field",
+			def: Definition{
+				EntityType: "Shipment",
+				Fields: []Field{
+					{Name: "carrier", Type: FieldString},
+					{Name: "shipped_at", Type: FieldDate, NotBefore: "carrier"},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "not_before referencing itself",
+			def: Definition{
+				EntityType: "Shipment",
+				Fields: []Field{
+					{Name: "shipped_at", Type: FieldDate, NotBefore: "shipped_at"},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			// Declaration order is display order, not dependency order
+			// (Validate's own second-pass comment) — a chain may point at
+			// a field declared later in Fields.
+			name: "not_before forward reference to a later-declared field is valid",
+			def: Definition{
+				EntityType: "Shipment",
+				Fields: []Field{
+					{Name: "shipped_at", Type: FieldDate, NotBefore: "ordered_at"},
+					{Name: "ordered_at", Type: FieldDate},
+				},
+			},
+			wantErr: false,
+		},
+		{
 			name: "status_type_code without a status_id field",
 			def: Definition{
 				EntityType:     "PurchaseOrder",
@@ -190,5 +252,40 @@ func TestFieldByName(t *testing.T) {
 	}
 	if _, ok := def.FieldByName("missing"); ok {
 		t.Fatal("did not expect to find field 'missing'")
+	}
+}
+
+// TestDefinitionValidate_NotBeforeCycle (#29 review finding 2): a
+// multi-hop not_before cycle must be unpublishable — record validation
+// walks these chains, and a cycle would otherwise be silent schema
+// nonsense (and, pre-guard, an infinite loop).
+func TestDefinitionValidate_NotBeforeCycle(t *testing.T) {
+	def := &Definition{
+		EntityType: "Cyclic",
+		Fields: []Field{
+			{Name: "a", Type: FieldDate, NotBefore: "b"},
+			{Name: "b", Type: FieldDate, NotBefore: "a"},
+		},
+	}
+	err := def.Validate()
+	if err == nil {
+		t.Fatal("expected a two-hop not_before cycle to fail Definition.Validate")
+	}
+	if !strings.Contains(err.Error(), "cycle") {
+		t.Fatalf("expected a cycle error, got: %v", err)
+	}
+
+	// A three-hop cycle reached through a non-cyclic entry point fails
+	// too (the entry field's own walk revisits a chain member).
+	def = &Definition{
+		EntityType: "Cyclic3",
+		Fields: []Field{
+			{Name: "entry", Type: FieldDate, NotBefore: "a"},
+			{Name: "a", Type: FieldDate, NotBefore: "b"},
+			{Name: "b", Type: FieldDate, NotBefore: "a"},
+		},
+	}
+	if err := def.Validate(); err == nil {
+		t.Fatal("expected a cycle reached via a non-cyclic entry to fail")
 	}
 }

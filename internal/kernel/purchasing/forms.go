@@ -43,7 +43,7 @@ func ItemForm() *form.Definition {
 func PurchaseOrderForm() *form.Definition {
 	return &form.Definition{
 		EntityType: "PurchaseOrder",
-		Version:    3,
+		Version:    4,
 		Sections: []form.Section{
 			{
 				Title:     "Header",
@@ -55,6 +55,22 @@ func PurchaseOrderForm() *form.Definition {
 					{Name: "currency_id", Label: "Currency"},
 					{Name: "status_id", Label: "Status"},
 					{Name: "total", Label: "Total"},
+				},
+			},
+			{
+				// The six R10 stage timestamps (#29) — their own section
+				// so the header stays scannable; labels localize via the
+				// field.PurchaseOrder.* catalog keys like every other
+				// field label.
+				Title:     "Lead-time stages",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "sourced_at", Label: "Sourced"},
+					{Name: "production_start_at", Label: "Production Started"},
+					{Name: "production_ready_at", Label: "Production Ready"},
+					{Name: "shipped_at", Label: "Shipped"},
+					{Name: "customs_cleared_at", Label: "Customs Cleared"},
+					{Name: "received_at", Label: "Received"},
 				},
 			},
 			{

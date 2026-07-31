@@ -21,9 +21,11 @@ import (
 	"github.com/universaltill/universal-core/internal/httpx"
 	"github.com/universaltill/universal-core/internal/i18n"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
+	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/form"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
+	"github.com/universaltill/universal-core/internal/kernel/purchasing"
 	"github.com/universaltill/universal-core/internal/kernel/workflow"
 	"github.com/universaltill/universal-core/internal/tenantdb"
 	"github.com/universaltill/universal-core/internal/testexec"
@@ -3253,5 +3255,156 @@ func TestWriteInternalError(t *testing.T) {
 	}
 	if strings.Contains(*env.Error, "secret_table") {
 		t.Fatal("the real error text must never reach the client")
+	}
+}
+
+// TestAPI_PurchaseOrder_StagedLeadTimeTimestamps drives #29's staged
+// lead-time chain through the real HTTP stack against the real published
+// purchasing module (not a throwaway test Definition): an in-order set
+// of all six stages creates cleanly and round-trips on GET, and an
+// out-of-order pair is refused with a 400 whose body names both fields
+// involved — the same registry -> crud -> handler path the generated
+// form's own Save posts through.
+func TestAPI_PurchaseOrder_StagedLeadTimeTimestamps(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, tenantDB := newTestTenant(t, router)
+	ctx := context.Background()
+	actor := humanActor()
+
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := foundation.PublishForms(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.PublishForms: %v", err)
+	}
+	if err := purchasing.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("purchasing.Publish: %v", err)
+	}
+	if err := purchasing.PublishForms(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("purchasing.PublishForms: %v", err)
+	}
+	if err := purchasing.PublishStatuses(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("purchasing.PublishStatuses: %v", err)
+	}
+
+	entityDefs := data.NewEntityDefinitionRepo(tenantDB)
+	def := func(entityType string) *entity.Definition {
+		v, err := entityDefs.GetPublished(ctx, entityType)
+		if err != nil {
+			t.Fatalf("GetPublished(%s): %v", entityType, err)
+		}
+		d, err := entity.Unmarshal(v.Definition)
+		if err != nil {
+			t.Fatalf("unmarshal %s: %v", entityType, err)
+		}
+		return d
+	}
+	engine := crud.NewEngine(tenantDB)
+	vendor, err := engine.Create(ctx, def("Party"), map[string]any{
+		"party_type": "organization", "name": "Staged Lead-Time Vendor", "status": "active",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create Party: %v", err)
+	}
+	statusTypes, err := engine.ListByField(ctx, def("StatusType"), "code", "purchase_order_status")
+	if err != nil || len(statusTypes) == 0 {
+		t.Fatalf("list purchase_order_status StatusType: %v (n=%d)", err, len(statusTypes))
+	}
+	poStatuses, err := engine.ListByField(ctx, def("Status"), "status_type_id", statusTypes[0].ID)
+	if err != nil {
+		t.Fatalf("list Status: %v", err)
+	}
+	var draftID string
+	for _, s := range poStatuses {
+		if code, _ := s.Data["code"].(string); code == "draft" {
+			draftID = s.ID
+		}
+	}
+	if draftID == "" {
+		t.Fatal("no draft Status seeded for purchase_order_status")
+	}
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	stages := map[string]string{
+		"sourced_at":          "2026-07-04",
+		"production_start_at": "2026-07-08",
+		"production_ready_at": "2026-07-18",
+		"shipped_at":          "2026-07-22",
+		"customs_cleared_at":  "2026-07-26",
+		"received_at":         "2026-07-27",
+	}
+	fields := map[string]any{
+		"po_number": "PO-STAGED-1", "vendor_id": vendor.ID,
+		"order_date": "2026-07-01", "status_id": draftID,
+	}
+	for k, v := range stages {
+		fields[k] = v
+	}
+	body, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatalf("marshal create body: %v", err)
+	}
+	createReq := newRequest("POST", "/api/records/PurchaseOrder", tenantID, "farshid", body)
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 for a fully in-order stage chain, got %d: %s", createRec.Code, createRec.Body.String())
+	}
+	var created struct {
+		Data struct {
+			ID   string         `json:"id"`
+			Data map[string]any `json:"data"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal create response: %v", err)
+	}
+
+	// GET it back: every stage date round-trips exactly (ISO-8601
+	// strings in JSONB, no truncation/reformatting anywhere in between).
+	getReq := newRequest("GET", "/api/records/PurchaseOrder/"+created.Data.ID, tenantID, "farshid", nil)
+	getRec := httptest.NewRecorder()
+	mux.ServeHTTP(getRec, getReq)
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", getRec.Code, getRec.Body.String())
+	}
+	var fetched struct {
+		Data struct {
+			Data map[string]any `json:"data"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(getRec.Body.Bytes(), &fetched); err != nil {
+		t.Fatalf("unmarshal get response: %v", err)
+	}
+	for name, want := range stages {
+		if got, _ := fetched.Data.Data[name].(string); got != want {
+			t.Errorf("stage %q: expected %q to round-trip, got %q", name, want, got)
+		}
+	}
+
+	// Out-of-order: shipped_at before production_ready_at -> 400, and
+	// the error body names both fields so the caller knows which pair to
+	// fix (entity.validateNotBefore's message, surfaced verbatim).
+	bad := map[string]any{
+		"po_number": "PO-STAGED-2", "vendor_id": vendor.ID,
+		"order_date": "2026-07-01", "status_id": draftID,
+		"sourced_at": "2026-07-04", "production_start_at": "2026-07-08",
+		"production_ready_at": "2026-07-18", "shipped_at": "2026-07-10",
+	}
+	badBody, err := json.Marshal(bad)
+	if err != nil {
+		t.Fatalf("marshal bad body: %v", err)
+	}
+	badReq := newRequest("POST", "/api/records/PurchaseOrder", tenantID, "farshid", badBody)
+	badRec := httptest.NewRecorder()
+	mux.ServeHTTP(badRec, badReq)
+	if badRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for shipped_at before production_ready_at, got %d: %s", badRec.Code, badRec.Body.String())
+	}
+	if b := badRec.Body.String(); !strings.Contains(b, "shipped_at") || !strings.Contains(b, "production_ready_at") {
+		t.Fatalf("expected the error body to name both fields of the violated chain, got: %s", b)
 	}
 }

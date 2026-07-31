@@ -60,6 +60,22 @@ type Field struct {
 	// VisibleIf is a conditional-visibility expression evaluated against
 	// sibling field values, e.g. "payment_method == 'LC'" (ADR-0017 §6).
 	VisibleIf string `json:"visible_if,omitempty"`
+	// NotBefore names a sibling FieldDate this date field must not
+	// precede — a generic, Definition-declared chronology constraint
+	// (first user: PurchaseOrder's staged lead-time timestamps, #29,
+	// where each stage must not predate the previous one). Only valid
+	// on FieldDate, referencing another FieldDate in the same
+	// Definition, with no chain cycles (Definition.Validate enforces
+	// all three at publish time). ValidateRecord compares against the
+	// NEAREST present, parseable predecessor along the chain (see
+	// validateNotBefore — a blank middle stage doesn't unconstrain the
+	// stages after it). What it deliberately does NOT do is load the
+	// stored record: a partial submission that omits the constrained
+	// field's own value, or every ancestor's, has nothing to compare
+	// and passes — a documented, test-pinned trade to keep
+	// ValidateRecord pure; declare chronology only where that's
+	// acceptable data hygiene, never as a ledger-grade invariant.
+	NotBefore string `json:"not_before,omitempty"`
 }
 
 // Relationship declares a composition or related-list link to another
@@ -173,6 +189,52 @@ func (d *Definition) Validate() error {
 		}
 		if f.Type == FieldReference && f.Target == "" {
 			return fmt.Errorf("field %q is type reference but has no target", f.Name)
+		}
+	}
+	// NotBefore checked in a second pass: it may reference a field
+	// declared later in the slice (declaration order is display order,
+	// not dependency order).
+	fieldTypes := make(map[string]FieldType, len(d.Fields))
+	for _, f := range d.Fields {
+		fieldTypes[f.Name] = f.Type
+	}
+	for _, f := range d.Fields {
+		if f.NotBefore == "" {
+			continue
+		}
+		if f.Type != FieldDate {
+			return fmt.Errorf("field %q has not_before but is type %q, not date", f.Name, f.Type)
+		}
+		if f.NotBefore == f.Name {
+			return fmt.Errorf("field %q has not_before referencing itself", f.Name)
+		}
+		target, ok := fieldTypes[f.NotBefore]
+		if !ok {
+			return fmt.Errorf("field %q not_before references %q, which is not a field of %s", f.Name, f.NotBefore, d.EntityType)
+		}
+		if target != FieldDate {
+			return fmt.Errorf("field %q not_before references %q, which is type %q, not date", f.Name, f.NotBefore, target)
+		}
+	}
+	// Cycle check, separate from the per-field checks above: a two-hop
+	// cycle (a→b, b→a) passes every individual check yet is schema
+	// nonsense — and record validation walks these chains, so a cycle
+	// must be unpublishable, not merely odd (independent review,
+	// 2026-07-31; the self-reference check above is just this check's
+	// one-hop special case, kept for its clearer error message).
+	notBefore := make(map[string]string, len(d.Fields))
+	for _, f := range d.Fields {
+		if f.NotBefore != "" {
+			notBefore[f.Name] = f.NotBefore
+		}
+	}
+	for start := range notBefore {
+		visited := map[string]bool{}
+		for name := start; name != ""; name = notBefore[name] {
+			if visited[name] {
+				return fmt.Errorf("field %q is part of a not_before cycle in %s", start, d.EntityType)
+			}
+			visited[name] = true
 		}
 	}
 	for _, r := range d.Relationships {

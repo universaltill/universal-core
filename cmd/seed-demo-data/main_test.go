@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -11,8 +12,11 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/db"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
+	"github.com/universaltill/universal-core/internal/kernel/crud"
+	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/finance"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
 	"github.com/universaltill/universal-core/internal/kernel/purchasing"
@@ -203,6 +207,31 @@ func TestSeedDemoData_SeedsSampleRecordsAndIsIdempotent(t *testing.T) {
 		t.Fatal("expected at least one journal entry posted by the GoodsReceiptLine/CustomerInvoice hooks")
 	}
 
+	// #29: a fresh seed gives PO-2026-0004 (a fully received PO) the
+	// complete six-stage lead-time chain, values exactly as declared in
+	// seedPurchaseOrders' table — this is #30's forecast demo data, so
+	// the actual dates matter, not just non-emptiness.
+	wantStages := map[string]string{
+		"sourced_at":          "2026-07-19",
+		"production_start_at": "2026-07-20",
+		"production_ready_at": "2026-07-23",
+		"shipped_at":          "2026-07-24",
+		"customs_cleared_at":  "2026-07-26",
+		"received_at":         "2026-07-27",
+	}
+	_, poData, poVersion := purchaseOrderByNumber(t, tenantDB, "PO-2026-0004")
+	for name, want := range wantStages {
+		if got, _ := poData[name].(string); got != want {
+			t.Errorf("PO-2026-0004 stage %q: expected %q, got %q", name, want, got)
+		}
+	}
+	// And a draft PO carries none — drafts/cancelled are the deliberate
+	// no-stage rows in the seed table.
+	_, draftData, _ := purchaseOrderByNumber(t, tenantDB, "PO-2026-0003")
+	if v, ok := draftData["sourced_at"]; ok && v != "" {
+		t.Errorf("PO-2026-0003 (draft) should have no stages, got sourced_at=%v", v)
+	}
+
 	// Re-run: must be idempotent (getOrCreate, per this binary's own
 	// doc comment) — record counts must not double.
 	_, stderr, code = run(t, []string{"DATABASE_URL=" + controlDSN}, "-tenant-id="+id, "-actor-id=smoke-test")
@@ -220,6 +249,153 @@ func TestSeedDemoData_SeedsSampleRecordsAndIsIdempotent(t *testing.T) {
 	if got := countJournalEntries(t, tenantDB); got != journalEntryCount {
 		t.Fatalf("journal entry count changed after re-running seed-demo-data: had %d, now %d (not idempotent — a hook may have double-posted)", journalEntryCount, got)
 	}
+	// #29's backfill must also be idempotent: a PO that already has
+	// sourced_at is left alone entirely (no Update, so no version bump).
+	_, poDataAfter, poVersionAfter := purchaseOrderByNumber(t, tenantDB, "PO-2026-0004")
+	if poVersionAfter != poVersion {
+		t.Fatalf("PO-2026-0004 version changed after re-run: had %d, now %d (stage backfill re-ran on a PO that already had stages)", poVersion, poVersionAfter)
+	}
+	for name, want := range wantStages {
+		if got, _ := poDataAfter[name].(string); got != want {
+			t.Errorf("PO-2026-0004 stage %q changed after re-run: expected %q, got %q", name, want, got)
+		}
+	}
+}
+
+// TestSeedDemoData_BackfillsStagesOnPreexistingPurchaseOrder covers
+// seedPurchaseOrders' other #29 branch: a PO seeded before the stage
+// fields existed (simulated by pre-creating PO-2026-0001 with no stage
+// timestamps through the same crud engine the binary uses) keeps its
+// identity — same record id, no duplicate row — and gains exactly the
+// stage prefix the seed table declares for it, with its other data
+// untouched. This is the "re-run the seeder against the live Demo
+// Organization tenant" convention working on a real pre-#29 row.
+func TestSeedDemoData_BackfillsStagesOnPreexistingPurchaseOrder(t *testing.T) {
+	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance")
+	control := testexec.Open(t, controlDSN)
+	router, err := tenantdb.NewRouter(control, controlDSN)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+	t.Cleanup(func() { router.Close() })
+	ctx := context.Background()
+	tenantDB, err := router.Get(ctx, id)
+	if err != nil {
+		t.Fatalf("router.Get: %v", err)
+	}
+
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "smoke-test-setup"}
+	entityDefs := data.NewEntityDefinitionRepo(tenantDB)
+	def := func(entityType string) *entity.Definition {
+		v, err := entityDefs.GetPublished(ctx, entityType)
+		if err != nil {
+			t.Fatalf("GetPublished(%s): %v", entityType, err)
+		}
+		d, err := entity.Unmarshal(v.Definition)
+		if err != nil {
+			t.Fatalf("unmarshal %s: %v", entityType, err)
+		}
+		return d
+	}
+	engine := crud.NewEngine(tenantDB)
+	vendor, err := engine.Create(ctx, def("Party"), map[string]any{
+		"party_type": "organization", "name": "Pre-Stage Vendor Co", "status": "active",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create Party: %v", err)
+	}
+	statusTypes, err := engine.ListByField(ctx, def("StatusType"), "code", "purchase_order_status")
+	if err != nil || len(statusTypes) == 0 {
+		t.Fatalf("list purchase_order_status StatusType: %v (n=%d)", err, len(statusTypes))
+	}
+	statuses, err := engine.ListByField(ctx, def("Status"), "status_type_id", statusTypes[0].ID)
+	if err != nil {
+		t.Fatalf("list Status: %v", err)
+	}
+	var draftID string
+	for _, s := range statuses {
+		if code, _ := s.Data["code"].(string); code == "draft" {
+			draftID = s.ID
+		}
+	}
+	if draftID == "" {
+		t.Fatal("no draft Status seeded for purchase_order_status")
+	}
+	pre, err := engine.Create(ctx, def("PurchaseOrder"), map[string]any{
+		"po_number": "PO-2026-0001", "vendor_id": vendor.ID,
+		"order_date": "2026-07-01", "status_id": draftID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("pre-create PurchaseOrder: %v", err)
+	}
+
+	_, stderr, code := run(t, []string{"DATABASE_URL=" + controlDSN}, "-tenant-id="+id, "-actor-id=smoke-test")
+	if code != 0 {
+		t.Fatalf("seed run: exit %d, stderr: %s", code, stderr)
+	}
+
+	gotID, gotData, _ := purchaseOrderByNumber(t, tenantDB, "PO-2026-0001")
+	if gotID != pre.ID {
+		t.Fatalf("expected the pre-existing PO-2026-0001 to be backfilled in place, got a different record (had %s, now %s)", pre.ID, gotID)
+	}
+	// PO-2026-0001 is an in-flight PO in the seed table: exactly the
+	// first four stages, no customs_cleared_at/received_at.
+	wantStages := map[string]string{
+		"sourced_at":          "2026-07-04",
+		"production_start_at": "2026-07-08",
+		"production_ready_at": "2026-07-18",
+		"shipped_at":          "2026-07-22",
+	}
+	for name, want := range wantStages {
+		if got, _ := gotData[name].(string); got != want {
+			t.Errorf("backfilled stage %q: expected %q, got %q", name, want, got)
+		}
+	}
+	for _, absent := range []string{"customs_cleared_at", "received_at"} {
+		if v, ok := gotData[absent]; ok && v != "" {
+			t.Errorf("stage %q must not be backfilled onto an in-flight PO, got %v", absent, v)
+		}
+	}
+	// The rest of the record rides along unchanged — the backfill copies
+	// the stored data and only adds stages, it doesn't reseed the row.
+	if got, _ := gotData["vendor_id"].(string); got != vendor.ID {
+		t.Errorf("vendor_id changed during backfill: had %s, got %s", vendor.ID, got)
+	}
+	if got, _ := gotData["status_id"].(string); got != draftID {
+		t.Errorf("status_id changed during backfill: had %s, got %s", draftID, got)
+	}
+}
+
+// purchaseOrderByNumber fetches the single live PurchaseOrder row with
+// the given po_number straight off the records table — and fails if
+// there's more than one, which doubles as the "no duplicate was created"
+// assertion everywhere it's called.
+func purchaseOrderByNumber(t *testing.T, tenantDB *sql.DB, poNumber string) (recordID string, recordData map[string]any, version int) {
+	t.Helper()
+	rows, err := tenantDB.QueryContext(context.Background(),
+		`SELECT id, data, version FROM records WHERE entity_type = 'PurchaseOrder' AND data->>'po_number' = $1 AND deleted_at IS NULL`, poNumber)
+	if err != nil {
+		t.Fatalf("query PurchaseOrder %s: %v", poNumber, err)
+	}
+	defer rows.Close()
+	n := 0
+	for rows.Next() {
+		n++
+		var raw []byte
+		if err := rows.Scan(&recordID, &raw, &version); err != nil {
+			t.Fatalf("scan PurchaseOrder %s: %v", poNumber, err)
+		}
+		if err := json.Unmarshal(raw, &recordData); err != nil {
+			t.Fatalf("unmarshal PurchaseOrder %s data: %v", poNumber, err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate PurchaseOrder %s: %v", poNumber, err)
+	}
+	if n != 1 {
+		t.Fatalf("expected exactly one PurchaseOrder with po_number %s, got %d", poNumber, n)
+	}
+	return recordID, recordData, version
 }
 
 func countRecords(t *testing.T, tenantDB *sql.DB, entityType string) int {
