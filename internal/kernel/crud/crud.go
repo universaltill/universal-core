@@ -284,6 +284,24 @@ func (e *Engine) Update(ctx context.Context, def *entity.Definition, id string, 
 		return 0, err
 	}
 
+	// A hook is allowed to write to this same record again inside tx (a
+	// hook-driven redirect — e.g. purchasing.MatchVendorInvoiceOnUpdate
+	// overriding status_id past what the caller requested) — re-read
+	// whatever version that left the row on rather than trusting
+	// newVersion, captured before the hook ran. Returning the stale value
+	// here would violate this method's own documented contract ("the
+	// version it should check against next time") and fail the caller's
+	// very next optimistic-locked Update with a false ErrVersionConflict.
+	// One extra read only when a hook is registered for this entity type
+	// — negligible next to the rest of this transaction's own work.
+	if _, hasHook := e.hooks[def.EntityType]; hasHook {
+		finalRec, err := e.records.GetTx(ctx, tx, def.EntityType, id)
+		if err != nil {
+			return 0, fmt.Errorf("re-read %s %s version after hook: %w", def.EntityType, id, err)
+		}
+		newVersion = finalRec.Version
+	}
+
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("commit tx: %w", err)
 	}

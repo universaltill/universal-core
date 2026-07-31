@@ -393,43 +393,47 @@ func TestMatchVendorInvoiceOnUpdate_MatchingTotal_TransitionSucceeds(t *testing.
 	}
 }
 
-// TestMatchVendorInvoiceOnUpdate_MismatchedTotal_RejectsTransition
+// TestMatchVendorInvoiceOnUpdate_MismatchedTotal_RedirectsToMatchException
 // confirms an invoice total that disagrees with what was actually
-// received is rejected outright — draft->matched fails with
-// ErrVendorInvoiceMatchFailed, and (crud.Hook's own contract) the whole
-// Update rolls back, leaving the invoice exactly as it was.
-func TestMatchVendorInvoiceOnUpdate_MismatchedTotal_RejectsTransition(t *testing.T) {
+// received no longer rejects the transition (Phase 1's original,
+// fail-closed behavior): the Update succeeds, but status_id lands on
+// "match_exception" instead of "matched" and match_exception_reason
+// carries why — the actual redirect this task adds.
+func TestMatchVendorInvoiceOnUpdate_MismatchedTotal_RedirectsToMatchException(t *testing.T) {
 	fx := setUpVendorInvoiceFixture(t, 10, 12.50, 10)
 	fx.engine.SetHook("VendorInvoice", MatchVendorInvoiceOnUpdate)
 	inv := createDraftVendorInvoice(t, fx, 999.00) // received value is 125.00, invoice claims 999.00
 
 	matchedStatusID := statusIDByCode(t, fx.engine, fx.tenantDB, "vendor_invoice_status", "matched")
+	exceptionStatusID := statusIDByCode(t, fx.engine, fx.tenantDB, "vendor_invoice_status", "match_exception")
 	version := inv.Version
-	_, err := fx.engine.Update(context.Background(), defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID, map[string]any{
+	if _, err := fx.engine.Update(context.Background(), defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID, map[string]any{
 		"invoice_number": "VINV-1", "purchase_order_id": fx.poID, "vendor_id": fx.vendorID,
 		"invoice_date": "2026-01-15", "status_id": matchedStatusID, "total": 999.00,
-	}, &version, humanActor())
-	if !errors.Is(err, ErrVendorInvoiceMatchFailed) {
-		t.Fatalf("expected ErrVendorInvoiceMatchFailed for a mismatched total, got: %v", err)
+	}, &version, humanActor()); err != nil {
+		t.Fatalf("expected the redirect to succeed (no rollback), got: %v", err)
 	}
 
 	got, err := fx.engine.Get(context.Background(), defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID)
 	if err != nil {
 		t.Fatalf("get VendorInvoice: %v", err)
 	}
-	draftStatusID := statusIDByCode(t, fx.engine, fx.tenantDB, "vendor_invoice_status", "draft")
-	if got.Data["status_id"] != draftStatusID {
-		t.Fatalf("expected the rejected transition to leave VendorInvoice in draft, got status_id=%v", got.Data["status_id"])
+	if got.Data["status_id"] != exceptionStatusID {
+		t.Fatalf("expected the mismatched transition to land in match_exception, got status_id=%v", got.Data["status_id"])
+	}
+	reason, _ := got.Data["match_exception_reason"].(string)
+	if !strings.Contains(reason, "999.00") || !strings.Contains(reason, "125.00") {
+		t.Fatalf("expected match_exception_reason to name both totals, got %q", reason)
 	}
 }
 
-// TestMatchVendorInvoiceOnUpdate_WrongVendor_RejectsTransition confirms
-// the PO leg of the match: an invoice whose vendor_id doesn't match its
-// own PurchaseOrder's vendor_id is rejected even when the total agrees
-// exactly with what was received — a value-only check would wrongly let
-// this through (found by independent review of this hook's first
-// version, which checked value only).
-func TestMatchVendorInvoiceOnUpdate_WrongVendor_RejectsTransition(t *testing.T) {
+// TestMatchVendorInvoiceOnUpdate_WrongVendor_RedirectsToMatchException
+// confirms the PO leg of the match: an invoice whose vendor_id doesn't
+// match its own PurchaseOrder's vendor_id redirects to match_exception
+// even when the total agrees exactly with what was received — a
+// value-only check would wrongly let this through (found by independent
+// review of this hook's first version, which checked value only).
+func TestMatchVendorInvoiceOnUpdate_WrongVendor_RedirectsToMatchException(t *testing.T) {
 	fx := setUpVendorInvoiceFixture(t, 10, 12.50, 10)
 	fx.engine.SetHook("VendorInvoice", MatchVendorInvoiceOnUpdate)
 
@@ -450,53 +454,210 @@ func TestMatchVendorInvoiceOnUpdate_WrongVendor_RejectsTransition(t *testing.T) 
 	}
 
 	matchedStatusID := statusIDByCode(t, fx.engine, fx.tenantDB, "vendor_invoice_status", "matched")
+	exceptionStatusID := statusIDByCode(t, fx.engine, fx.tenantDB, "vendor_invoice_status", "match_exception")
 	version := inv.Version
-	_, err = fx.engine.Update(context.Background(), defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID, map[string]any{
+	if _, err := fx.engine.Update(context.Background(), defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID, map[string]any{
 		"invoice_number": "VINV-1", "purchase_order_id": fx.poID, "vendor_id": otherVendor.ID,
 		"invoice_date": "2026-01-15", "status_id": matchedStatusID, "total": 125.00,
-	}, &version, humanActor())
-	if !errors.Is(err, ErrVendorInvoiceMatchFailed) {
-		t.Fatalf("expected ErrVendorInvoiceMatchFailed for a vendor_id that doesn't match the PurchaseOrder's own vendor, got: %v", err)
+	}, &version, humanActor()); err != nil {
+		t.Fatalf("expected the redirect to succeed (no rollback), got: %v", err)
+	}
+	got, err := fx.engine.Get(context.Background(), defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID)
+	if err != nil {
+		t.Fatalf("get VendorInvoice: %v", err)
+	}
+	if got.Data["status_id"] != exceptionStatusID {
+		t.Fatalf("expected the wrong-vendor transition to land in match_exception, got status_id=%v", got.Data["status_id"])
+	}
+	reason, _ := got.Data["match_exception_reason"].(string)
+	if !strings.Contains(reason, otherVendor.ID) {
+		t.Fatalf("expected match_exception_reason to name the invoice's own vendor_id %q, got %q", otherVendor.ID, reason)
 	}
 }
 
-// TestMatchVendorInvoiceOnUpdate_NothingReceived_RejectsTransition
+// TestMatchVendorInvoiceOnUpdate_NothingReceived_RedirectsToMatchException
 // confirms a PurchaseOrder with a real POLine but no GoodsReceipt at all
-// blocks the match — an invoice can't be "matched" against a receipt
-// that never happened, regardless of what total it claims.
-func TestMatchVendorInvoiceOnUpdate_NothingReceived_RejectsTransition(t *testing.T) {
+// redirects to match_exception — an invoice can't be "matched" against a
+// receipt that never happened, regardless of what total it claims, but
+// it's still a resolvable exception (wait for receipt, retry), not a
+// hard failure.
+func TestMatchVendorInvoiceOnUpdate_NothingReceived_RedirectsToMatchException(t *testing.T) {
 	fx := setUpVendorInvoiceFixture(t, 10, 12.50, 0) // receivedQty=0: no GoodsReceipt created at all
 	fx.engine.SetHook("VendorInvoice", MatchVendorInvoiceOnUpdate)
 	inv := createDraftVendorInvoice(t, fx, 125.00)
 
 	matchedStatusID := statusIDByCode(t, fx.engine, fx.tenantDB, "vendor_invoice_status", "matched")
+	exceptionStatusID := statusIDByCode(t, fx.engine, fx.tenantDB, "vendor_invoice_status", "match_exception")
 	version := inv.Version
-	_, err := fx.engine.Update(context.Background(), defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID, map[string]any{
+	if _, err := fx.engine.Update(context.Background(), defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID, map[string]any{
 		"invoice_number": "VINV-1", "purchase_order_id": fx.poID, "vendor_id": fx.vendorID,
 		"invoice_date": "2026-01-15", "status_id": matchedStatusID, "total": 125.00,
-	}, &version, humanActor())
-	if !errors.Is(err, ErrVendorInvoiceMatchFailed) {
-		t.Fatalf("expected ErrVendorInvoiceMatchFailed when nothing has been received, got: %v", err)
+	}, &version, humanActor()); err != nil {
+		t.Fatalf("expected the redirect to succeed (no rollback), got: %v", err)
+	}
+	got, err := fx.engine.Get(context.Background(), defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID)
+	if err != nil {
+		t.Fatalf("get VendorInvoice: %v", err)
+	}
+	if got.Data["status_id"] != exceptionStatusID {
+		t.Fatalf("expected the nothing-received transition to land in match_exception, got status_id=%v", got.Data["status_id"])
+	}
+	reason, _ := got.Data["match_exception_reason"].(string)
+	if !strings.Contains(reason, "nothing received") {
+		t.Fatalf("expected match_exception_reason to say nothing was received, got %q", reason)
 	}
 }
 
 // TestMatchVendorInvoiceOnUpdate_PartialReceipt_MatchesAgainstReceivedValue
 // confirms the match keys off what was actually received (a partial
 // delivery), not the PurchaseOrder's full ordered qty — an invoice for
-// exactly the received portion must match; one for the full order must not.
+// exactly the received portion must match; one for the full order must
+// redirect to match_exception instead.
 func TestMatchVendorInvoiceOnUpdate_PartialReceipt_MatchesAgainstReceivedValue(t *testing.T) {
 	fx := setUpVendorInvoiceFixture(t, 10, 12.50, 4) // ordered 10, only 4 received: received value = 50.00
 	fx.engine.SetHook("VendorInvoice", MatchVendorInvoiceOnUpdate)
 	matchedStatusID := statusIDByCode(t, fx.engine, fx.tenantDB, "vendor_invoice_status", "matched")
+	exceptionStatusID := statusIDByCode(t, fx.engine, fx.tenantDB, "vendor_invoice_status", "match_exception")
 
 	fullOrderInv := createDraftVendorInvoice(t, fx, 125.00) // the full ordered value, not what was received
 	version := fullOrderInv.Version
-	_, err := fx.engine.Update(context.Background(), defFor(t, fx.tenantDB, "VendorInvoice"), fullOrderInv.ID, map[string]any{
+	if _, err := fx.engine.Update(context.Background(), defFor(t, fx.tenantDB, "VendorInvoice"), fullOrderInv.ID, map[string]any{
 		"invoice_number": "VINV-1", "purchase_order_id": fx.poID, "vendor_id": fx.vendorID,
 		"invoice_date": "2026-01-15", "status_id": matchedStatusID, "total": 125.00,
-	}, &version, humanActor())
-	if !errors.Is(err, ErrVendorInvoiceMatchFailed) {
-		t.Fatalf("expected an invoice for the full ordered qty to fail matching against a partial receipt, got: %v", err)
+	}, &version, humanActor()); err != nil {
+		t.Fatalf("expected the redirect to succeed (no rollback), got: %v", err)
+	}
+	got, err := fx.engine.Get(context.Background(), defFor(t, fx.tenantDB, "VendorInvoice"), fullOrderInv.ID)
+	if err != nil {
+		t.Fatalf("get VendorInvoice: %v", err)
+	}
+	if got.Data["status_id"] != exceptionStatusID {
+		t.Fatalf("expected an invoice for the full ordered qty to redirect to match_exception against a partial receipt, got status_id=%v", got.Data["status_id"])
+	}
+}
+
+// TestMatchVendorInvoiceOnUpdate_Retry_ClearsExceptionAndMatches confirms
+// the actual resolution path: an invoice redirected to match_exception,
+// then corrected (its total fixed to agree) and resubmitted for
+// match_exception->matched, lands in "matched" with
+// match_exception_reason cleared back to "".
+func TestMatchVendorInvoiceOnUpdate_Retry_ClearsExceptionAndMatches(t *testing.T) {
+	fx := setUpVendorInvoiceFixture(t, 10, 12.50, 10) // received value 125.00
+	fx.engine.SetHook("VendorInvoice", MatchVendorInvoiceOnUpdate)
+	inv := createDraftVendorInvoice(t, fx, 999.00) // wrong total: lands in match_exception
+
+	matchedStatusID := statusIDByCode(t, fx.engine, fx.tenantDB, "vendor_invoice_status", "matched")
+	version := inv.Version
+	if _, err := fx.engine.Update(context.Background(), defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID, map[string]any{
+		"invoice_number": "VINV-1", "purchase_order_id": fx.poID, "vendor_id": fx.vendorID,
+		"invoice_date": "2026-01-15", "status_id": matchedStatusID, "total": 999.00,
+	}, &version, humanActor()); err != nil {
+		t.Fatalf("expected the initial redirect to succeed, got: %v", err)
+	}
+	inException, err := fx.engine.Get(context.Background(), defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID)
+	if err != nil {
+		t.Fatalf("get VendorInvoice: %v", err)
+	}
+	previousReason, _ := inException.Data["match_exception_reason"].(string)
+	if previousReason == "" {
+		t.Fatal("fixture bug: expected the initial redirect to have set a match_exception_reason to retry against")
+	}
+
+	var auditCountBefore int
+	if err := fx.tenantDB.QueryRow(`SELECT count(*) FROM audit_log WHERE record_id = $1`, inv.ID).Scan(&auditCountBefore); err != nil {
+		t.Fatalf("count audit_log before retry: %v", err)
+	}
+
+	// Correct the total and retry match_exception->matched — echoing
+	// match_exception_reason back in the submitted fields, the same way
+	// a real edit form round-trips a hidden field it isn't changing
+	// (formrender.buildHiddenFields): RecordRepo.UpdateTx is a full
+	// replacement, so a caller that silently dropped this field would
+	// already have cleared it via its OWN write, before this hook ever
+	// runs — that's a systemic property of every field on every entity
+	// in this kernel, not something specific to prove here. What this
+	// test needs to prove is clearVendorInvoiceMatchException's own
+	// behavior once a real previous reason is genuinely present.
+	version = inException.Version
+	if _, err := fx.engine.Update(context.Background(), defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID, map[string]any{
+		"invoice_number": "VINV-1", "purchase_order_id": fx.poID, "vendor_id": fx.vendorID,
+		"invoice_date": "2026-01-15", "status_id": matchedStatusID, "total": 125.00,
+		"match_exception_reason": previousReason,
+	}, &version, humanActor()); err != nil {
+		t.Fatalf("expected the corrected retry to succeed, got: %v", err)
+	}
+
+	got, err := fx.engine.Get(context.Background(), defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID)
+	if err != nil {
+		t.Fatalf("get VendorInvoice: %v", err)
+	}
+	if got.Data["status_id"] != matchedStatusID {
+		t.Fatalf("expected the retry to land in matched, got status_id=%v", got.Data["status_id"])
+	}
+	if reason, _ := got.Data["match_exception_reason"].(string); reason != "" {
+		t.Fatalf("expected match_exception_reason cleared after a successful retry, got %q", reason)
+	}
+
+	// clearVendorInvoiceMatchException writes its own audit entry
+	// (ledger.go's own doc comment on why) — confirm it actually ran,
+	// not just that the field happened to end up empty because the
+	// caller's own top-level Update already cleared it.
+	var auditCountAfter int
+	if err := fx.tenantDB.QueryRow(`SELECT count(*) FROM audit_log WHERE record_id = $1`, inv.ID).Scan(&auditCountAfter); err != nil {
+		t.Fatalf("count audit_log after retry: %v", err)
+	}
+	// +1 for the caller's own Update, +1 for clearVendorInvoiceMatchException's.
+	if auditCountAfter != auditCountBefore+2 {
+		t.Fatalf("expected 2 new audit rows (the retry's own Update + clearVendorInvoiceMatchException's), got %d new (before=%d after=%d)",
+			auditCountAfter-auditCountBefore, auditCountBefore, auditCountAfter)
+	}
+}
+
+// TestMatchVendorInvoiceOnUpdate_DriftAfterMatch_RedirectsToMatchException
+// confirms this hook's own "runs on every Update landing on matched, not
+// just the literal transition" contract: an already-matched invoice whose
+// total is edited into disagreement is redirected to match_exception with
+// a reason, not silently left "matched" and not rolled back.
+func TestMatchVendorInvoiceOnUpdate_DriftAfterMatch_RedirectsToMatchException(t *testing.T) {
+	fx := setUpVendorInvoiceFixture(t, 10, 12.50, 10) // received value 125.00
+	fx.engine.SetHook("VendorInvoice", MatchVendorInvoiceOnUpdate)
+	inv := createDraftVendorInvoice(t, fx, 125.00)
+
+	matchedStatusID := statusIDByCode(t, fx.engine, fx.tenantDB, "vendor_invoice_status", "matched")
+	exceptionStatusID := statusIDByCode(t, fx.engine, fx.tenantDB, "vendor_invoice_status", "match_exception")
+	version := inv.Version
+	if _, err := fx.engine.Update(context.Background(), defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID, map[string]any{
+		"invoice_number": "VINV-1", "purchase_order_id": fx.poID, "vendor_id": fx.vendorID,
+		"invoice_date": "2026-01-15", "status_id": matchedStatusID, "total": 125.00,
+	}, &version, humanActor()); err != nil {
+		t.Fatalf("expected the initial match to succeed, got: %v", err)
+	}
+	matched, err := fx.engine.Get(context.Background(), defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID)
+	if err != nil {
+		t.Fatalf("get VendorInvoice: %v", err)
+	}
+
+	// Edit the total on the already-matched invoice — same status_id
+	// (matched->matched, a no-op transition per ValidateStatusTransition),
+	// but the hook still re-checks because it reads the record's own
+	// resolved status, not the requested edge.
+	version = matched.Version
+	if _, err := fx.engine.Update(context.Background(), defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID, map[string]any{
+		"invoice_number": "VINV-1", "purchase_order_id": fx.poID, "vendor_id": fx.vendorID,
+		"invoice_date": "2026-01-15", "status_id": matchedStatusID, "total": 999.00,
+	}, &version, humanActor()); err != nil {
+		t.Fatalf("expected the drifted edit to succeed (redirected, not rolled back), got: %v", err)
+	}
+
+	got, err := fx.engine.Get(context.Background(), defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID)
+	if err != nil {
+		t.Fatalf("get VendorInvoice: %v", err)
+	}
+	if got.Data["status_id"] != exceptionStatusID {
+		t.Fatalf("expected the drift to redirect to match_exception, got status_id=%v", got.Data["status_id"])
+	}
+	if reason, _ := got.Data["match_exception_reason"].(string); reason == "" {
+		t.Fatal("expected a non-empty match_exception_reason after drift")
 	}
 }
 
@@ -538,6 +699,269 @@ func TestMatchVendorInvoiceOnUpdate_MultipleReceiptsSummed(t *testing.T) {
 		"invoice_date": "2026-01-15", "status_id": matchedStatusID, "total": 125.00,
 	}, &version, actor); err != nil {
 		t.Fatalf("expected the two receipts' summed value to match the invoice total, got: %v", err)
+	}
+}
+
+// TestMatchException_PaidTransition_IsRejected confirms the actual
+// "blocks payment release until resolved" mechanism structurally, not
+// just via the seeded-graph shape TestPublishStatuses_SeedsVendorInvoiceGraph
+// already checks: a VendorInvoice sitting in match_exception cannot be
+// moved straight to "paid" — crud.Engine.ValidateStatusTransition (the
+// same generic check internal/api runs before every Update) rejects it
+// with ErrInvalidTransition, because match_exception->paid was never
+// declared as an edge.
+func TestMatchException_PaidTransition_IsRejected(t *testing.T) {
+	fx := setUpVendorInvoiceFixture(t, 10, 12.50, 10)
+	fx.engine.SetHook("VendorInvoice", MatchVendorInvoiceOnUpdate)
+	inv := createDraftVendorInvoice(t, fx, 999.00) // wrong total: lands in match_exception
+
+	matchedStatusID := statusIDByCode(t, fx.engine, fx.tenantDB, "vendor_invoice_status", "matched")
+	version := inv.Version
+	if _, err := fx.engine.Update(context.Background(), defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID, map[string]any{
+		"invoice_number": "VINV-1", "purchase_order_id": fx.poID, "vendor_id": fx.vendorID,
+		"invoice_date": "2026-01-15", "status_id": matchedStatusID, "total": 999.00,
+	}, &version, humanActor()); err != nil {
+		t.Fatalf("expected the initial redirect to succeed, got: %v", err)
+	}
+	inException, err := fx.engine.Get(context.Background(), defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID)
+	if err != nil {
+		t.Fatalf("get VendorInvoice: %v", err)
+	}
+
+	paidStatusID := statusIDByCode(t, fx.engine, fx.tenantDB, "vendor_invoice_status", "paid")
+	version = inException.Version
+	err = fx.engine.ValidateStatusTransition(context.Background(), defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID, map[string]any{
+		"status_id": paidStatusID,
+	}, false, &version)
+	if !errors.Is(err, crud.ErrInvalidTransition) {
+		t.Fatalf("expected ErrInvalidTransition for match_exception->paid, got: %v", err)
+	}
+}
+
+// TestMatchVendorInvoiceOnUpdate_DanglingPurchaseOrder_RedirectsToMatchException
+// confirms a purchase_order_id that doesn't resolve to any real
+// PurchaseOrder (a bad reference, or one that's been soft-deleted since)
+// redirects to match_exception instead of hard-failing — independent
+// review's own finding: fixing the reference and retrying is exactly as
+// resolvable as a wrong vendor_id, so this shouldn't roll back any
+// differently than that case does.
+func TestMatchVendorInvoiceOnUpdate_DanglingPurchaseOrder_RedirectsToMatchException(t *testing.T) {
+	fx := setUpVendorInvoiceFixture(t, 10, 12.50, 10)
+	fx.engine.SetHook("VendorInvoice", MatchVendorInvoiceOnUpdate)
+
+	draftStatusID := statusIDByCode(t, fx.engine, fx.tenantDB, "vendor_invoice_status", "draft")
+	inv, err := fx.engine.Create(context.Background(), defFor(t, fx.tenantDB, "VendorInvoice"), map[string]any{
+		"invoice_number": "VINV-1", "purchase_order_id": "00000000-0000-0000-0000-000000000000", "vendor_id": fx.vendorID,
+		"invoice_date": "2026-01-15", "status_id": draftStatusID, "total": 125.00,
+	}, humanActor())
+	if err != nil {
+		t.Fatalf("create VendorInvoice: %v", err)
+	}
+
+	matchedStatusID := statusIDByCode(t, fx.engine, fx.tenantDB, "vendor_invoice_status", "matched")
+	exceptionStatusID := statusIDByCode(t, fx.engine, fx.tenantDB, "vendor_invoice_status", "match_exception")
+	version := inv.Version
+	if _, err := fx.engine.Update(context.Background(), defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID, map[string]any{
+		"invoice_number": "VINV-1", "purchase_order_id": "00000000-0000-0000-0000-000000000000", "vendor_id": fx.vendorID,
+		"invoice_date": "2026-01-15", "status_id": matchedStatusID, "total": 125.00,
+	}, &version, humanActor()); err != nil {
+		t.Fatalf("expected the redirect to succeed (no rollback), got: %v", err)
+	}
+	got, err := fx.engine.Get(context.Background(), defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID)
+	if err != nil {
+		t.Fatalf("get VendorInvoice: %v", err)
+	}
+	if got.Data["status_id"] != exceptionStatusID {
+		t.Fatalf("expected a dangling purchase_order_id to redirect to match_exception, got status_id=%v", got.Data["status_id"])
+	}
+	reason, _ := got.Data["match_exception_reason"].(string)
+	if !strings.Contains(reason, "does not exist") {
+		t.Fatalf("expected match_exception_reason to say the PurchaseOrder doesn't exist, got %q", reason)
+	}
+}
+
+// TestMatchVendorInvoiceOnUpdate_NoPOLines_RedirectsToMatchException
+// confirms a PurchaseOrder header that exists but has no POLine at all
+// yet (a real, ordinary in-progress state — POLine is its own separate
+// CRUD-able entity, created after the header) redirects to
+// match_exception rather than hard-failing.
+func TestMatchVendorInvoiceOnUpdate_NoPOLines_RedirectsToMatchException(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if err := PublishStatuses(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("PublishStatuses: %v", err)
+	}
+	engine := crud.NewEngine(tenantDB)
+	engine.SetHook("VendorInvoice", MatchVendorInvoiceOnUpdate)
+
+	vendor, err := engine.Create(ctx, defFor(t, tenantDB, "Party"), map[string]any{
+		"party_type": "organization", "name": "Acme Textiles", "status": "active",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create Party: %v", err)
+	}
+	draftPOStatusID := statusIDByCode(t, engine, tenantDB, "purchase_order_status", "draft")
+	po, err := engine.Create(ctx, defFor(t, tenantDB, "PurchaseOrder"), map[string]any{
+		"po_number": "PO-1", "vendor_id": vendor.ID, "order_date": "2026-01-01",
+		"status_id": draftPOStatusID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create PurchaseOrder: %v", err)
+	}
+	// Deliberately no POLine created — a header can exist with none yet.
+
+	draftInvStatusID := statusIDByCode(t, engine, tenantDB, "vendor_invoice_status", "draft")
+	inv, err := engine.Create(ctx, defFor(t, tenantDB, "VendorInvoice"), map[string]any{
+		"invoice_number": "VINV-1", "purchase_order_id": po.ID, "vendor_id": vendor.ID,
+		"invoice_date": "2026-01-15", "status_id": draftInvStatusID, "total": 125.00,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create VendorInvoice: %v", err)
+	}
+
+	matchedStatusID := statusIDByCode(t, engine, tenantDB, "vendor_invoice_status", "matched")
+	exceptionStatusID := statusIDByCode(t, engine, tenantDB, "vendor_invoice_status", "match_exception")
+	version := inv.Version
+	if _, err := engine.Update(ctx, defFor(t, tenantDB, "VendorInvoice"), inv.ID, map[string]any{
+		"invoice_number": "VINV-1", "purchase_order_id": po.ID, "vendor_id": vendor.ID,
+		"invoice_date": "2026-01-15", "status_id": matchedStatusID, "total": 125.00,
+	}, &version, actor); err != nil {
+		t.Fatalf("expected the redirect to succeed (no rollback), got: %v", err)
+	}
+	got, err := engine.Get(ctx, defFor(t, tenantDB, "VendorInvoice"), inv.ID)
+	if err != nil {
+		t.Fatalf("get VendorInvoice: %v", err)
+	}
+	if got.Data["status_id"] != exceptionStatusID {
+		t.Fatalf("expected a PurchaseOrder with no POLines to redirect to match_exception, got status_id=%v", got.Data["status_id"])
+	}
+	reason, _ := got.Data["match_exception_reason"].(string)
+	if !strings.Contains(reason, "no POLines") {
+		t.Fatalf("expected match_exception_reason to say the PurchaseOrder has no lines, got %q", reason)
+	}
+}
+
+// TestMatchVendorInvoiceOnUpdate_SecondConsecutiveFailure_UpdatesReason
+// confirms match_exception_reason reflects the MOST RECENT failed
+// attempt, not stuck on whatever the first one said — a retry that's
+// still wrong (for a different reason) must overwrite it, not append or
+// ignore it.
+func TestMatchVendorInvoiceOnUpdate_SecondConsecutiveFailure_UpdatesReason(t *testing.T) {
+	fx := setUpVendorInvoiceFixture(t, 10, 12.50, 10) // received value 125.00
+	fx.engine.SetHook("VendorInvoice", MatchVendorInvoiceOnUpdate)
+	inv := createDraftVendorInvoice(t, fx, 999.00) // wrong total #1
+
+	matchedStatusID := statusIDByCode(t, fx.engine, fx.tenantDB, "vendor_invoice_status", "matched")
+	version := inv.Version
+	if _, err := fx.engine.Update(context.Background(), defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID, map[string]any{
+		"invoice_number": "VINV-1", "purchase_order_id": fx.poID, "vendor_id": fx.vendorID,
+		"invoice_date": "2026-01-15", "status_id": matchedStatusID, "total": 999.00,
+	}, &version, humanActor()); err != nil {
+		t.Fatalf("expected the first redirect to succeed, got: %v", err)
+	}
+	first, err := fx.engine.Get(context.Background(), defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID)
+	if err != nil {
+		t.Fatalf("get VendorInvoice: %v", err)
+	}
+	firstReason, _ := first.Data["match_exception_reason"].(string)
+	if !strings.Contains(firstReason, "999.00") {
+		t.Fatalf("expected the first reason to mention 999.00, got %q", firstReason)
+	}
+
+	// Retry with a DIFFERENT wrong total — still disagrees, but not the
+	// same way. match_exception->matched is a real declared edge; the
+	// hook redirects back to match_exception again with a fresh reason.
+	version = first.Version
+	if _, err := fx.engine.Update(context.Background(), defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID, map[string]any{
+		"invoice_number": "VINV-1", "purchase_order_id": fx.poID, "vendor_id": fx.vendorID,
+		"invoice_date": "2026-01-15", "status_id": matchedStatusID, "total": 777.00,
+		"match_exception_reason": firstReason,
+	}, &version, humanActor()); err != nil {
+		t.Fatalf("expected the second redirect to succeed, got: %v", err)
+	}
+	second, err := fx.engine.Get(context.Background(), defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID)
+	if err != nil {
+		t.Fatalf("get VendorInvoice: %v", err)
+	}
+	secondReason, _ := second.Data["match_exception_reason"].(string)
+	if !strings.Contains(secondReason, "777.00") {
+		t.Fatalf("expected the second reason to mention the new total 777.00, got %q", secondReason)
+	}
+	if strings.Contains(secondReason, "999.00") {
+		t.Fatalf("expected the reason to be replaced, not accumulated — still mentions the old 999.00: %q", secondReason)
+	}
+}
+
+// TestMatchVendorInvoiceOnUpdate_NoPurchaseOrderID_HardFails confirms the
+// one case vendorInvoiceMatchDetail still fails closed on: no
+// purchase_order_id at all. Unreachable through the real API
+// (purchase_order_id is Required — entity.ValidateRecord blocks this
+// before crud.Engine.Update ever calls a hook), so this calls the hook
+// directly, the same "direct unit-level call" shape
+// TestPostGoodsReceiptLineToLedger_UpdateAction_IsNoOp already uses for
+// a hook contract that can't be reached through the normal engine path.
+func TestMatchVendorInvoiceOnUpdate_NoPurchaseOrderID_HardFails(t *testing.T) {
+	fx := setUpVendorInvoiceFixture(t, 10, 12.50, 10)
+	matchedStatusID := statusIDByCode(t, fx.engine, fx.tenantDB, "vendor_invoice_status", "matched")
+
+	tx, err := fx.tenantDB.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	rec := data.Record{ID: "does-not-matter", Data: map[string]any{"status_id": matchedStatusID, "total": float64(1)}}
+	err = MatchVendorInvoiceOnUpdate(context.Background(), tx, nil, rec, audit.ActionUpdate, humanActor())
+	if !errors.Is(err, ErrVendorInvoiceMatchFailed) {
+		t.Fatalf("expected ErrVendorInvoiceMatchFailed for a missing purchase_order_id, got: %v", err)
+	}
+}
+
+// TestStatusIDByCodeTx_NotSeeded_ReturnsError confirms statusIDByCodeTx
+// fails with a clear error (not a panic or a wrong id) when asked to
+// resolve a code under a StatusType that has no such Status seeded —
+// the "PublishStatuses not run for this tenant" case its own error
+// message names.
+func TestStatusIDByCodeTx_NotSeeded_ReturnsError(t *testing.T) {
+	fx := setUpVendorInvoiceFixture(t, 10, 12.50, 10)
+	tx, err := fx.tenantDB.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	records := data.NewRecordRepo(nil)
+	if _, err := statusIDByCodeTx(context.Background(), tx, records, "not-a-real-status-type-id", "match_exception"); err == nil {
+		t.Fatal("expected an error for a status_type_id with no seeded Status rows")
+	}
+}
+
+// TestMergedRecordData_OverlaysWithoutMutatingBase is a plain unit test
+// (no DB) for the helper both the redirect and the clear paths in
+// MatchVendorInvoiceOnUpdate rely on to avoid wiping a record's other
+// fields — RecordRepo.UpdateTx is a full replacement (crud.Engine.Update's
+// own doc comment, describing that same repo method: "Update validates
+// and applies a full replacement of fields"), so a caller of it must
+// always resend everything worth keeping.
+func TestMergedRecordData_OverlaysWithoutMutatingBase(t *testing.T) {
+	base := map[string]any{"a": float64(1), "b": "keep"}
+	merged := mergedRecordData(base, map[string]any{"b": "changed", "c": true})
+
+	if merged["a"] != float64(1) || merged["b"] != "changed" || merged["c"] != true {
+		t.Fatalf("unexpected merged result: %+v", merged)
+	}
+	if base["b"] != "keep" {
+		t.Fatalf("expected base map untouched, got %+v", base)
+	}
+	if _, ok := base["c"]; ok {
+		t.Fatal("expected base map untouched — 'c' should not have leaked into it")
 	}
 }
 

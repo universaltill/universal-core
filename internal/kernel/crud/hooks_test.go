@@ -128,6 +128,67 @@ func TestEngine_Create_HookErrorRollsBackWholeWrite(t *testing.T) {
 	}
 }
 
+// TestEngine_Update_ReturnsFreshVersionAfterHookWritesAgain confirms
+// Update's returned version reflects whatever a registered hook actually
+// left the row on, not the version captured before the hook ran — a real
+// bug an independent review of purchasing.MatchVendorInvoiceOnUpdate
+// found: that hook does its own records.UpdateTx on the very record
+// Update is already writing (a redirect to a different status), which
+// bumps the row's version a second time inside the same transaction.
+// Returning the pre-hook version would violate Update's own documented
+// contract ("the version it should check against next time") and fail
+// the caller's very next optimistic-locked Update with a false
+// ErrVersionConflict — reproduced directly here without needing the
+// purchasing package's own fixtures.
+func TestEngine_Update_ReturnsFreshVersionAfterHookWritesAgain(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	def := vendorDef()
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	rec, err := engine.Create(ctx, def, map[string]any{"name": "Acme"}, actor)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	records := data.NewRecordRepo(nil)
+	engine.SetHook("Vendor", func(ctx context.Context, tx *sql.Tx, _ *entity.Definition, updated data.Record, action audit.Action, _ audit.Actor) error {
+		if action != audit.ActionUpdate {
+			return nil
+		}
+		// A second write to the same record, inside the same tx — same
+		// shape as MatchVendorInvoiceOnUpdate's own redirect.
+		_, err := records.UpdateTx(ctx, tx, "Vendor", updated.ID, map[string]any{"name": "Redirected By Hook"}, nil)
+		return err
+	})
+
+	version := rec.Version
+	gotVersion, err := engine.Update(ctx, def, rec.ID, map[string]any{"name": "First Edit"}, &version, actor)
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	stored, err := engine.Get(ctx, def, rec.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if gotVersion != stored.Version {
+		t.Fatalf("Update returned version %d but the stored record is actually at version %d (hook's own write wasn't reflected)", gotVersion, stored.Version)
+	}
+	if stored.Data["name"] != "Redirected By Hook" {
+		t.Fatalf("expected the hook's own write to be the one that stuck, got %v", stored.Data["name"])
+	}
+
+	// The real-world consequence: the caller's next optimistic-locked
+	// Update, using the version Update just returned, must succeed —
+	// not fail with a false ErrVersionConflict against a version the row
+	// has already moved past.
+	if _, err := engine.Update(ctx, def, rec.ID, map[string]any{"name": "Second Edit"}, &gotVersion, actor); err != nil {
+		t.Fatalf("expected the next Update to succeed using the version Update returned, got: %v", err)
+	}
+}
+
 // TestEngine_Create_NoHookRegistered_IsANoOp confirms every existing
 // entity type (no hook ever registered for it) behaves exactly as
 // before this mechanism existed — the near-certain majority case.

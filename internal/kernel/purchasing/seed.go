@@ -106,13 +106,39 @@ type statusSpec = statusgraph.Spec
 //
 // vendor_invoice_status (VendorInvoice's own doc comment): draft is the
 // only is_initial status; draft->matched->paid is the happy path — the
-// "matched" transition is where purchasing.MatchVendorInvoiceOnUpdate
-// (ledger.go) runs the 3-way match and rejects the transition outright
-// (nothing written) if the invoice doesn't agree with what was actually
-// received against its PurchaseOrder. void is reachable from draft or
-// matched but not paid, same "money already moved, that's a credit
-// note/reversal event not a status edit" reasoning as
+// "matched" transition (and any other Update that resolves to "matched")
+// is where purchasing.MatchVendorInvoiceOnUpdate (ledger.go) runs the
+// 3-way match. A disagreement no longer rejects the transition outright:
+// the hook redirects the write to "match_exception" instead (with a
+// reason recorded on the record itself) and returns to "matched" only
+// once match_exception->matched is retried and agrees. match_exception
+// has no edge to "paid" — that missing edge, not a separate check, is
+// what blocks payment release until the exception is resolved. This
+// block is enforced by crud.Engine.ValidateStatusTransition, which is
+// only ever called from internal/api's HTTP handlers (not from
+// crud.Engine.Update itself) — a pre-existing property of this whole
+// mechanism, not something this task changes, but worth naming here
+// because this task is the first place a missing StatusTransition edge
+// is actually load-bearing for money leaving: any caller that reaches
+// crud.Engine.Update directly (a kernel-internal caller, a script) is
+// not stopped by this graph the way a browser/API client is.
+// match_exception->void lets an exception be abandoned the same way
+// draft/matched can be voided. void is reachable from draft, matched, or
+// match_exception but not paid, same "money already moved, that's a
+// credit note/reversal event not a status edit" reasoning as
 // sales.PublishStatuses gives for CustomerInvoice's identical shape.
+//
+// A tenant provisioned before match_exception existed has no such Status
+// seeded yet — MatchVendorInvoiceOnUpdate's redirect would then fail to
+// resolve it and roll back the whole Update (a worse outcome than this
+// hook's original fail-closed rejection, an independent review's own
+// finding). This function is idempotent and additive (Idempotent, below)
+// — re-running it against an already-provisioned tenant is always safe
+// and is what actually picks up match_exception for that tenant; there
+// is no separate migration/backfill step, unlike PurchaseOrder's
+// status->status_id Version bump (this file's own doc comment on that),
+// because nothing here replaces an existing field's meaning, it only
+// adds a new reachable Status.
 //
 // rfq_status (RequestForQuotation's own doc comment, #9): draft is the
 // only is_initial status — an RFQ being drafted, vendors/lines still
@@ -200,14 +226,46 @@ func PublishStatuses(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 		[]statusSpec{
 			{Code: "draft", Name: "Draft", Sequence: 1, IsInitial: true, IsTerminal: false},
 			{Code: "matched", Name: "Matched", Sequence: 2, IsInitial: false, IsTerminal: false},
-			{Code: "paid", Name: "Paid", Sequence: 3, IsInitial: false, IsTerminal: true},
-			{Code: "void", Name: "Void", Sequence: 4, IsInitial: false, IsTerminal: true},
+			// Sequence 3, ahead of paid/void: display-order only (this
+			// kernel has no other meaning for Sequence), placed here
+			// because an exception is a "still in flight" state like
+			// draft/matched, not a resolved one.
+			{Code: "match_exception", Name: "Match Exception", Sequence: 3, IsInitial: false, IsTerminal: false},
+			{Code: "paid", Name: "Paid", Sequence: 4, IsInitial: false, IsTerminal: true},
+			{Code: "void", Name: "Void", Sequence: 5, IsInitial: false, IsTerminal: true},
 		},
 		[][2]string{
 			{"draft", "matched"},
 			{"matched", "paid"},
 			{"draft", "void"},
 			{"matched", "void"},
+			// draft->match_exception and matched->match_exception:
+			// system-driven, not client-requested — a caller always asks
+			// for "matched" (the draft->matched or matched->matched edge
+			// above already covers what it requested), and
+			// MatchVendorInvoiceOnUpdate is the one that redirects the
+			// write to match_exception instead when the 3-way match
+			// disagrees. Declared here anyway, even though
+			// crud.Engine.ValidateStatusTransition is never actually
+			// asked to validate this specific edge (the hook writes
+			// through records.UpdateTx directly, past that check) — a
+			// StatusTransition graph that only lists client-requestable
+			// edges would silently lie to anything that reads it to show
+			// "what can this record become" (a future allowed-next-
+			// statuses UI, an audit report), since match_exception is a
+			// real, routinely-reached state.
+			{"draft", "match_exception"},
+			{"matched", "match_exception"},
+			// match_exception->matched: retry after the underlying data
+			// (invoice or the PO/GoodsReceipt it's matched against) is
+			// corrected — MatchVendorInvoiceOnUpdate re-runs the same
+			// match and, if it now agrees, this is the edge it lands on.
+			{"match_exception", "matched"},
+			// match_exception->void: abandon a bad invoice instead of
+			// fixing it. Deliberately NO match_exception->paid edge —
+			// that missing edge is the actual payment-release block, see
+			// the doc comment above.
+			{"match_exception", "void"},
 		},
 		actor,
 	); err != nil {
