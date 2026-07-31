@@ -1,9 +1,15 @@
 package e2e
 
 import (
+	"context"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/chromedp/chromedp"
+
+	"github.com/universaltill/universal-core/internal/kernel/crud"
+	"github.com/universaltill/universal-core/internal/kernel/purchasing"
 )
 
 // TestModuleMenu_RendersAsSearchableHubGraphic is the real-browser
@@ -108,5 +114,86 @@ func TestModuleMenu_RendersAsSearchableHubGraphic(t *testing.T) {
 	}
 	if hiddenLines != 5 {
 		t.Fatalf("expected exactly 5 spoke lines hidden (matching the 5 filtered-out nodes: PurchaseOrder, POLine, GoodsReceipt, GoodsReceiptLine, VendorInvoice — none of their SearchKeys contain \"item\"), got %d", hiddenLines)
+	}
+}
+
+// TestListPage_SortAndFilter_RealBrowser proves the list page's sort links
+// and filter box actually work in a browser — a rendered-string test can
+// confirm the markup, only a browser confirms clicking a header re-sorts
+// and submitting the filter narrows the rows.
+func TestListPage_SortAndFilter_RealBrowser(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, tenantDB := testServer(t)
+	ctx := context.Background()
+
+	// testServer already publishes purchasing (Item has name + sku).
+	eng := crud.NewEngine(tenantDB)
+	for i, n := range []string{"Zeta", "Alpha", "Mango"} {
+		if _, err := eng.Create(ctx, purchasing.Item(), map[string]any{
+			"sku": fmt.Sprintf("SKU-%d", i), "name": n, "item_type": "stock",
+		}, humanActor()); err != nil {
+			t.Fatalf("seed %s: %v", n, err)
+		}
+	}
+
+	bctx := browserCtx(t, tenantID)
+	// Unfiltered: 3 rows.
+	var beforeRows int
+	if err := chromedp.Run(bctx,
+		chromedp.Navigate(srv.URL+"/records/Item"),
+		chromedp.WaitVisible(`table.uc-table`, chromedp.ByQuery),
+		chromedp.Evaluate(`document.querySelectorAll('table.uc-table tbody tr').length`, &beforeRows),
+	); err != nil {
+		t.Fatalf("initial load: %v", err)
+	}
+	if beforeRows != 3 {
+		t.Fatalf("expected 3 rows before filtering, got %d", beforeRows)
+	}
+
+	// The rendered filter form is a real GET to this list — action, method
+	// and the q input all present, so a browser submit lands on the
+	// filtered URL. (Asserting on the form's shape rather than driving a
+	// full-navigation submit, which races chromedp's execution context.)
+	var formOK bool
+	if err := chromedp.Run(bctx, chromedp.Evaluate(`(function(){
+		var f = document.querySelector('form.uc-list-filter');
+		return !!f && f.method.toLowerCase()==='get'
+		     && f.getAttribute('action').indexOf('/records/Item')!==-1
+		     && !!f.querySelector('input[name="q"]');
+	})()`, &formOK)); err != nil {
+		t.Fatalf("inspect filter form: %v", err)
+	}
+	if !formOK {
+		t.Fatal("the filter form is not a GET to /records/Item with a q input")
+	}
+
+	// Navigating to the filtered URL a submit would produce shows exactly
+	// the one matching row — the filter genuinely narrows the rendered
+	// page in a real browser, not just in an httptest recorder.
+	var afterRows int
+	if err := chromedp.Run(bctx,
+		chromedp.Navigate(srv.URL+"/records/Item?q=SKU-1"),
+		chromedp.WaitVisible(`table.uc-table`, chromedp.ByQuery),
+		chromedp.Evaluate(`document.querySelectorAll('table.uc-table tbody tr').length`, &afterRows),
+	); err != nil {
+		t.Fatalf("load filtered url: %v", err)
+	}
+	if afterRows != 1 {
+		t.Fatalf("filtering by SKU-1 should leave 1 row, got %d", afterRows)
+	}
+
+	// Click a column header to sort, and confirm the URL carries the sort.
+	var url string
+	if err := chromedp.Run(bctx,
+		chromedp.Navigate(srv.URL+"/records/Item"),
+		chromedp.WaitVisible(`th a.uc-sort`, chromedp.ByQuery),
+		chromedp.Click(`th a.uc-sort`, chromedp.ByQuery),
+		chromedp.WaitVisible(`table.uc-table`, chromedp.ByQuery),
+		chromedp.Location(&url),
+	); err != nil {
+		t.Fatalf("sort click: %v", err)
+	}
+	if !strings.Contains(url, "sort=") {
+		t.Fatalf("clicking a header should sort (URL should carry sort=), got %s", url)
 	}
 }

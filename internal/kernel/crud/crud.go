@@ -342,6 +342,19 @@ func (e *Engine) ListPage(ctx context.Context, def *entity.Definition, limit, of
 	return e.records.ListPage(ctx, def.EntityType, limit, offset)
 }
 
+// ListPageFiltered is ListPage with an optional sort + substring filter —
+// see data.ListPageOptions. The generic engine stays generic: it passes
+// the options straight through, never branching on a field name.
+func (e *Engine) ListPageFiltered(ctx context.Context, def *entity.Definition, opts data.ListPageOptions) ([]data.Record, error) {
+	return e.records.ListPageFiltered(ctx, def.EntityType, opts)
+}
+
+// CountFiltered counts def records matching opts' filter (see
+// data.RecordRepo.CountFiltered).
+func (e *Engine) CountFiltered(ctx context.Context, def *entity.Definition, opts data.ListPageOptions) (int, error) {
+	return e.records.CountFiltered(ctx, def.EntityType, opts)
+}
+
 // ListByField returns every def record whose fieldName == value — used
 // to fetch a master-detail section's child rows (see
 // data.RecordRepo.ListByField).

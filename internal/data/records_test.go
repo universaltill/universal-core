@@ -221,3 +221,134 @@ func TestRecordRepo_ListTx_SeesUncommittedWritesInSameTx(t *testing.T) {
 		t.Fatalf("expected the uncommitted write to be invisible outside the tx, got %+v", outside)
 	}
 }
+
+// ListPageFiltered/CountFiltered: sorting, substring filtering, and — the
+// property that matters most for a JSONB query built from user input — no
+// injection through the field name.
+func TestRecordRepo_ListPageFilteredSortsAndFilters(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(db)
+
+	for _, name := range []string{"Charlie", "alice", "Bob"} {
+		if _, err := repo.Create(ctx, "Widget", map[string]any{"name": name}); err != nil {
+			t.Fatalf("create %s: %v", name, err)
+		}
+	}
+
+	// Case-insensitive ascending sort by a JSON field.
+	asc, err := repo.ListPageFiltered(ctx, "Widget", ListPageOptions{SortField: "name", Limit: 10})
+	if err != nil {
+		t.Fatalf("sort asc: %v", err)
+	}
+	got := []string{asc[0].Data["name"].(string), asc[1].Data["name"].(string), asc[2].Data["name"].(string)}
+	// Postgres text sort is byte-order: uppercase before lowercase, so
+	// "Bob","Charlie","alice" — the point is it is ordered by the field,
+	// deterministically, not that it matches a locale collation.
+	if !(got[0] <= got[1] && got[1] <= got[2]) {
+		t.Fatalf("not sorted ascending: %v", got)
+	}
+
+	desc, err := repo.ListPageFiltered(ctx, "Widget", ListPageOptions{SortField: "name", SortDesc: true, Limit: 10})
+	if err != nil {
+		t.Fatalf("sort desc: %v", err)
+	}
+	if desc[0].Data["name"] != asc[2].Data["name"] {
+		t.Fatalf("desc should reverse asc: asc=%v desc=%v", asc[2].Data["name"], desc[0].Data["name"])
+	}
+
+	// Substring filter, case-insensitive.
+	filtered, err := repo.ListPageFiltered(ctx, "Widget", ListPageOptions{FilterField: "name", FilterValue: "b", Limit: 10})
+	if err != nil {
+		t.Fatalf("filter: %v", err)
+	}
+	// "Bob" and "alice"? no — "b" matches Bob only (Charlie has no b,
+	// alice has no b). Actually "Bob" contains b/B. Charlie: no. alice: no.
+	if len(filtered) != 1 || filtered[0].Data["name"] != "Bob" {
+		t.Fatalf("filter b should match only Bob, got %v", filtered)
+	}
+	n, err := repo.CountFiltered(ctx, "Widget", ListPageOptions{FilterField: "name", FilterValue: "b"})
+	if err != nil || n != 1 {
+		t.Fatalf("CountFiltered b: got %d (%v), want 1", n, err)
+	}
+}
+
+// A field name carrying SQL must not alter the query — it is bound to the
+// ->> operator, never concatenated. Proven by using a hostile field name
+// and confirming the table still exists and the query simply matches
+// nothing.
+func TestRecordRepo_ListPageFilteredFieldNameCannotInject(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(db)
+	if _, err := repo.Create(ctx, "Widget", map[string]any{"name": "safe"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	hostile := "name'); DROP TABLE records; --"
+	_, err := repo.ListPageFiltered(ctx, "Widget", ListPageOptions{SortField: hostile, Limit: 10})
+	if err != nil {
+		t.Fatalf("hostile sort field should be inert, not error: %v", err)
+	}
+	// The table must still be there.
+	if _, err := repo.Create(ctx, "Widget", map[string]any{"name": "still here"}); err != nil {
+		t.Fatalf("records table was harmed by a hostile field name: %v", err)
+	}
+}
+
+// A numeric field must sort as a number, not as text — "100" after "90",
+// not before it. This is wrong-list-on-an-accounting-product, not cosmetic.
+func TestRecordRepo_ListPageFilteredNumericSort(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(db)
+	for _, v := range []float64{100, 9, 90, 2} {
+		if _, err := repo.Create(ctx, "Order", map[string]any{"total": v}); err != nil {
+			t.Fatalf("create %v: %v", v, err)
+		}
+	}
+	// Text sort would give 100, 2, 90, 9. Numeric must give 2, 9, 90, 100.
+	got, err := repo.ListPageFiltered(ctx, "Order", ListPageOptions{SortField: "total", SortNumeric: true, Limit: 10})
+	if err != nil {
+		t.Fatalf("sort: %v", err)
+	}
+	var order []float64
+	for _, r := range got {
+		order = append(order, r.Data["total"].(float64))
+	}
+	want := []float64{2, 9, 90, 100}
+	for i := range want {
+		if order[i] != want[i] {
+			t.Fatalf("numeric sort wrong: got %v, want %v", order, want)
+		}
+	}
+}
+
+// A literal "%" or "_" in a filter must match itself, not act as a LIKE
+// wildcard — otherwise typing "%" returns every row.
+func TestRecordRepo_ListPageFilteredEscapesLikeWildcards(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(db)
+	for _, n := range []string{"50%off", "plain", "under_score"} {
+		if _, err := repo.Create(ctx, "Promo", map[string]any{"name": n}); err != nil {
+			t.Fatalf("create %s: %v", n, err)
+		}
+	}
+	// "%" must match only the literal-percent row, not all three.
+	pct, err := repo.ListPageFiltered(ctx, "Promo", ListPageOptions{FilterField: "name", FilterValue: "%", Limit: 10})
+	if err != nil {
+		t.Fatalf("filter %%: %v", err)
+	}
+	if len(pct) != 1 || pct[0].Data["name"] != "50%off" {
+		t.Fatalf("literal %% should match only 50%%off, got %v", pct)
+	}
+	// "_" likewise.
+	us, err := repo.ListPageFiltered(ctx, "Promo", ListPageOptions{FilterField: "name", FilterValue: "_", Limit: 10})
+	if err != nil {
+		t.Fatalf("filter _: %v", err)
+	}
+	if len(us) != 1 || us[0].Data["name"] != "under_score" {
+		t.Fatalf("literal _ should match only under_score, got %v", us)
+	}
+}

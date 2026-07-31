@@ -739,6 +739,58 @@ func (g *GuardedEngine) ListPage(ctx context.Context, def *entity.Definition, li
 	return recs, nil
 }
 
+// ListPageFiltered / CountFiltered mirror ListPage's guarding: read
+// permission is checked, and rows are redacted before return. The
+// list-page handler validates that a sort/filter field is a REAL field
+// before calling — but a field this actor may not READ must not become a
+// filter/sort oracle either, so a hidden field used as a filter or sort
+// key is refused here (a field whose values you cannot see, you cannot
+// sort or filter by, or you could bisect its values through page order).
+func (g *GuardedEngine) ListPageFiltered(ctx context.Context, def *entity.Definition, opts data.ListPageOptions) ([]data.Record, error) {
+	if err := g.checkRead(ctx, def); err != nil {
+		return nil, err
+	}
+	if err := g.rejectHiddenSortFilter(ctx, def, opts); err != nil {
+		return nil, err
+	}
+	recs, err := g.raw.ListPageFiltered(ctx, def, opts)
+	if err != nil {
+		return nil, err
+	}
+	if err := g.redact(ctx, def, recs); err != nil {
+		return nil, err
+	}
+	return recs, nil
+}
+
+func (g *GuardedEngine) CountFiltered(ctx context.Context, def *entity.Definition, opts data.ListPageOptions) (int, error) {
+	if err := g.checkRead(ctx, def); err != nil {
+		return 0, err
+	}
+	if err := g.rejectHiddenSortFilter(ctx, def, opts); err != nil {
+		return 0, err
+	}
+	return g.raw.CountFiltered(ctx, def, opts)
+}
+
+// rejectHiddenSortFilter denies sorting or filtering by a field this
+// actor may not read — see ListPageFiltered's doc comment on the oracle.
+func (g *GuardedEngine) rejectHiddenSortFilter(ctx context.Context, def *entity.Definition, opts data.ListPageOptions) error {
+	if opts.SortField == "" && opts.FilterField == "" {
+		return nil
+	}
+	hidden, err := g.res.HiddenFields(ctx, def.EntityType)
+	if err != nil {
+		return err
+	}
+	for _, f := range []string{opts.SortField, opts.FilterField} {
+		if f != "" && hidden[f] {
+			return fmt.Errorf("%w: cannot sort or filter %s by hidden field %s", ErrDenied, def.EntityType, f)
+		}
+	}
+	return nil
+}
+
 // ListByField filters on fieldName server-side, so a hidden field is
 // still usable as a FILTER here even though its value is redacted from
 // the rows returned. That is deliberate and load-bearing: the only

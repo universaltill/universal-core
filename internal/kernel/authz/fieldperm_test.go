@@ -411,3 +411,32 @@ func TestFieldPermissionAloneClosesControlPlaneBootstrap(t *testing.T) {
 	got, err := r.CanWrite(ctx, "Role")
 	mustCan(t, got, err, false, "clerk CanWrite(Role) once field rules exist")
 }
+
+// Sorting or filtering by a field the actor may not read is refused at the
+// guard layer — independent review flagged this had no direct test (the
+// handler's own pre-filter reached it first). A hidden field used as a
+// sort key would otherwise let page order bisect its values.
+func TestGuardedEngine_RejectsHiddenSortFilter(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	clerk := f.role("clerk")
+	f.grant("user-clerk", clerk.ID)
+	f.hide(clerk.ID, "Party", "tax_id")
+
+	g := guardedFor(f, "user-clerk")
+	def := f.def("Party")
+
+	if _, err := g.ListPageFiltered(ctx, def, data.ListPageOptions{SortField: "tax_id", Limit: 10}); !errors.Is(err, ErrDenied) {
+		t.Fatalf("sorting by a hidden field should be denied, got %v", err)
+	}
+	if _, err := g.ListPageFiltered(ctx, def, data.ListPageOptions{FilterField: "tax_id", FilterValue: "x", Limit: 10}); !errors.Is(err, ErrDenied) {
+		t.Fatalf("filtering by a hidden field should be denied, got %v", err)
+	}
+	if _, err := g.CountFiltered(ctx, def, data.ListPageOptions{FilterField: "tax_id", FilterValue: "x"}); !errors.Is(err, ErrDenied) {
+		t.Fatalf("counting by a hidden field should be denied, got %v", err)
+	}
+	// A VISIBLE field is fine.
+	if _, err := g.ListPageFiltered(ctx, def, data.ListPageOptions{SortField: "name", Limit: 10}); err != nil {
+		t.Fatalf("sorting by a visible field should work: %v", err)
+	}
+}

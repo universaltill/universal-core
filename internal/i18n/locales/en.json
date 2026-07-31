@@ -289,5 +289,8 @@
   "workflow_inbox.column_action": "Action",
   "workflow_inbox.requires_role": "Needs the {role} role",
   "workflow_inbox.unavailable": "Unavailable",
-  "workflow_inbox.requires_role_in_department": "Needs the {role} role in this record's department"
+  "workflow_inbox.requires_role_in_department": "Needs the {role} role in this record's department",
+  "list.filter_placeholder": "Filter…",
+  "list.filter_button": "Filter",
+  "list.filter_clear": "Clear"
 }
