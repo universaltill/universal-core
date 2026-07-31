@@ -628,6 +628,62 @@ func Position() *entity.Definition {
 	}
 }
 
+// Delegation authorises delegate_user_id to act as an approver anywhere
+// delegator_user_id could (R17 "delegation/substitute approver" —
+// uc-infra#8). Deliberately narrow: it is consulted ONLY by workflow
+// approval-eligibility resolution (internal/api/workflow.go's
+// userMeetsApproval, via ActiveDelegatorsFor in roles.go) — it does NOT
+// grant the delegate the delegator's Permission/FieldPermission
+// entity/field access, admin status, or anything else
+// internal/kernel/authz resolves. A substitute approver gets no access
+// beyond standing in for approvals the delegator's OWN role/department
+// grants would already have covered; full impersonation would be a
+// materially different, bigger feature and is deliberately not what
+// this is (see uc-infra ADR-0006's delegation addendum).
+//
+// Non-transitive by construction: A delegating to B does not let B's own
+// delegate C stand in for A — ActiveDelegatorsFor only ever resolves one
+// hop, checking each delegator's OWN role grants, never anyone who has
+// in turn delegated to that delegator.
+//
+// ends_at is optional (FieldDate, inclusive through the end of that
+// day in the server's own local time zone — see ActiveDelegatorsFor in
+// roles.go) — empty means the delegation runs indefinitely until
+// explicitly revoked. There is no automatic expiry tied to a real return-from-leave
+// event because no Employee/LeaveRequest entity exists yet to detect one
+// (Phase 6, not started — see Department's own doc comment above); this
+// is a manually-toggled substitute-approver switch, not leave-aware
+// automation.
+//
+// revoked is the immediate off switch — set true to end a delegation
+// before its ends_at (or an indefinite one) without deleting the row, so
+// its history stays visible in the generated UI rather than erased.
+//
+// Self-delegation (delegator_user_id == delegate_user_id) is not
+// rejected at validation time — internal/kernel/entity has no generic
+// cross-field inequality check (CLAUDE.md's kernel-boundary rule keeps
+// that engine free of anything entity-specific), and it would be inert
+// anyway: ActiveDelegatorsFor excludes it explicitly, since it would
+// only grant a user standing they already hold in their own right.
+//
+// Escalation timers — the other half of uc-infra#8's original ticket —
+// are NOT this entity. They need a per-job elapsed-time sweep, a
+// different mechanism entirely, and are split into their own follow-up
+// backlog issue rather than bundled in here.
+func Delegation() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "Delegation",
+		Version:    1,
+		Module:     "foundation",
+		Fields: []entity.Field{
+			{Name: "delegator_user_id", Type: entity.FieldString, Required: true},
+			{Name: "delegate_user_id", Type: entity.FieldString, Required: true},
+			{Name: "ends_at", Type: entity.FieldDate},
+			{Name: "revoked", Type: entity.FieldBool},
+		},
+	}
+}
+
 // All returns every foundation Definition — the set that must exist
 // before any operational module is enabled for a tenant.
 func All() []*entity.Definition {
@@ -653,5 +709,6 @@ func All() []*entity.Definition {
 		FieldPermission(),
 		Department(),
 		Position(),
+		Delegation(),
 	}
 }

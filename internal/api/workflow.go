@@ -190,22 +190,53 @@ var errApprovalRoleDenied = errors.New("caller does not hold the role required t
 // param (or an empty one) is a no-op — see approveWorkflowJob's own doc
 // comment on why that's the deliberate backward-compatible default, not
 // an oversight.
+//
+// This is the one call site that also LOGS a successful delegated
+// approval — deliberately, since this function's only caller is
+// approveWorkflowJob, the actual mutation. userMeetsApproval itself
+// stays silent: it's also called by the JSON list endpoint and the HTML
+// inbox on every page render, and logging there would fire once per
+// eligible row per view rather than once per real approval (independent
+// review caught the first draft doing exactly that).
 func requireApprovalRole(ctx context.Context, ts tenantScope, job data.WorkflowJob, userID string) error {
 	req, err := approvalRoleFor(ctx, ts, job, nil)
 	if err != nil {
 		return err
 	}
-	ok, err := userMeetsApproval(ctx, ts, job, req, userID)
+	ok, viaDelegator, err := userMeetsApproval(ctx, ts, job, req, userID, newApprovalMemo())
 	if err != nil {
 		return err
 	}
 	if ok {
+		if viaDelegator != "" {
+			log.Printf("api: workflow job %s: %s approved as substitute via delegation from %s", job.ID, userID, viaDelegator)
+		}
 		return nil
 	}
 	if req.DepartmentField != "" {
 		return fmt.Errorf("%w: requires role %q in the record's own department", errApprovalRoleDenied, req.Role)
 	}
 	return fmt.Errorf("%w: requires role %q", errApprovalRoleDenied, req.Role)
+}
+
+// approvalMemo caches userMeetsApproval's own per-request lookups across
+// a page's worth of jobs — the JSON list endpoint and the HTML inbox
+// both call userMeetsApproval once per row for the SAME viewer, so a
+// viewer's delegator set, and either viewer's or a delegator's role
+// codes (keyed with the department id when the requirement is
+// department-scoped, since the answer depends on both), are identical
+// across every row that shares a department. Independent review
+// measured the unmemoized version at a 3.24x slowdown on a 40-row inbox
+// with 8 delegators; requireApprovalRole's own single-job call still
+// gets a fresh one-shot memo (a map allocation is free at that scale),
+// so every caller shares one code path rather than two.
+type approvalMemo struct {
+	delegators map[string][]string
+	codes      map[string][]string
+}
+
+func newApprovalMemo() *approvalMemo {
+	return &approvalMemo{delegators: map[string][]string{}, codes: map[string][]string{}}
 }
 
 // approvalRequirement is what a require_approval step demands: a Role, and
@@ -230,32 +261,92 @@ type approvalRequirement struct {
 // everyone: an unset department is not "any department", and treating it
 // as such would be exactly the fail-open the whole gate exists to
 // prevent.
-func userMeetsApproval(ctx context.Context, ts tenantScope, job data.WorkflowJob, req approvalRequirement, userID string) (bool, error) {
+//
+// Delegation (uc-infra#8, uc-infra ADR-0006's delegation addendum):
+// after userID's own standing fails to meet req, every user who
+// currently has an active Delegation naming userID as delegate
+// (foundation.ActiveDelegatorsFor) is checked in turn, against their OWN
+// role/department standing for this same req — if any of them would
+// meet it directly, userID may act as their substitute. This is
+// single-hop only: a delegator's OWN grants are what's checked, never
+// standing THEY in turn hold only via someone else's delegation to them,
+// so authority cannot chain past one substitution.
+//
+// Returns the delegator id whose standing granted eligibility, or "" if
+// userID met req directly (or not at all) — requireApprovalRole's own
+// doc comment explains the one thing this is used for (logging a real
+// approval, not every render). memo must not be nil; pass a fresh
+// newApprovalMemo() for a single call, or share one across every job on
+// a page so the (typically) unchanging viewer's delegator set and role
+// codes resolve once instead of once per row.
+func userMeetsApproval(ctx context.Context, ts tenantScope, job data.WorkflowJob, req approvalRequirement, userID string, memo *approvalMemo) (bool, string, error) {
 	if req.Role == "" {
-		return true, nil
-	}
-	if req.DepartmentField == "" {
-		codes, err := foundation.RoleCodesForUser(ctx, ts.db, userID)
-		if err != nil {
-			return false, fmt.Errorf("resolve roles for user %s: %w", userID, err)
-		}
-		return slices.Contains(codes, req.Role), nil
+		return true, "", nil
 	}
 
-	deptID, err := recordDepartmentID(ctx, ts, job, req.DepartmentField)
+	var deptID string
+	if req.DepartmentField != "" {
+		var err error
+		deptID, err = recordDepartmentID(ctx, ts, job, req.DepartmentField)
+		if err != nil {
+			return false, "", err
+		}
+		if deptID == "" {
+			// The record names no department in that field — routes to
+			// nobody, deliberately (see doc comment), including via
+			// delegation: there is no department standing for anyone
+			// to delegate.
+			return false, "", nil
+		}
+	}
+	codesFor := func(uid string) ([]string, error) {
+		key := uid
+		if req.DepartmentField != "" {
+			key = uid + "|" + deptID
+		}
+		if codes, ok := memo.codes[key]; ok {
+			return codes, nil
+		}
+		var codes []string
+		var err error
+		if req.DepartmentField == "" {
+			codes, err = foundation.RoleCodesForUser(ctx, ts.db, uid)
+		} else {
+			codes, err = foundation.RoleCodesForUserInDepartment(ctx, ts.db, uid, deptID)
+		}
+		if err != nil {
+			return nil, err
+		}
+		memo.codes[key] = codes
+		return codes, nil
+	}
+
+	codes, err := codesFor(userID)
 	if err != nil {
-		return false, err
+		return false, "", fmt.Errorf("resolve roles for user %s: %w", userID, err)
 	}
-	if deptID == "" {
-		// The record names no department in that field — routes to
-		// nobody, deliberately (see doc comment).
-		return false, nil
+	if slices.Contains(codes, req.Role) {
+		return true, "", nil
 	}
-	codes, err := foundation.RoleCodesForUserInDepartment(ctx, ts.db, userID, deptID)
-	if err != nil {
-		return false, fmt.Errorf("resolve department-scoped roles for user %s: %w", userID, err)
+
+	delegators, ok := memo.delegators[userID]
+	if !ok {
+		delegators, err = foundation.ActiveDelegatorsFor(ctx, ts.db, userID)
+		if err != nil {
+			return false, "", fmt.Errorf("resolve delegators for user %s: %w", userID, err)
+		}
+		memo.delegators[userID] = delegators
 	}
-	return slices.Contains(codes, req.Role), nil
+	for _, delegatorID := range delegators {
+		delegatorCodes, err := codesFor(delegatorID)
+		if err != nil {
+			return false, "", fmt.Errorf("resolve roles for delegator %s: %w", delegatorID, err)
+		}
+		if slices.Contains(delegatorCodes, req.Role) {
+			return true, delegatorID, nil
+		}
+	}
+	return false, "", nil
 }
 
 // recordDepartmentID reads the department id from the named field of the
@@ -475,12 +566,17 @@ func (h *Handler) listWorkflowJobs(w http.ResponseWriter, r *http.Request) {
 	// sitting at a require_approval step, and asking approvalRoleFor about it
 	// would be asking a question with no meaningful answer (it would report
 	// the step-kind mismatch as an error).
-	// Department-scoped approval resolves per-job (userMeetsApproval), so
-	// there is no one tenant-wide role set to precompute — only the
-	// definition cache is shared across the page's jobs.
+	// Department-scoped approval resolves per-job (userMeetsApproval), but
+	// the viewer is the same caller on every row of this one request —
+	// the definition cache AND userMeetsApproval's own memo (the
+	// viewer's delegator set, and any role-code lookup keyed by a
+	// user+department pair already seen on an earlier row) are both
+	// shared across the page's jobs, not just the definition lookup.
 	var defCache map[string]*cachedWorkflowDef
+	var memo *approvalMemo
 	if status == "waiting_approval" {
 		defCache = map[string]*cachedWorkflowDef{}
+		memo = newApprovalMemo()
 	}
 
 	out := make([]workflowJobResponse, len(jobs))
@@ -505,7 +601,7 @@ func (h *Handler) listWorkflowJobs(w http.ResponseWriter, r *http.Request) {
 			log.Printf("api: list workflow jobs: resolve required role for job %s: %v", j.ID, err)
 			continue
 		}
-		ok, err := userMeetsApproval(r.Context(), ts, j, req, rc.Actor.ID)
+		ok, _, err := userMeetsApproval(r.Context(), ts, j, req, rc.Actor.ID, memo)
 		if err != nil {
 			log.Printf("api: list workflow jobs: resolve approvability for job %s: %v", j.ID, err)
 			continue
@@ -560,8 +656,11 @@ func (h *Handler) renderWorkflowInbox(w http.ResponseWriter, r *http.Request) {
 	// Department-scoped approval (R17) resolves per-job against the record's
 	// own department, so the viewer's roles can no longer be reduced to one
 	// tenant-wide set up front — userMeetsApproval does the resolution per
-	// row, sharing the definition cache below.
+	// row, sharing the definition cache AND its own memo (the viewer's
+	// delegator set, and any role-code lookup already seen for a
+	// user+department pair) below.
 	defCache := map[string]*cachedWorkflowDef{}
+	memo := newApprovalMemo()
 
 	for _, j := range jobs {
 		row := workflowInboxRowView{
@@ -579,7 +678,7 @@ func (h *Handler) renderWorkflowInbox(w http.ResponseWriter, r *http.Request) {
 		req, err := approvalRoleFor(r.Context(), ts, j, defCache)
 		var meets bool
 		if err == nil {
-			meets, err = userMeetsApproval(r.Context(), ts, j, req, rc.Actor.ID)
+			meets, _, err = userMeetsApproval(r.Context(), ts, j, req, rc.Actor.ID, memo)
 		}
 		switch {
 		case err != nil:

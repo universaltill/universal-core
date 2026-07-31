@@ -260,7 +260,7 @@ func TestResolver_ControlPlane_SelfProtection(t *testing.T) {
 	// Non-admin writes to every control-plane type: denied now, even
 	// though no Permission row names these types.
 	r = humanResolver(f, "user-mallory")
-	for _, ct := range []string{"Role", "UserRole", "Permission", "FieldPermission"} {
+	for _, ct := range []string{"Role", "UserRole", "Permission", "FieldPermission", "Delegation"} {
 		got, err = r.CanWrite(ctx, ct)
 		mustCan(t, got, err, false, "mallory CanWrite("+ct+") once configured")
 	}

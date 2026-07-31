@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 
 	"github.com/universaltill/universal-core/internal/data"
 )
@@ -173,4 +174,70 @@ func RoleCodesForUserInDepartment(ctx context.Context, db *sql.DB, userID, depar
 		}
 	}
 	return codes, nil
+}
+
+// ActiveDelegatorsFor resolves every userID who currently has an active
+// Delegation (foundation.go) naming delegateUserID as delegate_user_id —
+// i.e. every user whose own approval standing delegateUserID may also
+// act with. The only caller is internal/api/workflow.go's
+// userMeetsApproval, which checks a delegator's OWN role grants for
+// each id this returns — this function decides WHO counts as an active
+// delegator, not whether that standing actually satisfies any particular
+// approval requirement.
+//
+// "Active" means not revoked and, when ends_at is set, not yet past it
+// (ends_at is inclusive through the end of that calendar day, evaluated
+// against the server's own local calendar — a delegation ending
+// "2026-08-05" is still active for any check made before local midnight
+// rolls over into the 6th). An absent ends_at is an indefinite
+// delegation until explicitly revoked (see Delegation's own doc
+// comment). A malformed ends_at value is treated as expired (excluded),
+// not indefinite — fail-closed, same posture RoleCodesForUserInDepartment's
+// own "unset department routes to nobody" rule takes for a grant that
+// can't be resolved cleanly: the wrong direction to fail on an access
+// grant is the direction that grants more. The cutoff is deliberately
+// parsed IN the server's local location (time.ParseInLocation, not the
+// UTC time.Parse would default to) so it lines up with the time.Now()
+// it's compared against — independent review caught the first draft
+// comparing a UTC midnight cutoff against a local-clock "now," which
+// fails open by up to ~14 hours in any tenant deployed east of UTC.
+//
+// Self-delegation (delegator_user_id == delegateUserID) is filtered out
+// here too — seeing it in the returned set would cost the caller nothing
+// incorrect (checking a user's own codes against themselves a second
+// time is a harmless no-op), but excluding it keeps this function's
+// contract — "who ELSE delegated to this user" — honest. Duplicate
+// delegator ids (two active Delegation rows from the same delegator) are
+// also deduplicated, so a caller resolving each one's own role grants
+// never pays for the same lookup twice.
+func ActiveDelegatorsFor(ctx context.Context, db *sql.DB, delegateUserID string) ([]string, error) {
+	if delegateUserID == "" {
+		return nil, nil
+	}
+	records := data.NewRecordRepo(db)
+	rows, err := records.ListByField(ctx, "Delegation", "delegate_user_id", delegateUserID)
+	if err != nil {
+		return nil, fmt.Errorf("list Delegation by delegate_user_id: %w", err)
+	}
+	now := time.Now()
+	seen := make(map[string]bool, len(rows))
+	var delegators []string
+	for _, row := range rows {
+		if revoked, _ := row.Data["revoked"].(bool); revoked {
+			continue
+		}
+		if endsAt, _ := row.Data["ends_at"].(string); endsAt != "" {
+			t, err := time.ParseInLocation("2006-01-02", endsAt, time.Local)
+			if err != nil || !now.Before(t.AddDate(0, 0, 1)) {
+				continue
+			}
+		}
+		delegatorID, _ := row.Data["delegator_user_id"].(string)
+		if delegatorID == "" || delegatorID == delegateUserID || seen[delegatorID] {
+			continue
+		}
+		seen[delegatorID] = true
+		delegators = append(delegators, delegatorID)
+	}
+	return delegators, nil
 }

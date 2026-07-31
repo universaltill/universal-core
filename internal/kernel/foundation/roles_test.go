@@ -3,6 +3,7 @@ package foundation
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/kernel/crud"
@@ -555,4 +556,191 @@ func containsCode(xs []string, w string) bool {
 		}
 	}
 	return false
+}
+
+// TestActiveDelegatorsFor_ResolvesActiveDelegation is the basic case: a
+// Delegation with no ends_at and not revoked is active indefinitely, and
+// ActiveDelegatorsFor(delegate) returns the delegator's id.
+func TestActiveDelegatorsFor_ResolvesActiveDelegation(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	eng := crud.NewEngine(db)
+	actor := humanActor()
+
+	if _, err := eng.Create(ctx, Delegation(), map[string]any{
+		"delegator_user_id": "alice", "delegate_user_id": "bob",
+	}, actor); err != nil {
+		t.Fatalf("create Delegation: %v", err)
+	}
+
+	delegators, err := ActiveDelegatorsFor(ctx, db, "bob")
+	if err != nil {
+		t.Fatalf("ActiveDelegatorsFor: %v", err)
+	}
+	if !containsCode(delegators, "alice") {
+		t.Fatalf("expected bob's active delegators to include alice, got %v", delegators)
+	}
+}
+
+// TestActiveDelegatorsFor_RevokedIsExcluded confirms revoked=true is an
+// immediate off switch — the delegation row still exists (this
+// package's history-preserving design, see Delegation's own doc
+// comment) but grants nothing.
+func TestActiveDelegatorsFor_RevokedIsExcluded(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	eng := crud.NewEngine(db)
+	actor := humanActor()
+
+	if _, err := eng.Create(ctx, Delegation(), map[string]any{
+		"delegator_user_id": "alice", "delegate_user_id": "bob", "revoked": true,
+	}, actor); err != nil {
+		t.Fatalf("create Delegation: %v", err)
+	}
+
+	delegators, err := ActiveDelegatorsFor(ctx, db, "bob")
+	if err != nil {
+		t.Fatalf("ActiveDelegatorsFor: %v", err)
+	}
+	if containsCode(delegators, "alice") {
+		t.Fatalf("a revoked delegation must not grant anything, got %v", delegators)
+	}
+}
+
+// TestActiveDelegatorsFor_ExpiredEndsAtIsExcluded confirms a delegation
+// whose ends_at is in the past no longer counts as active.
+func TestActiveDelegatorsFor_ExpiredEndsAtIsExcluded(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	eng := crud.NewEngine(db)
+	actor := humanActor()
+
+	yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
+	if _, err := eng.Create(ctx, Delegation(), map[string]any{
+		"delegator_user_id": "alice", "delegate_user_id": "bob", "ends_at": yesterday,
+	}, actor); err != nil {
+		t.Fatalf("create Delegation: %v", err)
+	}
+
+	delegators, err := ActiveDelegatorsFor(ctx, db, "bob")
+	if err != nil {
+		t.Fatalf("ActiveDelegatorsFor: %v", err)
+	}
+	if containsCode(delegators, "alice") {
+		t.Fatalf("a delegation past its ends_at must not grant anything, got %v", delegators)
+	}
+}
+
+// TestActiveDelegatorsFor_TodayEndsAtIsStillActive confirms ends_at is
+// inclusive through the end of that calendar day, not exclusive.
+func TestActiveDelegatorsFor_TodayEndsAtIsStillActive(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	eng := crud.NewEngine(db)
+	actor := humanActor()
+
+	today := time.Now().Format("2006-01-02")
+	if _, err := eng.Create(ctx, Delegation(), map[string]any{
+		"delegator_user_id": "alice", "delegate_user_id": "bob", "ends_at": today,
+	}, actor); err != nil {
+		t.Fatalf("create Delegation: %v", err)
+	}
+
+	delegators, err := ActiveDelegatorsFor(ctx, db, "bob")
+	if err != nil {
+		t.Fatalf("ActiveDelegatorsFor: %v", err)
+	}
+	if !containsCode(delegators, "alice") {
+		t.Fatalf("a delegation ending today should still be active through end of day, got %v", delegators)
+	}
+}
+
+// TestActiveDelegatorsFor_MalformedEndsAtIsExcluded confirms a value that
+// doesn't parse as a date fails closed (excluded, not indefinite) — the
+// same "wrong direction to fail on an access grant" posture
+// RoleCodesForUserInDepartment's own empty-department handling takes.
+func TestActiveDelegatorsFor_MalformedEndsAtIsExcluded(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	eng := crud.NewEngine(db)
+	actor := humanActor()
+
+	if _, err := eng.Create(ctx, Delegation(), map[string]any{
+		"delegator_user_id": "alice", "delegate_user_id": "bob", "ends_at": "not-a-date",
+	}, actor); err != nil {
+		t.Fatalf("create Delegation: %v", err)
+	}
+
+	delegators, err := ActiveDelegatorsFor(ctx, db, "bob")
+	if err != nil {
+		t.Fatalf("ActiveDelegatorsFor: %v", err)
+	}
+	if containsCode(delegators, "alice") {
+		t.Fatalf("a malformed ends_at must fail closed (excluded), got %v", delegators)
+	}
+}
+
+// TestActiveDelegatorsFor_SelfDelegationExcluded confirms a delegation
+// naming the same user as both delegator and delegate never appears in
+// the returned set — see Delegation's own doc comment on why this is
+// inert rather than rejected.
+func TestActiveDelegatorsFor_SelfDelegationExcluded(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	eng := crud.NewEngine(db)
+	actor := humanActor()
+
+	if _, err := eng.Create(ctx, Delegation(), map[string]any{
+		"delegator_user_id": "alice", "delegate_user_id": "alice",
+	}, actor); err != nil {
+		t.Fatalf("create Delegation: %v", err)
+	}
+
+	delegators, err := ActiveDelegatorsFor(ctx, db, "alice")
+	if err != nil {
+		t.Fatalf("ActiveDelegatorsFor: %v", err)
+	}
+	if containsCode(delegators, "alice") {
+		t.Fatalf("self-delegation must not appear in the returned set, got %v", delegators)
+	}
+}
+
+// TestActiveDelegatorsFor_NotTargetingThisUserIsExcluded confirms a
+// delegation naming a different delegate doesn't leak into an unrelated
+// user's result.
+func TestActiveDelegatorsFor_NotTargetingThisUserIsExcluded(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	eng := crud.NewEngine(db)
+	actor := humanActor()
+
+	if _, err := eng.Create(ctx, Delegation(), map[string]any{
+		"delegator_user_id": "alice", "delegate_user_id": "bob",
+	}, actor); err != nil {
+		t.Fatalf("create Delegation: %v", err)
+	}
+
+	delegators, err := ActiveDelegatorsFor(ctx, db, "carol")
+	if err != nil {
+		t.Fatalf("ActiveDelegatorsFor: %v", err)
+	}
+	if len(delegators) != 0 {
+		t.Fatalf("carol has no delegations naming her, expected none, got %v", delegators)
+	}
+}
+
+// TestActiveDelegatorsFor_NoDelegations_ReturnsEmptyNotError matches the
+// nil-not-error-on-zero-grants contract every other resolver in this
+// file establishes.
+func TestActiveDelegatorsFor_NoDelegations_ReturnsEmptyNotError(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+
+	delegators, err := ActiveDelegatorsFor(ctx, db, "nobody-delegated-to")
+	if err != nil {
+		t.Fatalf("expected no error for a user with zero delegations, got %v", err)
+	}
+	if len(delegators) != 0 {
+		t.Fatalf("expected zero delegators, got %v", delegators)
+	}
 }
