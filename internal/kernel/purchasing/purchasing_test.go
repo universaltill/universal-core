@@ -19,6 +19,8 @@ func TestAllPurchasingFormsAreValid(t *testing.T) {
 	forms := []*form.Definition{
 		ItemForm(), PurchaseOrderForm(), POLineForm(), InventoryItemForm(),
 		GoodsReceiptForm(), GoodsReceiptLineForm(), ReorderRuleForm(),
+		RequestForQuotationForm(), RequestForQuotationLineForm(),
+		RequestForQuotationVendorForm(), RequestForQuotationQuoteLineForm(),
 	}
 	for _, f := range forms {
 		if err := f.Validate(); err != nil {

@@ -63,18 +63,22 @@ var poStatusDisplayOrder = []string{"draft", "submitted", "approved", "received"
 var purchasingReportEntityTypes = []string{"PurchaseOrder", "Status", "Party", "InventoryItem", "Item", "POLine", "GoodsReceipt", "ReorderRule"}
 
 // requireReportRead denies the whole report page unless the actor can
-// read every entity type it aggregates, reusing ts.crud.CanRead (the
-// same GuardedEngine/Resolver method dashboard.go already uses to filter
-// nav links) rather than inventing a new permission check: ReportingRepo
+// read every one of entityTypes, reusing ts.crud.CanRead (the same
+// GuardedEngine/Resolver method dashboard.go already uses to filter nav
+// links) rather than inventing a new permission check: ReportingRepo
 // itself bypasses the guarded engine for its aggregate SQL, but the
 // question this must answer first — can this actor see PurchaseOrder/
-// Party/InventoryItem/Item at all — is exactly what the Resolver already
-// knows, opt-in semantics and all (a type with zero Permission rows
-// stays readable, same as everywhere else this method is used).
-func (h *Handler) requireReportRead(w http.ResponseWriter, r *http.Request, rc *httpx.RequestContext, ts tenantScope, locale string) bool {
-	for _, entityType := range purchasingReportEntityTypes {
+// Party/InventoryItem/Item (or, for the RFQ comparison report,
+// RequestForQuotation/.../Party) at all — is exactly what the Resolver
+// already knows, opt-in semantics and all (a type with zero Permission
+// rows stays readable, same as everywhere else this method is used).
+// Shared by every whole-page report gate in this package (see
+// purchasingReportEntityTypes/rfqReportEntityTypes) rather than each
+// report re-implementing the same loop.
+func (h *Handler) requireReportRead(w http.ResponseWriter, r *http.Request, rc *httpx.RequestContext, ts tenantScope, locale string, entityTypes []string) bool {
+	for _, entityType := range entityTypes {
 		allowed, err := ts.crud.CanRead(r.Context(), entityType)
-		if !h.denyPageUnless(w, r, rc, locale, allowed, err, "check "+entityType+" read permission for purchasing report") {
+		if !h.denyPageUnless(w, r, rc, locale, allowed, err, "check "+entityType+" read permission for report") {
 			return false
 		}
 	}
@@ -111,7 +115,7 @@ func (h *Handler) renderPurchasingReport(w http.ResponseWriter, r *http.Request)
 	locale := localeFromRequest(w, r)
 	ctx := r.Context()
 
-	if !h.requireReportRead(w, r, &rc, ts, locale) {
+	if !h.requireReportRead(w, r, &rc, ts, locale, purchasingReportEntityTypes) {
 		return
 	}
 

@@ -338,6 +338,11 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	// The mgmt reporting workbench (QUEUE.md's design-partner opportunity
 	// entry) — see reporting.go's doc comment.
 	mux.Handle("GET /reports/purchasing", authPage(h.renderPurchasingReport))
+	// The RFQ vendor-comparison report (#9) — see rfq_report.go's doc
+	// comment. {id} is the RequestForQuotation record's own id, not an
+	// entity type — this report is scoped to exactly one RFQ, unlike the
+	// purchasing report above which aggregates across every record.
+	mux.Handle("GET /reports/rfq/{id}", authPage(h.renderRFQComparisonReport))
 	// The BYOK AI-provider settings page — see aiprovidersettings.go's own
 	// doc comment. Not entity-scoped in the URL, same reasoning as
 	// /issue-report/*: AIProviderConnection is one fixed foundation
