@@ -181,6 +181,21 @@ type fieldView struct {
 	// the user searches.
 	RefTarget    string
 	CurrentLabel string
+	// I18nInputs is set only for FieldI18nText (ADR-0009): one entry per
+	// supported locale, each rendered as its own text input named
+	// "{Name}.{Locale}" so the form decoder can reassemble the per-locale
+	// object. Ordered by locale for stable rendering.
+	I18nInputs []i18nInputView
+}
+
+// i18nInputView is one locale's input within an i18n_text field. Required
+// is set only on the fallback (primary) locale's input when the field is
+// required — a required multilingual field must be named in the primary
+// language at least, not in every language at once (ADR-0009).
+type i18nInputView struct {
+	Locale   string
+	Value    string
+	Required bool
 }
 
 // optionView is one <option> — Label and Value differ for
@@ -526,6 +541,20 @@ func (r *Renderer) buildFields(s form.Section, ent *entity.Definition, record ma
 					break
 				}
 			}
+		case entity.FieldI18nText:
+			// One input per supported locale (ADR-0009), each pre-filled
+			// from the stored per-locale object and named "{field}.{locale}"
+			// so the API's form decoder can reassemble the object. Ordered
+			// by locale (Available is sorted) for stable rendering.
+			values, _ := record[ff.Name].(map[string]any)
+			for _, loc := range r.i18n.Available() {
+				val, _ := values[loc].(string)
+				fv.I18nInputs = append(fv.I18nInputs, i18nInputView{
+					Locale:   loc,
+					Value:    val,
+					Required: ef.Required && loc == r.i18n.Fallback(),
+				})
+			}
 		}
 
 		out = append(out, fv)
@@ -573,6 +602,9 @@ const tmplSrc = `<form class="uc-form" data-entity-type="{{.EntityType}}" hx-pos
 <input type="text" id="{{.Name}}" class="uc-ref-search" autocomplete="off" value="{{.CurrentLabel}}" placeholder="{{$.RefSearchPlaceholder}}"{{if .Required}} required{{end}}>
 <div class="uc-ref-results" hidden></div>
 </div>
+{{else if eq .Type "i18n_text"}}<div class="uc-i18n" data-field="{{.Name}}">
+{{$fname := .Name}}{{range $i, $inp := .I18nInputs}}<div class="uc-i18n-row"><span class="uc-i18n-locale">{{$inp.Locale}}</span><input type="text"{{if eq $i 0}} id="{{$fname}}"{{end}} name="{{$fname}}.{{$inp.Locale}}" value="{{$inp.Value}}" autocomplete="off" aria-label="{{$fname}} {{$inp.Locale}}"{{if $inp.Required}} required{{end}}></div>
+{{end}}</div>
 {{else if eq .Type "enum"}}<select id="{{.Name}}" name="{{.Name}}"{{if .Required}} required{{end}}>
 {{range .Options}}<option value="{{.Value}}" {{if .Selected}}selected{{end}}>{{.Label}}</option>{{end}}
 </select>

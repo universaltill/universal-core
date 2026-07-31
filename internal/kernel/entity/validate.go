@@ -49,6 +49,22 @@ func validateFieldValue(f Field, v any) error {
 		if !slices.Contains(f.EnumValues, s) {
 			return fmt.Errorf("value %q not in enum %v", s, f.EnumValues)
 		}
+	case FieldI18nText:
+		// Structural only (ADR-0009): a JSON object of locale -> string.
+		// Which locales are valid is deliberately NOT checked here — that
+		// would couple this generic engine to the i18n catalog; the
+		// render/API layer only ever offers real locales. An empty object
+		// is allowed (it reads back as "no translation", same as an unset
+		// field), so this is purely a shape check.
+		m, ok := v.(map[string]any)
+		if !ok {
+			return fmt.Errorf("expected an object of locale->string for i18n_text, got %T", v)
+		}
+		for loc, val := range m {
+			if _, ok := val.(string); !ok {
+				return fmt.Errorf("i18n_text value for locale %q must be a string, got %T", loc, val)
+			}
+		}
 	default:
 		return fmt.Errorf("unknown field type %q", f.Type)
 	}

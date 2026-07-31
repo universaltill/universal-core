@@ -2,6 +2,7 @@ package csvimport
 
 import (
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"io"
 	"strconv"
@@ -117,6 +118,19 @@ func formatValue(v any) string {
 		return strconv.FormatBool(t)
 	case float64:
 		return strconv.FormatFloat(t, 'f', -1, 64)
+	case map[string]any:
+		// An i18n_text value (ADR-0009) exports as its JSON object, the
+		// exact string form Coerce parses back on re-import. An empty
+		// object exports as an empty cell so it round-trips as "absent",
+		// consistent with the nil case above.
+		if len(t) == 0 {
+			return ""
+		}
+		b, err := json.Marshal(t)
+		if err != nil {
+			return fmt.Sprintf("%v", t)
+		}
+		return string(b)
 	default:
 		// Unreachable for any value entity.ValidateRecord would have
 		// accepted in the first place — falling back to fmt.Sprintf

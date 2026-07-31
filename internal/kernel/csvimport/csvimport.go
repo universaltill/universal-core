@@ -32,6 +32,7 @@ package csvimport
 import (
 	"context"
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"io"
 	"strconv"
@@ -265,6 +266,20 @@ func Coerce(t entity.FieldType, raw string) (any, error) {
 			return nil, fmt.Errorf("%q is not a bool (use true/false/1/0/t/f)", raw)
 		}
 		return b, nil
+	case entity.FieldI18nText:
+		// An i18n_text value (ADR-0009) round-trips through CSV as a JSON
+		// object string, e.g. {"en":"Each","tr":"Adet"} — the same shape
+		// export.go writes. An empty cell is "no translations" (an empty
+		// object), matching the blank-cell-is-absent convention callers
+		// already apply before ever calling Coerce.
+		if strings.TrimSpace(raw) == "" {
+			return map[string]any{}, nil
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(raw), &m); err != nil {
+			return nil, fmt.Errorf("%q is not a JSON object of locale->text for an i18n_text field", raw)
+		}
+		return m, nil
 	default: // FieldString, FieldDate, FieldReference, FieldEnum
 		return raw, nil
 	}

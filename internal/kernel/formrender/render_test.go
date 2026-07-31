@@ -988,3 +988,56 @@ func TestRender_NoRedactionMatchesUnfilteredRender(t *testing.T) {
 		t.Fatalf("empty redaction set changed the render:\n%s\n---\n%s", got, want)
 	}
 }
+
+// TestRender_I18nTextRendersOneInputPerLocale covers the i18n_text field
+// type (ADR-0009): a multilingual field renders one text input per catalog
+// locale, each named "{field}.{locale}" so the API form decoder can
+// reassemble the object, pre-filled from the stored per-locale values,
+// with `required` on the fallback (primary) locale only — not every input.
+func TestRender_I18nTextRendersOneInputPerLocale(t *testing.T) {
+	r := testRenderer(t)
+	ent := &entity.Definition{
+		EntityType: "Unit",
+		Fields:     []entity.Field{{Name: "label", Type: entity.FieldI18nText, Required: true}},
+	}
+	def := &form.Definition{
+		EntityType: "Unit",
+		Sections: []form.Section{{
+			Title: "Details", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "label", Label: "Label"}},
+		}},
+	}
+	data := Data{Record: map[string]any{"label": map[string]any{"en": "Each", "tr": "Adet"}}}
+	var buf strings.Builder
+	if err := r.Render(&buf, def, ent, data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	body := buf.String()
+
+	// One input per catalog locale (ar, en, fa, tr), each named field.locale.
+	for _, loc := range []string{"ar", "en", "fa", "tr"} {
+		if !strings.Contains(body, `name="label.`+loc+`"`) {
+			t.Fatalf("expected an input for locale %q (name=\"label.%s\"), got:\n%s", loc, loc, body)
+		}
+	}
+	// Stored values are pre-filled.
+	if !strings.Contains(body, `name="label.en" value="Each"`) {
+		t.Fatalf("expected the en value pre-filled, got:\n%s", body)
+	}
+	if !strings.Contains(body, `name="label.tr" value="Adet"`) {
+		t.Fatalf("expected the tr value pre-filled, got:\n%s", body)
+	}
+	// A locale with no stored value renders an empty input, not an error.
+	if !strings.Contains(body, `name="label.fa" value=""`) {
+		t.Fatalf("expected an empty fa input, got:\n%s", body)
+	}
+	// `required` is ONLY on the fallback locale (en), not on every input:
+	// a required multilingual field must be named in the primary language,
+	// not in all four at once.
+	if !strings.Contains(body, `name="label.en" value="Each" autocomplete="off" aria-label="label en" required>`) {
+		t.Fatalf("expected required on the en (fallback) input, got:\n%s", body)
+	}
+	if strings.Contains(body, `name="label.tr" value="Adet" autocomplete="off" aria-label="label tr" required>`) {
+		t.Fatalf("required must NOT be on a non-fallback locale input, got:\n%s", body)
+	}
+}

@@ -76,7 +76,7 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 	// means a typo'd or hidden field silently falls back to the default
 	// ordering rather than erroring or leaking that the field exists.
 	opts := data.ListPageOptions{Limit: listPageSize}
-	if sf := r.URL.Query().Get("sort"); sf != "" && isVisibleColumn(columns, sf) {
+	if sf := r.URL.Query().Get("sort"); sf != "" && isVisibleColumn(columns, sf) && sortFilterableField(def, sf) {
 		opts.SortField = sf
 		opts.SortDesc = r.URL.Query().Get("dir") == "desc"
 		// A number field sorts numerically, not as text — otherwise a
@@ -86,15 +86,24 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	filterField := r.URL.Query().Get("filter")
-	if filterField == "" && len(columns) > 0 {
-		// No explicit field: search the first visible column. A
-		// single-box filter with no column picker (the current UI) needs a
-		// default target, and the first column — conventionally name — is
-		// the one a user means by "filter this list".
-		filterField = columns[0].Name
+	if filterField == "" {
+		// No explicit field: the single filter box (no column picker in the
+		// current UI) targets the first visible column that can actually be
+		// filtered — conventionally name. An i18n_text column is skipped
+		// because it stores a JSON object, not a searchable string
+		// (ADR-0009): `data->>'name'` on an object matches its raw JSON
+		// text, which is meaningless — the same reason the reference-search
+		// endpoint degrades. Localized filtering needs a per-locale JSONB
+		// expression index and is deferred (ties into #64).
+		for _, c := range columns {
+			if sortFilterableField(def, c.Name) {
+				filterField = c.Name
+				break
+			}
+		}
 	}
 	filterValue := r.URL.Query().Get("q")
-	if filterValue != "" && isVisibleColumn(columns, filterField) {
+	if filterValue != "" && isVisibleColumn(columns, filterField) && sortFilterableField(def, filterField) {
 		opts.FilterField = filterField
 		opts.FilterValue = filterValue
 	}
@@ -133,7 +142,7 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 	// target was deleted, or is not readable by this viewer) falls back to
 	// showing the raw id in the cell renderer — visible-but-broken beats
 	// silently hiding that the reference is dangling.
-	referenceLabels := h.pageReferenceLabels(r.Context(), ts, def, records)
+	referenceLabels := h.pageReferenceLabels(r.Context(), ts, def, records, locale)
 
 	view := recordListView{
 		Name:        h.entityDisplayName(locale, entityType),
@@ -199,6 +208,14 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 		// arrow shows the current sort so the ordering is legible, not a
 		// mystery the user has to test by reading rows.
 		label := h.catalog.TOrDefault(locale, "field."+entityType+"."+f.Name, f.Name)
+		// An i18n_text column can't be sorted (its value is a JSON object,
+		// not orderable text — ADR-0009), so it renders as a plain header
+		// with no sort link rather than a link that would order by raw JSON
+		// text. Empty Href signals the template to drop the <a>.
+		if !sortFilterableField(def, f.Name) {
+			view.Columns = append(view.Columns, columnView{Label: label})
+			continue
+		}
 		nextDesc := opts.SortField == f.Name && !opts.SortDesc
 		params := url.Values{"sort": {f.Name}}
 		if nextDesc {
@@ -259,6 +276,19 @@ func isVisibleColumn(cols []entity.Field, name string) bool {
 	return false
 }
 
+// sortFilterableField reports whether a field can back a SQL sort/filter.
+// An i18n_text field (ADR-0009) can't: its value is a JSON object, so
+// `data->>'name'` would order/match by the object's raw JSON text, which is
+// meaningless — the same reason the reference-search endpoint degrades for
+// such a label. Localized sort/filter needs a per-locale JSONB expression
+// index and is deferred (#64). A field the Definition doesn't declare is
+// not sort/filterable either (defensive; callers already gate on
+// isVisibleColumn).
+func sortFilterableField(def *entity.Definition, name string) bool {
+	f, ok := def.FieldByName(name)
+	return ok && f.Type != entity.FieldI18nText
+}
+
 func visibleFields(def *entity.Definition, redacted map[string]bool) []entity.Field {
 	if len(redacted) == 0 {
 		return def.Fields
@@ -292,6 +322,14 @@ func (h *Handler) cellText(entityType string, f entity.Field, value any, referen
 	case entity.FieldEnum:
 		if v, ok := value.(string); ok && v != "" {
 			return h.catalog.TOrDefault(locale, "field."+entityType+"."+f.Name+"."+v, v)
+		}
+	case entity.FieldI18nText:
+		// A multilingual field (ADR-0009) is a JSON object, not a string —
+		// resolve it to the viewer's locale so its OWN list column shows a
+		// readable value, not a raw map dump. An empty/absent value falls
+		// through to FormatFieldValue's blank.
+		if s, ok := h.catalog.ResolveLocalized(value, locale); ok {
+			return s
 		}
 	}
 	return formrender.FormatFieldValue(value)
@@ -352,7 +390,7 @@ var recordListTmpl = template.Must(template.New("recordList").Parse(`
 <p class="uc-empty">{{.Empty}}</p>
 {{else}}
 <table class="uc-table">
-<thead><tr>{{range .Columns}}<th><a class="uc-sort" href="{{.Href}}">{{.Label}}{{.Arrow}}</a></th>{{end}}</tr></thead>
+<thead><tr>{{range .Columns}}<th>{{if .Href}}<a class="uc-sort" href="{{.Href}}">{{.Label}}{{.Arrow}}</a>{{else}}{{.Label}}{{end}}</th>{{end}}</tr></thead>
 <tbody>
 {{range .Rows}}
 {{$row := .}}

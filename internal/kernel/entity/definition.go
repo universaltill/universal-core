@@ -22,6 +22,14 @@ const (
 	FieldDate      FieldType = "date"
 	FieldEnum      FieldType = "enum"
 	FieldReference FieldType = "reference" // points at an independently existing entity
+	// FieldI18nText holds multilingual record data (ADR-0009): its value is
+	// a JSON object keyed by locale, e.g. {"en":"Each","tr":"Adet"}, stored
+	// in the same JSONB data column as every other field. Read locale-aware
+	// via i18n.Catalog.ResolveLocalized; rendered as one input per locale.
+	// The kernel validates it only structurally (an object of strings) and
+	// never checks which locales are valid — that stays at the i18n/render
+	// layer, keeping this generic engine decoupled from the catalog.
+	FieldI18nText FieldType = "i18n_text"
 )
 
 // RelationshipKind distinguishes the three relationship mechanisms named

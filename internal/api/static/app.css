@@ -486,3 +486,12 @@ th a.uc-sort:hover { text-decoration: underline; }
 }
 .uc-ref-option { padding: 0.4rem 0.6rem; cursor: pointer; font-size: 0.9rem; }
 .uc-ref-option:hover { background: var(--uc-bg); }
+
+/* Multilingual (i18n_text) field: one input per locale (ADR-0009, #23). */
+.uc-i18n { display: flex; flex-direction: column; gap: 0.3rem; }
+.uc-i18n-row { display: flex; align-items: center; gap: 0.5rem; }
+.uc-i18n-locale {
+  flex: 0 0 2.5rem; text-transform: uppercase; font-size: 0.75rem;
+  color: var(--uc-muted, #666); font-weight: 600;
+}
+.uc-i18n-row input { flex: 1 1 auto; }

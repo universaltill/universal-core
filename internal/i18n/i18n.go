@@ -88,6 +88,53 @@ func (c *Catalog) TOrDefault(locale, key, fallback string) string {
 	return fallback
 }
 
+// ResolveLocalized resolves a record's multilingual value (an entity
+// FieldI18nText, ADR-0009) for the given viewer locale. v is the raw
+// value straight off the JSONB data column: for an i18n_text field it is a
+// map[string]any of locale -> string (that is how encoding/json unmarshals
+// the stored object).
+//
+// Returns (resolved, true) when v is such an object, so callers can tell a
+// genuine i18n value apart from an ordinary field — a plain string field
+// yields (\"\", false) and the caller keeps its existing string handling
+// untouched. The fallback chain mirrors T's: exact locale, its base
+// language, the catalog fallback and its base language, then — so a value
+// that exists in *some* language is never shown blank — the first
+// non-empty entry in deterministic (sorted) locale order. All-empty or a
+// non-object yields \"\".
+func (c *Catalog) ResolveLocalized(v any, locale string) (string, bool) {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return "", false
+	}
+	str := func(loc string) string {
+		s, _ := m[loc].(string)
+		return s
+	}
+	for _, loc := range []string{locale, baseLang(locale), c.fallback, baseLang(c.fallback)} {
+		if s := str(loc); s != "" {
+			return s, true
+		}
+	}
+	// Last resort: any translation at all, chosen deterministically so the
+	// same record always resolves the same way regardless of map order.
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if s := str(k); s != "" {
+			return s, true
+		}
+	}
+	return "", true
+}
+
+// Fallback returns the catalog's fallback locale (the primary language a
+// required multilingual field must at least be filled in — see ADR-0009).
+func (c *Catalog) Fallback() string { return c.fallback }
+
 // Available returns the sorted locale codes that have at least one message.
 func (c *Catalog) Available() []string {
 	out := make([]string, 0, len(c.messages))

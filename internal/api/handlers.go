@@ -671,6 +671,29 @@ func parseRecordFields(r *http.Request, entDef *entity.Definition) (map[string]a
 		}
 		fields := make(map[string]any, len(entDef.Fields))
 		for _, f := range entDef.Fields {
+			if f.Type == entity.FieldI18nText {
+				// An i18n_text field (ADR-0009) is submitted as one input per
+				// locale named "{field}.{locale}", not a single "{field}"
+				// value — reassemble them into the locale->string object the
+				// record stores. Only non-empty locales are kept (a cleared
+				// locale drops that translation on a full-replacement update);
+				// an all-empty field is treated as absent, exactly like a
+				// blank plain field below.
+				obj := map[string]any{}
+				prefix := f.Name + "."
+				for key, vals := range r.PostForm {
+					if len(vals) == 0 || !strings.HasPrefix(key, prefix) {
+						continue
+					}
+					if val := vals[len(vals)-1]; val != "" {
+						obj[key[len(prefix):]] = val
+					}
+				}
+				if len(obj) > 0 {
+					fields[f.Name] = obj
+				}
+				continue
+			}
 			vals := r.PostForm[f.Name]
 			if len(vals) == 0 {
 				// Absent entirely, not just empty: formrender always
@@ -762,13 +785,14 @@ func (h *Handler) writeRecordFormFragment(w http.ResponseWriter, r *http.Request
 		writeDefinitionLookupError(w, entityType, err)
 		return
 	}
-	renderData, err := h.buildFormRenderData(r.Context(), ts, entDef, formDef, id)
+	locale := localeFromRequest(w, r)
+	renderData, err := h.buildFormRenderData(r.Context(), ts, entDef, formDef, id, locale)
 	if err != nil {
 		writeCrudError(w, fmt.Sprintf("build %s form render data (id=%q)", entityType, id), err)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := h.renderer.Render(w, formDef, entDef, renderData, localeFromRequest(w, r)); err != nil {
+	if err := h.renderer.Render(w, formDef, entDef, renderData, locale); err != nil {
 		log.Printf("api: render %s form fragment (id=%q): %v", entityType, id, err)
 		httpx.WriteError(w, http.StatusInternalServerError, "internal error")
 	}
@@ -865,7 +889,7 @@ func (h *Handler) renderForm(w http.ResponseWriter, r *http.Request, id string) 
 		return
 	}
 
-	renderData, err := h.buildFormRenderData(r.Context(), ts, entDef, formDef, id)
+	renderData, err := h.buildFormRenderData(r.Context(), ts, entDef, formDef, id, locale)
 	if errors.Is(err, data.ErrNotFound) {
 		httpx.WriteError(w, http.StatusNotFound, fmt.Sprintf("%s %q not found", entityType, id))
 		return
@@ -904,7 +928,7 @@ func (h *Handler) renderForm(w http.ResponseWriter, r *http.Request, id string) 
 // both build the exact same data shape the same way, rather than two
 // copies that could silently drift (e.g. one remembering to populate
 // master-detail children, the other not).
-func (h *Handler) buildFormRenderData(ctx context.Context, ts tenantScope, entDef *entity.Definition, formDef *form.Definition, id string) (formrender.Data, error) {
+func (h *Handler) buildFormRenderData(ctx context.Context, ts tenantScope, entDef *entity.Definition, formDef *form.Definition, id, locale string) (formrender.Data, error) {
 	// Resolved before anything else: a field this viewer may not see must
 	// be absent from the form whether or not there's a record to load,
 	// since a blank "new" form leaks a hidden field's NAME just as
@@ -936,7 +960,7 @@ func (h *Handler) buildFormRenderData(ctx context.Context, ts tenantScope, entDe
 	// nothing pre-loaded — the picker fetches candidates on demand from
 	// /api/references. This is the whole point of the task: form render no
 	// longer lists every target record.
-	renderData.ReferenceOptions = h.loadCurrentReferenceLabels(ctx, ts, entDef, renderData.Record)
+	renderData.ReferenceOptions = h.loadCurrentReferenceLabels(ctx, ts, entDef, renderData.Record, locale)
 	return renderData, nil
 }
 
@@ -958,7 +982,7 @@ func (h *Handler) buildFormRenderData(ctx context.Context, ts tenantScope, entDe
 // picker then simply opens empty, the same graceful degradation the old
 // full-list loader applied. Labels are cached per target+id so two fields
 // pointing at the same record resolve it once.
-func (h *Handler) loadCurrentReferenceLabels(ctx context.Context, ts tenantScope, entDef *entity.Definition, record map[string]any) map[string][]formrender.ReferenceOption {
+func (h *Handler) loadCurrentReferenceLabels(ctx context.Context, ts tenantScope, entDef *entity.Definition, record map[string]any, locale string) map[string][]formrender.ReferenceOption {
 	if record == nil {
 		return nil
 	}
@@ -976,7 +1000,7 @@ func (h *Handler) loadCurrentReferenceLabels(ctx context.Context, ts tenantScope
 		label, ok := cache[key]
 		if !ok {
 			var err error
-			label, err = h.referenceLabelFor(ctx, ts, f.Target, current)
+			label, err = h.referenceLabelFor(ctx, ts, f.Target, current, locale)
 			if err != nil {
 				log.Printf("api: resolve reference label for %s.%s -> %s(%s): %v", entDef.EntityType, f.Name, f.Target, current, err)
 				continue
@@ -1021,15 +1045,37 @@ func referenceLabelFieldFor(targetDef *entity.Definition) string {
 	return ""
 }
 
+// recordLabel is the single place a referenced record's human label is
+// derived from a LOADED record — shared by referenceLabelFor (which Gets
+// the record) and searchReferenceOptions (which already has it). Labeled by
+// the first field in referenceLabelFieldCandidates the target declares. If
+// that field is an i18n_text (ADR-0009), the label is resolved for the
+// viewer's locale via the i18n catalog's fallback chain; otherwise it's the
+// plain string. Falls back to the raw id when there is no label field, the
+// value is empty, or the i18n object has no usable translation. Ordinary
+// (non-i18n) record data is still not translated — only a field explicitly
+// declared i18n_text is (see ADR-0009 and locale.go's entityDisplayName,
+// which translates the "PurchaseOrder" identifier, a different concern).
+func (h *Handler) recordLabel(def *entity.Definition, rec data.Record, locale string) string {
+	labelField := referenceLabelFieldFor(def)
+	if labelField == "" {
+		return rec.ID
+	}
+	if f, ok := def.FieldByName(labelField); ok && f.Type == entity.FieldI18nText {
+		if s, ok := h.catalog.ResolveLocalized(rec.Data[labelField], locale); ok && s != "" {
+			return s
+		}
+		return rec.ID
+	}
+	if s, ok := rec.Data[labelField].(string); ok && s != "" {
+		return s
+	}
+	return rec.ID
+}
+
 // referenceLabelFor resolves ONE referenced record's human label by id —
-// an indexed Get, not a full-table List. Labeled by the first field in
-// referenceLabelFieldCandidates the target entity declares, or its raw id
-// if it declares none (or the label field is empty). Record data itself is
-// tenant-owned business data, not UI chrome — no i18n applies to the label
-// the way it does to entity/module type names (see locale.go's
-// entityDisplayName, a genuinely different concern: translating
-// "PurchaseOrder" the identifier, not translating one vendor's name).
-func (h *Handler) referenceLabelFor(ctx context.Context, ts tenantScope, targetType, id string) (string, error) {
+// an indexed Get, not a full-table List — for the viewer's locale.
+func (h *Handler) referenceLabelFor(ctx context.Context, ts tenantScope, targetType, id, locale string) (string, error) {
 	targetDef, err := ts.entityDef(ctx, targetType)
 	if err != nil {
 		return "", fmt.Errorf("look up target entity %s: %w", targetType, err)
@@ -1038,12 +1084,7 @@ func (h *Handler) referenceLabelFor(ctx context.Context, ts tenantScope, targetT
 	if err != nil {
 		return "", fmt.Errorf("get %s record %s: %w", targetType, id, err)
 	}
-	if labelField := referenceLabelFieldFor(targetDef); labelField != "" {
-		if s, ok := rec.Data[labelField].(string); ok && s != "" {
-			return s, nil
-		}
-	}
-	return rec.ID, nil
+	return h.recordLabel(targetDef, rec, locale), nil
 }
 
 // pageReferenceLabels resolves the labels of just the reference ids that
@@ -1055,7 +1096,7 @@ func (h *Handler) referenceLabelFor(ctx context.Context, ts tenantScope, targetT
 // can't be resolved (dangling id, or this viewer lacking read access to
 // the target) is simply omitted; the cell renderer falls back to the raw
 // id — visible-but-broken beats silently hiding a dangling reference.
-func (h *Handler) pageReferenceLabels(ctx context.Context, ts tenantScope, def *entity.Definition, records []data.Record) map[string]map[string]string {
+func (h *Handler) pageReferenceLabels(ctx context.Context, ts tenantScope, def *entity.Definition, records []data.Record, locale string) map[string]map[string]string {
 	out := map[string]map[string]string{}
 	cache := map[string]string{} // "target\x00id" -> label
 	for _, f := range def.Fields {
@@ -1075,7 +1116,7 @@ func (h *Handler) pageReferenceLabels(ctx context.Context, ts tenantScope, def *
 			label, ok := cache[key]
 			if !ok {
 				var err error
-				label, err = h.referenceLabelFor(ctx, ts, f.Target, id)
+				label, err = h.referenceLabelFor(ctx, ts, f.Target, id, locale)
 				if err != nil {
 					log.Printf("api: resolve list reference label for %s.%s -> %s(%s): %v", def.EntityType, f.Name, f.Target, id, err)
 					continue

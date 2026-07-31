@@ -100,3 +100,52 @@ func TestAvailable_ListsBothLocales(t *testing.T) {
 		}
 	}
 }
+
+// TestResolveLocalized covers the multilingual-data resolver (ADR-0009):
+// exact-locale hit, base-language fall-through, catalog-fallback, the
+// "any translation rather than blank" last resort, and the two negative
+// cases (a non-object value, and an all-empty object).
+func TestResolveLocalized(t *testing.T) {
+	c, err := Load("en")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	full := map[string]any{"en": "Each", "tr": "Adet", "fa": "عدد", "ar": "قطعة"}
+
+	// Exact locale.
+	if got, ok := c.ResolveLocalized(full, "tr"); !ok || got != "Adet" {
+		t.Fatalf("exact locale: got (%q,%v), want (Adet,true)", got, ok)
+	}
+	// Region tag falls through to base language: "en-US" -> "en".
+	if got, ok := c.ResolveLocalized(full, "en-US"); !ok || got != "Each" {
+		t.Fatalf("base-lang fall-through: got (%q,%v), want (Each,true)", got, ok)
+	}
+	// Missing locale falls back to the catalog fallback ("en").
+	if got, ok := c.ResolveLocalized(map[string]any{"en": "Each"}, "tr"); !ok || got != "Each" {
+		t.Fatalf("fallback locale: got (%q,%v), want (Each,true)", got, ok)
+	}
+	// No requested/base/fallback match: any non-empty translation, chosen
+	// deterministically (sorted key order → "ar" before "fa").
+	if got, ok := c.ResolveLocalized(map[string]any{"fa": "عدد", "ar": "قطعة"}, "tr"); !ok || got != "قطعة" {
+		t.Fatalf("last-resort: got (%q,%v), want (قطعة,true)", got, ok)
+	}
+	// A plain string field (not an i18n object) → (\"\", false) so callers
+	// keep their existing string handling.
+	if got, ok := c.ResolveLocalized("plain", "en"); ok || got != "" {
+		t.Fatalf("non-object: got (%q,%v), want (\"\",false)", got, ok)
+	}
+	// An all-empty object is a valid i18n value with nothing to show.
+	if got, ok := c.ResolveLocalized(map[string]any{"en": "", "tr": ""}, "en"); !ok || got != "" {
+		t.Fatalf("all-empty: got (%q,%v), want (\"\",true)", got, ok)
+	}
+}
+
+func TestFallback_ReturnsConfiguredLocale(t *testing.T) {
+	c, err := Load("en")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.Fallback() != "en" {
+		t.Fatalf("Fallback: got %q, want en", c.Fallback())
+	}
+}
