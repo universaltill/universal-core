@@ -230,46 +230,44 @@ func TestRecordRepo_ListPageFilteredSortsAndFilters(t *testing.T) {
 	ctx := context.Background()
 	repo := NewRecordRepo(db)
 
-	for _, name := range []string{"Charlie", "alice", "Bob"} {
+	// Values chosen to sort identically under ANY collation — all lower
+	// case, no case-fold ambiguity — so this test isn't hostage to the
+	// server's LC_COLLATE (a case assumption made the first version pass
+	// locally and fail on CI's UTF-8-collated Postgres).
+	for _, name := range []string{"cherry", "apple", "banana"} {
 		if _, err := repo.Create(ctx, "Widget", map[string]any{"name": name}); err != nil {
 			t.Fatalf("create %s: %v", name, err)
 		}
 	}
 
-	// Case-insensitive ascending sort by a JSON field.
 	asc, err := repo.ListPageFiltered(ctx, "Widget", ListPageOptions{SortField: "name", Limit: 10})
 	if err != nil {
 		t.Fatalf("sort asc: %v", err)
 	}
 	got := []string{asc[0].Data["name"].(string), asc[1].Data["name"].(string), asc[2].Data["name"].(string)}
-	// Postgres text sort is byte-order: uppercase before lowercase, so
-	// "Bob","Charlie","alice" — the point is it is ordered by the field,
-	// deterministically, not that it matches a locale collation.
-	if !(got[0] <= got[1] && got[1] <= got[2]) {
-		t.Fatalf("not sorted ascending: %v", got)
+	if want := []string{"apple", "banana", "cherry"}; got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+		t.Fatalf("ascending sort: got %v, want %v", got, want)
 	}
 
 	desc, err := repo.ListPageFiltered(ctx, "Widget", ListPageOptions{SortField: "name", SortDesc: true, Limit: 10})
 	if err != nil {
 		t.Fatalf("sort desc: %v", err)
 	}
-	if desc[0].Data["name"] != asc[2].Data["name"] {
-		t.Fatalf("desc should reverse asc: asc=%v desc=%v", asc[2].Data["name"], desc[0].Data["name"])
+	if desc[0].Data["name"] != "cherry" {
+		t.Fatalf("desc should start with cherry, got %v", desc[0].Data["name"])
 	}
 
-	// Substring filter, case-insensitive.
-	filtered, err := repo.ListPageFiltered(ctx, "Widget", ListPageOptions{FilterField: "name", FilterValue: "b", Limit: 10})
+	// Substring filter, case-insensitive: only banana contains "an".
+	filtered, err := repo.ListPageFiltered(ctx, "Widget", ListPageOptions{FilterField: "name", FilterValue: "AN", Limit: 10})
 	if err != nil {
 		t.Fatalf("filter: %v", err)
 	}
-	// "Bob" and "alice"? no — "b" matches Bob only (Charlie has no b,
-	// alice has no b). Actually "Bob" contains b/B. Charlie: no. alice: no.
-	if len(filtered) != 1 || filtered[0].Data["name"] != "Bob" {
-		t.Fatalf("filter b should match only Bob, got %v", filtered)
+	if len(filtered) != 1 || filtered[0].Data["name"] != "banana" {
+		t.Fatalf("filter AN should match only banana (case-insensitively), got %v", filtered)
 	}
-	n, err := repo.CountFiltered(ctx, "Widget", ListPageOptions{FilterField: "name", FilterValue: "b"})
+	n, err := repo.CountFiltered(ctx, "Widget", ListPageOptions{FilterField: "name", FilterValue: "an"})
 	if err != nil || n != 1 {
-		t.Fatalf("CountFiltered b: got %d (%v), want 1", n, err)
+		t.Fatalf("CountFiltered an: got %d (%v), want 1", n, err)
 	}
 }
 
