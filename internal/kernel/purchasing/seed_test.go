@@ -463,6 +463,113 @@ func TestPublishStatuses_SeedsVendorInvoiceGraph(t *testing.T) {
 	}
 }
 
+// TestPublishStatuses_SeedsRFQGraph is TestPublishStatuses_SeedsGraph's
+// counterpart for the third StatusType this package now seeds
+// (rfq_status, #9): draft the only is_initial status; closed and
+// cancelled both is_terminal; and specifically NOT a closed->cancelled
+// or cancelled->* edge — both terminal states are dead ends, matching
+// purchase_order_status's own "received and cancelled are both terminal,
+// no edges leave either" shape.
+func TestPublishStatuses_SeedsRFQGraph(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	if err := foundation.Publish(ctx, db, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := PublishStatuses(ctx, db, actor); err != nil {
+		t.Fatalf("PublishStatuses: %v", err)
+	}
+
+	entityDefs := data.NewEntityDefinitionRepo(db)
+	engine := crud.NewEngine(db)
+	def := func(entityType string) *entity.Definition {
+		v, err := entityDefs.GetPublished(ctx, entityType)
+		if err != nil {
+			t.Fatalf("GetPublished(%s): %v", entityType, err)
+		}
+		d, err := entity.Unmarshal(v.Definition)
+		if err != nil {
+			t.Fatalf("unmarshal %s: %v", entityType, err)
+		}
+		return d
+	}
+
+	statusTypes, err := engine.ListByField(ctx, def("StatusType"), "code", "rfq_status")
+	if err != nil {
+		t.Fatalf("list rfq_status StatusType: %v", err)
+	}
+	if len(statusTypes) != 1 {
+		t.Fatalf("expected exactly 1 rfq_status StatusType, got %d", len(statusTypes))
+	}
+
+	statuses, err := engine.ListByField(ctx, def("Status"), "status_type_id", statusTypes[0].ID)
+	if err != nil {
+		t.Fatalf("list Status: %v", err)
+	}
+	wantStatuses := map[string]struct{ isInitial, isTerminal bool }{
+		"draft":           {true, false},
+		"sent":            {false, false},
+		"quotes_received": {false, false},
+		"closed":          {false, true},
+		"cancelled":       {false, true},
+	}
+	if len(statuses) != len(wantStatuses) {
+		t.Fatalf("expected %d Status records, got %d", len(wantStatuses), len(statuses))
+	}
+	statusIDs := map[string]string{}
+	for _, s := range statuses {
+		code, _ := s.Data["code"].(string)
+		want, ok := wantStatuses[code]
+		if !ok {
+			t.Fatalf("unexpected Status code %q", code)
+		}
+		if got := s.Data["is_initial"]; got != want.isInitial {
+			t.Errorf("Status %q: expected is_initial=%v, got %v", code, want.isInitial, got)
+		}
+		if got := s.Data["is_terminal"]; got != want.isTerminal {
+			t.Errorf("Status %q: expected is_terminal=%v, got %v", code, want.isTerminal, got)
+		}
+		statusIDs[code] = s.ID
+	}
+
+	transitionDef := def("StatusTransition")
+	wantEdges := [][2]string{
+		{"draft", "sent"}, {"sent", "quotes_received"}, {"quotes_received", "closed"},
+		{"draft", "cancelled"}, {"sent", "cancelled"}, {"quotes_received", "cancelled"},
+	}
+	for _, edge := range wantEdges {
+		rows, err := engine.ListByField(ctx, transitionDef, "from_status_id", statusIDs[edge[0]])
+		if err != nil {
+			t.Fatalf("list StatusTransition from %s: %v", edge[0], err)
+		}
+		found := false
+		for _, r := range rows {
+			if to, _ := r.Data["to_status_id"].(string); to == statusIDs[edge[1]] {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected a declared %s->%s StatusTransition", edge[0], edge[1])
+		}
+	}
+
+	// Both terminal states must be genuine dead ends — no edge leaves
+	// "closed" or "cancelled" (mirrors purchase_order_status's own
+	// "received"/"cancelled" shape).
+	for _, code := range []string{"closed", "cancelled"} {
+		rows, err := engine.ListByField(ctx, transitionDef, "from_status_id", statusIDs[code])
+		if err != nil {
+			t.Fatalf("list StatusTransition from %s: %v", code, err)
+		}
+		if len(rows) != 0 {
+			t.Errorf("expected no outgoing transitions from terminal status %q, got %d: %+v", code, len(rows), rows)
+		}
+	}
+}
+
 // TestPublishStatuses_IsIdempotent confirms a second call doesn't
 // duplicate the StatusType/Status/StatusTransition rows — same
 // getOrCreate-by-natural-key discipline as cmd/seed-demo-data.
@@ -495,10 +602,10 @@ func TestPublishStatuses_IsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list Status: %v", err)
 	}
-	// 5 purchase_order_status + 4 vendor_invoice_status — this package now
-	// seeds two StatusTypes (seedStatusGraph's own doc comment), not just
-	// purchase_order_status's original 5.
-	const wantTotal = 5 + 4
+	// 5 purchase_order_status + 4 vendor_invoice_status + 5 rfq_status —
+	// this package now seeds three StatusTypes (seedStatusGraph's own doc
+	// comment), not just purchase_order_status's original 5.
+	const wantTotal = 5 + 4 + 5
 	if len(all) != wantTotal {
 		t.Fatalf("expected exactly %d Status records after two PublishStatuses calls, got %d", wantTotal, len(all))
 	}

@@ -308,6 +308,34 @@ func TestUniversalCore_TenantPrefixRoute_RegisteredAndGated(t *testing.T) {
 	}
 }
 
+// TestUniversalCore_ReportRoutes_RegisteredAndGated is the smoke layer
+// for the report pages — the RFQ vendor-comparison report (#9) and the
+// purchasing report it shares requireReportRead with: the real compiled
+// binary registers both on the production mux (401 from the auth
+// wrapper, not the mux's own 404) rather than only internal/api's
+// httptest mux knowing about them. The RFQ route is path-parameterised
+// (/reports/rfq/{id}), so a bare registration bug there would surface as
+// a 404 for every id — worth pinning at the binary level, since nothing
+// in the UI links to it yet for a human to notice.
+func TestUniversalCore_ReportRoutes_RegisteredAndGated(t *testing.T) {
+	controlDSN := testexec.FreshDatabase(t, "uc_test_server_control")
+	baseURL := startServer(t, controlDSN, "INSECURE_DEV_AUTH=true")
+
+	for _, path := range []string{
+		"/reports/purchasing",
+		"/reports/rfq/00000000-0000-0000-0000-000000000000",
+	} {
+		resp, err := http.Get(baseURL + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("GET %s: expected 401 (registered, auth-gated), got %d", path, resp.StatusCode)
+		}
+	}
+}
+
 // TestUniversalCore_SAFTExportRoutes_ServedByRealBinary is the smoke
 // layer for the SAF-T export (universaltill/uc-infra#28): the real
 // compiled binary registers GET /export/saft (an actual XML audit file

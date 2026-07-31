@@ -119,6 +119,114 @@ func AllForms() []*form.Definition {
 		ItemForm(), PurchaseOrderForm(), POLineForm(), InventoryItemForm(),
 		GoodsReceiptForm(), GoodsReceiptLineForm(), VendorInvoiceForm(),
 		ReorderRuleForm(),
+		RequestForQuotationForm(), RequestForQuotationLineForm(),
+		RequestForQuotationVendorForm(), RequestForQuotationQuoteLineForm(),
+	}
+}
+
+// RequestForQuotationForm's Vendors and Lines sections are both
+// master-detail (composition children — see RequestForQuotation's own
+// doc comment on why each is a real child entity, not an array field).
+// Neither carries a RollUp, unlike PurchaseOrderForm's own Lines
+// section: there's no header total field to roll a line sum into — an
+// RFQ line has no unit_price at all (RequestForQuotationLine's own doc
+// comment: this is a request for pricing, not a priced commitment).
+func RequestForQuotationForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "RequestForQuotation",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Header",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "rfq_number", Label: "RFQ Number"},
+					{Name: "due_date", Label: "Due Date"},
+					{Name: "status_id", Label: "Status"},
+				},
+			},
+			{
+				Title:     "Vendors",
+				Component: form.ComponentMasterDetail,
+				Target:    "RequestForQuotationVendor",
+			},
+			{
+				Title:     "Lines",
+				Component: form.ComponentMasterDetail,
+				Target:    "RequestForQuotationLine",
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
+	}
+}
+
+func RequestForQuotationLineForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "RequestForQuotationLine",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Details",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "request_for_quotation_id", Label: "Request for Quotation"},
+					{Name: "item_id", Label: "Item"},
+					{Name: "qty", Label: "Quantity"},
+				},
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
+	}
+}
+
+func RequestForQuotationVendorForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "RequestForQuotationVendor",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Details",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "request_for_quotation_id", Label: "Request for Quotation"},
+					{Name: "vendor_id", Label: "Vendor"},
+				},
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
+	}
+}
+
+// RequestForQuotationQuoteLineForm is a plain single-section form — the
+// manual data-entry surface procurement staff use to record a vendor's
+// quoted price against one RFQ line (see
+// RequestForQuotationQuoteLine's own doc comment: there is no vendor
+// self-service submission in this codebase).
+func RequestForQuotationQuoteLineForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "RequestForQuotationQuoteLine",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Details",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "rfq_line_id", Label: "RFQ Line"},
+					{Name: "vendor_id", Label: "Vendor"},
+					{Name: "unit_price", Label: "Unit Price"},
+					{Name: "quoted_at", Label: "Quoted At"},
+				},
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
 	}
 }
 

@@ -13,6 +13,7 @@
   --uc-accent-bg: #0969da;
   --uc-nav-bg: #24292f;
   --uc-nav-text: #ffffff;
+  --uc-highlight: #e6f4ea;
 }
 
 * {
@@ -382,6 +383,17 @@ table.uc-table tbody tr:hover {
   background: var(--uc-bg);
 }
 
+/* uc-rfq-vendor-col: the RFQ comparison report (rfq_report.go) puts real
+   Party names in column <th> cells, unlike every other uc-table header
+   (fixed labels like "Item"/"Quantity"). table.uc-table th's blanket
+   text-transform: uppercase is fine for a fixed label but visually
+   defaces a real vendor's name (a proper noun, possibly a registered
+   brand) — this opts those specific header cells back out, same
+   font-weight/size/color as any other header, just not re-cased. */
+table.uc-table th.uc-rfq-vendor-col {
+  text-transform: none;
+}
+
 table.uc-table tbody tr:last-child td {
   border-bottom: none;
 }
@@ -392,6 +404,15 @@ table.uc-table tbody tr:last-child td {
   text-align: center;
   border: 1px dashed var(--uc-border);
   border-radius: 6px;
+}
+
+/* The RFQ vendor-comparison report's cheapest-price marking (#9) — a
+   real computed style (background + bold weight), not just a CSS class
+   name in the markup, so a browser test can assert against something
+   the eye actually perceives, not a string match on a class attribute. */
+.uc-rfq-lowest {
+  background: var(--uc-highlight);
+  font-weight: 700;
 }
 
 /* The rendered 403 (see denied.go). Styled as a real page rather than

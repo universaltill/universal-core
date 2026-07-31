@@ -213,6 +213,31 @@ func seedStatusGraph(
 // note/reversal event not a status edit" reasoning as
 // sales.PublishStatuses gives for CustomerInvoice's identical shape.
 //
+// rfq_status (RequestForQuotation's own doc comment, #9): draft is the
+// only is_initial status — an RFQ being drafted, vendors/lines still
+// being assembled. draft->sent is "the RFQ was actually sent to its
+// invited vendors" (a real-world action, not a data edit — nothing else
+// in this Definition forces vendors/lines to be non-empty at that
+// point, same "declared, not schema-enforced" trust this kernel already
+// places in a form submission generally). sent->quotes_received is "at
+// least one vendor has responded and staff started recording quote
+// lines" — deliberately not auto-derived from RequestForQuotationQuoteLine
+// rows existing (this package's generic engine has no cross-record
+// "does a child exist" trigger, and forcing one in here would be exactly
+// the kind of entity-specific machinery CLAUDE.md's kernel-boundary rule
+// warns against outside a Definition); a human/staff action moves it,
+// same as every other status transition in this kernel.
+// quotes_received->closed is "a vendor was chosen (or the RFQ abandoned
+// with an answer in hand) and comparison is done" — deliberately NOT
+// "converts to a PurchaseOrder": that conversion is explicit non-goal
+// scope for #9 (a future task's job), so "closed" only means "this RFQ's
+// own lifecycle is finished," not "a PO now exists." cancellation is
+// reachable from draft, sent, or quotes_received but not from closed or
+// cancelled itself — once closed, reopening/cancelling is a new RFQ, the
+// same "the real-world event has already happened, that's not a status
+// edit" reasoning purchase_order_status gives for excluding "received".
+// closed and cancelled are both is_terminal.
+//
 // Idempotent: every StatusType/Status looked up by its code, every
 // StatusTransition by its from_status_id/to_status_id pair, same
 // getOrCreate-by-natural-key shape cmd/seed-demo-data's seeder already
@@ -286,6 +311,28 @@ func PublishStatuses(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 		actor,
 	); err != nil {
 		return fmt.Errorf("seed vendor_invoice_status: %w", err)
+	}
+
+	if _, err := seedStatusGraph(ctx, engine, statusTypeDef, statusDef, transitionDef,
+		"RequestForQuotation", "rfq_status", "RFQ Status",
+		[]statusSpec{
+			{"draft", "Draft", 1, true, false},
+			{"sent", "Sent", 2, false, false},
+			{"quotes_received", "Quotes Received", 3, false, false},
+			{"closed", "Closed", 4, false, true},
+			{"cancelled", "Cancelled", 5, false, true},
+		},
+		[][2]string{
+			{"draft", "sent"},
+			{"sent", "quotes_received"},
+			{"quotes_received", "closed"},
+			{"draft", "cancelled"},
+			{"sent", "cancelled"},
+			{"quotes_received", "cancelled"},
+		},
+		actor,
+	); err != nil {
+		return fmt.Errorf("seed rfq_status: %w", err)
 	}
 
 	return nil

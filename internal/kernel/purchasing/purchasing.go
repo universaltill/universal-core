@@ -323,6 +323,138 @@ func ReorderRule() *entity.Definition {
 	}
 }
 
+// RequestForQuotation (RFQ) is a buyer's request to one or more vendors
+// for pricing on a set of items before committing to a PurchaseOrder
+// (reference-data-model.md's aspirational RFQ shape, Phase 3 R23,
+// universal-core#9) — the vendor-comparison step that precedes a
+// PurchaseOrder in a real procurement flow, not built until now. Like
+// PurchaseOrder, an invited vendor is a Party record holding the vendor
+// PartyRole, not a separate Vendor entity — same Party-Role reasoning as
+// PurchaseOrder's own doc comment: a company that is both a customer and
+// a vendor stays one Party record, not two, and every "vendor" reference
+// field in this module (here included) targets Party directly.
+//
+// rfq_number is the natural key, the same application-level convention
+// as PurchaseOrder.po_number (not schema-enforced unique — no such
+// constraint concept exists in entity.Field yet, see PurchaseOrder's own
+// doc comment on po_number).
+//
+// Relationships: "lines" (the items being quoted, composition child
+// RequestForQuotationLine) and "vendors" (the invited vendors,
+// composition child RequestForQuotationVendor). Both are composition
+// children rather than fields on this header for the same reason: this
+// kernel's entity.FieldReference targets exactly one entity type (no
+// array/multi-reference field exists), so reference-data-model.md's
+// aspirational "vendor_ids[]" shape has to become a real child entity —
+// see RequestForQuotationVendor's own doc comment for the full
+// reasoning, which applies equally to why "lines" isn't a single
+// multi-valued field either.
+//
+// status_id/StatusTypeCode ("rfq_status") follows the same
+// Status/StatusType pattern as PurchaseOrder/VendorInvoice — see
+// PublishStatuses (seed.go) for the actual draft -> sent ->
+// quotes_received -> closed/cancelled graph this needs published before
+// any RequestForQuotation create/update can pass
+// crud.Engine.ValidateStatusTransition.
+func RequestForQuotation() *entity.Definition {
+	return &entity.Definition{
+		EntityType:     "RequestForQuotation",
+		Version:        1,
+		Module:         "purchasing",
+		StatusTypeCode: "rfq_status",
+		Fields: []entity.Field{
+			{Name: "rfq_number", Type: entity.FieldString, Required: true},
+			{Name: "due_date", Type: entity.FieldDate, Required: true},
+			{Name: "status_id", Type: entity.FieldReference, Required: true, Target: "Status"},
+		},
+		Relationships: []entity.Relationship{
+			{Name: "lines", Kind: entity.RelationComposition, Target: "RequestForQuotationLine", ParentField: "request_for_quotation_id"},
+			{Name: "vendors", Kind: entity.RelationComposition, Target: "RequestForQuotationVendor", ParentField: "request_for_quotation_id"},
+		},
+	}
+}
+
+// RequestForQuotationLine is one item + qty a RequestForQuotation is
+// asking vendors to price — the composition child of
+// RequestForQuotation, mirroring POLine's own role for PurchaseOrder.
+// Deliberately NO unit_price here, unlike POLine: an RFQ line is a
+// REQUEST, not a priced commitment — the price is exactly the thing
+// being solicited from each vendor, and lives instead on
+// RequestForQuotationQuoteLine, one row per vendor's response to this
+// line.
+func RequestForQuotationLine() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "RequestForQuotationLine",
+		Version:    1,
+		Module:     "purchasing",
+		Fields: []entity.Field{
+			{Name: "request_for_quotation_id", Type: entity.FieldReference, Required: true, Target: "RequestForQuotation"},
+			{Name: "item_id", Type: entity.FieldReference, Required: true, Target: "Item"},
+			{Name: "qty", Type: entity.FieldNumber, Required: true},
+		},
+	}
+}
+
+// RequestForQuotationVendor is one vendor invited to quote against a
+// RequestForQuotation — the composition-child modeling of what
+// reference-data-model.md's aspirational RFQ shape describes as a
+// "vendor_ids[]" array field. This kernel has no array/multi-reference
+// field type at all (entity.FieldReference targets exactly one entity
+// type per field — see entity.Field's own doc comment), so "many
+// vendors attached to one RFQ header" has to become a real child
+// entity, one row per invited vendor, exactly the same composition-child
+// pattern POLine/GoodsReceiptLine already use for "many of these
+// attached to a header." vendor_id references Party directly — same
+// Party-Role reasoning as RequestForQuotation's own doc comment, not a
+// separate Vendor entity.
+func RequestForQuotationVendor() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "RequestForQuotationVendor",
+		Version:    1,
+		Module:     "purchasing",
+		Fields: []entity.Field{
+			{Name: "request_for_quotation_id", Type: entity.FieldReference, Required: true, Target: "RequestForQuotation"},
+			{Name: "vendor_id", Type: entity.FieldReference, Required: true, Target: "Party"},
+		},
+	}
+}
+
+// RequestForQuotationQuoteLine is one vendor's quoted unit price against
+// one RequestForQuotationLine — one row per (line, vendor) response,
+// manually entered by procurement staff recording what a vendor quoted
+// (phone/email/portal response). There is no vendor self-service quote
+// submission anywhere in this codebase, and building one is explicitly
+// out of scope for #9 — this is a plain data-entry record, same as every
+// other entity in this kernel.
+//
+// Deliberately NOT a composition child of anything, unlike
+// RequestForQuotationLine/RequestForQuotationVendor above: a composition
+// relationship has exactly one parent (entity.Relationship.ParentField),
+// but a quote line is naturally keyed by TWO independent things — which
+// line, and which vendor. That's the same "independent entity with
+// plain reference fields, not a child of either side" shape
+// VendorInvoice's own doc comment already describes for referencing
+// both PurchaseOrder and Party directly rather than being modeled as a
+// child of one of them.
+//
+// quoted_at is optional: a quote line is sometimes entered before the
+// vendor's actual response date is confirmed, or backfilled without
+// recording one at all — the price itself (unit_price, Required) is the
+// one thing this record must carry to be useful for comparison.
+func RequestForQuotationQuoteLine() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "RequestForQuotationQuoteLine",
+		Version:    1,
+		Module:     "purchasing",
+		Fields: []entity.Field{
+			{Name: "rfq_line_id", Type: entity.FieldReference, Required: true, Target: "RequestForQuotationLine"},
+			{Name: "vendor_id", Type: entity.FieldReference, Required: true, Target: "Party"},
+			{Name: "unit_price", Type: entity.FieldNumber, Required: true},
+			{Name: "quoted_at", Type: entity.FieldDate},
+		},
+	}
+}
+
 // All returns every Definition this module adds — the set a tenant gets
 // once Purchasing is one of their licensed modules (seed.go's Publish).
 func All() []*entity.Definition {
@@ -335,5 +467,9 @@ func All() []*entity.Definition {
 		GoodsReceiptLine(),
 		VendorInvoice(),
 		ReorderRule(),
+		RequestForQuotation(),
+		RequestForQuotationLine(),
+		RequestForQuotationVendor(),
+		RequestForQuotationQuoteLine(),
 	}
 }
