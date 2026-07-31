@@ -93,11 +93,21 @@ const AdminRoleCode = "tenant_admin"
 // describes instead of plain opt-in. This is authz protecting its own
 // model, not business logic for an operational entity type — the
 // generic engines (entity/form/workflow) still know nothing about them.
+//
+// Delegation (uc-infra#8) joins this set for the same reason as the
+// original four: it is itself an access-granting record (it can make a
+// user approval-eligible for standing they don't hold directly, see
+// foundation.ActiveDelegatorsFor), so an unprivileged user authoring one
+// naming themselves as delegate would otherwise be able to grant
+// themselves someone else's approval standing the moment any tenant
+// configures RBAC at all — exactly the self-grant escalation this
+// deny-unless-granted posture exists to close.
 var controlPlaneTypes = map[string]bool{
 	"Role":            true,
 	"UserRole":        true,
 	"Permission":      true,
 	"FieldPermission": true,
+	"Delegation":      true,
 }
 
 // entityPerm is the memoized per-entity-type resolution result.

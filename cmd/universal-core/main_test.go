@@ -253,6 +253,28 @@ func TestUniversalCore_DevAuthEnabled_ValidHeaders_ServesRecordsAPI(t *testing.T
 	if !strings.Contains(string(deptBody), `"data"`) {
 		t.Fatalf("expected the standard {data,error} envelope for Department, got: %s", deptBody)
 	}
+
+	// Delegation (uc-infra#8) is the newest foundation.All() entity —
+	// same "confirm the real compiled binary actually serves this one
+	// too" check Department got when it landed.
+	delReq, err := http.NewRequest(http.MethodGet, baseURL+"/api/records/Delegation", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	delReq.Header.Set("X-Tenant-ID", tenantID)
+	delReq.Header.Set("X-Actor-ID", "smoke-test")
+	delResp, err := http.DefaultClient.Do(delReq)
+	if err != nil {
+		t.Fatalf("GET /api/records/Delegation: %v", err)
+	}
+	defer delResp.Body.Close()
+	delBody, _ := io.ReadAll(delResp.Body)
+	if delResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for /api/records/Delegation, got %d: %s", delResp.StatusCode, delBody)
+	}
+	if !strings.Contains(string(delBody), `"data"`) {
+		t.Fatalf("expected the standard {data,error} envelope for Delegation, got: %s", delBody)
+	}
 }
 
 // TestUniversalCore_MembersRoutes_RegisteredAndGated is the smoke layer

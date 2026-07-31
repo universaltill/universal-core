@@ -100,6 +100,7 @@ func AllForms() []*form.Definition {
 		RoleForm(), UserRoleForm(),
 		PermissionForm(), FieldPermissionForm(),
 		DepartmentForm(), PositionForm(),
+		DelegationForm(),
 	}
 }
 
@@ -136,6 +137,33 @@ func PositionForm() *form.Definition {
 					{Name: "title", Label: "Title"},
 					{Name: "department_id", Label: "Department"},
 					{Name: "reports_to_position_id", Label: "Reports To"},
+				},
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
+	}
+}
+
+// DelegationForm is the generated screen for creating/revoking a
+// substitute-approver delegation (Delegation, foundation.go) — plain
+// user-id text fields, same shape as UserRoleForm's own user_id input,
+// since there is no Core-side User/Person entity to pick from either
+// (see UserRole's own doc comment).
+func DelegationForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "Delegation",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Details",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "delegator_user_id", Label: "Delegator (user id)"},
+					{Name: "delegate_user_id", Label: "Delegate (user id)"},
+					{Name: "ends_at", Label: "Ends At"},
+					{Name: "revoked", Label: "Revoked"},
 				},
 			},
 		},
