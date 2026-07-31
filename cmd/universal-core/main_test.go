@@ -249,3 +249,42 @@ func TestUniversalCore_DevAuthEnabled_ValidHeaders_ServesRecordsAPI(t *testing.T
 		t.Fatalf("expected the standard {data,error} envelope for Department, got: %s", deptBody)
 	}
 }
+
+// TestUniversalCore_MembersRoutes_RegisteredAndGated is the smoke layer
+// for universal-core#3: the real compiled binary registers the
+// /settings/members routes (a 401 from the auth wrapper, not a bare
+// 404) even when the member-management client is unconfigured — the
+// route always exists, the page itself degrades to its "unavailable"
+// state behind auth (see internal/api/members.go; the page-level
+// behavior is covered by internal/api and internal/e2e, this asserts
+// the wiring in main.go actually registers it on the production mux).
+func TestUniversalCore_MembersRoutes_RegisteredAndGated(t *testing.T) {
+	controlDSN := testexec.FreshDatabase(t, "uc_test_server_control")
+	baseURL := startServer(t, controlDSN, "INSECURE_DEV_AUTH=true")
+
+	for _, route := range []struct{ method, path string }{
+		{"GET", "/settings/members"},
+		{"POST", "/settings/members/invite"},
+		{"POST", "/settings/members/remove"},
+		{"POST", "/settings/members/password-link"},
+		{"POST", "/settings/members/password-email"},
+		{"POST", "/settings/members/roles/assign"},
+		{"POST", "/settings/members/roles/revoke"},
+	} {
+		req, err := http.NewRequest(route.method, baseURL+route.path, nil)
+		if err != nil {
+			t.Fatalf("build %s %s: %v", route.method, route.path, err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", route.method, route.path, err)
+		}
+		resp.Body.Close()
+		// No dev-auth headers sent: DevAuth fails closed with 401 — the
+		// route being registered is exactly what distinguishes this from
+		// the mux's own 404.
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("%s %s: expected 401 (registered, auth-gated), got %d", route.method, route.path, resp.StatusCode)
+		}
+	}
+}

@@ -63,6 +63,23 @@ func (h *Handler) renderNav(r *http.Request, rc *httpx.RequestContext, locale st
 		// entity, always present (see aiprovidersettings.go).
 		view.ShowAIProviderSettings = true
 		view.AIProviderSettingsLabel = h.catalog.T(locale, "nav.ai_provider_settings")
+		// Members is the one nav link that IS role-gated: the page
+		// itself 403s non-admins (members.go's requireMembersAccess), so
+		// showing it to everyone would be a guaranteed dead end, not a
+		// discoverability win. The same tenant_admin check, one indexed
+		// query; a failure degrades to link-hidden (logged), same as the
+		// module lookup above — never a page failure. Deliberately NOT
+		// gated on h.members.Enabled(): an admin on an unconfigured
+		// deployment still reaches the page's explicit "unavailable"
+		// explanation instead of wondering where the feature went.
+		if err == nil {
+			if admin, aerr := isTenantAdmin(r.Context(), ts, *rc); aerr != nil {
+				log.Printf("api: nav: tenant_admin check: %v", aerr)
+			} else if admin {
+				view.ShowMembers = true
+				view.MembersLabel = h.catalog.T(locale, "nav.members")
+			}
+		}
 		if h.auth.Enabled() {
 			view.ShowLogout = true
 			view.LogoutLabel = h.catalog.T(locale, "nav.logout")
@@ -89,6 +106,8 @@ type navView struct {
 	IssueReportLabel        string
 	ShowAIProviderSettings  bool
 	AIProviderSettingsLabel string
+	ShowMembers             bool
+	MembersLabel            string
 	ShowLogout              bool
 	LogoutLabel             string
 }
@@ -100,6 +119,7 @@ var navTmpl = template.Must(template.New("nav").Parse(`
 {{if .ShowApprovals}}<a class="uc-nav-link" href="/workflow-jobs">{{.ApprovalsLabel}}</a>{{end}}
 {{if .ShowIssueReport}}<a class="uc-nav-link" href="/issue-report/new">{{.IssueReportLabel}}</a>{{end}}
 {{if .ShowAIProviderSettings}}<a class="uc-nav-link" href="/settings/ai-provider">{{.AIProviderSettingsLabel}}</a>{{end}}
+{{if .ShowMembers}}<a class="uc-nav-link" href="/settings/members">{{.MembersLabel}}</a>{{end}}
 <span class="uc-nav-spacer"></span>
 {{if .ShowLogout}}<a class="uc-nav-link" href="/ui/logout">{{.LogoutLabel}}</a>{{end}}
 {{$path := .CurrentPath}}

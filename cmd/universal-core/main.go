@@ -30,6 +30,7 @@ import (
 	"github.com/universaltill/universal-core/internal/tenantdb"
 	"github.com/universaltill/universal-core/internal/webauth"
 	"github.com/universaltill/universal-core/internal/worker"
+	"github.com/universaltill/universal-core/internal/zitadelmgmt"
 )
 
 // defaultOllamaModel matches the model already pulled by the reference
@@ -251,6 +252,23 @@ func main() {
 		log.Printf("SECRET_ENCRYPTION_KEY not set — the AI-provider settings page will refuse to store a tenant API key")
 	}
 	handler := api.New(router, catalog, auth, svc, ai, speech, secretCryptor)
+	// Runtime member management (universal-core#3, ADR-0010): the
+	// /settings/members page's outbound Zitadel client. Issuer reuses
+	// OIDC_ISSUER_URL — one identity instance for login and management;
+	// PAT and project id arrive from Key Vault (member-mgmt-zitadel-pat,
+	// zitadel-project-id). Any field empty ⇒ nil client ⇒ the page
+	// renders its "unavailable" state, nothing else is affected.
+	memberMgmt := zitadelmgmt.NewClient(zitadelmgmt.Config{
+		PAT:       os.Getenv("ZITADEL_MGMT_PAT"),
+		Issuer:    os.Getenv("OIDC_ISSUER_URL"),
+		ProjectID: os.Getenv("ZITADEL_PROJECT_ID"),
+	})
+	handler.SetMemberMgmt(memberMgmt, data.NewTenantRepo(controlDB))
+	if memberMgmt.Enabled() {
+		log.Printf("member management enabled — /settings/members manages Zitadel users/grants at runtime (ADR-0010)")
+	} else {
+		log.Printf("ZITADEL_MGMT_PAT/ZITADEL_PROJECT_ID not set — /settings/members will render its unavailable state")
+	}
 	// The real composition root for lifecycle hooks (internal/kernel/
 	// crud.Hook) — internal/api itself never imports purchasing/sales
 	// directly, keeping that package entity-agnostic (its own doc

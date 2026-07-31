@@ -138,6 +138,27 @@ func (r *TenantRepo) SetZitadelOrgID(ctx context.Context, tenantID, orgID string
 	return nil
 }
 
+// GetZitadelOrgID is SetZitadelOrgID's read side: which Zitadel org (if
+// any) tenantID is linked to. The members page (internal/api/members.go)
+// calls this per request to scope its management-API calls — a tenant
+// with no linked org gets the page's "unavailable" state, the same
+// degrade-visibly contract as an unconfigured client, since there is no
+// org to manage members in.
+func (r *TenantRepo) GetZitadelOrgID(ctx context.Context, tenantID string) (string, error) {
+	var orgID sql.NullString
+	err := r.db.QueryRowContext(ctx,
+		`SELECT zitadel_org_id FROM tenants WHERE id = $1`,
+		tenantID,
+	).Scan(&orgID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("get tenant zitadel org id: %w", err)
+	}
+	return orgID.String, nil
+}
+
 // GetByZitadelOrgID resolves a Zitadel organization id (an id_token claim,
 // see internal/webauth) to the Universal Core tenant it's linked to —
 // internal/webauth's login callback's only per-sign-in DB lookup; every

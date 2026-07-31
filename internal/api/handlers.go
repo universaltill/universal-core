@@ -36,6 +36,7 @@ import (
 	"github.com/universaltill/universal-core/internal/svcauth"
 	"github.com/universaltill/universal-core/internal/tenantdb"
 	"github.com/universaltill/universal-core/internal/webauth"
+	"github.com/universaltill/universal-core/internal/zitadelmgmt"
 )
 
 // Handler wires the registry, crud.Engine, and formrender.Renderer
@@ -80,6 +81,24 @@ type Handler struct {
 	// caught this coupling in an earlier draft that called SetHook
 	// directly with purchasing/sales imports in this file.
 	hooks []hookRegistration
+	// members is nil (Enabled() == false) unless the Zitadel
+	// member-management credential is configured (ZITADEL_MGMT_PAT etc.,
+	// ADR-0010) — the /settings/members page renders its unavailable
+	// state rather than erroring, same nil-safe contract as ai/speech.
+	// tenants (the control-plane TenantRepo) resolves the current
+	// tenant's linked Zitadel org for it; both are set together by the
+	// composition root via SetMemberMgmt.
+	members *zitadelmgmt.Client
+	tenants *data.TenantRepo
+}
+
+// SetMemberMgmt wires the member-management client and the tenant
+// registry lookup it scopes by — a post-construction setter for the
+// same reason RegisterHook is one (New already has seven parameters,
+// and this is optional wiring done exactly once at startup).
+func (h *Handler) SetMemberMgmt(client *zitadelmgmt.Client, tenants *data.TenantRepo) {
+	h.members = client
+	h.tenants = tenants
 }
 
 type hookRegistration struct {
@@ -307,6 +326,17 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	mux.Handle("GET /settings/ai-provider", auth(h.aiProviderSettingsPage))
 	mux.Handle("POST /settings/ai-provider", auth(h.aiProviderSettingsSave))
 	mux.Handle("POST /settings/ai-provider/clear", auth(h.aiProviderSettingsClear))
+	// The self-service tenant member management page (universal-core#3,
+	// ADR-0010) — see members.go's own doc comment. Every route is
+	// additionally gated to the tenant_admin role code server-side
+	// (requireMembersAccess), on top of auth()'s session gate.
+	mux.Handle("GET /settings/members", auth(h.membersPage))
+	mux.Handle("POST /settings/members/invite", auth(h.membersInvite))
+	mux.Handle("POST /settings/members/remove", auth(h.membersRemove))
+	mux.Handle("POST /settings/members/password-link", auth(h.membersPasswordLink))
+	mux.Handle("POST /settings/members/password-email", auth(h.membersPasswordEmail))
+	mux.Handle("POST /settings/members/roles/assign", auth(h.membersAssignRole))
+	mux.Handle("POST /settings/members/roles/revoke", auth(h.membersRevokeRole))
 }
 
 // requestContext fetches the httpx.RequestContext a preceding DevAuth (or
