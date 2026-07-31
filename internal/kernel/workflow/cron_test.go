@@ -283,3 +283,26 @@ func TestParseSchedule_RejectsSignedNumbers(t *testing.T) {
 		}
 	}
 }
+
+// The department param on require_approval is validated at publish time
+// (R17 routing): a non-string or empty value, or one with no role to
+// scope, must be rejected rather than silently ignored at approval time.
+func TestDefinitionValidate_DepartmentParam(t *testing.T) {
+	step := func(params map[string]any) *Definition {
+		return &Definition{Name: "w", Version: 1,
+			Trigger: Trigger{Type: TriggerManual},
+			Steps:   []Step{{Kind: StepRequireApproval, Params: params}}}
+	}
+	if err := step(map[string]any{"role": "fm", "department": "department_id"}).Validate(); err != nil {
+		t.Fatalf("a valid role+department should publish: %v", err)
+	}
+	if err := step(map[string]any{"role": "fm", "department": ""}).Validate(); err == nil {
+		t.Fatal("empty department field must be rejected")
+	}
+	if err := step(map[string]any{"role": "fm", "department": 5}).Validate(); err == nil {
+		t.Fatal("non-string department must be rejected")
+	}
+	if err := step(map[string]any{"department": "department_id"}).Validate(); err == nil {
+		t.Fatal("department with no role to scope must be rejected")
+	}
+}

@@ -288,5 +288,6 @@
   "error.access_denied.body": "Bu sayfayı görüntüleme izniniz yok. Erişime ihtiyacınız varsa kuruluşunuzdaki bir yöneticiden isteyin.",
   "workflow_inbox.column_action": "İşlem",
   "workflow_inbox.requires_role": "{role} rolü gerekiyor",
-  "workflow_inbox.unavailable": "Kullanılamıyor"
+  "workflow_inbox.unavailable": "Kullanılamıyor",
+  "workflow_inbox.requires_role_in_department": "Bu kaydın departmanında {role} rolü gerekiyor"
 }
