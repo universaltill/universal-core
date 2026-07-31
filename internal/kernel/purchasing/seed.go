@@ -214,14 +214,14 @@ func PublishStatuses(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 		return fmt.Errorf("seed vendor_invoice_status: %w", err)
 	}
 
-	if _, err := seedStatusGraph(ctx, engine, statusTypeDef, statusDef, transitionDef,
+	if _, err := statusgraph.Seed(ctx, engine, statusTypeDef, statusDef, transitionDef,
 		"RequestForQuotation", "rfq_status", "RFQ Status",
 		[]statusSpec{
-			{"draft", "Draft", 1, true, false},
-			{"sent", "Sent", 2, false, false},
-			{"quotes_received", "Quotes Received", 3, false, false},
-			{"closed", "Closed", 4, false, true},
-			{"cancelled", "Cancelled", 5, false, true},
+			{Code: "draft", Name: "Draft", Sequence: 1, IsInitial: true, IsTerminal: false},
+			{Code: "sent", Name: "Sent", Sequence: 2, IsInitial: false, IsTerminal: false},
+			{Code: "quotes_received", Name: "Quotes Received", Sequence: 3, IsInitial: false, IsTerminal: false},
+			{Code: "closed", Name: "Closed", Sequence: 4, IsInitial: false, IsTerminal: true},
+			{Code: "cancelled", Name: "Cancelled", Sequence: 5, IsInitial: false, IsTerminal: true},
 		},
 		[][2]string{
 			{"draft", "sent"},
