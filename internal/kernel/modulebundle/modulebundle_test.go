@@ -94,13 +94,19 @@ func TestLoad_Rejections(t *testing.T) {
 				m["entities"].([]any)[0].(map[string]any)["module"] = "other"
 			}), "declares module",
 		},
-		// NOTE: an unknown field TYPE is not rejected — entity.Validate
-		// has no field-type allowlist today (kernel gap, filed on the
-		// board at this card's close-out); an empty entity_type is the
-		// invalid-definition case Validate does catch.
 		"invalid entity definition": {
 			mutate(t, func(m map[string]any) {
 				m["entities"].([]any)[0].(map[string]any)["entity_type"] = ""
+			}), "invalid entity definition",
+		},
+		// #71: entity.Validate now has a field-type allowlist, so a
+		// hand-authored bundle (ADR-0012's own external-input path)
+		// declaring a misspelled/unknown field type is rejected here too,
+		// not just via the entity package's own unit tests.
+		"unknown field type inside an entity definition": {
+			mutate(t, func(m map[string]any) {
+				fields := m["entities"].([]any)[0].(map[string]any)["fields"].([]any)
+				fields[0].(map[string]any)["type"] = "isbn_number"
 			}), "invalid entity definition",
 		},
 		"duplicate entity": {

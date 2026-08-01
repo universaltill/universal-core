@@ -230,6 +230,42 @@ func TestDefinitionValidate(t *testing.T) {
 			},
 			wantErr: false,
 		},
+		{
+			// #71: a field type outside the declared FieldType allowlist must
+			// not silently publish -- downstream code (formrender, csvimport,
+			// the JSON API) all switch on Type, and an unknown value's
+			// behavior there is undefined.
+			name: "unknown field type",
+			def: Definition{
+				EntityType: "Vendor",
+				Fields:     []Field{{Name: "risk_level", Type: FieldType("no_such_type")}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "empty field type",
+			def: Definition{
+				EntityType: "Vendor",
+				Fields:     []Field{{Name: "risk_level", Type: FieldType("")}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "all seven valid field types on one definition",
+			def: Definition{
+				EntityType: "Vendor",
+				Fields: []Field{
+					{Name: "name", Type: FieldString},
+					{Name: "lead_time_days", Type: FieldNumber},
+					{Name: "is_preferred", Type: FieldBool},
+					{Name: "onboarded_on", Type: FieldDate},
+					{Name: "risk_level", Type: FieldEnum, EnumValues: []string{"low", "high"}},
+					{Name: "primary_contact_id", Type: FieldReference, Target: "Party"},
+					{Name: "notes", Type: FieldI18nText},
+				},
+			},
+			wantErr: false,
+		},
 	}
 
 	for _, tc := range cases {
@@ -239,6 +275,47 @@ func TestDefinitionValidate(t *testing.T) {
 				t.Fatalf("Validate() error = %v, wantErr %v", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// TestUnmarshal_RejectsUnknownFieldType (#71): a JSONB row declaring a
+// misspelled or unknown "type" — whether hand-authored, from an
+// erp_module bundle (ADR-0012), or hand-edited directly in Postgres —
+// must fail loud through the same path Validate() now guards, not just
+// when constructed as a Go literal.
+func TestUnmarshal_RejectsUnknownFieldType(t *testing.T) {
+	raw := []byte(`{
+		"entity_type": "Vendor",
+		"version": 1,
+		"fields": [{"name": "risk_level", "type": "risky"}]
+	}`)
+	if _, err := Unmarshal(raw); err == nil {
+		t.Fatal("expected Unmarshal to reject an unknown field type")
+	}
+}
+
+// TestDefinitionValidate_UnknownTypeReportedBeforeLabelFieldCheck
+// (independent review, 2026-08-01): label_field's own check switches on
+// the referenced field's Type to judge label-suitability. Before the
+// type-allowlist check was moved ahead of it, a label_field pointing at
+// a field with an unknown type reported the confusing "is a %s; a label
+// must be a string, number, date or enum" message instead of the
+// clearer "has unknown type" — this pins the fixed ordering.
+func TestDefinitionValidate_UnknownTypeReportedBeforeLabelFieldCheck(t *testing.T) {
+	def := &Definition{
+		EntityType: "Vendor",
+		LabelField: "name",
+		Fields:     []Field{{Name: "name", Type: FieldType("no_such_type")}},
+	}
+	err := def.Validate()
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "unknown type") {
+		t.Fatalf("expected an 'unknown type' error, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "label must be") {
+		t.Fatalf("expected the unknown-type error, not the label-suitability error, got: %v", err)
 	}
 }
 

@@ -32,6 +32,20 @@ const (
 	FieldI18nText FieldType = "i18n_text"
 )
 
+// allFieldTypes is the exhaustive set of FieldType values a Definition may
+// declare — keep in sync with the const block above and with
+// validateFieldValue's own per-type switch (validate.go): a new FieldType
+// constant added there but not here fails closed (every definition using
+// it becomes unpublishable) rather than silently accepted, but it's still
+// two places to remember.
+var allFieldTypes = []FieldType{
+	FieldString, FieldNumber, FieldBool, FieldDate, FieldEnum, FieldReference, FieldI18nText,
+}
+
+func (t FieldType) valid() bool {
+	return slices.Contains(allFieldTypes, t)
+}
+
 // RelationshipKind distinguishes the three relationship mechanisms named
 // in ADR-0017 §6 — they must stay distinct, not folded into one concept.
 type RelationshipKind string
@@ -152,6 +166,16 @@ func (d *Definition) FieldByName(name string) (Field, bool) {
 func (d *Definition) Validate() error {
 	if d.EntityType == "" {
 		return fmt.Errorf("entity_type is required")
+	}
+	// Checked before label_field below: label_field's own check switches
+	// on the referenced field's Type to judge label-suitability, which
+	// would otherwise misreport an unknown type as "not a valid label
+	// type" instead of the clearer "unknown type" — independent review,
+	// 2026-08-01.
+	for _, f := range d.Fields {
+		if !f.Type.valid() {
+			return fmt.Errorf("field %q in %s has unknown type %q", f.Name, d.EntityType, f.Type)
+		}
 	}
 	if d.LabelField != "" {
 		f, ok := d.FieldByName(d.LabelField)
