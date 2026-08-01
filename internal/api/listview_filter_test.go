@@ -87,3 +87,142 @@ func TestListPage_FilterAndSort(t *testing.T) {
 		t.Fatalf("hidden field offered as a sort link to a user who can't see it:\n%s", clerkBody)
 	}
 }
+
+// referenceFirstEntityDef declares "category" (a Reference) as the FIRST
+// field, so the no-explicit-filter default (renderRecordList's own loop
+// over columns) lands on it — the exact shape board #49 flagged: for an
+// entity type where the first visible column is a reference, does typing
+// a label into the single filter box actually find anything, or does it
+// silently match against the raw target id?
+func referenceFirstEntityDef() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "Gadget", Version: 1, Module: "foundation",
+		Fields: []entity.Field{
+			{Name: "category", Type: entity.FieldReference, Target: "Category"},
+			{Name: "name", Type: entity.FieldString, Required: true},
+		},
+	}
+}
+
+func categoryEntityDef() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "Category", Version: 1, Module: "foundation",
+		Fields: []entity.Field{
+			{Name: "name", Type: entity.FieldString, Required: true},
+		},
+	}
+}
+
+// TestListPage_DefaultFilterOnReferenceColumn_ResolvesByLabel is a
+// regression test for board #49: when no explicit ?filter= is given, the
+// single filter box targets the first visible column, and for ~16 of ~34
+// entity types today that column is a Reference. Confirms the box still
+// finds the record when the user types the TARGET's label (what the cell
+// actually displays), not the stored id — this already works end-to-end
+// via the same label-resolution path #24 added for an explicit
+// ?filter=<reference field>, but nothing exercised it for the DEFAULT
+// (no ?filter=) case, so a regression here would have shipped silently.
+func TestListPage_DefaultFilterOnReferenceColumn_ResolvesByLabel(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := foundation.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	publishEntityAndForm(t, db, categoryEntityDef(), &form.Definition{
+		EntityType: "Category", Version: 1,
+		Sections: []form.Section{{Title: "D", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "name"}}}},
+	})
+	publishEntityAndForm(t, db, referenceFirstEntityDef(), &form.Definition{
+		EntityType: "Gadget", Version: 1,
+		Sections: []form.Section{{Title: "D", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "category"}, {Name: "name"}}}},
+	})
+
+	eng := crud.NewEngine(db)
+	widgets, err := eng.Create(ctx, categoryEntityDef(), map[string]any{"name": "Widgets"}, humanActor())
+	if err != nil {
+		t.Fatalf("create Widgets category: %v", err)
+	}
+	gizmos, err := eng.Create(ctx, categoryEntityDef(), map[string]any{"name": "Gizmos"}, humanActor())
+	if err != nil {
+		t.Fatalf("create Gizmos category: %v", err)
+	}
+	if _, err := eng.Create(ctx, referenceFirstEntityDef(), map[string]any{"category": widgets.ID, "name": "Sprocket"}, humanActor()); err != nil {
+		t.Fatalf("seed Sprocket: %v", err)
+	}
+	if _, err := eng.Create(ctx, referenceFirstEntityDef(), map[string]any{"category": gizmos.ID, "name": "Doohickey"}, humanActor()); err != nil {
+		t.Fatalf("seed Doohickey: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	// No ?filter= at all: the box defaults to "category" (first column),
+	// a Reference. Typing the target's own label ("Widgets") must find
+	// Sprocket and must NOT match on the raw stored category id.
+	body := getAs(t, mux, "/records/Gadget?q=Widgets", tenantID, "anyone").Body.String()
+	if !strings.Contains(body, "Sprocket") {
+		t.Fatalf("default filter on a reference column should resolve %q by label and find Sprocket:\n%s", "Widgets", body)
+	}
+	if strings.Contains(body, "Doohickey") {
+		t.Fatalf("default filter q=Widgets should not also match Doohickey (Gizmos category):\n%s", body)
+	}
+
+	// The hidden input carrying the resolved default field must actually
+	// be "category" — asserting the mechanism, not just the outcome.
+	if !strings.Contains(body, `name="filter" value="category"`) {
+		t.Fatalf("expected the default filter field to resolve to the reference column \"category\":\n%s", body)
+	}
+
+	// A label matching NO category must show NO rows — not every row.
+	// referenceIDsMatching returns a non-nil-but-empty slice for "no
+	// target matched" specifically so ListPageFiltered's FilterIn takes
+	// the "match these ids" branch with an empty id list, rather than
+	// its FilterIn == nil branch ("no id-based filter at all"), which
+	// would silently widen this into every Gadget in the tenant.
+	noMatch := getAs(t, mux, "/records/Gadget?q=Nonexistent", tenantID, "anyone").Body.String()
+	if strings.Contains(noMatch, "Sprocket") || strings.Contains(noMatch, "Doohickey") {
+		t.Fatalf("default filter q=Nonexistent (matches no category) should show no rows, not every row:\n%s", noMatch)
+	}
+}
+
+// TestListPage_DefaultFilterOnReferenceColumn_UnlicensedTarget is a
+// regression test for the referenceIDsMatching degradation branch
+// (listview.go's data.ErrNotFound case): a reference field's target
+// entity type can be legitimately absent from the tenant's registry (its
+// module isn't licensed here — crm referencing Item/SalesOrder is the
+// real-world case), and filtering by it must resolve to "no matches",
+// not 500 the whole list page. Gadget is published; Category is not.
+func TestListPage_DefaultFilterOnReferenceColumn_UnlicensedTarget(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := foundation.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	// Deliberately NOT publishing Category — Gadget's "category" reference
+	// target is absent from this tenant's registry.
+	publishEntityAndForm(t, db, referenceFirstEntityDef(), &form.Definition{
+		EntityType: "Gadget", Version: 1,
+		Sections: []form.Section{{Title: "D", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "category"}, {Name: "name"}}}},
+	})
+	if _, err := crud.NewEngine(db).Create(ctx, referenceFirstEntityDef(), map[string]any{"category": "no-such-id", "name": "Sprocket"}, humanActor()); err != nil {
+		t.Fatalf("seed Sprocket: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	resp := getAs(t, mux, "/records/Gadget?q=Widgets", tenantID, "anyone")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("filtering by an unlicensed reference target should degrade to a normal page, not %d:\n%s", resp.Code, resp.Body.String())
+	}
+	if strings.Contains(resp.Body.String(), "Sprocket") {
+		t.Fatalf("q=Widgets should match nothing when the target type isn't licensed (no target to resolve a label against):\n%s", resp.Body.String())
+	}
+}
