@@ -93,6 +93,9 @@ func TestIssueReport_NewPage_RendersCaptureForm(t *testing.T) {
 	if !strings.Contains(body, `action="/issue-report/submit"`) {
 		t.Fatalf("expected the form to post to /issue-report/submit, got:\n%s", body)
 	}
+	if !strings.Contains(body, `id="uc-issue-console-log"`) || !strings.Contains(body, `name="console_log"`) {
+		t.Fatalf("expected the console-log capture field (universaltill/uc-infra#46), got:\n%s", body)
+	}
 }
 
 func TestIssueReport_NewPage_RequiresAuth(t *testing.T) {
@@ -274,6 +277,68 @@ func TestIssueReport_Submit_CreatesRecordAndItsQueryable(t *testing.T) {
 	}
 	if !strings.Contains(body, `"status":"new"`) {
 		t.Fatalf("expected the new report to default to status \"new\", got:\n%s", body)
+	}
+}
+
+// TestIssueReport_Submit_StoresConsoleLog is the storage-layer proof for
+// universaltill/uc-infra#46's log-capture slice: whatever the capture
+// page's JS pre-filled the (visible, human-reviewed) console-log textarea
+// with is exactly what ends up on the record, same as transcript already
+// does — this handler doesn't re-derive or filter it.
+func TestIssueReport_Submit_StoresConsoleLog(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	form := "title=" + "Save+button+throws" +
+		"&description=" + "Clicking+save+throws+a+JS+error." +
+		"&console_log=" + "%5Berror%5D+TypeError%3A+cannot+read+properties+of+undefined"
+	req := newRequest("POST", "/issue-report/submit", tenantID, "farshid", []byte(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	listReq := newRequest("GET", "/api/records/IssueReport", tenantID, "farshid", nil)
+	listRec := httptest.NewRecorder()
+	mux.ServeHTTP(listRec, listReq)
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 listing IssueReport records, got %d: %s", listRec.Code, listRec.Body.String())
+	}
+	body := listRec.Body.String()
+	if !strings.Contains(body, "TypeError: cannot read properties of undefined") {
+		t.Fatalf("expected the submitted console_log to be queryable afterward, got:\n%s", body)
+	}
+}
+
+// TestIssueReport_Submit_NoConsoleLogIsFine confirms console_log stays
+// genuinely optional: a browser that never captured anything (or an old
+// client without this field) must not fail submission — same "empty
+// means absent" contract page_url/user_agent already have.
+func TestIssueReport_Submit_NoConsoleLogIsFine(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	form := "title=" + "No+console+activity" + "&description=" + "Nothing+to+report."
+	req := newRequest("POST", "/issue-report/submit", tenantID, "farshid", []byte(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 with no console_log submitted, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 

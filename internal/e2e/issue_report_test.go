@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/chromedp/cdproto/page"
+	cdpruntime "github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
 )
 
@@ -151,5 +152,91 @@ func TestIssueReportPage_VoiceRecordShowsCleanErrorNotRawJSON(t *testing.T) {
 	}
 	if !strings.Contains(statusText, "voice transcription is not configured") {
 		t.Fatalf("expected the real server error message to reach the status line, got %q", statusText)
+	}
+}
+
+// TestIssueReportPage_ConsoleLogCapturedFromEarlierPageAndPrefilled is the
+// real-browser proof for universaltill/uc-infra#46's log-capture slice:
+// internal/api/layout.go's shellTmpl installs a console/error listener on
+// EVERY page (persisted to sessionStorage), specifically so a problem
+// noticed on one page can still be reported with its own console output
+// once the person navigates to the issue-report page — a rendered-HTML-
+// string test can't prove any of this, since it's entirely a real
+// browser's console object, sessionStorage, and page-to-page navigation
+// working together, not markup.
+func TestIssueReportPage_ConsoleLogCapturedFromEarlierPageAndPrefilled(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, _ := testServer(t)
+	ctx := browserCtx(t, tenantID)
+
+	// Land on an ordinary page first — anything that goes through the
+	// shared shell — and make it misbehave, the same way a real user
+	// would stumble into a real error before ever opening the issue
+	// reporter.
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/issue-report/new"),
+		chromedp.WaitVisible(`#uc-issue-title`, chromedp.ByQuery),
+		chromedp.Evaluate(`console.error("Save failed", "TypeError: cannot read properties of undefined"); void 0;`, nil),
+	); err != nil {
+		t.Fatalf("trigger a console.error on the first page load: %v", err)
+	}
+
+	// A fresh navigation to the same capture page (simulating the user
+	// leaving and coming back to file the report) must still see the
+	// entry sessionStorage already holds from before.
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/issue-report/new"),
+		chromedp.WaitVisible(`#uc-issue-console-log`, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("navigate to the issue report page: %v", err)
+	}
+
+	var consoleLogValue string
+	if err := chromedp.Run(ctx, chromedp.Value(`#uc-issue-console-log`, &consoleLogValue, chromedp.ByQuery)); err != nil {
+		t.Fatalf("read the console-log textarea's value: %v", err)
+	}
+	if !strings.Contains(consoleLogValue, "Save failed") || !strings.Contains(consoleLogValue, "TypeError") {
+		t.Fatalf("expected the earlier console.error to be pre-filled into the console-log field, got %q", consoleLogValue)
+	}
+
+	// And it must be genuinely submitted, not just displayed: same
+	// end-to-end proof TestIssueReport_Submit_StoresConsoleLog already
+	// gives at the HTTP layer, but here driven by a real click through the
+	// real DOM. Submitting this <form> is a plain (non-htmx) POST, so the
+	// browser navigates to a whole new document — issueReportSubmit's own
+	// "result" template output, identified by its class (not the
+	// original page's #uc-issue-report-result placeholder div, which this
+	// navigation replaces entirely rather than swapping into).
+	if err := chromedp.Run(ctx,
+		chromedp.SetValue(`#uc-issue-title`, "Save button throws", chromedp.ByQuery),
+		chromedp.SetValue(`#uc-issue-description`, "Clicking save throws a JS error.", chromedp.ByQuery),
+		chromedp.Click(`#uc-issue-report-form button[type="submit"]`, chromedp.ByQuery),
+		chromedp.WaitVisible(`.uc-issue-report-result`, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("submit the report: %v", err)
+	}
+
+	// The vacuous version of this check would still pass with console_log
+	// silently dropped from the submit (the result page looks identical
+	// either way, since the field is optional) — so this reads the actual
+	// stored record back through the generic API, same server session,
+	// rather than trusting the result page's mere existence.
+	var apiResult struct {
+		Status int    `json:"status"`
+		Body   string `json:"body"`
+	}
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`
+		fetch('/api/records/IssueReport')
+			.then(function(r){ return r.text().then(function(t){ return {status: r.status, body: t}; }); })
+	`, &apiResult, func(p *cdpruntime.EvaluateParams) *cdpruntime.EvaluateParams {
+		return p.WithAwaitPromise(true)
+	})); err != nil {
+		t.Fatalf("fetch the stored IssueReport records from the browser: %v", err)
+	}
+	if apiResult.Status != 200 {
+		t.Fatalf("expected 200 listing IssueReport records, got %d: %.300s", apiResult.Status, apiResult.Body)
+	}
+	if !strings.Contains(apiResult.Body, "Save failed") || !strings.Contains(apiResult.Body, "TypeError") {
+		t.Fatalf("expected the pre-filled console log to have actually been submitted and stored, got:\n%.500s", apiResult.Body)
 	}
 }

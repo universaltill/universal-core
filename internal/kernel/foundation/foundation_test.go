@@ -390,6 +390,35 @@ func TestIssueReport_TranscriptIsOptional(t *testing.T) {
 	}
 }
 
+// TestIssueReport_ConsoleLogIsOptional is console_log's own version of
+// TestIssueReport_TranscriptIsOptional immediately above: a browser that
+// captured no console/error activity (or an old client predating this
+// field, universaltill/uc-infra#46) must still be a valid submission —
+// console_log is captured evidence, not a requirement to file a report.
+func TestIssueReport_ConsoleLogIsOptional(t *testing.T) {
+	def := IssueReport()
+	data := map[string]any{"title": "Something's broken", "description": "The button does nothing when clicked.", "status": "new"}
+	if err := entity.ValidateRecord(def, data); err != nil {
+		t.Fatalf("expected a report with no console_log to be valid, got %v", err)
+	}
+}
+
+// TestIssueReport_ConsoleLogAccepted confirms a report that does carry a
+// captured console_log validates cleanly, same shape as any other typed
+// FieldString value on this entity.
+func TestIssueReport_ConsoleLogAccepted(t *testing.T) {
+	def := IssueReport()
+	data := map[string]any{
+		"title":       "Something's broken",
+		"description": "The button does nothing when clicked.",
+		"console_log": "[error] TypeError: cannot read properties of undefined",
+		"status":      "new",
+	}
+	if err := entity.ValidateRecord(def, data); err != nil {
+		t.Fatalf("expected a report with console_log to be valid, got %v", err)
+	}
+}
+
 func TestIssueReport_RejectsUnknownStatus(t *testing.T) {
 	def := IssueReport()
 	data := map[string]any{"title": "x", "description": "y", "status": "resolved-by-magic"}
