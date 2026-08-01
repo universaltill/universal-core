@@ -262,10 +262,21 @@ func ReorderRuleForm() *form.Definition {
 // CustomerInvoice's own (sales/forms.go) — no master-detail Lines
 // section, matching VendorInvoice's own doc comment on why this task
 // stayed header-only (no VendorInvoiceLine breakdown).
+//
+// match_exception_reason (Version 2 — matching VendorInvoice's own field
+// Version bump) is listed here for the same reason every other field is:
+// so it's actually visible on the record's own detail/edit page, not
+// only present in stored data — the whole point of
+// MatchVendorInvoiceOnUpdate (ledger.go) recording *why* a match failed
+// is defeated if a reader can never see it. This kernel's FormField has
+// no read-only concept yet (form/definition.go), so this stays a plain
+// editable field like every other one here — same trust-the-form-
+// submission posture this kernel already takes with status_id and total,
+// not a gap unique to this field.
 func VendorInvoiceForm() *form.Definition {
 	return &form.Definition{
 		EntityType: "VendorInvoice",
-		Version:    1,
+		Version:    2,
 		Sections: []form.Section{
 			{
 				Title:     "Details",
@@ -278,6 +289,7 @@ func VendorInvoiceForm() *form.Definition {
 					{Name: "currency_id", Label: "Currency"},
 					{Name: "status_id", Label: "Status"},
 					{Name: "total", Label: "Total"},
+					{Name: "match_exception_reason", Label: "Match Exception Reason"},
 				},
 			},
 		},

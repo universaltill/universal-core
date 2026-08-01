@@ -406,10 +406,11 @@ func TestPublishStatuses_SeedsVendorInvoiceGraph(t *testing.T) {
 		t.Fatalf("list vendor_invoice_status Status: %v", err)
 	}
 	wantStatuses := map[string]struct{ isInitial, isTerminal bool }{
-		"draft":   {true, false},
-		"matched": {false, false},
-		"paid":    {false, true},
-		"void":    {false, true},
+		"draft":           {true, false},
+		"matched":         {false, false},
+		"match_exception": {false, false},
+		"paid":            {false, true},
+		"void":            {false, true},
 	}
 	if len(viStatuses) != len(wantStatuses) {
 		t.Fatalf("expected %d vendor_invoice_status Status records, got %d", len(wantStatuses), len(viStatuses))
@@ -444,6 +445,8 @@ func TestPublishStatuses_SeedsVendorInvoiceGraph(t *testing.T) {
 	transitionDef := def("StatusTransition")
 	wantEdges := [][2]string{
 		{"draft", "matched"}, {"matched", "paid"}, {"draft", "void"}, {"matched", "void"},
+		{"draft", "match_exception"}, {"matched", "match_exception"},
+		{"match_exception", "matched"}, {"match_exception", "void"},
 	}
 	for _, edge := range wantEdges {
 		rows, err := engine.ListByField(ctx, transitionDef, "from_status_id", statusIDs[edge[0]])
@@ -459,6 +462,18 @@ func TestPublishStatuses_SeedsVendorInvoiceGraph(t *testing.T) {
 		}
 		if !found {
 			t.Errorf("expected a declared %s->%s StatusTransition", edge[0], edge[1])
+		}
+	}
+
+	// The actual "blocks payment release until resolved" mechanism: no
+	// match_exception->paid edge exists at all.
+	rows, err := engine.ListByField(ctx, transitionDef, "from_status_id", statusIDs["match_exception"])
+	if err != nil {
+		t.Fatalf("list StatusTransition from match_exception: %v", err)
+	}
+	for _, r := range rows {
+		if to, _ := r.Data["to_status_id"].(string); to == statusIDs["paid"] {
+			t.Fatal("expected NO match_exception->paid StatusTransition — that missing edge is what blocks payment release")
 		}
 	}
 }
@@ -602,10 +617,11 @@ func TestPublishStatuses_IsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list Status: %v", err)
 	}
-	// 5 purchase_order_status + 4 vendor_invoice_status + 5 rfq_status —
-	// this package now seeds three StatusTypes (seedStatusGraph's own doc
-	// comment), not just purchase_order_status's original 5.
-	const wantTotal = 5 + 4 + 5
+	// 5 purchase_order_status + 5 vendor_invoice_status (draft/matched/
+	// match_exception/paid/void) + 5 rfq_status — this package now seeds
+	// three StatusTypes (seedStatusGraph's own doc comment), not just
+	// purchase_order_status's original 5.
+	const wantTotal = 5 + 5 + 5
 	if len(all) != wantTotal {
 		t.Fatalf("expected exactly %d Status records after two PublishStatuses calls, got %d", wantTotal, len(all))
 	}
