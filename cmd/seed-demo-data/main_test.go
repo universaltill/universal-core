@@ -196,7 +196,7 @@ func TestSeedDemoData_SeedsSampleRecordsAndIsIdempotent(t *testing.T) {
 		"FixedAsset", "DepreciationSchedule", "MaintenanceOrder",
 		"Project", "Task", "TimeEntry",
 		"Employee", "LeaveRequest", "AttendanceRecord",
-		"Case",
+		"Case", "Campaign", "Lead", "Opportunity",
 	} {
 		counts[entityType] = countRecords(t, tenantDB, entityType)
 		if counts[entityType] == 0 {
@@ -784,5 +784,121 @@ func TestSeedDemoData_CaseWarrantyContextIsCoherent(t *testing.T) {
 	}
 	if lines == 0 {
 		t.Error("the case cites a product that was never a line on the order it cites")
+	}
+}
+
+// The pipeline demo data must model ADR-0014's Contact shape and must
+// hang together as one story, not three records that merely exist.
+//
+// Both halves have failed in this repo before. #15's review found
+// seedCases citing an order that belonged to a different customer on
+// every run, because it picked records by ranging over a map. And
+// ADR-0013 clause 2 originally claimed HR seeding that had not been
+// written — so a demo tenant asserted to model the intended shape is
+// worth a test rather than a sentence.
+func TestSeedDemoData_PipelineModelsTheContactShape(t *testing.T) {
+	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance", "assets", "projects", "hr", "crm")
+	if _, stderr, code := run(t, []string{"DATABASE_URL=" + controlDSN}, "-tenant-id="+id, "-actor-id=smoke-test"); code != 0 {
+		t.Fatalf("seed: exit %d: %s", code, stderr)
+	}
+	control := testexec.Open(t, controlDSN)
+	router, err := tenantdb.NewRouter(control, controlDSN)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+	t.Cleanup(func() { router.Close() })
+	tenantDB, err := router.Get(context.Background(), id)
+	if err != nil {
+		t.Fatalf("router.Get: %v", err)
+	}
+	ctx := context.Background()
+
+	var leadID, companyName, convertedPartyID string
+	if err := tenantDB.QueryRowContext(ctx,
+		`SELECT id::text, data->>'company_name', data->>'converted_party_id'
+		 FROM records WHERE entity_type = 'Lead' AND data->>'name' = 'Layla Hassan' AND deleted_at IS NULL`,
+	).Scan(&leadID, &companyName, &convertedPartyID); err != nil {
+		t.Fatalf("read the converted lead: %v", err)
+	}
+	if convertedPartyID == "" {
+		t.Fatal("a lead in the `converted` state must record the Party it converted to")
+	}
+
+	// It converted to a PERSON, not an organization — the distinction
+	// ADR-0014 rests on.
+	var partyType string
+	if err := tenantDB.QueryRowContext(ctx,
+		`SELECT data->>'party_type' FROM records WHERE id = $1::uuid AND entity_type = 'Party'`, convertedPartyID,
+	).Scan(&partyType); err != nil {
+		t.Fatalf("read the converted Party: %v", err)
+	}
+	if partyType != "person" {
+		t.Errorf("the converted Party is a %q; a Contact is a person Party (ADR-0014)", partyType)
+	}
+
+	// It holds the `contact` role.
+	var roles int
+	if err := tenantDB.QueryRowContext(ctx,
+		`SELECT count(*) FROM records WHERE entity_type = 'PartyRole' AND deleted_at IS NULL
+		   AND data->>'party_id' = $1 AND data->>'role_type' = 'contact'`, convertedPartyID,
+	).Scan(&roles); err != nil {
+		t.Fatalf("count contact PartyRoles: %v", err)
+	}
+	if roles != 1 {
+		t.Errorf("the converted Party holds %d `contact` PartyRoles, want exactly 1", roles)
+	}
+
+	// The organization the lead named must exist as a Party, and the
+	// relationship must run FROM the person TO that organization. The
+	// direction is the assertion that matters: the kernel cannot
+	// enforce it (contact_for runs person -> organization while its
+	// neighbour `employs` runs the other way), so a reversed row would
+	// look perfectly valid.
+	var orgID string
+	if err := tenantDB.QueryRowContext(ctx,
+		`SELECT id::text FROM records WHERE entity_type = 'Party' AND data->>'name' = $1 AND deleted_at IS NULL`,
+		companyName,
+	).Scan(&orgID); err != nil {
+		t.Fatalf("the lead's company_name %q must name a real Party: %v", companyName, err)
+	}
+	var rels int
+	if err := tenantDB.QueryRowContext(ctx,
+		`SELECT count(*) FROM records WHERE entity_type = 'PartyRelationship' AND deleted_at IS NULL
+		   AND data->>'relationship_type' = 'contact_for'
+		   AND data->>'party_id_from' = $1 AND data->>'party_id_to' = $2`, convertedPartyID, orgID,
+	).Scan(&rels); err != nil {
+		t.Fatalf("count contact_for relationships: %v", err)
+	}
+	if rels != 1 {
+		t.Errorf("want exactly 1 contact_for relationship person(%s) -> organization(%s), got %d",
+			convertedPartyID, orgID, rels)
+	}
+
+	// And the deal that lead produced is against that same customer —
+	// not some other account that happened to be in the map.
+	var oppCustomer string
+	if err := tenantDB.QueryRowContext(ctx,
+		`SELECT data->>'customer_id' FROM records WHERE entity_type = 'Opportunity'
+		   AND data->>'lead_id' = $1 AND deleted_at IS NULL`, leadID,
+	).Scan(&oppCustomer); err != nil {
+		t.Fatalf("read the opportunity the lead produced: %v", err)
+	}
+	if oppCustomer != orgID {
+		t.Errorf("the opportunity from lead %q is against a different customer than the lead's own company: opp=%s lead-company=%s",
+			leadID, oppCustomer, orgID)
+	}
+
+	// A campaign-sourced lead must actually point at the campaign, and
+	// its campaign must be one the seeder created.
+	var campaignName string
+	if err := tenantDB.QueryRowContext(ctx,
+		`SELECT c.data->>'name' FROM records l
+		   JOIN records c ON c.id::text = l.data->>'campaign_id' AND c.entity_type = 'Campaign'
+		 WHERE l.entity_type = 'Lead' AND l.data->>'name' = 'Nadia Karim' AND l.deleted_at IS NULL`,
+	).Scan(&campaignName); err != nil {
+		t.Fatalf("the event-sourced lead must resolve to a real Campaign: %v", err)
+	}
+	if campaignName != "Gulf Expo 2026" {
+		t.Errorf("event-sourced lead points at campaign %q, want the event campaign", campaignName)
 	}
 }

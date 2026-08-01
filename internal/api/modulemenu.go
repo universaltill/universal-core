@@ -158,6 +158,9 @@ func entityHubLayout(h *Handler, locale, centerLabel string, entities []moduleEn
 // back to a generic document icon rather than an empty/broken node.
 var entityIcons = map[string]string{
 	"Case":                 "🎫",
+	"Campaign":             "📣",
+	"Lead":                 "🌱",
+	"Opportunity":          "💡",
 	"Party":                "👤",
 	"PartyRole":            "🎭",
 	"PartyRelationship":    "🔗",

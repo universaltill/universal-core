@@ -51,18 +51,42 @@ func PartyRole() *entity.Definition {
 }
 
 // PartyRelationship models connections between two parties — org charts,
-// vendor/subsidiary links, employment — with one mechanism instead of a
-// bespoke foreign key per module.
+// vendor/subsidiary links, employment, CRM contacts — with one mechanism
+// instead of a bespoke foreign key per module.
+//
+// **Direction is per value, and the kernel cannot enforce it.** The enum
+// says what the relationship is, not which end is which, so every value
+// must state its own direction here or the table quietly fills with
+// reversed rows nobody can tell apart:
+//
+//   - employs:     party_id_from EMPLOYS party_id_to (organization → person)
+//   - supplies:    party_id_from SUPPLIES party_id_to (vendor → customer)
+//   - parent_of:   party_id_from IS PARENT OF party_id_to (parent org → subsidiary)
+//   - contact_for: party_id_from IS A CONTACT FOR party_id_to (person → organization)
+//
+// Note that contact_for runs person → organization while employs runs
+// organization → person. That is deliberate — each reads naturally in
+// its own direction — and it is exactly why the list above is an
+// obligation on any future value, not decoration (ADR-0014).
+//
+// v3 added contact_for: a CRM contact is a person Party holding the
+// `contact` PartyRole, joined to an organization Party by one of these
+// rows (reference-data-model.md §6, ADR-0014). Reusing `employs` for it
+// was rejected because nothing in this schema identifies the tenant's
+// own organization Party (#63 is unbuilt), so one value would have had
+// to carry both "our staff" and "their staff" with no field able to
+// separate them. Additive enum value, no data migration: rows written
+// against v2 still hold legal values.
 func PartyRelationship() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "PartyRelationship",
-		Version:    2,
+		Version:    3,
 		Module:     "foundation",
 		Fields: []entity.Field{
 			{Name: "party_id_from", Type: entity.FieldReference, Required: true, Target: "Party"},
 			{Name: "party_id_to", Type: entity.FieldReference, Required: true, Target: "Party"},
 			{Name: "relationship_type", Type: entity.FieldEnum, Required: true,
-				EnumValues: []string{"employs", "supplies", "parent_of"}},
+				EnumValues: []string{"employs", "supplies", "parent_of", "contact_for"}},
 		},
 	}
 }

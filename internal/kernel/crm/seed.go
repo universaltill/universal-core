@@ -58,8 +58,11 @@ func PublishForms(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 }
 
 // PublishStatuses seeds the StatusType/Status/StatusTransition records
-// Case's StatusTypeCode needs before the guarded engine will accept a
-// create (the shared seeder is internal/kernel/statusgraph).
+// this module's four StatusTypeCodes need before the guarded engine
+// will accept a create (the shared seeder is internal/kernel/
+// statusgraph, which scopes status codes by status_type_id — so
+// `new` meaning a fresh Case and `new` meaning a fresh Lead do not
+// collide, the bug fixed across purchasing/sales on 2026-07-29).
 //
 // case_status is a support workflow, which is neither a pure lifecycle
 // nor an approval chain: new -> in_progress -> resolved -> closed is
@@ -143,6 +146,120 @@ func PublishStatuses(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 		actor,
 	); err != nil {
 		return fmt.Errorf("seed case_status: %w", err)
+	}
+
+	// lead_status is a qualification funnel with two exits and no way
+	// back in. converted is where a lead stops being a lead: a real
+	// Party now exists (Lead.converted_party_id records which), and
+	// anything further happens on the Opportunity. disqualified is the
+	// other end — wrong fit, no budget, or a duplicate.
+	//
+	// Both are terminal, which means **a disqualified lead that comes
+	// back is a new lead**, not a reopened one. That is deliberate and
+	// it is the opposite of Case's resolved -> in_progress edge, for a
+	// reason worth stating: reopening a case preserves one problem's
+	// history, whereas a prospect returning eighteen months later is a
+	// genuinely new opportunity to win, and folding it into the old
+	// record would date the lead to the first contact and quietly
+	// corrupt every time-to-qualify measure.
+	//
+	// There is no path back from qualified to contacted either. Nothing
+	// is lost by leaving a stalled lead qualified, and an edge that
+	// exists only to let someone undo a misclick is an edge a report
+	// then has to reason about.
+	if _, err := statusgraph.Seed(ctx, engine, statusTypeDef, statusDef, transitionDef,
+		"Lead", "lead_status", "Lead Status",
+		[]statusgraph.Spec{
+			{Code: "new", Name: "New", Sequence: 1, IsInitial: true},
+			{Code: "contacted", Name: "Contacted", Sequence: 2},
+			{Code: "qualified", Name: "Qualified", Sequence: 3},
+			{Code: "converted", Name: "Converted", Sequence: 4, IsTerminal: true},
+			{Code: "disqualified", Name: "Disqualified", Sequence: 5, IsTerminal: true},
+		},
+		[][2]string{
+			{"new", "contacted"},
+			{"contacted", "qualified"},
+			{"qualified", "converted"},
+			// Reachable from every live state: a lead can turn out to be
+			// a dead end at any point, including before anyone calls.
+			{"new", "disqualified"},
+			{"contacted", "disqualified"},
+			{"qualified", "disqualified"},
+		},
+		actor,
+	); err != nil {
+		return fmt.Errorf("seed lead_status: %w", err)
+	}
+
+	// opportunity_stage is the pipeline. The forward path is the
+	// familiar funnel; the edges that matter are the two backward ones
+	// and the breadth of `lost`.
+	//
+	// negotiation -> proposal is real and common: the customer asks for
+	// a revised quote, which puts the deal back in proposal rather than
+	// killing it. proposal -> qualification covers the requirements
+	// changing under you. Without those, a rep's only honest options
+	// are to leave the stage wrong or mark the deal lost and open a
+	// second one — and a pipeline where stage regression is impossible
+	// is a pipeline that reports optimistically by construction.
+	//
+	// won is reachable from proposal as well as negotiation, because a
+	// customer accepting a proposal outright is not an anomaly to be
+	// modelled around. lost is reachable from every live stage,
+	// including prospecting.
+	if _, err := statusgraph.Seed(ctx, engine, statusTypeDef, statusDef, transitionDef,
+		"Opportunity", "opportunity_stage", "Opportunity Stage",
+		[]statusgraph.Spec{
+			{Code: "prospecting", Name: "Prospecting", Sequence: 1, IsInitial: true},
+			{Code: "qualification", Name: "Qualification", Sequence: 2},
+			{Code: "proposal", Name: "Proposal", Sequence: 3},
+			{Code: "negotiation", Name: "Negotiation", Sequence: 4},
+			{Code: "won", Name: "Won", Sequence: 5, IsTerminal: true},
+			{Code: "lost", Name: "Lost", Sequence: 6, IsTerminal: true},
+		},
+		[][2]string{
+			{"prospecting", "qualification"},
+			{"qualification", "proposal"},
+			{"proposal", "negotiation"},
+			{"negotiation", "won"},
+			{"proposal", "won"},
+			// The customer asks for a revised quote; the requirements move.
+			{"negotiation", "proposal"},
+			{"proposal", "qualification"},
+			{"prospecting", "lost"},
+			{"qualification", "lost"},
+			{"proposal", "lost"},
+			{"negotiation", "lost"},
+		},
+		actor,
+	); err != nil {
+		return fmt.Errorf("seed opportunity_stage: %w", err)
+	}
+
+	// campaign_status is a lifecycle, and it is a real one rather than
+	// something derivable from start_date/end_date: a campaign cancelled
+	// before it ran and a campaign that ran to its end date are
+	// different facts, and the dates cannot tell them apart. Modelled as
+	// a graph rather than a plain enum for the same reason
+	// SalesOrder.status_id is — this codebase has already paid for the
+	// enum-to-graph migration once (PurchaseOrder).
+	if _, err := statusgraph.Seed(ctx, engine, statusTypeDef, statusDef, transitionDef,
+		"Campaign", "campaign_status", "Campaign Status",
+		[]statusgraph.Spec{
+			{Code: "planned", Name: "Planned", Sequence: 1, IsInitial: true},
+			{Code: "active", Name: "Active", Sequence: 2},
+			{Code: "completed", Name: "Completed", Sequence: 3, IsTerminal: true},
+			{Code: "cancelled", Name: "Cancelled", Sequence: 4, IsTerminal: true},
+		},
+		[][2]string{
+			{"planned", "active"},
+			{"active", "completed"},
+			{"planned", "cancelled"},
+			{"active", "cancelled"},
+		},
+		actor,
+	); err != nil {
+		return fmt.Errorf("seed campaign_status: %w", err)
 	}
 	return nil
 }

@@ -148,6 +148,13 @@ func main() {
 			log.Fatalf("publish crm statuses: %v", err)
 		}
 		s.seedCases(customers, items, soIDs)
+		// Gated separately from Case, not folded into the check above:
+		// a tenant provisioned before the pipeline entities shipped has
+		// Case published and Opportunity not (#70), and seeding into an
+		// unpublished type is a log.Fatalf, not a skip.
+		if hasPublished(s.ctx, s.entityDefs, "Opportunity") {
+			s.seedPipeline(customers, currencies)
+		}
 	}
 	if hasPublished(s.ctx, s.entityDefs, "Employee") {
 		if err := hr.PublishStatuses(context.Background(), sqlDB, s.actor); err != nil {
@@ -565,30 +572,36 @@ func (s *seeder) seedOrgChart() {
 	})
 }
 
+// ensurePartyRole gives partyID the named PartyRole if it doesn't hold
+// it already. A method rather than seedParties' local closure because
+// seedPipeline needs the same idempotency for the `contact` role
+// (ADR-0014) — and PartyRole has no single natural key, so getOrCreate
+// cannot express it.
+func (s *seeder) ensurePartyRole(partyID, roleType string) {
+	roleDef := s.def("PartyRole")
+	existing, err := s.crud.ListByField(s.ctx, roleDef, "party_id", partyID)
+	if err != nil {
+		log.Fatalf("list PartyRole by party_id: %v", err)
+	}
+	for _, r := range existing {
+		if r.Data["role_type"] == roleType {
+			return
+		}
+	}
+	if _, err := s.crud.Create(s.ctx, roleDef, map[string]any{
+		"party_id": partyID, "role_type": roleType,
+	}, s.actor); err != nil {
+		log.Fatalf("create PartyRole: %v", err)
+	}
+}
+
 // seedParties creates both vendors and customers, tagging each with a
 // PartyRole row — the reference-data-model.md Party-Role pattern this
 // kernel is built around, so the sample data actually demonstrates it
 // instead of leaving PartyRole empty. Names lean into the UK+GCC+Turkey
 // launch markets (BACKLOG.md's R1) rather than generic placeholders.
 func (s *seeder) seedParties() (vendors, customers map[string]string) {
-	roleDef := s.def("PartyRole")
-
-	seedRole := func(partyID, roleType string) {
-		existing, err := s.crud.ListByField(s.ctx, roleDef, "party_id", partyID)
-		if err != nil {
-			log.Fatalf("list PartyRole by party_id: %v", err)
-		}
-		for _, r := range existing {
-			if r.Data["role_type"] == roleType {
-				return
-			}
-		}
-		if _, err := s.crud.Create(s.ctx, roleDef, map[string]any{
-			"party_id": partyID, "role_type": roleType,
-		}, s.actor); err != nil {
-			log.Fatalf("create PartyRole: %v", err)
-		}
-	}
+	seedRole := s.ensurePartyRole
 
 	vendors = map[string]string{}
 	for _, name := range []string{
@@ -1469,5 +1482,160 @@ func (s *seeder) seedCases(customers, items, soIDs map[string]string) {
 		"priority":    "low",
 		"opened_date": "2026-07-30",
 		"status_id":   s.statusID("case_status", "new"),
+	})
+}
+
+// ensureContactFor wires up ADR-0014's Contact shape and returns the
+// person's Party id: a person Party, the `contact` PartyRole, and a
+// contact_for PartyRelationship pointing FROM the person TO the
+// organization.
+//
+// The direction matters and is the whole reason this is a helper rather
+// than three inline calls — contact_for runs person -> organization
+// while its neighbour `employs` runs organization -> person, the kernel
+// cannot enforce either, and a reversed row is indistinguishable from a
+// correct one by inspection. Writing it in one place, with a test that
+// asserts the ends, is what keeps ADR-0014's documented convention from
+// being a comment nobody checks.
+func (s *seeder) ensureContactFor(personName, organizationID string) string {
+	personID := s.getOrCreate("Party", "name", personName, map[string]any{
+		"party_type": "person", "name": personName, "status": "active",
+	})
+	s.ensurePartyRole(personID, "contact")
+
+	relDef := s.def("PartyRelationship")
+	existing, err := s.crud.ListByField(s.ctx, relDef, "party_id_from", personID)
+	if err != nil {
+		log.Fatalf("list PartyRelationship by party_id_from: %v", err)
+	}
+	for _, r := range existing {
+		if r.Data["party_id_to"] == organizationID && r.Data["relationship_type"] == "contact_for" {
+			return personID
+		}
+	}
+	if _, err := s.crud.Create(s.ctx, relDef, map[string]any{
+		"party_id_from":     personID,
+		"party_id_to":       organizationID,
+		"relationship_type": "contact_for",
+	}, s.actor); err != nil {
+		log.Fatalf("create contact_for PartyRelationship: %v", err)
+	}
+	return personID
+}
+
+// seedPipeline gives the demo tenant a CRM pipeline: two campaigns, three
+// leads at different points in the funnel, and two open opportunities.
+//
+// Named keys throughout, and every cross-reference is coherent rather
+// than "whichever record came back first" — the mistake #15's review
+// caught in seedCases, where three independently random pointers were
+// documented as warranty context. Specifically: the converted lead
+// (Layla Hassan) names Doha Retail Group as its company, converts to a
+// person Party who is a `contact_for` that same organization, and the
+// opportunity that lead produced is against that same customer. A
+// pipeline demo where the converted lead points at an unrelated account
+// would teach the shape wrong.
+func (s *seeder) seedPipeline(customers, currencies map[string]string) {
+	const (
+		expoCampaign  = "Gulf Expo 2026"
+		emailCampaign = "Autumn Email Series"
+		convertedLead = "Layla Hassan"
+		leadCustomer  = "Doha Retail Group"
+	)
+
+	// The rep gets a real PartyRole. owner_id is one of the "any Party is
+	// accepted" gaps crm.go lists (#78), and a demo tenant whose only
+	// roleless person Party is the one five records point at would be
+	// demonstrating the loophole — the opposite of what ADR-0013 clause 2
+	// asks the sample data to do (independent review).
+	salesRep := s.getOrCreate("Party", "name", "Demo Sales Rep", map[string]any{
+		"party_type": "person", "name": "Demo Sales Rep", "status": "active",
+	})
+	s.ensurePartyRole(salesRep, "employee")
+
+	expoID := s.getOrCreate("Campaign", "name", expoCampaign, map[string]any{
+		"name":        expoCampaign,
+		"channel":     "event",
+		"budget":      25000.0,
+		"currency_id": currencies["QAR"],
+		"start_date":  "2026-09-01",
+		"end_date":    "2026-09-30",
+		"description": "Trade stand and follow-up programme at the regional expo.",
+		"status_id":   s.statusID("campaign_status", "active"),
+	})
+	s.getOrCreate("Campaign", "name", emailCampaign, map[string]any{
+		"name":        emailCampaign,
+		"channel":     "email",
+		"budget":      3000.0,
+		"currency_id": currencies["USD"],
+		"start_date":  "2026-10-01",
+		"end_date":    "2026-11-15",
+		"description": "Four-part sequence to dormant accounts.",
+		"status_id":   s.statusID("campaign_status", "planned"),
+	})
+
+	// The converted lead, and the Contact it converted into. Doing this
+	// in the demo tenant is the point: ADR-0014 says a contact is a
+	// Party plus a role plus a relationship, and the kernel cannot yet
+	// enforce any of that (#78), so the demo data is what shows the
+	// intended shape rather than the loophole (ADR-0013 clause 2).
+	contactPartyID := s.ensureContactFor(convertedLead, customers[leadCustomer])
+
+	convertedLeadID := s.getOrCreate("Lead", "name", convertedLead, map[string]any{
+		"name":               convertedLead,
+		"company_name":       leadCustomer,
+		"email":              "layla.hassan@example.com",
+		"phone":              "+974 5555 0101",
+		"source":             "referral",
+		"owner_id":           salesRep,
+		"converted_party_id": contactPartyID,
+		"notes":              "Introduced by an existing account; now the buying contact.",
+		"status_id":          s.statusID("lead_status", "converted"),
+	})
+
+	s.getOrCreate("Lead", "name", "Nadia Karim", map[string]any{
+		"name":         "Nadia Karim",
+		"company_name": "Northline Logistics",
+		"email":        "nadia.karim@example.com",
+		"phone":        "+974 5555 0102",
+		"source":       "event",
+		"campaign_id":  expoID,
+		"owner_id":     salesRep,
+		"notes":        "Visited the stand; asked for a fleet-scale quote.",
+		"status_id":    s.statusID("lead_status", "qualified"),
+	})
+	s.getOrCreate("Lead", "name", "Tomas Berg", map[string]any{
+		"name":         "Tomas Berg",
+		"company_name": "Berg Manufacturing",
+		"email":        "tomas.berg@example.com",
+		"source":       "web",
+		"owner_id":     salesRep,
+		"status_id":    s.statusID("lead_status", "new"),
+	})
+
+	// The deal the converted lead produced — same customer the lead
+	// named and the contact belongs to.
+	s.getOrCreate("Opportunity", "name", leadCustomer+" — POS refresh", map[string]any{
+		"name":                leadCustomer + " — POS refresh",
+		"customer_id":         customers[leadCustomer],
+		"lead_id":             convertedLeadID,
+		"amount":              120000.0,
+		"currency_id":         currencies["QAR"],
+		"probability":         60.0,
+		"expected_close_date": "2026-10-15",
+		"owner_id":            salesRep,
+		"description":         "Replace end-of-life terminals across eleven stores.",
+		"status_id":           s.statusID("opportunity_stage", "negotiation"),
+	})
+	s.getOrCreate("Opportunity", "name", "London Fashion House — warehouse fit-out", map[string]any{
+		"name":                "London Fashion House — warehouse fit-out",
+		"customer_id":         customers["London Fashion House"],
+		"amount":              45000.0,
+		"currency_id":         currencies["GBP"],
+		"probability":         30.0,
+		"expected_close_date": "2026-12-01",
+		"owner_id":            salesRep,
+		"description":         "Racking, scanners and stock-count tooling for the new site.",
+		"status_id":           s.statusID("opportunity_stage", "qualification"),
 	})
 }
