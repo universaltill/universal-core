@@ -73,6 +73,10 @@ func (h *Handler) renderNav(r *http.Request, rc *httpx.RequestContext, locale st
 		// entity, always present (see aiprovidersettings.go).
 		view.ShowAIProviderSettings = true
 		view.AIProviderSettingsLabel = h.catalog.T(locale, "nav.ai_provider_settings")
+		// Same reasoning again: ExternalSQLSource is a foundation entity,
+		// always present (see extsqlsource.go).
+		view.ShowSQLSourceSettings = true
+		view.SQLSourceSettingsLabel = h.catalog.T(locale, "nav.sql_sources")
 		// Members is the one nav link that IS role-gated: the page
 		// itself 403s non-admins (members.go's requireMembersAccess), so
 		// showing it to everyone would be a guaranteed dead end, not a
@@ -134,6 +138,8 @@ type navView struct {
 	IssueReportLabel        string
 	ShowAIProviderSettings  bool
 	AIProviderSettingsLabel string
+	ShowSQLSourceSettings   bool
+	SQLSourceSettingsLabel  string
 	ShowMembers             bool
 	MembersLabel            string
 	ShowLogout              bool
@@ -158,6 +164,7 @@ var navTmpl = template.Must(template.New("nav").Parse(`
 {{if .ShowApprovals}}<a class="uc-nav-link" href="/workflow-jobs">{{.ApprovalsLabel}}</a>{{end}}
 {{if .ShowIssueReport}}<a class="uc-nav-link" href="/issue-report/new">{{.IssueReportLabel}}</a>{{end}}
 {{if .ShowAIProviderSettings}}<a class="uc-nav-link" href="/settings/ai-provider">{{.AIProviderSettingsLabel}}</a>{{end}}
+{{if .ShowSQLSourceSettings}}<a class="uc-nav-link" href="/settings/sql-sources">{{.SQLSourceSettingsLabel}}</a>{{end}}
 {{if .ShowMembers}}<a class="uc-nav-link" href="/settings/members">{{.MembersLabel}}</a>{{end}}
 <span class="uc-nav-spacer"></span>
 {{if .Tenants}}<details class="uc-nav-tenant"><summary title="{{.SwitcherLabel}}">{{.ActiveTenantName}}</summary>

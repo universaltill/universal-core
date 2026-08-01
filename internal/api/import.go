@@ -79,6 +79,11 @@ func (h *Handler) importUploadPage(w http.ResponseWriter, r *http.Request) {
 		PreviewHref:  "/import/" + entityType + "/preview",
 		ChooseFile:   h.catalog.T(locale, "import.choose_file"),
 		PreviewLabel: h.catalog.T(locale, "import.preview_button"),
+		// The SQL-source flow's entry point (extsqlimport.go) — always
+		// linked; that page explains itself when no source is registered
+		// yet, and links onward to /settings/sql-sources.
+		SQLImportHref:  "/import/" + entityType + "/sql",
+		SQLImportLabel: h.catalog.T(locale, "import.sql_source_link"),
 	})
 	if err != nil {
 		writeInternalError(w, "render import upload page", err)
@@ -461,10 +466,12 @@ func mappingFromForm(r *http.Request) csvimport.ColumnMapping {
 // --- view models ---
 
 type importPageView struct {
-	EntityType   string
-	PreviewHref  string
-	ChooseFile   string
-	PreviewLabel string
+	EntityType     string
+	PreviewHref    string
+	ChooseFile     string
+	PreviewLabel   string
+	SQLImportHref  string
+	SQLImportLabel string
 }
 
 type importPreviewView struct {
@@ -563,6 +570,7 @@ var importTmpl = template.Must(template.New("import").Parse(`
 <input type="file" id="uc-import-file" name="file" accept=".csv,.xlsx" required>
 <button type="button" hx-post="{{.PreviewHref}}" hx-include="#uc-import-form" hx-target="#uc-import-result" hx-encoding="multipart/form-data">{{.PreviewLabel}}</button>
 </form>
+<p class="uc-import-sql-link"><a href="{{.SQLImportHref}}">{{.SQLImportLabel}}</a></p>
 <div id="uc-import-result"></div>
 </div>
 {{end}}

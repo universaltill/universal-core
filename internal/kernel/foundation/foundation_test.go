@@ -33,16 +33,16 @@ func TestAllFoundationFormsAreValid(t *testing.T) {
 // BOTH its entity Definition AND its Form Definition are published, so
 // an entity Definition with no matching form is invisible — reachable by
 // no module-menu node, no /forms/{entityType}/new|{id} route. Every
-// foundation entity except AIProviderConnection (its own doc comment:
-// deliberately bespoke, a generic form would render its encrypted API
-// key as a plain text box) must have a form.
+// foundation entity except AIProviderConnection and ExternalSQLSource
+// (their own doc comments: deliberately bespoke, a generic form would
+// render their encrypted secrets as plain text boxes) must have a form.
 func TestAllFoundationEntitiesHaveAForm(t *testing.T) {
 	formTypes := map[string]bool{}
 	for _, f := range AllForms() {
 		formTypes[f.EntityType] = true
 	}
 	for _, def := range All() {
-		if def.EntityType == "AIProviderConnection" {
+		if def.EntityType == "AIProviderConnection" || def.EntityType == "ExternalSQLSource" {
 			continue
 		}
 		if !formTypes[def.EntityType] {
@@ -553,5 +553,53 @@ func TestPosition_ReportsToIsOptional(t *testing.T) {
 		"title": "Accountant", "department_id": "dept-1", "reports_to_position_id": "pos-manager",
 	}); err != nil {
 		t.Fatalf("expected a Position with reports_to_position_id to validate, got %v", err)
+	}
+}
+
+func TestExternalSQLSource_RequiresNameDriverHostDatabase(t *testing.T) {
+	def := ExternalSQLSource()
+	valid := map[string]any{
+		"name": "Legacy NAV", "driver": "mssql",
+		"host": "nav.internal", "database": "NAVDB",
+	}
+	if err := entity.ValidateRecord(def, valid); err != nil {
+		t.Fatalf("expected a minimal source (name/driver/host/database) to be valid, got %v", err)
+	}
+	for _, missing := range []string{"name", "driver", "host", "database"} {
+		data := map[string]any{}
+		for k, v := range valid {
+			if k != missing {
+				data[k] = v
+			}
+		}
+		if err := entity.ValidateRecord(def, data); err == nil {
+			t.Errorf("expected an error for a source missing required %q", missing)
+		}
+	}
+}
+
+func TestExternalSQLSource_RejectsUnknownDriver(t *testing.T) {
+	def := ExternalSQLSource()
+	data := map[string]any{
+		"name": "x", "driver": "oracle", "host": "h", "database": "d",
+	}
+	if err := entity.ValidateRecord(def, data); err == nil {
+		t.Fatal("expected error for a driver outside the declared enum (mssql/postgres)")
+	}
+}
+
+// TestExternalSQLSource_PasswordEncryptedIsNotRequiredAtTheEntityLevel —
+// same reasoning as AIProviderConnection's api_key_encrypted: a source
+// may legitimately have no password, and Required here would force the
+// settings handler to round-trip the secret on every edit instead of
+// treating blank-on-edit as "unchanged" (see the entity's doc comment).
+func TestExternalSQLSource_PasswordEncryptedIsNotRequiredAtTheEntityLevel(t *testing.T) {
+	def := ExternalSQLSource()
+	data := map[string]any{
+		"name": "Dev box", "driver": "postgres", "host": "localhost",
+		"database": "navmirror", "username": "readonly",
+	}
+	if err := entity.ValidateRecord(def, data); err != nil {
+		t.Fatalf("expected a passwordless source to be valid at the entity level, got %v", err)
 	}
 }

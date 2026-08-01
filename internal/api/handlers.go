@@ -306,6 +306,16 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	mux.Handle("GET /import/{entityType}", authPage(h.importUploadPage))
 	mux.Handle("POST /import/{entityType}/preview", auth(h.importPreview))
 	mux.Handle("POST /import/{entityType}/commit", auth(h.importCommit))
+	// Import from a registered external SQL source (ADR-0019) — see
+	// extsqlimport.go. Same gating as the file-based import routes above:
+	// the page behind authPage, the htmx fragments behind auth, and the
+	// commit writing through the same RBAC-guarded engine (ADR-0006).
+	// The literal "sql" segment outranks the file flow's wildcard-free
+	// patterns by segment count, so there's no collision.
+	mux.Handle("GET /import/{entityType}/sql", authPage(h.extSQLImportPage))
+	mux.Handle("POST /import/{entityType}/sql/relations", auth(h.extSQLImportRelations))
+	mux.Handle("POST /import/{entityType}/sql/preview", auth(h.extSQLImportPreview))
+	mux.Handle("POST /import/{entityType}/sql/commit", auth(h.extSQLImportCommit))
 	// The exporter half of Farshid's original "importer exporter
 	// plugins" ask — see export.go's own doc comment.
 	mux.Handle("GET /export/{entityType}", auth(h.exportRecordsCSV))
@@ -351,6 +361,16 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	mux.Handle("GET /settings/ai-provider", authPage(h.aiProviderSettingsPage))
 	mux.Handle("POST /settings/ai-provider", auth(h.aiProviderSettingsSave))
 	mux.Handle("POST /settings/ai-provider/clear", auth(h.aiProviderSettingsClear))
+	// The external SQL sources settings page (ADR-0019) — see
+	// extsqlsource.go's own doc comment. Same shape as /settings/
+	// ai-provider (a fixed foundation entity's bespoke settings page,
+	// never a generic form), except ExternalSQLSource is a list, so the
+	// mutating routes are per-record.
+	mux.Handle("GET /settings/sql-sources", authPage(h.extSQLSourcesPage))
+	mux.Handle("POST /settings/sql-sources", auth(h.extSQLSourceCreate))
+	mux.Handle("POST /settings/sql-sources/{id}", auth(h.extSQLSourceUpdate))
+	mux.Handle("POST /settings/sql-sources/{id}/delete", auth(h.extSQLSourceDelete))
+	mux.Handle("POST /settings/sql-sources/{id}/test", auth(h.extSQLSourceTest))
 	// The self-service tenant member management page (universal-core#3,
 	// ADR-0010) — see members.go's own doc comment. Every route is
 	// additionally gated to the tenant_admin role code server-side

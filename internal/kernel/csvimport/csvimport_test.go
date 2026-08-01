@@ -368,3 +368,111 @@ func TestCommit_WritesAuditRowsPerRecord(t *testing.T) {
 		t.Fatalf("expected %d audit rows (one per committed row), got %d", len(results), auditCount)
 	}
 }
+
+// TestPreviewRows_MatchesFileBasedPreview pins the contract ADR-0019
+// leans on: the rows-based entry points (what an external SQL relation
+// feeds) and the file-based ones (what an upload feeds) must be the
+// same engine, not two engines that can drift.
+func TestPreviewRows_MatchesFileBasedPreview(t *testing.T) {
+	def := vendorDef()
+	mapping := ColumnMapping{"Vendor Name": "name", "Lead Time": "lead_time_days"}
+	csvData := "Vendor Name,Lead Time\nAcme,60\n,30\nBeta,not-a-number\n"
+
+	fromFile, err := Preview(strings.NewReader(csvData), def, mapping)
+	if err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+	headers := []string{"Vendor Name", "Lead Time"}
+	rows := [][]string{{"Acme", "60"}, {"", "30"}, {"Beta", "not-a-number"}}
+	fromRows, err := PreviewRows(headers, rows, def, mapping)
+	if err != nil {
+		t.Fatalf("PreviewRows: %v", err)
+	}
+
+	if len(fromFile) != len(fromRows) {
+		t.Fatalf("result count differs: file=%d rows=%d", len(fromFile), len(fromRows))
+	}
+	for i := range fromFile {
+		if (fromFile[i].Err == nil) != (fromRows[i].Err == nil) {
+			t.Errorf("row %d: validity differs between file and rows path (file err=%v, rows err=%v)", i+1, fromFile[i].Err, fromRows[i].Err)
+		}
+		if fmt.Sprint(fromFile[i].Data) != fmt.Sprint(fromRows[i].Data) {
+			t.Errorf("row %d: data differs between file and rows path (%v vs %v)", i+1, fromFile[i].Data, fromRows[i].Data)
+		}
+	}
+}
+
+func TestPreviewRows_RejectsBrokenMappingUpfront(t *testing.T) {
+	def := vendorDef()
+	_, err := PreviewRows([]string{"A"}, [][]string{{"x"}}, def, ColumnMapping{"Missing": "name"})
+	if err == nil {
+		t.Fatal("expected ValidateMapping to reject a mapping referencing an absent column")
+	}
+}
+
+// TestCommitRows_WritesLikeFileBasedCommit — the rows path writes
+// through the same engine.Create per row, skipping bad rows without
+// blocking good ones, exactly like TestCommit_WritesOnlyRowsThatPassValidation.
+func TestCommitRows_WritesLikeFileBasedCommit(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	engine := crud.NewEngine(db)
+	def := vendorDef()
+
+	headers := []string{"Vendor Name", "Lead Time"}
+	rows := [][]string{{"Acme", "60"}, {"", "30"}, {"Gamma", "45"}}
+	results, err := CommitRows(ctx, headers, rows, def, ColumnMapping{"Vendor Name": "name", "Lead Time": "lead_time_days"}, engine, humanActor())
+	if err != nil {
+		t.Fatalf("CommitRows: %v", err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("expected 3 row results, got %d", len(results))
+	}
+	if results[0].RecordID == "" || results[2].RecordID == "" {
+		t.Fatalf("expected rows 1 and 3 to commit, got %+v", results)
+	}
+	if results[1].Err == nil || results[1].RecordID != "" {
+		t.Fatalf("expected row 2 (missing required name) skipped, got %+v", results[1])
+	}
+	got, err := engine.List(ctx, def)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected exactly the 2 valid rows written, got %d", len(got))
+	}
+}
+
+// TestCommitRows_StopsOnContextCancellation — a deadline mid-batch must
+// not grind through the remaining rows collecting identical driver
+// errors; unattempted rows carry the context error honestly.
+func TestCommitRows_StopsOnContextCancellation(t *testing.T) {
+	db := freshTenantDB(t)
+	engine := crud.NewEngine(db)
+	def := vendorDef()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled before the first write
+
+	headers := []string{"Vendor Name"}
+	rows := [][]string{{"Acme"}, {"Beta"}}
+	results, err := CommitRows(ctx, headers, rows, def, ColumnMapping{"Vendor Name": "name"}, engine, humanActor())
+	if err != nil {
+		t.Fatalf("CommitRows: %v", err)
+	}
+	for i, res := range results {
+		if res.RecordID != "" {
+			t.Errorf("row %d: committed despite cancelled context", i+1)
+		}
+		if res.Err == nil || !strings.Contains(res.Err.Error(), "context canceled") {
+			t.Errorf("row %d: expected a context error, got %v", i+1, res.Err)
+		}
+	}
+	got, err := engine.List(context.Background(), def)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected no records written under a cancelled context, got %d", len(got))
+	}
+}

@@ -123,6 +123,16 @@ func preview(r io.Reader, read reader, def *entity.Definition, mapping ColumnMap
 	if err != nil {
 		return nil, err
 	}
+	return PreviewRows(headers, rows, def, mapping)
+}
+
+// PreviewRows is Preview for rows that already exist in memory as a
+// header row plus data rows — the shape an external SQL relation's
+// fetched result set arrives in (internal/kernel/sqlsource), where there
+// is no file to parse. Same validation contract, same RowResult shape;
+// the file-based Preview/PreviewXLSX are thin parse-then-delegate
+// wrappers over this, so the two import paths cannot drift.
+func PreviewRows(headers []string, rows [][]string, def *entity.Definition, mapping ColumnMapping) ([]RowResult, error) {
 	if err := ValidateMapping(def, headers, mapping); err != nil {
 		return nil, err
 	}
@@ -165,12 +175,33 @@ func CommitXLSX(ctx context.Context, r io.Reader, def *entity.Definition, mappin
 }
 
 func commit(ctx context.Context, r io.Reader, read reader, def *entity.Definition, mapping ColumnMapping, engine RecordCreator, actor audit.Actor) ([]RowResult, error) {
-	results, err := preview(r, read, def, mapping)
+	headers, rows, err := read(r)
+	if err != nil {
+		return nil, err
+	}
+	return CommitRows(ctx, headers, rows, def, mapping, engine, actor)
+}
+
+// CommitRows is Commit for in-memory header+rows input — see PreviewRows
+// for why this exists. Identical semantics: preview first, then write
+// only the rows that passed, atomically per row, bad rows reported and
+// skipped rather than blocking the batch.
+func CommitRows(ctx context.Context, headers []string, rows [][]string, def *entity.Definition, mapping ColumnMapping, engine RecordCreator, actor audit.Actor) ([]RowResult, error) {
+	results, err := PreviewRows(headers, rows, def, mapping)
 	if err != nil {
 		return nil, err
 	}
 	for i, res := range results {
 		if res.Err != nil {
+			continue
+		}
+		// A cancelled/expired context (an import request hitting its
+		// deadline mid-batch) stops the loop instead of grinding through
+		// the remaining rows collecting one identical driver error each —
+		// the unwritten rows get the context error so the caller's
+		// per-row report stays honest about what never got attempted.
+		if err := ctx.Err(); err != nil {
+			results[i].Err = fmt.Errorf("not attempted: %w", err)
 			continue
 		}
 		rec, err := engine.Create(ctx, def, res.Data, actor)

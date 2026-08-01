@@ -87,10 +87,11 @@ func IssueReportForm() *form.Definition {
 // already-seeded, already-referenced data (Currency and UnitOfMeasure in
 // particular are actively created by cmd/seed-demo-data and referenced
 // by Item/PurchaseOrder, yet had no way to view or edit a single one
-// through the app itself). AIProviderConnection is the one deliberate,
-// still-standing exception — see its own doc comment in foundation.go:
-// a generic form would render its encrypted API key as a plain text
-// box, so its settings page is bespoke and stays that way.
+// through the app itself). AIProviderConnection and ExternalSQLSource
+// are the two deliberate, still-standing exceptions — see their doc
+// comments in foundation.go: a generic form would render their
+// encrypted secrets as plain text boxes, so their settings pages are
+// bespoke and stay that way.
 func AllForms() []*form.Definition {
 	return []*form.Definition{
 		PartyForm(), IssueReportForm(),

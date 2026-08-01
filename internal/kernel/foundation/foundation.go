@@ -452,6 +452,49 @@ func AIProviderConnection() *entity.Definition {
 	}
 }
 
+// ExternalSQLSource is a tenant-registered connection to an external SQL
+// database — a legacy ERP's SQL Server (the NAV 2009 case ADR-0019 was
+// written for), or any Postgres/MSSQL database the tenant wants to pull
+// records from through the import wizard's mapping/preview/commit flow.
+// Unlike AIProviderConnection this IS a list, not an upsert-one: a
+// tenant may register several sources (a NAV company database and a
+// reporting mirror, say) and each import run picks one.
+//
+// password_encrypted follows api_key_encrypted's discipline exactly:
+// internal/kernel/secretcrypt encrypts it before internal/api's handler
+// ever calls crud.Engine.Create/Update, it is never echoed back to a
+// browser after saving, and it is deliberately not Required at the
+// entity level — a source may legitimately have no password (integrated
+// auth on a dev box, a passwordless local Postgres), and requiring it
+// here would also force the settings handler to round-trip the secret on
+// every edit instead of treating "blank on edit" as "unchanged".
+//
+// The connection details are plain fields, not a single opaque DSN
+// string: the settings UI edits them individually, and
+// internal/kernel/sqlsource composes the driver-specific DSN — keeping
+// DSN syntax (a driver concern) out of stored data.
+func ExternalSQLSource() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "ExternalSQLSource",
+		Version:    1,
+		Module:     "foundation",
+		Fields: []entity.Field{
+			{Name: "name", Type: entity.FieldString, Required: true},
+			{Name: "driver", Type: entity.FieldEnum, Required: true,
+				EnumValues: []string{"mssql", "postgres"}},
+			{Name: "host", Type: entity.FieldString, Required: true},
+			{Name: "port", Type: entity.FieldNumber},
+			{Name: "database", Type: entity.FieldString, Required: true},
+			{Name: "username", Type: entity.FieldString},
+			{Name: "password_encrypted", Type: entity.FieldString},
+			// options: driver-specific extras a DSN needs verbatim
+			// (e.g. "encrypt=disable" against an old on-prem SQL
+			// Server that predates TLS-by-default drivers).
+			{Name: "options", Type: entity.FieldString},
+		},
+	}
+}
+
 // Role is a tenant-defined, tenant-customizable access-control role —
 // "Warehouse Supervisor," "Finance Manager," whatever a given tenant
 // actually needs (Farshid, 2026-07-29: "we need lots of role in the
@@ -738,6 +781,7 @@ func All() []*entity.Definition {
 		StatusTransition(),
 		IssueReport(),
 		AIProviderConnection(),
+		ExternalSQLSource(),
 		Role(),
 		UserRole(),
 		Permission(),
