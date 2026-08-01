@@ -682,7 +682,17 @@
   "extsql_import.constants_heading": "Fixed Values",
   "extsql_import.fixed_value": "fixed value",
   "extsql_import.template_note": "Mapping pre-filled from the {vendor} template — review before importing.",
-  "extsql_import.row_cap_note": "Each run imports at most {max} rows in one shot, and the previewed rows are fetched again at commit. Re-running the import duplicates rows that were already imported, so tables larger than the cap cannot be fully imported yet.",
+  "extsql_import.row_cap_note": "Each run imports at most {max} rows in one shot, and the previewed rows are fetched again at commit. Without a key column, re-running creates duplicate records; with one, re-running updates the rows imported earlier.",
   "extsql_import.connection_failed": "Could not read from the external source. Check the connection on the SQL sources settings page — the technical details were logged on the server.",
-  "extsql.error_link_local_host": "The host may not point at a link-local address."
+  "extsql.error_link_local_host": "The host may not point at a link-local address.",
+  "extsql_import.key_column_label": "Key column",
+  "extsql_import.key_none": "— none —",
+  "extsql_import.key_help": "With a key column, re-importing updates the rows imported earlier instead of duplicating them; without one, every run creates new records.",
+  "extsql_import.key_update_note": "A key column is selected — rows whose key matches an earlier import will update the existing record instead of creating a new one.",
+  "extsql_import.result_created": "created",
+  "extsql_import.result_updated": "updated",
+  "extsql_import.row_created": "Created",
+  "extsql_import.row_updated": "Updated",
+  "extsql_import.identity_unavailable": "Update-on-re-import is not available for this tenant yet (the ExternalIdentity definition is not published). Import without a key column, or ask an administrator to update the tenant.",
+  "extsql_import.key_not_in_columns": "The selected key column is not a column of this table. Re-open the table and choose the key column again."
 }

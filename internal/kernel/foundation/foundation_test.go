@@ -35,14 +35,23 @@ func TestAllFoundationFormsAreValid(t *testing.T) {
 // no module-menu node, no /forms/{entityType}/new|{id} route. Every
 // foundation entity except AIProviderConnection and ExternalSQLSource
 // (their own doc comments: deliberately bespoke, a generic form would
-// render their encrypted secrets as plain text boxes) must have a form.
+// render their encrypted secrets as plain text boxes) and
+// ExternalIdentity (a different reason — no secrets, but it is system
+// bookkeeping written by the import engine; hand-editing identity rows
+// silently breaks import idempotency, see AllForms' doc comment) must
+// have a form.
 func TestAllFoundationEntitiesHaveAForm(t *testing.T) {
 	formTypes := map[string]bool{}
 	for _, f := range AllForms() {
 		formTypes[f.EntityType] = true
 	}
+	noForm := map[string]bool{
+		"AIProviderConnection": true,
+		"ExternalSQLSource":    true,
+		"ExternalIdentity":     true,
+	}
 	for _, def := range All() {
-		if def.EntityType == "AIProviderConnection" || def.EntityType == "ExternalSQLSource" {
+		if noForm[def.EntityType] {
 			continue
 		}
 		if !formTypes[def.EntityType] {
@@ -601,5 +610,34 @@ func TestExternalSQLSource_PasswordEncryptedIsNotRequiredAtTheEntityLevel(t *tes
 	}
 	if err := entity.ValidateRecord(def, data); err != nil {
 		t.Fatalf("expected a passwordless source to be valid at the entity level, got %v", err)
+	}
+}
+
+// TestExternalIdentity_RequiresAllFields — every field on
+// ExternalIdentity is Required by design: an identity row missing any of
+// source/relation/entity-type/record/key answers no "have I imported
+// this legacy record before?" question and would only poison future
+// upsert lookups. source_relation is required like the rest — it is part
+// of the identity scope, not decoration (NAV $Customer/$Vendor both land
+// in Party with overlapping number series; see the entity's doc comment).
+func TestExternalIdentity_RequiresAllFields(t *testing.T) {
+	def := ExternalIdentity()
+	valid := map[string]any{
+		"source_id": "src-1", "source_relation": "dbo.A$Item", "entity_type": "Item",
+		"record_id": "rec-1", "external_key": "1000",
+	}
+	if err := entity.ValidateRecord(def, valid); err != nil {
+		t.Fatalf("expected a complete identity row to be valid, got %v", err)
+	}
+	for _, missing := range []string{"source_id", "source_relation", "entity_type", "record_id", "external_key"} {
+		data := map[string]any{}
+		for k, v := range valid {
+			if k != missing {
+				data[k] = v
+			}
+		}
+		if err := entity.ValidateRecord(def, data); err == nil {
+			t.Errorf("expected an error for an identity row missing required %q", missing)
+		}
 	}
 }

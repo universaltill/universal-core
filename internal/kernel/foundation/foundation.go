@@ -495,6 +495,58 @@ func ExternalSQLSource() *entity.Definition {
 	}
 }
 
+// ExternalIdentity remembers which legacy record a Core record came from
+// (uc-infra#101): one row per imported record, keyed by the source it was
+// pulled from (source_id → ExternalSQLSource), the entity type it landed
+// as, and the legacy system's own key for it (external_key — e.g. NAV's
+// "No_"). This is what lets a re-import UPDATE the record it created last
+// time instead of duplicating it (internal/kernel/sqlsource.
+// CommitRowsUpserting is the consumer — and the only writer, see below).
+//
+// entity_type/record_id are plain string fields rather than a
+// FieldReference with a fixed Target, for exactly Attachment's reason: a
+// FieldReference can only ever point at one target entity type (see
+// entity.Field.Target), but an ExternalIdentity for an imported Item
+// today and an imported Party tomorrow needs to name a different target
+// each time. This mirrors how the generic `records` table and
+// `audit_log` already store entity_type+record_id (CLAUDE.md's
+// generic-storage pattern), not a new mechanism.
+//
+// Uniqueness on (source_id, source_relation, entity_type, external_key)
+// is an application-level convention, not a DB constraint — the generic
+// entity/crud layer has no unique-constraint concept, the same
+// "application-level convention, not a DB constraint" limitation
+// AIProviderConnection's one-row-per-tenant convention already documents
+// for this kernel, pending the declarative-constraint work (board #81,
+// in flight elsewhere). What keeps the convention honest in the
+// meantime: user-driven WRITES are denied unconditionally
+// (authz.systemOnlyWriteTypes — even admins, even before a tenant
+// configures RBAC), so the import engine's raw-engine side-channel is
+// the only write path; a duplicate, should one ever appear, surfaces as
+// a per-row "ambiguous identity" import error rather than a silent
+// guess. Reads through the generic API remain possible — the
+// legacy-key→record map is not a secret, just not user-editable.
+func ExternalIdentity() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "ExternalIdentity",
+		Version:    1,
+		Module:     "foundation",
+		Fields: []entity.Field{
+			{Name: "source_id", Type: entity.FieldReference, Required: true, Target: "ExternalSQLSource"},
+			// source_relation is part of the identity scope, not
+			// decoration: NAV's $Customer and $Vendor both land in Party
+			// and their number series overlap, so scoping by source
+			// alone would let a Vendor import overwrite Customer records
+			// (independent review, 2026-08-01). Schema-qualified
+			// relation name, exactly as fetched.
+			{Name: "source_relation", Type: entity.FieldString, Required: true},
+			{Name: "entity_type", Type: entity.FieldString, Required: true},
+			{Name: "record_id", Type: entity.FieldString, Required: true},
+			{Name: "external_key", Type: entity.FieldString, Required: true},
+		},
+	}
+}
+
 // Role is a tenant-defined, tenant-customizable access-control role —
 // "Warehouse Supervisor," "Finance Manager," whatever a given tenant
 // actually needs (Farshid, 2026-07-29: "we need lots of role in the
@@ -782,6 +834,7 @@ func All() []*entity.Definition {
 		IssueReport(),
 		AIProviderConnection(),
 		ExternalSQLSource(),
+		ExternalIdentity(),
 		Role(),
 		UserRole(),
 		Permission(),

@@ -253,14 +253,31 @@ func TestResolver_ControlPlane_SelfProtection(t *testing.T) {
 	got, err := r.CanWrite(ctx, "Role")
 	mustCan(t, got, err, true, "bootstrap CanWrite(Role)")
 
+	// ...except ExternalIdentity, which is denied even INSIDE the
+	// bootstrap window (systemOnlyWriteTypes): the window exists so the
+	// first admin can be created, and identity rows have no such
+	// bootstrapping need — an open pre-RBAC write path would let any
+	// member re-point the next keyed import at an arbitrary record.
+	got, err = r.CanWrite(ctx, "ExternalIdentity")
+	mustCan(t, got, err, false, "bootstrap CanWrite(ExternalIdentity)")
+	// Reads stay open — the legacy-key map is not a secret, just not
+	// user-editable.
+	got, err = r.CanRead(ctx, "ExternalIdentity")
+	mustCan(t, got, err, true, "bootstrap CanRead(ExternalIdentity)")
+
 	// Configure RBAC: a real tenant_admin grant.
 	admin := f.role(AdminRoleCode)
 	f.grant("user-admin", admin.ID)
 
 	// Non-admin writes to every control-plane type: denied now, even
-	// though no Permission row names these types.
+	// though no Permission row names these types. ExternalIdentity is in
+	// this set for its redirection-of-authority risk (uc-infra#101): an
+	// identity row decides which existing record a keyed re-import will
+	// silently UPDATE, so authoring one is re-pointing the next import —
+	// the import engine writes identities through a raw-engine
+	// side-channel instead (sqlsource.RecordEngine's doc comment).
 	r = humanResolver(f, "user-mallory")
-	for _, ct := range []string{"Role", "UserRole", "Permission", "FieldPermission", "Delegation"} {
+	for _, ct := range []string{"Role", "UserRole", "Permission", "FieldPermission", "Delegation", "ExternalIdentity"} {
 		got, err = r.CanWrite(ctx, ct)
 		mustCan(t, got, err, false, "mallory CanWrite("+ct+") once configured")
 	}
@@ -275,6 +292,11 @@ func TestResolver_ControlPlane_SelfProtection(t *testing.T) {
 	r = humanResolver(f, "user-admin")
 	got, err = r.CanWrite(ctx, "UserRole")
 	mustCan(t, got, err, true, "admin CanWrite(UserRole)")
+	// ...but NOT ExternalIdentity — system-only means even admins: a
+	// hand-written identity row breaks import idempotency regardless of
+	// who writes it.
+	got, err = r.CanWrite(ctx, "ExternalIdentity")
+	mustCan(t, got, err, false, "admin CanWrite(ExternalIdentity) — system-only")
 
 	hr := f.role("hr-manager")
 	f.grant("user-hr", hr.ID)

@@ -12,16 +12,19 @@
 // objects are exactly the discovery problem BACKLOG.md R7 owns, not
 // something a static template should pretend to cover.
 //
-// Two limitations these templates surface deliberately, both recorded
+// Two limitations these templates surfaced deliberately, both recorded
 // as R4 evidence in ADR-0019 and the card's close-out:
 //   - Required enum fields (Item.item_type, Party.party_type) have no
 //     NAV column carrying their values — hence Constants, not a column
 //     mapping.
 //   - NAV's record keys ("No_") mostly have no target field on the
 //     canonical entities (Party has no external-code field), so the
-//     legacy key is not preserved yet. A cross-system external-ID
-//     mechanism is a sync-engine (#33) prerequisite, not a template
-//     problem.
+//     legacy key originally wasn't preserved at all. That half is now
+//     closed by uc-infra#101's cross-system external-ID mechanism:
+//     KeyColumn names No_ and CommitRowsUpserting (upsert.go) stores it
+//     per record as foundation.ExternalIdentity.external_key — off the
+//     record itself, so the canonical entities still carry no legacy
+//     field.
 package sqlsource
 
 import (
@@ -39,6 +42,12 @@ type TemplateEntity struct {
 	EntityType     string
 	Mapping        csvimport.ColumnMapping // source column -> target field
 	Constants      map[string]string       // target field -> fixed raw value
+	// KeyColumn names the source column carrying the legacy system's own
+	// record key — what CommitRowsUpserting (upsert.go) stores as each
+	// imported record's ExternalIdentity.external_key so a re-import
+	// updates instead of duplicating. Empty means the template declares
+	// no key and the source can only be imported create-only.
+	KeyColumn string
 }
 
 // Template is one vendor's set of relation mappings.
@@ -63,6 +72,9 @@ func nav2009Template() Template {
 			{
 				RelationSuffix: "$Item",
 				EntityType:     "Item",
+				// No_ is NAV's primary key on every master table — the
+				// natural external_key for upserting re-imports.
+				KeyColumn: "No_",
 				Mapping: csvimport.ColumnMapping{
 					"No_":         "sku",
 					"Description": "name",
@@ -78,6 +90,7 @@ func nav2009Template() Template {
 			{
 				RelationSuffix: "$Customer",
 				EntityType:     "Party",
+				KeyColumn:      "No_", // NAV's primary No_ field, same as $Item
 				Mapping: csvimport.ColumnMapping{
 					"Name":                 "name",
 					"VAT Registration No_": "tax_id",
@@ -89,6 +102,7 @@ func nav2009Template() Template {
 			{
 				RelationSuffix: "$Vendor",
 				EntityType:     "Party",
+				KeyColumn:      "No_", // NAV's primary No_ field, same as $Item
 				Mapping: csvimport.ColumnMapping{
 					"Name":                 "name",
 					"VAT Registration No_": "tax_id",

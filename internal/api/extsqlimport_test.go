@@ -7,6 +7,9 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+
+	"github.com/universaltill/universal-core/internal/kernel/form"
+	"github.com/universaltill/universal-core/internal/kernel/foundation"
 )
 
 // registerTestPGSource registers the test suite's own Postgres (the
@@ -221,8 +224,8 @@ func TestExtSQLImport_Commit_WritesRecordsViaGuardedEngine(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "2 succeeded") {
-		t.Fatalf("expected the result to report 2 succeeded, got:\n%s", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), "2 created, 0 updated") {
+		t.Fatalf("expected the result to report 2 created, got:\n%s", rec.Body.String())
 	}
 
 	listReq := newRequest("GET", "/api/records/Vendor", tenantID, "farshid", nil)
@@ -295,8 +298,8 @@ func TestExtSQLImport_NAVTemplate_PrefillsMappingAndConstants(t *testing.T) {
 	if commitRec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", commitRec.Code, commitRec.Body.String())
 	}
-	if !strings.Contains(commitRec.Body.String(), "1 succeeded") {
-		t.Fatalf("expected 1 succeeded, got:\n%s", commitRec.Body.String())
+	if !strings.Contains(commitRec.Body.String(), "1 created, 0 updated") {
+		t.Fatalf("expected 1 created, got:\n%s", commitRec.Body.String())
 	}
 
 	listReq := newRequest("GET", "/api/records/Party", tenantID, "farshid", nil)
@@ -437,8 +440,8 @@ func TestExtSQLImport_UserMappingBeatsTemplateConstant(t *testing.T) {
 	if commitRec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", commitRec.Code, commitRec.Body.String())
 	}
-	if !strings.Contains(commitRec.Body.String(), "1 succeeded") {
-		t.Fatalf("expected 1 succeeded, got:\n%s", commitRec.Body.String())
+	if !strings.Contains(commitRec.Body.String(), "1 created, 0 updated") {
+		t.Fatalf("expected 1 created, got:\n%s", commitRec.Body.String())
 	}
 
 	listReq := newRequest("GET", "/api/records/Party", tenantID, "farshid", nil)
@@ -446,6 +449,429 @@ func TestExtSQLImport_UserMappingBeatsTemplateConstant(t *testing.T) {
 	mux.ServeHTTP(listRec, listReq)
 	if !strings.Contains(listRec.Body.String(), `"party_type":"person"`) {
 		t.Fatalf("expected the user-mapped column value (person), not the template constant (organization), got:\n%s", listRec.Body.String())
+	}
+}
+
+// TestExtSQLImport_Preview_KeyColumnPrefilledFromTemplate (uc-infra#101):
+// when the matched template names a KeyColumn the relation actually has,
+// the mapping form's key-column select renders with it pre-selected,
+// alongside the translated help text and the "matching rows will update"
+// note.
+func TestExtSQLImport_Preview_KeyColumnPrefilledFromTemplate(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
+	createScratchTable(t, db,
+		`CREATE TABLE "CRONUS International Ltd_$Customer" ("No_" text, "Name" text, "VAT Registration No_" text)`,
+		`INSERT INTO "CRONUS International Ltd_$Customer" VALUES ('C0001', 'Acme Corp', 'GB123456789')`)
+
+	mux := http.NewServeMux()
+	testHandlerWithSecretCryptor(t, router, testCryptor(t)).Routes(mux)
+	sourceID := registerTestPGSource(t, mux, tenantID, db)
+
+	rec := postExtSQLImport(mux, "/import/Party/sql/preview", tenantID,
+		url.Values{"source_id": {sourceID}, "schema": {"public"}, "relation": {"CRONUS International Ltd_$Customer"}})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `name="key_column"`) {
+		t.Fatalf("expected the key-column select, got:\n%s", body)
+	}
+	if !strings.Contains(body, `value="No_" selected`) {
+		t.Fatalf("expected the template's KeyColumn (No_) pre-selected, got:\n%s", body)
+	}
+	if !strings.Contains(body, "re-importing updates the rows imported earlier") {
+		t.Fatalf("expected the translated key-column help text, got:\n%s", body)
+	}
+	if !strings.Contains(body, "A key column is selected") {
+		t.Fatalf("expected the will-update note when a key column is selected, got:\n%s", body)
+	}
+}
+
+// TestExtSQLImport_Commit_WithKeyColumnIsIdempotent is uc-infra#101's
+// end-to-end proof: the same keyed commit run twice reports 2 created
+// then 2 updated, and the live record count stays constant — no
+// duplicates.
+func TestExtSQLImport_Commit_WithKeyColumnIsIdempotent(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
+	createScratchTable(t, db,
+		`CREATE TABLE ext_vendors ("code" text, "name" text)`,
+		`INSERT INTO ext_vendors VALUES ('V-1', 'Acme Textiles'), ('V-2', 'Beta Supplies')`)
+
+	mux := http.NewServeMux()
+	testHandlerWithSecretCryptor(t, router, testCryptor(t)).Routes(mux)
+	sourceID := registerTestPGSource(t, mux, tenantID, db)
+
+	vals := url.Values{
+		"source_id":    {sourceID},
+		"schema":       {"public"},
+		"relation":     {"ext_vendors"},
+		"mapping.name": {"name"},
+		"key_column":   {"code"},
+	}
+
+	first := postExtSQLImport(mux, "/import/Vendor/sql/commit", tenantID, vals)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first commit: expected 200, got %d: %s", first.Code, first.Body.String())
+	}
+	if !strings.Contains(first.Body.String(), "2 created, 0 updated, 0 failed") {
+		t.Fatalf("first commit: expected 2 created, got:\n%s", first.Body.String())
+	}
+
+	second := postExtSQLImport(mux, "/import/Vendor/sql/commit", tenantID, vals)
+	if second.Code != http.StatusOK {
+		t.Fatalf("second commit: expected 200, got %d: %s", second.Code, second.Body.String())
+	}
+	if !strings.Contains(second.Body.String(), "0 created, 2 updated, 0 failed") {
+		t.Fatalf("second commit: expected 2 updated, got:\n%s", second.Body.String())
+	}
+	if !strings.Contains(second.Body.String(), ">Updated<") {
+		t.Fatalf("second commit: expected per-row Updated status, got:\n%s", second.Body.String())
+	}
+
+	var count int
+	if err := db.QueryRow(`SELECT count(*) FROM records WHERE entity_type = 'Vendor' AND deleted_at IS NULL`).Scan(&count); err != nil {
+		t.Fatalf("count Vendor records: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("expected the keyed re-run to leave exactly 2 Vendor records, found %d", count)
+	}
+
+	// The identity rows carry the schema-qualified relation — the scope
+	// that keeps two relations importing into one entity type from
+	// sharing a key namespace (sqlsource's package comment).
+	var identities int
+	if err := db.QueryRow(
+		`SELECT count(*) FROM records WHERE entity_type = 'ExternalIdentity' AND deleted_at IS NULL AND data->>'source_relation' = 'public.ext_vendors'`,
+	).Scan(&identities); err != nil {
+		t.Fatalf("count ExternalIdentity records: %v", err)
+	}
+	if identities != 2 {
+		t.Fatalf("expected 2 identity rows scoped to public.ext_vendors, found %d", identities)
+	}
+}
+
+// TestExtSQLImport_Commit_WithoutKeyColumnDuplicatesOnRerun pins the
+// create-only path's unchanged behavior: no key column means every run
+// creates fresh records — exactly what the reworded row-cap note warns.
+func TestExtSQLImport_Commit_WithoutKeyColumnDuplicatesOnRerun(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
+	createScratchTable(t, db,
+		`CREATE TABLE ext_vendors ("code" text, "name" text)`,
+		`INSERT INTO ext_vendors VALUES ('V-1', 'Acme Textiles'), ('V-2', 'Beta Supplies')`)
+
+	mux := http.NewServeMux()
+	testHandlerWithSecretCryptor(t, router, testCryptor(t)).Routes(mux)
+	sourceID := registerTestPGSource(t, mux, tenantID, db)
+
+	vals := url.Values{
+		"source_id":    {sourceID},
+		"schema":       {"public"},
+		"relation":     {"ext_vendors"},
+		"mapping.name": {"name"},
+	}
+	for run := 1; run <= 2; run++ {
+		rec := postExtSQLImport(mux, "/import/Vendor/sql/commit", tenantID, vals)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("run %d: expected 200, got %d: %s", run, rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "2 created, 0 updated") {
+			t.Fatalf("run %d: expected 2 created, got:\n%s", run, rec.Body.String())
+		}
+	}
+
+	var count int
+	if err := db.QueryRow(`SELECT count(*) FROM records WHERE entity_type = 'Vendor' AND deleted_at IS NULL`).Scan(&count); err != nil {
+		t.Fatalf("count Vendor records: %v", err)
+	}
+	if count != 4 {
+		t.Fatalf("expected the keyless re-run to duplicate (4 records), found %d", count)
+	}
+}
+
+// TestExtSQLImport_Commit_KeyColumnWithoutIdentityDefRendersTranslatedError:
+// a tenant whose foundation set predates ExternalIdentity gets the clear
+// translated explanation on a keyed commit, not a 500 — tenant sync owns
+// publishing the definition, the handler only has to fail legibly.
+func TestExtSQLImport_Commit_KeyColumnWithoutIdentityDefRendersTranslatedError(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	// Deliberately NOT publishFoundation: only the two definitions this
+	// flow strictly needs, leaving ExternalIdentity unpublished.
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
+	publishEntityAndForm(t, db, foundation.ExternalSQLSource(), &form.Definition{
+		EntityType: "ExternalSQLSource",
+		Version:    1,
+		Sections: []form.Section{{Title: "Details", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "name", Label: "Name"}}}},
+	})
+	createScratchTable(t, db,
+		`CREATE TABLE ext_vendors ("code" text, "name" text)`,
+		`INSERT INTO ext_vendors VALUES ('V-1', 'Acme Textiles')`)
+
+	mux := http.NewServeMux()
+	testHandlerWithSecretCryptor(t, router, testCryptor(t)).Routes(mux)
+	sourceID := registerTestPGSource(t, mux, tenantID, db)
+
+	rec := postExtSQLImport(mux, "/import/Vendor/sql/commit", tenantID,
+		url.Values{
+			"source_id":    {sourceID},
+			"schema":       {"public"},
+			"relation":     {"ext_vendors"},
+			"mapping.name": {"name"},
+			"key_column":   {"code"},
+		})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 (inline translated error), got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "Update-on-re-import is not available for this tenant yet") {
+		t.Fatalf("expected the translated identity-unavailable error, got:\n%s", rec.Body.String())
+	}
+
+	var count int
+	if err := db.QueryRow(`SELECT count(*) FROM records WHERE entity_type = 'Vendor' AND deleted_at IS NULL`).Scan(&count); err != nil {
+		t.Fatalf("count Vendor records: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected nothing written when the keyed commit is refused, found %d", count)
+	}
+}
+
+// TestExtSQLImport_KeyedImports_ScopedPerRelation is the review's NAV
+// scenario made concrete: two relations with overlapping keys, both
+// importing into the same entity type. The second relation's rows must
+// CREATE — never silently overwrite the first relation's records just
+// because a legacy number series repeats across tables.
+func TestExtSQLImport_KeyedImports_ScopedPerRelation(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
+	createScratchTable(t, db,
+		`CREATE TABLE ext_customers ("code" text, "name" text)`,
+		`INSERT INTO ext_customers VALUES ('10000', 'Customer Ten Thousand')`)
+	createScratchTable(t, db,
+		`CREATE TABLE ext_suppliers ("code" text, "name" text)`,
+		`INSERT INTO ext_suppliers VALUES ('10000', 'Supplier Ten Thousand')`)
+
+	mux := http.NewServeMux()
+	testHandlerWithSecretCryptor(t, router, testCryptor(t)).Routes(mux)
+	sourceID := registerTestPGSource(t, mux, tenantID, db)
+
+	commit := func(relation string) *httptest.ResponseRecorder {
+		return postExtSQLImport(mux, "/import/Vendor/sql/commit", tenantID, url.Values{
+			"source_id":    {sourceID},
+			"schema":       {"public"},
+			"relation":     {relation},
+			"mapping.name": {"name"},
+			"key_column":   {"code"},
+		})
+	}
+
+	if rec := commit("ext_customers"); !strings.Contains(rec.Body.String(), "1 created, 0 updated") {
+		t.Fatalf("first relation: expected 1 created, got %d:\n%s", rec.Code, rec.Body.String())
+	}
+	// Same key "10000", different relation: a create, not an update of
+	// the customer-relation record.
+	if rec := commit("ext_suppliers"); !strings.Contains(rec.Body.String(), "1 created, 0 updated") {
+		t.Fatalf("second relation: expected 1 created (no cross-relation overwrite), got %d:\n%s", rec.Code, rec.Body.String())
+	}
+
+	listReq := newRequest("GET", "/api/records/Vendor", tenantID, "farshid", nil)
+	listRec := httptest.NewRecorder()
+	mux.ServeHTTP(listRec, listReq)
+	if !strings.Contains(listRec.Body.String(), "Customer Ten Thousand") || !strings.Contains(listRec.Body.String(), "Supplier Ten Thousand") {
+		t.Fatalf("expected both relations' records to coexist, got:\n%s", listRec.Body.String())
+	}
+}
+
+// TestExtSQLImport_IdentityWritesAreControlPlaneGated: ExternalIdentity
+// is control-plane-gated in authz — once a tenant configures RBAC, a
+// non-admin user's generic write to it is denied (an identity row
+// re-points what the next import updates), while the keyed import
+// itself, run by a user with ordinary write permission on the target
+// entity, still works via the importer's raw-engine side-channel.
+func TestExtSQLImport_IdentityWritesAreControlPlaneGated(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
+	createScratchTable(t, db,
+		`CREATE TABLE ext_vendors ("code" text, "name" text)`,
+		`INSERT INTO ext_vendors VALUES ('V-1', 'Acme Textiles')`)
+
+	seedRBAC(t, db,
+		map[string][]string{"importer": {"user-importer"}},
+		[]map[string]any{
+			{"role": "importer", "entity_type": "Vendor", "can_read": true, "can_write": true},
+		},
+	)
+
+	mux := http.NewServeMux()
+	testHandlerWithSecretCryptor(t, router, testCryptor(t)).Routes(mux)
+	sourceID := registerTestPGSource(t, mux, tenantID, db)
+
+	// The generic record API must refuse the identity write outright.
+	denyReq := newRequest("POST", "/api/records/ExternalIdentity", tenantID, "user-importer",
+		[]byte(`{"source_id":"`+sourceID+`","source_relation":"public.ext_vendors","entity_type":"Vendor","record_id":"11111111-1111-1111-1111-111111111111","external_key":"V-1"}`))
+	denyRec := httptest.NewRecorder()
+	mux.ServeHTTP(denyRec, denyReq)
+	if denyRec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for a user's generic ExternalIdentity write, got %d: %s", denyRec.Code, denyRec.Body.String())
+	}
+
+	// The keyed import as that same ordinary user still works end to end.
+	req := newRequest("POST", "/import/Vendor/sql/commit", tenantID, "user-importer",
+		[]byte(url.Values{
+			"source_id":    {sourceID},
+			"schema":       {"public"},
+			"relation":     {"ext_vendors"},
+			"mapping.name": {"name"},
+			"key_column":   {"code"},
+		}.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for the keyed import, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "1 created, 0 updated") {
+		t.Fatalf("expected 1 created, got:\n%s", rec.Body.String())
+	}
+
+	var identities int
+	if err := db.QueryRow(`SELECT count(*) FROM records WHERE entity_type = 'ExternalIdentity' AND deleted_at IS NULL`).Scan(&identities); err != nil {
+		t.Fatalf("count ExternalIdentity records: %v", err)
+	}
+	if identities != 1 {
+		t.Fatalf("expected the import's own identity row to be written despite the gate, found %d", identities)
+	}
+}
+
+// TestExtSQLImport_Preview_BlankKeyCellIsRowError: with a key column
+// selected, a row whose key cell is blank shows as a row error at
+// PREVIEW, exactly as commit would report it — the two stages must not
+// disagree (sqlsource.MarkMissingKeys).
+func TestExtSQLImport_Preview_BlankKeyCellIsRowError(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
+	createScratchTable(t, db,
+		`CREATE TABLE ext_vendors ("code" text, "name" text)`,
+		`INSERT INTO ext_vendors VALUES ('V-1', 'Acme Textiles'), ('', 'Keyless Supplies')`)
+
+	mux := http.NewServeMux()
+	testHandlerWithSecretCryptor(t, router, testCryptor(t)).Routes(mux)
+	sourceID := registerTestPGSource(t, mux, tenantID, db)
+
+	rec := postExtSQLImport(mux, "/import/Vendor/sql/preview", tenantID, url.Values{
+		"source_id":      {sourceID},
+		"schema":         {"public"},
+		"relation":       {"ext_vendors"},
+		"mapping.name":   {"name"},
+		"key_column":     {"code"},
+		"key_column_set": {"1"},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "uc-row-error") {
+		t.Fatalf("expected the blank-key row marked as an error row at preview, got:\n%s", body)
+	}
+	if !strings.Contains(body, "missing key") {
+		t.Fatalf("expected the missing-key row error text, got:\n%s", body)
+	}
+	if !strings.Contains(body, "uc-row-ok") {
+		t.Fatalf("expected the keyed row to still preview OK, got:\n%s", body)
+	}
+}
+
+// TestExtSQLImport_KeyColumnNotAColumnRendersTranslatedError: a
+// hand-built/stale key_column that isn't one of the relation's columns
+// gets the translated error fragment, not a hardcoded-English 400.
+func TestExtSQLImport_KeyColumnNotAColumnRendersTranslatedError(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
+	createScratchTable(t, db,
+		`CREATE TABLE ext_vendors ("code" text, "name" text)`,
+		`INSERT INTO ext_vendors VALUES ('V-1', 'Acme Textiles')`)
+
+	mux := http.NewServeMux()
+	testHandlerWithSecretCryptor(t, router, testCryptor(t)).Routes(mux)
+	sourceID := registerTestPGSource(t, mux, tenantID, db)
+
+	rec := postExtSQLImport(mux, "/import/Vendor/sql/preview", tenantID, url.Values{
+		"source_id":      {sourceID},
+		"schema":         {"public"},
+		"relation":       {"ext_vendors"},
+		"mapping.name":   {"name"},
+		"key_column":     {"no_such_column"},
+		"key_column_set": {"1"},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 (inline translated error), got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "The selected key column is not a column of this table.") {
+		t.Fatalf("expected the translated key-column error, got:\n%s", rec.Body.String())
+	}
+}
+
+// TestExtSQLImport_Preview_ExplicitNoneKeyColumnSurvivesResubmit pins
+// the pre-fill gating fix: a user who resubmits with key_column
+// explicitly set to none — even with every column unmapped — must not
+// have the template's KeyColumn silently reapplied. Only the very first
+// render (no key_column_set marker) gets the template pre-fill.
+func TestExtSQLImport_Preview_ExplicitNoneKeyColumnSurvivesResubmit(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
+	createScratchTable(t, db,
+		`CREATE TABLE "CRONUS International Ltd_$Customer" ("No_" text, "Name" text, "VAT Registration No_" text)`,
+		`INSERT INTO "CRONUS International Ltd_$Customer" VALUES ('C0001', 'Acme Corp', 'GB123456789')`)
+
+	mux := http.NewServeMux()
+	testHandlerWithSecretCryptor(t, router, testCryptor(t)).Routes(mux)
+	sourceID := registerTestPGSource(t, mux, tenantID, db)
+
+	// A resubmission that deliberately unmapped everything AND chose no
+	// key column — the shape that used to be indistinguishable from a
+	// first render.
+	rec := postExtSQLImport(mux, "/import/Party/sql/preview", tenantID, url.Values{
+		"source_id":      {sourceID},
+		"schema":         {"public"},
+		"relation":       {"CRONUS International Ltd_$Customer"},
+		"key_column":     {""},
+		"key_column_set": {"1"},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, `value="No_" selected`) {
+		t.Fatalf("expected the template KeyColumn NOT to override an explicit none, got:\n%s", body)
+	}
+	if strings.Contains(body, "A key column is selected") {
+		t.Fatalf("expected no will-update note with key column explicitly none, got:\n%s", body)
 	}
 }
 

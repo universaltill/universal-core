@@ -682,7 +682,17 @@
   "extsql_import.constants_heading": "Sabit Değerler",
   "extsql_import.fixed_value": "sabit değer",
   "extsql_import.template_note": "Eşleme {vendor} şablonundan önceden dolduruldu — içe aktarmadan önce gözden geçirin.",
-  "extsql_import.row_cap_note": "Her çalıştırma tek seferde en fazla {max} satır içe aktarır ve önizlenen satırlar onay sırasında yeniden okunur. İçe aktarmayı yeniden çalıştırmak daha önce aktarılan satırları çoğaltır; bu yüzden sınırdan büyük tablolar henüz tamamen içe aktarılamaz.",
+  "extsql_import.row_cap_note": "Her çalıştırma tek seferde en fazla {max} satır içe aktarır ve önizlenen satırlar onay sırasında yeniden okunur. Anahtar sütunu olmadan yeniden çalıştırmak yinelenen kayıtlar oluşturur; anahtar sütunuyla yeniden çalıştırmak daha önce aktarılan satırları günceller.",
   "extsql_import.connection_failed": "Harici kaynaktan okunamadı. SQL kaynakları ayarlar sayfasından bağlantıyı kontrol edin — teknik ayrıntılar sunucuda günlüğe kaydedildi.",
-  "extsql.error_link_local_host": "Sunucu adresi link-local bir adrese işaret edemez."
+  "extsql.error_link_local_host": "Sunucu adresi link-local bir adrese işaret edemez.",
+  "extsql_import.key_column_label": "Anahtar sütunu",
+  "extsql_import.key_none": "— yok —",
+  "extsql_import.key_help": "Anahtar sütunu seçildiğinde, yeniden içe aktarma daha önce aktarılan satırları çoğaltmak yerine günceller; seçilmediğinde her çalıştırma yeni kayıtlar oluşturur.",
+  "extsql_import.key_update_note": "Bir anahtar sütunu seçili — anahtarı önceki bir içe aktarmayla eşleşen satırlar yeni kayıt oluşturmak yerine mevcut kaydı günceller.",
+  "extsql_import.result_created": "oluşturuldu",
+  "extsql_import.result_updated": "güncellendi",
+  "extsql_import.row_created": "Oluşturuldu",
+  "extsql_import.row_updated": "Güncellendi",
+  "extsql_import.identity_unavailable": "Yeniden içe aktarmada güncelleme bu kiracı için henüz kullanılamıyor (ExternalIdentity tanımı yayımlanmamış). Anahtar sütunu olmadan içe aktarın veya bir yöneticiden kiracıyı güncellemesini isteyin.",
+  "extsql_import.key_not_in_columns": "Seçilen anahtar sütunu bu tablonun bir sütunu değil. Tabloyu yeniden açıp anahtar sütununu tekrar seçin."
 }

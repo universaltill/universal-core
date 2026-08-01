@@ -39,6 +39,7 @@ import (
 
 	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/httpx"
+	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/csvimport"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/sqlsource"
@@ -298,24 +299,52 @@ func (h *Handler) extSQLImportPreviewOrCommit(w http.ResponseWriter, r *http.Req
 	// matching vendor template for this entity type (its mapping filtered
 	// to the columns this relation actually has — a customized legacy
 	// schema may lack some), otherwise the plain name-match suggestion.
+	// The key column (uc-infra#101 — idempotent re-import) follows the
+	// same convention: on the FIRST render the template's KeyColumn
+	// pre-fills the select; on any resubmission the user's own choice —
+	// including "none", the empty value — is the only source of truth.
+	// First-vs-resubmitted is decided by the key_column_set marker the
+	// preview form itself carries, NOT by len(mapping)==0: a user who
+	// deliberately unmapped every column submits an empty mapping too,
+	// and their explicit key_column choice must not be silently
+	// overridden by the template (review finding, this commit).
 	mapping := extSQLMappingFromForm(r)
+	keyColumn := r.PostForm.Get("key_column")
+	// "User has engaged" is EITHER signal: the preview form's own
+	// key_column_set marker (present even when every column was
+	// unmapped), or any submitted mapping field (a caller driving the
+	// endpoints directly without the marker still gets its mapping
+	// honored, never overwritten by the template).
+	userEdited := r.PostForm.Get("key_column_set") == "1" || len(mapping) > 0
+	headerSet := make(map[string]bool, len(headers))
+	for _, hd := range headers {
+		headerSet[hd] = true
+	}
 	tmpl, tmplEntity, tmplMatched := sqlsource.MatchTemplate(relation)
 	templateApplies := tmplMatched && tmplEntity.EntityType == def.EntityType
-	if len(mapping) == 0 {
+	if !userEdited {
 		if templateApplies {
-			headerSet := make(map[string]bool, len(headers))
-			for _, hd := range headers {
-				headerSet[hd] = true
-			}
 			mapping = csvimport.ColumnMapping{}
 			for col, field := range tmplEntity.Mapping {
 				if headerSet[col] {
 					mapping[col] = field
 				}
 			}
+			if headerSet[tmplEntity.KeyColumn] {
+				keyColumn = tmplEntity.KeyColumn
+			}
 		} else {
 			mapping = csvimport.SuggestMapping(headers, def)
 		}
+	}
+	// A key column must be one of the relation's real headers — the
+	// select only ever offers those, so anything else is a hand-built or
+	// stale request. Rendered as a translated error fragment like this
+	// flow's other failures.
+	if keyColumn != "" && !headerSet[keyColumn] {
+		log.Printf("api: SQL import: key column %q is not a column of %s.%s", keyColumn, schema, relation)
+		h.writeExtSQLImportFragment(w, "error", h.catalog.T(locale, "extsql_import.key_not_in_columns"))
+		return
 	}
 	var constants map[string]string
 	if templateApplies {
@@ -346,7 +375,7 @@ func (h *Handler) extSQLImportPreviewOrCommit(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	view := h.extSQLImportPreviewView(locale, def, entityType, sourceID, schema, relation, headers, mapping, constants)
+	view := h.extSQLImportPreviewView(locale, def, entityType, sourceID, schema, relation, headers, mapping, constants, keyColumn)
 	if templateApplies {
 		view.TemplateNote = strings.ReplaceAll(h.catalog.T(locale, "extsql_import.template_note"), "{vendor}", tmpl.Vendor)
 	}
@@ -359,6 +388,8 @@ func (h *Handler) extSQLImportPreviewOrCommit(w http.ResponseWriter, r *http.Req
 
 	rowOK := h.catalog.T(locale, "import.row_status_ok")
 	rowError := h.catalog.T(locale, "import.row_status_error")
+	rowCreated := h.catalog.T(locale, "extsql_import.row_created")
+	rowUpdated := h.catalog.T(locale, "extsql_import.row_updated")
 
 	if !commit {
 		results, err := csvimport.PreviewRows(augHeaders, augRows, def, augMapping)
@@ -368,32 +399,117 @@ func (h *Handler) extSQLImportPreviewOrCommit(w http.ResponseWriter, r *http.Req
 			writeInternalError(w, fmt.Sprintf("preview %s SQL import rows", entityType), err)
 			return
 		}
+		if keyColumn != "" {
+			// The same missing-key row errors a keyed commit raises,
+			// surfaced at preview so the two stages never disagree
+			// (review finding). Raw headers/rows, not the
+			// constant-augmented copies: the key column is a source
+			// column, ApplyConstants only appends, and results align
+			// row-for-row with both shapes — but the raw pair is what
+			// the key cell actually lives in.
+			results, err = sqlsource.MarkMissingKeys(headers, rows, keyColumn, results)
+			if err != nil {
+				// keyColumn was membership-checked above — unreachable.
+				writeInternalError(w, fmt.Sprintf("mark missing keys for %s SQL import preview", entityType), err)
+				return
+			}
+		}
 		view.Rows = buildResultRows(results, rowOK, rowError)
 		h.writeExtSQLImportFragment(w, "preview", view)
 		return
 	}
 
-	results, err := csvimport.CommitRows(ctx, augHeaders, augRows, def, augMapping, ts.crud, rc.Actor)
-	if err != nil {
-		writeCrudError(w, fmt.Sprintf("commit %s SQL import rows", entityType), err)
-		return
+	// Commit. With a key column the upserting engine (uc-infra#101)
+	// consults the ExternalIdentity registry so a re-run updates the
+	// records an earlier run created; without one, the original
+	// create-only path is untouched. Either way every write goes through
+	// the same guarded engine + audit actor.
+	var upserts []sqlsource.UpsertResult
+	if keyColumn != "" {
+		identityDef, err := ts.entityDef(r.Context(), "ExternalIdentity")
+		if err != nil {
+			// A tenant whose foundation set predates ExternalIdentity: a
+			// clear translated explanation, not a 500 — tenant sync will
+			// publish the definition, nothing for this handler to migrate.
+			log.Printf("api: SQL import: ExternalIdentity definition unavailable for keyed commit: %v", err)
+			h.writeExtSQLImportFragment(w, "error", h.catalog.T(locale, "extsql_import.identity_unavailable"))
+			return
+		}
+		// Identity scope is (source, relation, entity type) — the
+		// relation formatted exactly as the form fields carry it, so
+		// $Customer and $Vendor imports landing in one entity type never
+		// share a key namespace (sqlsource's package comment).
+		sourceRelation := schema + "." + relation
+		// Target records go through the GUARDED engine (ts.crud) like
+		// every user-driven write; the identity rows go through a raw
+		// engine deliberately: ExternalIdentity is control-plane-gated in
+		// authz (a user authoring one could re-point the next import at
+		// any record), so the importer writes them via the same
+		// system-path side-channel workflow steps and provisioning use —
+		// see tenantScope's own doc comment and sqlsource.RecordEngine's.
+		upserts, err = sqlsource.CommitRowsUpserting(ctx, augHeaders, augRows, def, augMapping, keyColumn, sourceID, sourceRelation, ts.crud, crud.NewEngine(ts.db), identityDef, rc.Actor)
+		if err != nil {
+			writeCrudError(w, fmt.Sprintf("commit %s SQL import rows (keyed)", entityType), err)
+			return
+		}
+	} else {
+		results, err := csvimport.CommitRows(ctx, augHeaders, augRows, def, augMapping, ts.crud, rc.Actor)
+		if err != nil {
+			writeCrudError(w, fmt.Sprintf("commit %s SQL import rows", entityType), err)
+			return
+		}
+		upserts = make([]sqlsource.UpsertResult, len(results))
+		for i, res := range results {
+			upserts[i] = sqlsource.UpsertResult{RowResult: res}
+		}
 	}
-	succeeded := 0
-	for _, res := range results {
-		if res.Err == nil {
-			succeeded++
+
+	created, updated := 0, 0
+	for _, res := range upserts {
+		if res.Err != nil {
+			continue
+		}
+		if res.Updated {
+			updated++
+		} else {
+			created++
 		}
 	}
 	h.writeExtSQLImportFragment(w, "result", extSQLImportResultView{
-		Heading:        h.catalog.T(locale, "import.result_heading"),
-		Succeeded:      succeeded,
-		Failed:         len(results) - succeeded,
-		Total:          len(results),
-		SucceededLabel: h.catalog.T(locale, "import.result_succeeded"),
-		FailedLabel:    h.catalog.T(locale, "import.result_failed"),
-		RowCapNote:     extSQLRowCapNote(h, locale),
-		Rows:           buildResultRows(results, rowOK, rowError),
+		Heading:      h.catalog.T(locale, "import.result_heading"),
+		Created:      created,
+		Updated:      updated,
+		Failed:       len(upserts) - created - updated,
+		Total:        len(upserts),
+		CreatedLabel: h.catalog.T(locale, "extsql_import.result_created"),
+		UpdatedLabel: h.catalog.T(locale, "extsql_import.result_updated"),
+		FailedLabel:  h.catalog.T(locale, "import.result_failed"),
+		RowCapNote:   extSQLRowCapNote(h, locale),
+		Rows:         buildUpsertResultRows(upserts, rowCreated, rowUpdated, rowError),
 	})
+}
+
+// buildUpsertResultRows is buildResultRows with the created/updated
+// distinction a keyed commit reports per row (create-only commits pass
+// through it too — every OK row is simply "created").
+func buildUpsertResultRows(results []sqlsource.UpsertResult, createdLabel, updatedLabel, errorLabel string) []previewRowView {
+	rows := make([]previewRowView, len(results))
+	for i, res := range results {
+		row := previewRowView{RowNumber: res.RowNumber, Data: fmt.Sprintf("%v", res.Data)}
+		switch {
+		case res.Err != nil:
+			row.Status = errorLabel
+			row.Error = res.Err.Error()
+		case res.Updated:
+			row.OK = true
+			row.Status = updatedLabel
+		default:
+			row.OK = true
+			row.Status = createdLabel
+		}
+		rows[i] = row
+	}
+	return rows
 }
 
 // denyFragmentUnlessWritable is denyPageUnless for this flow's htmx
@@ -528,7 +644,7 @@ func extSQLRowCapNote(h *Handler, locale string) string {
 	return strings.ReplaceAll(h.catalog.T(locale, "extsql_import.row_cap_note"), "{max}", strconv.Itoa(sqlsource.MaxImportRows))
 }
 
-func (h *Handler) extSQLImportPreviewView(locale string, def *entity.Definition, entityType, sourceID, schema, relation string, headers []string, mapping csvimport.ColumnMapping, constants map[string]string) extSQLImportPreviewView {
+func (h *Handler) extSQLImportPreviewView(locale string, def *entity.Definition, entityType, sourceID, schema, relation string, headers []string, mapping csvimport.ColumnMapping, constants map[string]string, keyColumn string) extSQLImportPreviewView {
 	view := extSQLImportPreviewView{
 		EntityType:       entityType,
 		PreviewHref:      "/import/" + entityType + "/sql/preview",
@@ -542,8 +658,20 @@ func (h *Handler) extSQLImportPreviewView(locale string, def *entity.Definition,
 		RepreviewLabel:   h.catalog.T(locale, "import.repreview_button"),
 		ConstantsHeading: h.catalog.T(locale, "extsql_import.constants_heading"),
 		FixedValueLabel:  h.catalog.T(locale, "extsql_import.fixed_value"),
+		KeyColumnLabel:   h.catalog.T(locale, "extsql_import.key_column_label"),
+		KeyNoneLabel:     h.catalog.T(locale, "extsql_import.key_none"),
+		KeyHelp:          h.catalog.T(locale, "extsql_import.key_help"),
 		RowCapNote:       extSQLRowCapNote(h, locale),
 		Mappings:         buildMappingRows(headers, mapping, nil, def, h.catalog.T(locale, "import.unmapped_option")),
+	}
+	for _, hd := range headers {
+		view.KeyOptions = append(view.KeyOptions, extSQLImportKeyOption{Value: hd, Selected: hd == keyColumn})
+	}
+	if keyColumn != "" {
+		// The one-line promise the key column makes — shown only when one
+		// is actually selected (no per-row would-update lookup: preview
+		// stays cheap, the commit result reports what really happened).
+		view.KeyUpdateNote = h.catalog.T(locale, "extsql_import.key_update_note")
 	}
 	for _, f := range sortedConstantFields(constants) {
 		view.Constants = append(view.Constants, extSQLImportConstantView{Field: f, Value: constants[f]})
@@ -606,14 +734,24 @@ type extSQLImportPreviewView struct {
 	RepreviewLabel   string
 	ConstantsHeading string
 	FixedValueLabel  string
+	KeyColumnLabel   string
+	KeyNoneLabel     string
+	KeyHelp          string
+	KeyUpdateNote    string
 	RowCapNote       string
 	TemplateNote     string
 
-	Mappings  []mappingRowView
-	Constants []extSQLImportConstantView
+	Mappings   []mappingRowView
+	KeyOptions []extSQLImportKeyOption
+	Constants  []extSQLImportConstantView
 
 	MappingError string
 	Rows         []previewRowView
+}
+
+type extSQLImportKeyOption struct {
+	Value    string
+	Selected bool
 }
 
 type extSQLImportConstantView struct {
@@ -622,14 +760,16 @@ type extSQLImportConstantView struct {
 }
 
 type extSQLImportResultView struct {
-	Heading        string
-	Succeeded      int
-	Failed         int
-	Total          int
-	SucceededLabel string
-	FailedLabel    string
-	RowCapNote     string
-	Rows           []previewRowView
+	Heading      string
+	Created      int
+	Updated      int
+	Failed       int
+	Total        int
+	CreatedLabel string
+	UpdatedLabel string
+	FailedLabel  string
+	RowCapNote   string
+	Rows         []previewRowView
 }
 
 var extSQLImportTmpl = template.Must(template.New("ext-sql-import").Parse(`
@@ -685,6 +825,7 @@ var extSQLImportTmpl = template.Must(template.New("ext-sql-import").Parse(`
 <input type="hidden" name="source_id" value="{{.SourceID}}">
 <input type="hidden" name="schema" value="{{.Schema}}">
 <input type="hidden" name="relation" value="{{.Relation}}">
+<input type="hidden" name="key_column_set" value="1">
 <h2>{{.MappingHeading}}</h2>
 {{if .TemplateNote}}<p class="uc-extsql-template-note">{{.TemplateNote}}</p>{{end}}
 <table class="uc-import-mapping">
@@ -701,6 +842,13 @@ var extSQLImportTmpl = template.Must(template.New("ext-sql-import").Parse(`
 {{end}}
 </tbody>
 </table>
+<label for="uc-extsql-key-column">{{.KeyColumnLabel}}</label>
+<select id="uc-extsql-key-column" name="key_column">
+<option value="">{{.KeyNoneLabel}}</option>
+{{range .KeyOptions}}<option value="{{.Value}}" {{if .Selected}}selected{{end}}>{{.Value}}</option>{{end}}
+</select>
+<p class="uc-extsql-hint">{{.KeyHelp}}</p>
+{{if .KeyUpdateNote}}<p class="uc-extsql-key-note">{{.KeyUpdateNote}}</p>{{end}}
 {{if .Constants}}
 <h3>{{.ConstantsHeading}}</h3>
 <table class="uc-extsql-constants">
@@ -741,7 +889,7 @@ var extSQLImportTmpl = template.Must(template.New("ext-sql-import").Parse(`
 {{define "result"}}
 <div class="uc-extsql-import-result">
 <h2>{{.Heading}}</h2>
-<p>{{.Succeeded}} {{.SucceededLabel}}, {{.Failed}} {{.FailedLabel}} ({{.Total}} total)</p>
+<p>{{.Created}} {{.CreatedLabel}}, {{.Updated}} {{.UpdatedLabel}}, {{.Failed}} {{.FailedLabel}} ({{.Total}} total)</p>
 <p class="uc-extsql-row-cap">{{.RowCapNote}}</p>
 <table class="uc-import-rows">
 <tbody>

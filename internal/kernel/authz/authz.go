@@ -108,6 +108,15 @@ var controlPlaneTypes = map[string]bool{
 	"Permission":      true,
 	"FieldPermission": true,
 	"Delegation":      true,
+	// ExternalIdentity (uc-infra#101) joins for the same
+	// redirection-of-authority reason: it decides which existing record
+	// a keyed legacy-import row will silently UPDATE, so an
+	// unprivileged user authoring one could re-point the next import at
+	// any record of that entity type. The import engine itself writes
+	// identities through a raw-engine side-channel (see
+	// sqlsource.RecordEngine's doc comment), the same posture workflow
+	// steps and provisioning use.
+	"ExternalIdentity": true,
 }
 
 // entityPerm is the memoized per-entity-type resolution result.
@@ -405,11 +414,30 @@ func (r *Resolver) CanRead(ctx context.Context, entityType string) (bool, error)
 	return p.canRead, nil
 }
 
+// systemOnlyWriteTypes are entity types no user-driven write path may
+// touch, even inside the RBAC bootstrap window that keeps
+// controlPlaneTypes open until a tenant configures RBAC. That window
+// exists so the first admin can be created; ExternalIdentity has no
+// such bootstrapping need, and leaving it open pre-configuration would
+// let any authenticated user re-point the next keyed import at an
+// arbitrary record (re-verification finding, 2026-08-01). Its writes
+// happen exclusively through the import engine's raw-engine
+// side-channel (machine/system callers bypass this resolver entirely).
+// Checked before the admin bypass deliberately: an admin hand-editing
+// identity rows breaks import idempotency exactly like anyone else —
+// there is no legitimate hand-written identity row.
+var systemOnlyWriteTypes = map[string]bool{
+	"ExternalIdentity": true,
+}
+
 // CanWrite reports whether the actor may create/update/delete records
 // of entityType.
 func (r *Resolver) CanWrite(ctx context.Context, entityType string) (bool, error) {
 	if r.machine {
 		return true, nil
+	}
+	if systemOnlyWriteTypes[entityType] {
+		return false, nil
 	}
 	if err := r.loadRoles(ctx); err != nil {
 		return false, err

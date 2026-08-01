@@ -88,10 +88,16 @@ func IssueReportForm() *form.Definition {
 // particular are actively created by cmd/seed-demo-data and referenced
 // by Item/PurchaseOrder, yet had no way to view or edit a single one
 // through the app itself). AIProviderConnection and ExternalSQLSource
-// are the two deliberate, still-standing exceptions — see their doc
+// are two deliberate, still-standing exceptions — see their doc
 // comments in foundation.go: a generic form would render their
 // encrypted secrets as plain text boxes, so their settings pages are
-// bespoke and stay that way.
+// bespoke and stay that way. ExternalIdentity is the third exception,
+// for a different reason than those two secret-bearing entities: it
+// holds no secret at all, it is system bookkeeping written by the
+// import engine (internal/kernel/sqlsource.CommitRowsUpserting, its
+// only writer) — hand-editing identity rows silently breaks import
+// idempotency, so it gets no editing surface rather than an inviting
+// generic form.
 func AllForms() []*form.Definition {
 	return []*form.Definition{
 		PartyForm(), IssueReportForm(),

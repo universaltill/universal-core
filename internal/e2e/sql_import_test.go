@@ -270,13 +270,55 @@ func TestSQLImportSourceSettings_RealBrowser(t *testing.T) {
 	}
 }
 
+// driveToNAVPreview walks the already-open browser back through the SQL
+// import flow to the mapping/preview fragment for navTable: source pick,
+// relation browse (a real dial-out), relation select. The re-import
+// rounds of the wizard test repeat this exactly as a user re-running
+// last month's pull would.
+func driveToNAVPreview(t *testing.T, ctx context.Context, srv *httptest.Server, sourceID, navTable string) {
+	t.Helper()
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/import/Item/sql"),
+		chromedp.WaitVisible(`#uc-extsql-import-form`, chromedp.ByQuery),
+		chromedp.SetValue(`#uc-extsql-import-source`, sourceID, chromedp.ByQuery),
+		clickAndSettle(`button[hx-post="/import/Item/sql/relations"]`),
+		clickAndSettle(`#uc-extsql-relations form:has(input[value="`+navTable+`"]) button`),
+		chromedp.WaitVisible(`#uc-extsql-preview`, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("drive to NAV preview: %v", err)
+	}
+}
+
+// countTenantRecords counts live records of one entity type straight in
+// the tenant database — the wizard test's proof that what the browser
+// reported actually matches storage.
+func countTenantRecords(t *testing.T, tenantDB *sql.DB, entityType string) int {
+	t.Helper()
+	var count int
+	if err := tenantDB.QueryRow(
+		`SELECT count(*) FROM records WHERE entity_type = $1 AND deleted_at IS NULL`, entityType,
+	).Scan(&count); err != nil {
+		t.Fatalf("count %s records: %v", entityType, err)
+	}
+	return count
+}
+
 // TestSQLImportWizard_NAVTemplate_RealBrowser drives the SQL-source
 // import flow end to end for entity type Item in a real browser: the
 // upload page's link into /import/Item/sql, the source picker, the real
 // dial-out relation browse, the nav2009 template pre-fill (No_->sku,
-// Description->name, plus the read-only item_type=stock constant), a
-// re-preview through the real mapping <select>s, the commit, and finally
-// the tenant database itself — the Item records must actually exist.
+// Description->name, the read-only item_type=stock constant, and the
+// template's KeyColumn No_ pre-selecting the key-column <select> —
+// uc-infra#101), a re-preview through the real mapping <select>s, the
+// keyed commit, and finally the tenant database itself — the Item
+// records must actually exist.
+//
+// It then re-imports twice: once keyed (after changing a Description at
+// the source — the upsert path must UPDATE the records the first run
+// created, 0 created / 2 updated, identity count unchanged) and once
+// with the key column explicitly set to "none" (the create-only path
+// must still duplicate — the pre-#101 behavior stays available and
+// intact).
 func TestSQLImportWizard_NAVTemplate_RealBrowser(t *testing.T) {
 	withDevAuthEnabled(t)
 	srv, tenantID, tenantDB := testServerWithSecretCryptor(t)
@@ -329,11 +371,13 @@ func TestSQLImportWizard_NAVTemplate_RealBrowser(t *testing.T) {
 
 	// The mapping form pre-fills from the nav2009 template — real
 	// <select> values, not markup substrings.
-	var skuValue, nameValue, templateNote, constantsText string
+	var skuValue, nameValue, keyValue, keyNote, templateNote, constantsText string
 	var constantEditable bool
 	if err := chromedp.Run(ctx,
 		chromedp.Value(`select[name="mapping.No_"]`, &skuValue, chromedp.ByQuery),
 		chromedp.Value(`select[name="mapping.Description"]`, &nameValue, chromedp.ByQuery),
+		chromedp.Value(`#uc-extsql-key-column`, &keyValue, chromedp.ByQuery),
+		chromedp.Text(`.uc-extsql-key-note`, &keyNote, chromedp.ByQuery),
 		chromedp.Text(`.uc-extsql-template-note`, &templateNote, chromedp.ByQuery),
 		chromedp.Text(`.uc-extsql-constants`, &constantsText, chromedp.ByQuery),
 		chromedp.Evaluate(`document.querySelector('#uc-extsql-preview [name="mapping.item_type"], #uc-extsql-preview [name="item_type"]') !== null`, &constantEditable),
@@ -342,6 +386,14 @@ func TestSQLImportWizard_NAVTemplate_RealBrowser(t *testing.T) {
 	}
 	if skuValue != "sku" || nameValue != "name" {
 		t.Fatalf("expected the nav2009 template pre-fill (No_->sku, Description->name), got %q, %q", skuValue, nameValue)
+	}
+	// The template's KeyColumn pre-selects the key-column <select>
+	// (uc-infra#101), and the will-update note renders alongside it.
+	if keyValue != "No_" {
+		t.Fatalf("expected the nav2009 template's KeyColumn to pre-select No_, got %q", keyValue)
+	}
+	if keyNote == "" {
+		t.Fatal("expected the key-update note to render when a key column is selected")
 	}
 	if !strings.Contains(templateNote, "Microsoft Dynamics NAV 2009") {
 		t.Fatalf("expected the template note to name the matched vendor template, got: %q", templateNote)
@@ -363,27 +415,29 @@ func TestSQLImportWizard_NAVTemplate_RealBrowser(t *testing.T) {
 	}
 
 	// Step 4: re-preview through the mapping form itself — the round trip
-	// that resubmits the real mapping.* selects — then commit.
-	var resultText string
+	// that resubmits the real mapping.* selects and the key_column — then
+	// the first, keyed commit: everything is new, so everything creates.
+	var resultText, resultRowsHTML string
 	if err := chromedp.Run(ctx,
 		clickAndSettle(`#uc-extsql-preview button[hx-post="/import/Item/sql/preview"]`),
 		chromedp.WaitVisible(`.uc-import-rows`, chromedp.ByQuery),
 		clickAndSettle(`button[hx-post="/import/Item/sql/commit"]`),
 		chromedp.Text(`.uc-extsql-import-result`, &resultText, chromedp.ByQuery),
+		chromedp.InnerHTML(`.uc-extsql-import-result .uc-import-rows`, &resultRowsHTML, chromedp.ByQuery),
 	); err != nil {
 		t.Fatalf("re-preview + commit: %v", err)
 	}
-	if !strings.Contains(resultText, "2 succeeded") {
-		t.Fatalf("expected the commit result to report 2 succeeded, got: %q", resultText)
+	if !strings.Contains(resultText, "2 created, 0 updated, 0 failed (2 total)") {
+		t.Fatalf("expected the keyed first commit to report 2 created, 0 updated, got: %q", resultText)
+	}
+	if !strings.Contains(resultRowsHTML, ">Created<") || strings.Contains(resultRowsHTML, ">Updated<") {
+		t.Fatalf("expected every per-row status to be Created on the first commit, got:\n%s", resultRowsHTML)
 	}
 
 	// Underneath the rendering: the Item records genuinely exist in the
-	// tenant database, mapped columns and template constant applied.
-	var count int
-	if err := tenantDB.QueryRow(`SELECT count(*) FROM records WHERE entity_type = 'Item' AND deleted_at IS NULL`).Scan(&count); err != nil {
-		t.Fatalf("count imported Items: %v", err)
-	}
-	if count != 2 {
+	// tenant database, mapped columns and template constant applied — and
+	// the keyed commit remembered them, one ExternalIdentity row each.
+	if count := countTenantRecords(t, tenantDB, "Item"); count != 2 {
 		t.Fatalf("expected 2 imported Item records, got %d", count)
 	}
 	for sku, name := range map[string]string{"1000": "Bicycle", "1001": "Touring Bicycle"} {
@@ -397,5 +451,94 @@ func TestSQLImportWizard_NAVTemplate_RealBrowser(t *testing.T) {
 		if gotName != name || gotType != "stock" {
 			t.Fatalf("Item %s: expected name %q and item_type \"stock\", got %q, %q", sku, name, gotName, gotType)
 		}
+	}
+	identityCount := func() int {
+		t.Helper()
+		var count int
+		if err := tenantDB.QueryRow(
+			`SELECT count(*) FROM records WHERE entity_type = 'ExternalIdentity' AND data->>'source_id' = $1 AND data->>'entity_type' = 'Item' AND deleted_at IS NULL`,
+			sourceID,
+		).Scan(&count); err != nil {
+			t.Fatalf("count ExternalIdentity rows: %v", err)
+		}
+		return count
+	}
+	if got := identityCount(); got != 2 {
+		t.Fatalf("expected one ExternalIdentity row per imported record (2), got %d", got)
+	}
+
+	// Round 2 — the re-import that motivated uc-infra#101. The legacy
+	// source changed a Description; running the same pull again must
+	// UPDATE the records the first run created, never duplicate them.
+	if _, err := tenantDB.Exec(`UPDATE "` + navTable + `" SET "Description" = 'Racing Bicycle' WHERE "No_" = '1001'`); err != nil {
+		t.Fatalf("change Description at the source: %v", err)
+	}
+	driveToNAVPreview(t, ctx, srv, sourceID, navTable)
+	if err := chromedp.Run(ctx,
+		chromedp.Value(`#uc-extsql-key-column`, &keyValue, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("read key column on re-import: %v", err)
+	}
+	if keyValue != "No_" {
+		t.Fatalf("expected the template's KeyColumn pre-selected again on re-import, got %q", keyValue)
+	}
+	if err := chromedp.Run(ctx,
+		clickAndSettle(`button[hx-post="/import/Item/sql/commit"]`),
+		chromedp.Text(`.uc-extsql-import-result`, &resultText, chromedp.ByQuery),
+		chromedp.InnerHTML(`.uc-extsql-import-result .uc-import-rows`, &resultRowsHTML, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("keyed re-import commit: %v", err)
+	}
+	if !strings.Contains(resultText, "0 created, 2 updated, 0 failed (2 total)") {
+		t.Fatalf("expected the keyed re-import to report 0 created, 2 updated, got: %q", resultText)
+	}
+	if !strings.Contains(resultRowsHTML, ">Updated<") || strings.Contains(resultRowsHTML, ">Created<") {
+		t.Fatalf("expected every per-row status to be Updated on the re-import, got:\n%s", resultRowsHTML)
+	}
+	if count := countTenantRecords(t, tenantDB, "Item"); count != 2 {
+		t.Fatalf("expected the re-import to leave the record count at 2, got %d", count)
+	}
+	var updatedName string
+	if err := tenantDB.QueryRow(
+		`SELECT data->>'name' FROM records WHERE entity_type = 'Item' AND data->>'sku' = '1001' AND deleted_at IS NULL`,
+	).Scan(&updatedName); err != nil {
+		t.Fatalf("read re-imported Item 1001: %v", err)
+	}
+	if updatedName != "Racing Bicycle" {
+		t.Fatalf("expected the changed Description to land on the existing record, got %q", updatedName)
+	}
+	if got := identityCount(); got != 2 {
+		t.Fatalf("expected the re-import to reuse the identity rows (2), got %d", got)
+	}
+
+	// Round 3 — key column explicitly set to "none": the create-only
+	// path must remain intact, duplicating exactly as it always did.
+	// (Set via JS rather than chromedp.SetValue — see the settings test's
+	// note on SetValue and empty strings; hx-include serializes the DOM
+	// value, so no change event is needed.)
+	driveToNAVPreview(t, ctx, srv, sourceID, navTable)
+	if err := chromedp.Run(ctx,
+		chromedp.Evaluate(`document.querySelector('#uc-extsql-key-column').value = ''`, nil),
+		chromedp.Value(`#uc-extsql-key-column`, &keyValue, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("clear key column: %v", err)
+	}
+	if keyValue != "" {
+		t.Fatalf("expected the key column cleared to none, got %q", keyValue)
+	}
+	if err := chromedp.Run(ctx,
+		clickAndSettle(`button[hx-post="/import/Item/sql/commit"]`),
+		chromedp.Text(`.uc-extsql-import-result`, &resultText, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("keyless commit: %v", err)
+	}
+	if !strings.Contains(resultText, "2 created, 0 updated, 0 failed (2 total)") {
+		t.Fatalf("expected the keyless commit to create-only, got: %q", resultText)
+	}
+	if count := countTenantRecords(t, tenantDB, "Item"); count != 4 {
+		t.Fatalf("expected the keyless commit to duplicate (4 Item records), got %d", count)
+	}
+	if got := identityCount(); got != 2 {
+		t.Fatalf("expected the keyless commit to write no identity rows (still 2), got %d", got)
 	}
 }
