@@ -231,11 +231,21 @@ func TestPurchaseOrder_StagedLeadTimeStages(t *testing.T) {
 		{"customs_cleared_at", "shipped_at"},
 		{"received_at", "customs_cleared_at"},
 	}
-	// Collect every chained field in declaration order — this asserts
+	// Collect every #29 chained field in declaration order — this asserts
 	// both "exactly six" and "declared in reference-model order" at once.
+	// #11's promised_delivery_date also carries a NotBefore chain (its own
+	// test, TestPurchaseOrder_PromisedDeliveryDate, pins that separately)
+	// but is deliberately excluded here BY NAME, not by membership in
+	// `want`: it records a vendor COMMITMENT made at order time, not one
+	// of #29's ACTUAL-outcome stages, so it isn't part of what this test
+	// is pinning. Excluding by name (rather than "keep only fields also
+	// in `want`") is deliberate — the latter would make the count check a
+	// tautology that can never catch an UNLISTED seventh stage field
+	// added later, only a deletion (independent review of #11,
+	// 2026-08-01: an earlier version of this test did exactly that).
 	var staged []entity.Field
 	for _, f := range def.Fields {
-		if f.NotBefore != "" {
+		if f.NotBefore != "" && f.Name != "promised_delivery_date" {
 			staged = append(staged, f)
 		}
 	}
@@ -261,6 +271,52 @@ func TestPurchaseOrder_StagedLeadTimeStages(t *testing.T) {
 	// (Definition.Validate's NotBefore second pass).
 	if err := def.Validate(); err != nil {
 		t.Fatalf("PurchaseOrder with staged lead-time chain must validate: %v", err)
+	}
+}
+
+// TestPurchaseOrder_PromisedDeliveryDate pins #11's on-time-delivery
+// prerequisite: an optional FieldDate, chained via NotBefore to
+// order_date (a promise can't predate the order itself), that validates
+// cleanly both with and without a value present — an old PO written
+// before this field existed, or a PO whose promise was simply never
+// pinned down, must still pass.
+func TestPurchaseOrder_PromisedDeliveryDate(t *testing.T) {
+	def := PurchaseOrder()
+	f, ok := def.FieldByName("promised_delivery_date")
+	if !ok {
+		t.Fatal("expected a promised_delivery_date field")
+	}
+	if f.Type != entity.FieldDate {
+		t.Fatalf("expected promised_delivery_date to be a FieldDate, got %s", f.Type)
+	}
+	if f.Required {
+		t.Fatal("promised_delivery_date must be optional — not every PO pins one down, and old rows have none")
+	}
+	if f.NotBefore != "order_date" {
+		t.Fatalf("expected NotBefore %q, got %q", "order_date", f.NotBefore)
+	}
+
+	withoutPromise := map[string]any{
+		"po_number": "PO-TEST-1", "vendor_id": "party-1", "order_date": "2026-07-20", "status_id": "status-1",
+	}
+	if err := entity.ValidateRecord(def, withoutPromise); err != nil {
+		t.Fatalf("PurchaseOrder without a promised_delivery_date must still validate: %v", err)
+	}
+
+	withPromise := map[string]any{
+		"po_number": "PO-TEST-1", "vendor_id": "party-1", "order_date": "2026-07-20",
+		"promised_delivery_date": "2026-07-27", "status_id": "status-1",
+	}
+	if err := entity.ValidateRecord(def, withPromise); err != nil {
+		t.Fatalf("PurchaseOrder with a promised_delivery_date on/after order_date must validate: %v", err)
+	}
+
+	beforeOrder := map[string]any{
+		"po_number": "PO-TEST-1", "vendor_id": "party-1", "order_date": "2026-07-20",
+		"promised_delivery_date": "2026-07-19", "status_id": "status-1",
+	}
+	if err := entity.ValidateRecord(def, beforeOrder); err == nil {
+		t.Fatal("expected error for promised_delivery_date before order_date")
 	}
 }
 

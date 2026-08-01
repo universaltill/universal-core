@@ -379,6 +379,211 @@ func TestAPI_PurchasingReport_InsufficientHistoryStates(t *testing.T) {
 	}
 }
 
+// TestAPI_PurchasingReport_OnTimeDeliverySection (#11) exercises the
+// on-time-delivery table end to end: a vendor with enough promised-date
+// samples to show a real rate, a vendor with only one (insufficient),
+// and a completed PO with NO promised_delivery_date at all (must be
+// excluded from every count, not counted as a miss) — plus the overall
+// summary row and localized (tr) rendering, same structure as
+// TestAPI_PurchasingReport_LeadTimeAndReorderSections.
+func TestAPI_PurchasingReport_OnTimeDeliverySection(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := purchasing.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("purchasing.Publish: %v", err)
+	}
+	records := data.NewRecordRepo(db)
+
+	mustCreate := func(entityType string, fields map[string]any) string {
+		t.Helper()
+		rec, err := records.Create(ctx, entityType, fields)
+		if err != nil {
+			t.Fatalf("create %s: %v", entityType, err)
+		}
+		return rec.ID
+	}
+
+	vendor := mustCreate("Party", map[string]any{"name": "Promise Co", "party_type": "organization"})
+	soloVendor := mustCreate("Party", map[string]any{"name": "Solo Promiser", "party_type": "organization"})
+
+	// Promise Co: 2 on-time (received on/before promise), 1 late -> 2/3.
+	mustCreate("PurchaseOrder", map[string]any{
+		"po_number": "PO-OT-1", "vendor_id": vendor,
+		"order_date": "2026-07-01", "promised_delivery_date": "2026-07-10", "received_at": "2026-07-08",
+	})
+	mustCreate("PurchaseOrder", map[string]any{
+		"po_number": "PO-OT-2", "vendor_id": vendor,
+		"order_date": "2026-07-02", "promised_delivery_date": "2026-07-12", "received_at": "2026-07-12",
+	})
+	mustCreate("PurchaseOrder", map[string]any{
+		"po_number": "PO-OT-3", "vendor_id": vendor,
+		"order_date": "2026-07-03", "promised_delivery_date": "2026-07-11", "received_at": "2026-07-15",
+	})
+	// Solo Promiser: one promised sample -> insufficient.
+	mustCreate("PurchaseOrder", map[string]any{
+		"po_number": "PO-OT-SOLO", "vendor_id": soloVendor,
+		"order_date": "2026-07-04", "promised_delivery_date": "2026-07-14", "received_at": "2026-07-14",
+	})
+	// A completed PO with no promised_delivery_date at all — must not
+	// appear in any on-time count for Promise Co (it has no promise to
+	// judge against), even though it's a real completed order.
+	mustCreate("PurchaseOrder", map[string]any{
+		"po_number": "PO-OT-NOPROMISE", "vendor_id": vendor,
+		"order_date": "2026-07-05", "received_at": "2026-07-09",
+	})
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+	rec := getAs(t, mux, "/reports/purchasing", tenantID, "farshid")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+
+	if !strings.Contains(body, "On-Time Delivery") {
+		t.Fatalf("expected the #11 On-Time Delivery section heading:\n%s", body)
+	}
+	// Promise Co: N=3 (the no-promise PO excluded), 2 on time -> 66.7%.
+	if !strings.Contains(body, "<tr><td>Promise Co</td><td>3</td><td>66.7%</td></tr>") {
+		t.Errorf("expected the Promise Co on-time row at 3 samples / 66.7%%:\n%s", body)
+	}
+	// Solo Promiser: N=1, insufficient — never a fabricated rate.
+	if !strings.Contains(body, "<tr><td>Solo Promiser</td><td>1</td><td>Insufficient history</td></tr>") {
+		t.Errorf("expected the Solo Promiser row to say insufficient at n=1:\n%s", body)
+	}
+	// Overall across the 4 promised samples (Promise Co's 3 + Solo's 1):
+	// 3 on-time -> 3/4 = 75%.
+	if !strings.Contains(body, "<tr><td>All vendors</td><td>4</td><td>75%</td></tr>") {
+		t.Errorf("expected the all-vendors on-time summary row at 4 samples / 75%%:\n%s", body)
+	}
+
+	recTR := getAs(t, mux, "/reports/purchasing?lang=tr", tenantID, "farshid")
+	if recTR.Code != http.StatusOK {
+		t.Fatalf("expected 200 for ?lang=tr, got %d: %s", recTR.Code, recTR.Body.String())
+	}
+	if !strings.Contains(recTR.Body.String(), "Zamanında Teslimat") {
+		t.Errorf("expected the localized (tr) On-Time Delivery heading:\n%s", recTR.Body.String())
+	}
+}
+
+// TestAPI_PurchasingReport_OnTimeDeliveryPartialReceipt (#11,
+// independent review 2026-08-01) is the end-to-end regression for the
+// bug that review caught: a PO promised 2026-07-10 whose first
+// GoodsReceipt arrives a day EARLY (07-09) but whose order isn't
+// actually complete until a second GoodsReceipt 82 days LATE (09-30).
+// Before the fix, the report used the FIRST receipt date (#30's
+// lead-time semantics reused unexamined) and scored this vendor 100%
+// on-time; it must now score 0% — the order was not fully satisfied
+// until long after the promise.
+func TestAPI_PurchasingReport_OnTimeDeliveryPartialReceipt(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := purchasing.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("purchasing.Publish: %v", err)
+	}
+	records := data.NewRecordRepo(db)
+
+	vendor, err := records.Create(ctx, "Party", map[string]any{"name": "Partial Ship Co", "party_type": "organization"})
+	if err != nil {
+		t.Fatalf("create Party: %v", err)
+	}
+	po, err := records.Create(ctx, "PurchaseOrder", map[string]any{
+		"po_number": "PO-PARTIAL-API", "vendor_id": vendor.ID,
+		"order_date": "2026-07-01", "promised_delivery_date": "2026-07-10",
+	})
+	if err != nil {
+		t.Fatalf("create PurchaseOrder: %v", err)
+	}
+	if _, err := records.Create(ctx, "GoodsReceipt", map[string]any{
+		"purchase_order_id": po.ID, "received_date": "2026-07-09",
+	}); err != nil {
+		t.Fatalf("create early partial GoodsReceipt: %v", err)
+	}
+	if _, err := records.Create(ctx, "GoodsReceipt", map[string]any{
+		"purchase_order_id": po.ID, "received_date": "2026-09-30",
+	}); err != nil {
+		t.Fatalf("create late completing GoodsReceipt: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+	rec := getAs(t, mux, "/reports/purchasing", tenantID, "farshid")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	// N=1, 0 on time -> 0%. The single sample is below MinSamples, so the
+	// vendor row itself says "Insufficient history" — but the overall row
+	// (also N=1 here) proves the SAME thing: this is a per-row rendering
+	// choice (MinSamples), not evidence the rate was computed correctly,
+	// so assert on the underlying stats via a second promised PO for the
+	// same vendor that IS on time, making N=2 sufficient and forcing the
+	// rate itself (1/2 = 50%) to render.
+	mustCreate := func(fields map[string]any) {
+		t.Helper()
+		if _, err := records.Create(ctx, "PurchaseOrder", fields); err != nil {
+			t.Fatalf("create PurchaseOrder: %v", err)
+		}
+	}
+	mustCreate(map[string]any{
+		"po_number": "PO-PARTIAL-API-2", "vendor_id": vendor.ID,
+		"order_date": "2026-07-02", "promised_delivery_date": "2026-07-12", "received_at": "2026-07-12",
+	})
+	rec = getAs(t, mux, "/reports/purchasing", tenantID, "farshid")
+	body = rec.Body.String()
+	if !strings.Contains(body, "<tr><td>Partial Ship Co</td><td>2</td><td>50%</td></tr>") {
+		t.Errorf("expected Partial Ship Co at 1/2 = 50%% (the partial-receipt PO must count as LATE, not on time):\n%s", body)
+	}
+	if strings.Contains(body, "<tr><td>Partial Ship Co</td><td>2</td><td>100%</td></tr>") {
+		t.Fatal("Partial Ship Co scored 100% on-time — the early PARTIAL receipt was used instead of the actual completion date")
+	}
+}
+
+// TestAPI_PurchasingReport_OnTimeDeliveryEmptyState (#11): when no
+// completed PO carries a promised_delivery_date at all — true for every
+// tenant until someone starts filling it in, and true of every OTHER
+// report test in this file that predates #11 — the section must render
+// its own empty-state copy, not an empty table and not the lead-time
+// section's unrelated one.
+func TestAPI_PurchasingReport_OnTimeDeliveryEmptyState(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := purchasing.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("purchasing.Publish: %v", err)
+	}
+	records := data.NewRecordRepo(db)
+	vendor, err := records.Create(ctx, "Party", map[string]any{"name": "No Promise Vendor", "party_type": "organization"})
+	if err != nil {
+		t.Fatalf("create Party: %v", err)
+	}
+	if _, err := records.Create(ctx, "PurchaseOrder", map[string]any{
+		"po_number": "PO-NOPROMISE-1", "vendor_id": vendor.ID,
+		"order_date": "2026-07-01", "received_at": "2026-07-09",
+	}); err != nil {
+		t.Fatalf("create PurchaseOrder: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+	rec := getAs(t, mux, "/reports/purchasing", tenantID, "farshid")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "No completed purchase orders with a promised delivery date yet.") {
+		t.Errorf("expected the on-time-delivery empty state:\n%s", body)
+	}
+	if !strings.Contains(body, "Supplier Lead Times") {
+		t.Errorf("expected the lead-time section to still render its own (non-empty) data:\n%s", body)
+	}
+}
+
 // TestAPI_PurchasingReport_EntityTypeListMatchesTheActualQueries pins
 // purchasingReportEntityTypes to a hardcoded, independently-derived set
 // so a change to the var — an addition OR an omission — fails loudly

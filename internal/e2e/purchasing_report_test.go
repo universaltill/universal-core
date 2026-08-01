@@ -123,3 +123,64 @@ func TestPurchasingReport_LeadTimeAndReorderSections_RealBrowser(t *testing.T) {
 		t.Fatalf("signal row's item link missing (err=%v ok=%v)", err, ok)
 	}
 }
+
+// TestPurchasingReport_OnTimeDeliverySection_RealBrowser (#11): the
+// third completed-PO-derived section — "On-Time Delivery" — renders in
+// a real headless Chrome alongside the two #30 sections it sits next to
+// on the same page. The internal/api tests already pin the exact row
+// markup/percentage math; this proves the page a buyer actually loads
+// carries the section through the real server + browser stack, same
+// reasoning as TestPurchasingReport_LeadTimeAndReorderSections_RealBrowser.
+func TestPurchasingReport_OnTimeDeliverySection_RealBrowser(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, tenantDB := testServer(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	if err := purchasing.PublishStatuses(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("PublishStatuses: %v", err)
+	}
+	engine := crud.NewEngine(tenantDB)
+
+	vendor, err := engine.Create(ctx, foundation.Party(), map[string]any{
+		"name": "Promise Co", "party_type": "organization", "status": "active",
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed vendor: %v", err)
+	}
+	receivedID := publishedStatusID(t, tenantDB, "purchase_order_status", "received")
+
+	// Two on-time (received on/before promise), one late -> 2/3 = 66.7%.
+	for _, po := range []struct{ number, ordered, promised, received string }{
+		{"PO-OT-E2E-1", "2026-07-01", "2026-07-10", "2026-07-08"},
+		{"PO-OT-E2E-2", "2026-07-02", "2026-07-12", "2026-07-12"},
+		{"PO-OT-E2E-3", "2026-07-03", "2026-07-11", "2026-07-15"},
+	} {
+		if _, err := engine.Create(ctx, purchasing.PurchaseOrder(), map[string]any{
+			"po_number": po.number, "vendor_id": vendor.ID, "order_date": po.ordered,
+			"promised_delivery_date": po.promised, "status_id": receivedID, "received_at": po.received,
+		}, actor); err != nil {
+			t.Fatalf("seed completed PO %s: %v", po.number, err)
+		}
+	}
+
+	bctx := browserCtx(t, tenantID)
+	var bodyText string
+	if err := chromedp.Run(bctx,
+		chromedp.Navigate(srv.URL+"/reports/purchasing"),
+		chromedp.WaitVisible(`table.uc-table`, chromedp.ByQuery),
+		chromedp.Text(`body`, &bodyText, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("open /reports/purchasing: %v", err)
+	}
+
+	for _, want := range []string{
+		"On-Time Delivery",
+		"Promise Co",
+		"66.7%",
+	} {
+		if !strings.Contains(bodyText, want) {
+			t.Errorf("report page missing %q; body text:\n%s", want, bodyText)
+		}
+	}
+}

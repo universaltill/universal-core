@@ -283,6 +283,115 @@ func TestCompletedPOLeadTimes_ReceivedAtWithGoodsReceiptFallback(t *testing.T) {
 	if got[2].POID != fallback || got[2].ReceivedDate != "2026-07-17" {
 		t.Errorf("row 2 = %+v, want PO-FALLBACK with earliest GoodsReceipt date 2026-07-17", got[2])
 	}
+	// LastReceivedDate (#11) diverges from ReceivedDate exactly here: two
+	// partial GoodsReceipts (07-17 and 07-20) means the LATEST one, not
+	// the earliest, is when the order was actually fully satisfied.
+	if got[2].LastReceivedDate != "2026-07-20" {
+		t.Errorf("row 2 LastReceivedDate = %q, want the LATEST GoodsReceipt date 2026-07-20 (not the earliest)", got[2].LastReceivedDate)
+	}
+	// Rows with a stamped received_at (no partial-receipt ambiguity)
+	// carry the same value in both fields — they only diverge across
+	// multiple partial GoodsReceipt rows.
+	if got[0].LastReceivedDate != got[0].ReceivedDate {
+		t.Errorf("row 0 LastReceivedDate = %q, want it to equal ReceivedDate %q (single stamped receipt)", got[0].LastReceivedDate, got[0].ReceivedDate)
+	}
+}
+
+// TestCompletedPOLeadTimes_PromisedDeliveryDate (#11) pins the
+// pass-through of the new optional field: present when set, empty
+// (never null-panics the scan) when the PO predates #11 or simply never
+// had one pinned down.
+func TestCompletedPOLeadTimes_PromisedDeliveryDate(t *testing.T) {
+	ctx := context.Background()
+	tenantDB := freshTenantDB(t)
+	records := data.NewRecordRepo(tenantDB)
+	reporting := data.NewReportingRepo(tenantDB)
+
+	vendor, err := records.Create(ctx, "Party", map[string]any{"name": "Promise Vendor", "party_type": "organization"})
+	if err != nil {
+		t.Fatalf("create Party: %v", err)
+	}
+
+	promised, err := records.Create(ctx, "PurchaseOrder", map[string]any{
+		"po_number": "PO-PROMISED", "vendor_id": vendor.ID,
+		"order_date": "2026-07-01", "promised_delivery_date": "2026-07-10", "received_at": "2026-07-09",
+	})
+	if err != nil {
+		t.Fatalf("create PO with promised_delivery_date: %v", err)
+	}
+	unpromised, err := records.Create(ctx, "PurchaseOrder", map[string]any{
+		"po_number": "PO-UNPROMISED", "vendor_id": vendor.ID,
+		"order_date": "2026-07-02", "received_at": "2026-07-09",
+	})
+	if err != nil {
+		t.Fatalf("create PO without promised_delivery_date: %v", err)
+	}
+
+	got, err := reporting.CompletedPOLeadTimes(ctx)
+	if err != nil {
+		t.Fatalf("CompletedPOLeadTimes: %v", err)
+	}
+	byID := make(map[string]data.CompletedPOLeadTime, len(got))
+	for _, row := range got {
+		byID[row.POID] = row
+	}
+	if got := byID[promised.ID].PromisedDeliveryDate; got != "2026-07-10" {
+		t.Errorf("PO-PROMISED.PromisedDeliveryDate = %q, want 2026-07-10", got)
+	}
+	if got := byID[unpromised.ID].PromisedDeliveryDate; got != "" {
+		t.Errorf("PO-UNPROMISED.PromisedDeliveryDate = %q, want empty", got)
+	}
+}
+
+// TestCompletedPOLeadTimes_PartialReceiptLastReceivedDate (#11,
+// independent review 2026-08-01) is the exact scenario that motivated
+// LastReceivedDate: a PO promised for 2026-07-10, with a 1-unit partial
+// GoodsReceipt one day EARLY (07-09) followed by the bulk of the order
+// arriving 82 days LATE (09-30). ReceivedDate (MIN, #30's lead-time
+// semantics) would say 07-09 — on time. LastReceivedDate (MAX, #11's
+// on-time semantics) must say 09-30 — the actual completion date, and
+// the one an on-time judgement has to be measured against.
+func TestCompletedPOLeadTimes_PartialReceiptLastReceivedDate(t *testing.T) {
+	ctx := context.Background()
+	tenantDB := freshTenantDB(t)
+	records := data.NewRecordRepo(tenantDB)
+	reporting := data.NewReportingRepo(tenantDB)
+
+	vendor, err := records.Create(ctx, "Party", map[string]any{"name": "Partial Ship Vendor", "party_type": "organization"})
+	if err != nil {
+		t.Fatalf("create Party: %v", err)
+	}
+	po, err := records.Create(ctx, "PurchaseOrder", map[string]any{
+		"po_number": "PO-PARTIAL", "vendor_id": vendor.ID,
+		"order_date": "2026-07-01", "promised_delivery_date": "2026-07-10",
+	})
+	if err != nil {
+		t.Fatalf("create PurchaseOrder: %v", err)
+	}
+	if _, err := records.Create(ctx, "GoodsReceipt", map[string]any{
+		"purchase_order_id": po.ID, "received_date": "2026-07-09",
+	}); err != nil {
+		t.Fatalf("create early partial GoodsReceipt: %v", err)
+	}
+	if _, err := records.Create(ctx, "GoodsReceipt", map[string]any{
+		"purchase_order_id": po.ID, "received_date": "2026-09-30",
+	}); err != nil {
+		t.Fatalf("create late completing GoodsReceipt: %v", err)
+	}
+
+	got, err := reporting.CompletedPOLeadTimes(ctx)
+	if err != nil {
+		t.Fatalf("CompletedPOLeadTimes: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d rows, want 1", len(got))
+	}
+	if got[0].ReceivedDate != "2026-07-09" {
+		t.Errorf("ReceivedDate (first-arrival, #30 lead-time semantics) = %q, want the EARLY partial 2026-07-09", got[0].ReceivedDate)
+	}
+	if got[0].LastReceivedDate != "2026-09-30" {
+		t.Errorf("LastReceivedDate (full-completion, #11 on-time semantics) = %q, want the LATE completing receipt 2026-09-30, not the early partial", got[0].LastReceivedDate)
+	}
 }
 
 // TestOnOrderQtyByItem_SumsOpenStatusesOnly pins R3's on-order

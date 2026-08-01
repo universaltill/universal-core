@@ -43,7 +43,7 @@ func ItemForm() *form.Definition {
 func PurchaseOrderForm() *form.Definition {
 	return &form.Definition{
 		EntityType: "PurchaseOrder",
-		Version:    4,
+		Version:    5,
 		Sections: []form.Section{
 			{
 				Title:     "Header",
@@ -52,6 +52,7 @@ func PurchaseOrderForm() *form.Definition {
 					{Name: "po_number", Label: "PO Number"},
 					{Name: "vendor_id", Label: "Vendor"},
 					{Name: "order_date", Label: "Order Date"},
+					{Name: "promised_delivery_date", Label: "Promised Delivery Date"},
 					{Name: "currency_id", Label: "Currency"},
 					{Name: "status_id", Label: "Status"},
 					{Name: "total", Label: "Total"},

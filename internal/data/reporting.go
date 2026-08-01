@@ -203,8 +203,32 @@ type CompletedPOLeadTime struct {
 	CustomsClearedAt  string
 	// ReceivedDate is COALESCE(received_at, MIN(GoodsReceipt.
 	// received_date)) — never empty; a PO with neither is not
-	// "completed" and isn't returned at all.
+	// "completed" and isn't returned at all. This is the FIRST evidence
+	// of arrival — correct for #30's lead-time quantiles (how long until
+	// something shows up), but deliberately NOT what #11's on-time
+	// determination uses (see LastReceivedDate) — a single early partial
+	// shipment would otherwise mark a PO "on time" while the bulk of the
+	// order was still months late (independent review of #11, 2026-07-31:
+	// reproduced with a 1-unit receipt one day early followed by a
+	// 99-unit receipt 82 days late).
 	ReceivedDate string
+	// PromisedDeliveryDate (#11) is the PO's own promised_delivery_date
+	// field, empty when never set — most rows, since it's optional and
+	// every PO written before #11 has none. The caller (forecast.
+	// OnTimeSample) is responsible for treating "" as "no on-time
+	// sample here", same division of responsibility as every other
+	// date on this struct.
+	PromisedDeliveryDate string
+	// LastReceivedDate is COALESCE(received_at, MAX(GoodsReceipt.
+	// received_date)) — the LAST evidence of arrival, i.e. when the PO
+	// was actually fully satisfied. #11's on-time determination
+	// (forecast.OnTimeSample.ReceivedDate) uses THIS, not ReceivedDate:
+	// "on time" has to mean the whole order arrived by the promise, not
+	// that the first box did. Equal to ReceivedDate whenever there's at
+	// most one GoodsReceipt (the common case) or the PO's own received_at
+	// stage is set directly (which both fields fall back from equally) —
+	// they only diverge across multiple partial GoodsReceipt rows.
+	LastReceivedDate string
 }
 
 // CompletedPOLeadTimes returns every PurchaseOrder with a known receipt
@@ -237,14 +261,17 @@ func (r *ReportingRepo) CompletedPOLeadTimes(ctx context.Context) ([]CompletedPO
 		        coalesce(po.data->>'production_ready_at', ''),
 		        coalesce(po.data->>'shipped_at', ''),
 		        coalesce(po.data->>'customs_cleared_at', ''),
-		        coalesce(nullif(po.data->>'received_at', ''), gr.first_received)
+		        coalesce(nullif(po.data->>'received_at', ''), gr.first_received),
+		        coalesce(po.data->>'promised_delivery_date', ''),
+		        coalesce(nullif(po.data->>'received_at', ''), gr.last_received)
 		 FROM records po
 		 LEFT JOIN records v
 		   ON v.entity_type = 'Party'
 		  AND v.deleted_at IS NULL
 		  AND v.id::text = po.data->>'vendor_id'
 		 LEFT JOIN LATERAL (
-		   SELECT min(g.data->>'received_date') AS first_received
+		   SELECT min(g.data->>'received_date') AS first_received,
+		          max(g.data->>'received_date') AS last_received
 		   FROM records g
 		   WHERE g.entity_type = 'GoodsReceipt'
 		     AND g.deleted_at IS NULL
@@ -269,7 +296,8 @@ func (r *ReportingRepo) CompletedPOLeadTimes(ctx context.Context) ([]CompletedPO
 		var row CompletedPOLeadTime
 		if err := rows.Scan(&row.POID, &row.VendorID, &row.VendorName, &row.OrderDate,
 			&row.SourcedAt, &row.ProductionStartAt, &row.ProductionReadyAt,
-			&row.ShippedAt, &row.CustomsClearedAt, &row.ReceivedDate); err != nil {
+			&row.ShippedAt, &row.CustomsClearedAt, &row.ReceivedDate,
+			&row.PromisedDeliveryDate, &row.LastReceivedDate); err != nil {
 			return nil, fmt.Errorf("scan completed po lead time row: %w", err)
 		}
 		out = append(out, row)
