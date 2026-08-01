@@ -363,6 +363,286 @@ func TestPostGoodsReceiptLineToLedger_UpdateAction_IsNoOp(t *testing.T) {
 	}
 }
 
+// TestValidateStockTransfer_SameFacility_Rejected and its
+// siblings below are direct unit-level calls — ValidateStockTransfer
+// never touches tx or def (pure business-rule validation, no DB read/
+// write of its own), the same "nil tx/def is safe" shape
+// TestPostGoodsReceiptLineToLedger_UpdateAction_IsNoOp already
+// establishes for a hook that guards on action before doing anything else.
+// Every one of them runs the same assertion twice, once per action:
+// these are invariants of what a StockTransfer is, so Update must reject
+// exactly what Create rejects (the hook's own doc comment).
+func TestValidateStockTransfer_SameFacility_Rejected(t *testing.T) {
+	for _, action := range []audit.Action{audit.ActionCreate, audit.ActionUpdate} {
+		rec := data.Record{ID: "x", Data: map[string]any{
+			"from_facility_id": "f1", "to_facility_id": "f1", "qty": float64(5),
+		}}
+		err := ValidateStockTransfer(context.Background(), nil, nil, rec, action, humanActor())
+		if err == nil {
+			t.Fatalf("%s: expected an error when from_facility_id == to_facility_id", action)
+		}
+		if !errors.Is(err, crud.ErrHookRejected) {
+			t.Errorf("%s: expected error to wrap crud.ErrHookRejected (so writeCrudError maps it to 400), got: %v", action, err)
+		}
+	}
+}
+
+func TestValidateStockTransfer_ZeroQty_Rejected(t *testing.T) {
+	for _, action := range []audit.Action{audit.ActionCreate, audit.ActionUpdate} {
+		rec := data.Record{ID: "x", Data: map[string]any{
+			"from_facility_id": "f1", "to_facility_id": "f2", "qty": float64(0),
+		}}
+		err := ValidateStockTransfer(context.Background(), nil, nil, rec, action, humanActor())
+		if err == nil {
+			t.Fatalf("%s: expected an error when qty == 0", action)
+		}
+		if !errors.Is(err, crud.ErrHookRejected) {
+			t.Errorf("%s: expected error to wrap crud.ErrHookRejected, got: %v", action, err)
+		}
+	}
+}
+
+func TestValidateStockTransfer_NegativeQty_Rejected(t *testing.T) {
+	for _, action := range []audit.Action{audit.ActionCreate, audit.ActionUpdate} {
+		rec := data.Record{ID: "x", Data: map[string]any{
+			"from_facility_id": "f1", "to_facility_id": "f2", "qty": float64(-3),
+		}}
+		err := ValidateStockTransfer(context.Background(), nil, nil, rec, action, humanActor())
+		if err == nil {
+			t.Fatalf("%s: expected an error when qty < 0", action)
+		}
+		if !errors.Is(err, crud.ErrHookRejected) {
+			t.Errorf("%s: expected error to wrap crud.ErrHookRejected, got: %v", action, err)
+		}
+	}
+}
+
+func TestValidateStockTransfer_ValidRecord_IsNoOp(t *testing.T) {
+	for _, action := range []audit.Action{audit.ActionCreate, audit.ActionUpdate} {
+		rec := data.Record{ID: "x", Data: map[string]any{
+			"from_facility_id": "f1", "to_facility_id": "f2", "qty": float64(5),
+		}}
+		if err := ValidateStockTransfer(context.Background(), nil, nil, rec, action, humanActor()); err != nil {
+			t.Fatalf("%s: expected a valid StockTransfer to pass, got: %v", action, err)
+		}
+	}
+}
+
+// TestValidateStockTransfer_AcceptsEveryNumericTypeEntityValidationDoes
+// pins numberFieldValue against entity.validateFieldValue's own accepted
+// set for FieldNumber (float64/int/int64). A plain float64 assertion
+// reads an int-typed qty as 0 and rejects a valid transfer claiming
+// "got 0" — reachable from any Go caller writing a literal, e.g.
+// cmd/seed-demo-data, which already registers this hook.
+func TestValidateStockTransfer_AcceptsEveryNumericTypeEntityValidationDoes(t *testing.T) {
+	for _, qty := range []any{float64(5), int(5), int64(5)} {
+		rec := data.Record{ID: "x", Data: map[string]any{
+			"from_facility_id": "f1", "to_facility_id": "f2", "qty": qty,
+		}}
+		if err := ValidateStockTransfer(context.Background(), nil, nil, rec, audit.ActionCreate, humanActor()); err != nil {
+			t.Errorf("qty %T(%v) is a valid FieldNumber value for entity.ValidateRecord, so this hook must accept it too, got: %v", qty, qty, err)
+		}
+	}
+	// A non-numeric qty is rejected rather than silently read as 0 — the
+	// error must say what actually arrived, not "got 0".
+	rec := data.Record{ID: "x", Data: map[string]any{
+		"from_facility_id": "f1", "to_facility_id": "f2", "qty": "5",
+	}}
+	err := ValidateStockTransfer(context.Background(), nil, nil, rec, audit.ActionCreate, humanActor())
+	if err == nil || !errors.Is(err, crud.ErrHookRejected) {
+		t.Fatalf("expected a non-numeric qty to be rejected as a hook rejection, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "must be a number") {
+		t.Errorf("expected the error to name the real problem (not a bogus zero-quantity), got: %v", err)
+	}
+}
+
+// stockTransferFixture bundles a real tenant database with foundation +
+// purchasing published, an Item, two Facility rows (so from_facility_id
+// != to_facility_id is a real, distinct pair), and the stock_transfer_
+// status "draft" Status id — everything a real end-to-end
+// engine.Create("StockTransfer", ...) call needs.
+type stockTransferFixture struct {
+	tenantDB      *sql.DB
+	engine        *crud.Engine
+	itemID        string
+	facilityAID   string
+	facilityBID   string
+	draftStatusID string
+}
+
+func setUpStockTransferFixture(t *testing.T) stockTransferFixture {
+	t.Helper()
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if err := PublishStatuses(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("PublishStatuses: %v", err)
+	}
+
+	engine := crud.NewEngine(tenantDB)
+	item, err := engine.Create(ctx, defFor(t, tenantDB, "Item"), map[string]any{
+		"sku": "SKU-ST-1", "name": "Widget", "item_type": "stock",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create Item: %v", err)
+	}
+	facilityA, err := engine.Create(ctx, defFor(t, tenantDB, "Facility"), map[string]any{
+		"code": "WH-A", "name": "Warehouse A", "facility_type": "warehouse",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create Facility A: %v", err)
+	}
+	facilityB, err := engine.Create(ctx, defFor(t, tenantDB, "Facility"), map[string]any{
+		"code": "WH-B", "name": "Warehouse B", "facility_type": "warehouse",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create Facility B: %v", err)
+	}
+	draftStatusID := statusIDByCode(t, engine, tenantDB, "stock_transfer_status", "draft")
+
+	return stockTransferFixture{
+		tenantDB: tenantDB, engine: engine,
+		itemID: item.ID, facilityAID: facilityA.ID, facilityBID: facilityB.ID,
+		draftStatusID: draftStatusID,
+	}
+}
+
+// TestValidateStockTransfer_ValidCreate_SucceedsEndToEnd confirms
+// the hook is actually wired and firing through the real
+// crud.Engine.Create path (not just callable directly, as the unit tests
+// above already confirm) and that a valid StockTransfer is genuinely
+// persisted.
+func TestValidateStockTransfer_ValidCreate_SucceedsEndToEnd(t *testing.T) {
+	fx := setUpStockTransferFixture(t)
+	fx.engine.SetHook("StockTransfer", ValidateStockTransfer)
+	ctx := context.Background()
+
+	rec, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "StockTransfer"), map[string]any{
+		"item_id": fx.itemID, "from_facility_id": fx.facilityAID, "to_facility_id": fx.facilityBID,
+		"qty": float64(10), "transfer_date": "2026-08-01", "status_id": fx.draftStatusID,
+	}, humanActor())
+	if err != nil {
+		t.Fatalf("expected a valid StockTransfer create to succeed, got: %v", err)
+	}
+	if rec.ID == "" {
+		t.Fatal("expected a real record ID back")
+	}
+}
+
+// TestValidateStockTransfer_SameFacility_RollsBackTheWholeWrite
+// confirms the hook rejection actually rolls back the write through the
+// real engine — no orphaned StockTransfer record left behind — and that
+// the rejection surfaces as crud.ErrHookRejected through the real
+// Create path (Engine.runHook wraps it as "%s hook: %w", so this also
+// confirms errors.Is still finds it through that extra wrapping layer).
+func TestValidateStockTransfer_SameFacility_RollsBackTheWholeWrite(t *testing.T) {
+	fx := setUpStockTransferFixture(t)
+	fx.engine.SetHook("StockTransfer", ValidateStockTransfer)
+	ctx := context.Background()
+
+	_, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "StockTransfer"), map[string]any{
+		"item_id": fx.itemID, "from_facility_id": fx.facilityAID, "to_facility_id": fx.facilityAID,
+		"qty": float64(10), "transfer_date": "2026-08-01", "status_id": fx.draftStatusID,
+	}, humanActor())
+	if err == nil {
+		t.Fatal("expected the create to fail when from_facility_id == to_facility_id")
+	}
+	if !errors.Is(err, crud.ErrHookRejected) {
+		t.Errorf("expected error to wrap crud.ErrHookRejected through the real Create path, got: %v", err)
+	}
+
+	var count int
+	if err := fx.tenantDB.QueryRowContext(ctx, `SELECT count(*) FROM records WHERE entity_type = 'StockTransfer'`).Scan(&count); err != nil {
+		t.Fatalf("count StockTransfer records: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected the rejected StockTransfer write to roll back entirely, found %d", count)
+	}
+}
+
+// TestValidateStockTransfer_ZeroQty_RollsBackTheWholeWrite is
+// TestValidateStockTransfer_SameFacility_RollsBackTheWholeWrite's
+// counterpart for the qty<=0 rejection.
+func TestValidateStockTransfer_ZeroQty_RollsBackTheWholeWrite(t *testing.T) {
+	fx := setUpStockTransferFixture(t)
+	fx.engine.SetHook("StockTransfer", ValidateStockTransfer)
+	ctx := context.Background()
+
+	_, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "StockTransfer"), map[string]any{
+		"item_id": fx.itemID, "from_facility_id": fx.facilityAID, "to_facility_id": fx.facilityBID,
+		"qty": float64(0), "transfer_date": "2026-08-01", "status_id": fx.draftStatusID,
+	}, humanActor())
+	if err == nil {
+		t.Fatal("expected the create to fail when qty == 0")
+	}
+	if !errors.Is(err, crud.ErrHookRejected) {
+		t.Errorf("expected error to wrap crud.ErrHookRejected through the real Create path, got: %v", err)
+	}
+
+	var count int
+	if err := fx.tenantDB.QueryRowContext(ctx, `SELECT count(*) FROM records WHERE entity_type = 'StockTransfer'`).Scan(&count); err != nil {
+		t.Fatalf("count StockTransfer records: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected the rejected StockTransfer write to roll back entirely, found %d", count)
+	}
+}
+
+// TestValidateStockTransfer_UpdateToSameFacility_RollsBackTheWholeWrite
+// is the regression test for the hole an independent review measured on
+// #13's first draft: the hook gated on audit.ActionCreate, so a
+// StockTransfer created legitimately could be edited — through the
+// ordinary PUT /api/records/StockTransfer/{id} route every entity has,
+// and through the edit form a saved create form becomes — into exactly
+// the same-facility, negative-quantity record the create path refuses.
+// Reverting the hook to a create-only gate fails this test with the
+// stored record holding from == to.
+func TestValidateStockTransfer_UpdateToSameFacility_RollsBackTheWholeWrite(t *testing.T) {
+	fx := setUpStockTransferFixture(t)
+	fx.engine.SetHook("StockTransfer", ValidateStockTransfer)
+	ctx := context.Background()
+	def := defFor(t, fx.tenantDB, "StockTransfer")
+
+	rec, err := fx.engine.Create(ctx, def, map[string]any{
+		"item_id": fx.itemID, "from_facility_id": fx.facilityAID, "to_facility_id": fx.facilityBID,
+		"qty": float64(10), "transfer_date": "2026-08-01", "status_id": fx.draftStatusID,
+	}, humanActor())
+	if err != nil {
+		t.Fatalf("create a valid StockTransfer first: %v", err)
+	}
+
+	version := rec.Version
+	_, err = fx.engine.Update(ctx, def, rec.ID, map[string]any{
+		"item_id": fx.itemID, "from_facility_id": fx.facilityAID, "to_facility_id": fx.facilityAID,
+		"qty": float64(-5), "transfer_date": "2026-08-01", "status_id": fx.draftStatusID,
+	}, &version, humanActor())
+	if err == nil {
+		t.Fatal("expected an update to from == to (and qty < 0) to be rejected, not silently stored")
+	}
+	if !errors.Is(err, crud.ErrHookRejected) {
+		t.Errorf("expected error to wrap crud.ErrHookRejected through the real Update path, got: %v", err)
+	}
+
+	after, err := fx.engine.Get(ctx, def, rec.ID)
+	if err != nil {
+		t.Fatalf("re-read StockTransfer %s: %v", rec.ID, err)
+	}
+	if got, _ := after.Data["to_facility_id"].(string); got != fx.facilityBID {
+		t.Errorf("expected the rejected update to roll back entirely, to_facility_id is now %q", got)
+	}
+	if got, _ := after.Data["qty"].(float64); got != 10 {
+		t.Errorf("expected the rejected update to roll back entirely, qty is now %v", got)
+	}
+}
+
 // TestMatchVendorInvoiceOnUpdate_MatchingTotal_TransitionSucceeds confirms
 // the base 3-way-match happy path: a PO received in full, an invoice
 // whose total exactly equals qty x unit_price, draft->matched succeeds —

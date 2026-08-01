@@ -165,6 +165,21 @@ type statusSpec = statusgraph.Spec
 // edit" reasoning purchase_order_status gives for excluding "received".
 // closed and cancelled are both is_terminal.
 //
+// stock_transfer_status (StockTransfer's own doc comment, #13): draft is
+// the only is_initial status — the transfer is recorded but stock hasn't
+// moved yet. draft->in_transit is stock physically leaving the source
+// facility; in_transit->received is it physically arriving at the
+// destination — the happy path, and the whole reason this is a status
+// graph rather than a quantity edit (the in-transit state has no other
+// way to exist). received is is_terminal with no outbound edge, same
+// "the real-world event already happened, that's not a status edit"
+// reasoning purchase_order_status gives for excluding edges out of its
+// own "received": a transfer that has arrived doesn't un-arrive by
+// editing a field; correcting it is a new, reversing transfer. cancelled
+// is reachable from draft or in_transit (a transfer can be called off
+// before or during transit) but not from received or cancelled itself,
+// and is itself is_terminal.
+//
 // Idempotent: every StatusType/Status looked up by its code, every
 // StatusTransition by its from_status_id/to_status_id pair, same
 // getOrCreate-by-natural-key shape cmd/seed-demo-data's seeder already
@@ -270,6 +285,25 @@ func PublishStatuses(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 		actor,
 	); err != nil {
 		return fmt.Errorf("seed vendor_invoice_status: %w", err)
+	}
+
+	if _, err := statusgraph.Seed(ctx, engine, statusTypeDef, statusDef, transitionDef,
+		"StockTransfer", "stock_transfer_status", "Stock Transfer Status",
+		[]statusSpec{
+			{Code: "draft", Name: "Draft", Sequence: 1, IsInitial: true, IsTerminal: false},
+			{Code: "in_transit", Name: "In Transit", Sequence: 2, IsInitial: false, IsTerminal: false},
+			{Code: "received", Name: "Received", Sequence: 3, IsInitial: false, IsTerminal: true},
+			{Code: "cancelled", Name: "Cancelled", Sequence: 4, IsInitial: false, IsTerminal: true},
+		},
+		[][2]string{
+			{"draft", "in_transit"},
+			{"in_transit", "received"},
+			{"draft", "cancelled"},
+			{"in_transit", "cancelled"},
+		},
+		actor,
+	); err != nil {
+		return fmt.Errorf("seed stock_transfer_status: %w", err)
 	}
 
 	if _, err := statusgraph.Seed(ctx, engine, statusTypeDef, statusDef, transitionDef,

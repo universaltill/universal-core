@@ -18,6 +18,7 @@ func TestAllPurchasingDefinitionsAreValid(t *testing.T) {
 func TestAllPurchasingFormsAreValid(t *testing.T) {
 	forms := []*form.Definition{
 		ItemForm(), PurchaseOrderForm(), POLineForm(), InventoryItemForm(),
+		StockTransferForm(),
 		GoodsReceiptForm(), GoodsReceiptLineForm(), ReorderRuleForm(),
 		RequestForQuotationForm(), RequestForQuotationLineForm(),
 		RequestForQuotationVendorForm(), RequestForQuotationQuoteLineForm(),
@@ -614,5 +615,81 @@ func TestInventoryItem_IsKeyedByItemAndFacility(t *testing.T) {
 	legacy["facility_id"] = "00000000-0000-0000-0000-000000000002"
 	if err := entity.ValidateRecord(def, legacy); err != nil {
 		t.Fatalf("the same record with a facility_id must validate: %v", err)
+	}
+}
+
+func TestStockTransfer_Shape(t *testing.T) {
+	def := StockTransfer()
+	if def.Module != "purchasing" {
+		t.Errorf("StockTransfer.Module = %q, want purchasing", def.Module)
+	}
+	if def.StatusTypeCode != "stock_transfer_status" {
+		t.Errorf("StockTransfer.StatusTypeCode = %q, want stock_transfer_status", def.StatusTypeCode)
+	}
+	// ADR-0013's closing rule: no name/title field, so it must declare
+	// its own label rather than let a picker fall back to a raw uuid.
+	if def.LabelField == "" {
+		t.Error("StockTransfer declares no name or title field, so it must declare a LabelField (ADR-0013)")
+	}
+	if _, ok := def.FieldByName(def.LabelField); !ok {
+		t.Errorf("StockTransfer.LabelField = %q, which is not one of its own fields", def.LabelField)
+	}
+	wantRequiredRefs := map[string]string{
+		"item_id":          "Item",
+		"from_facility_id": "Facility",
+		"to_facility_id":   "Facility",
+		"status_id":        "Status",
+	}
+	for name, target := range wantRequiredRefs {
+		f, ok := def.FieldByName(name)
+		if !ok || f.Type != entity.FieldReference || !f.Required || f.Target != target {
+			t.Errorf("StockTransfer.%s: expected required FieldReference -> %s, got ok=%v %+v", name, target, ok, f)
+		}
+	}
+	if f, ok := def.FieldByName("qty"); !ok || f.Type != entity.FieldNumber || !f.Required {
+		t.Errorf("StockTransfer.qty: expected required FieldNumber, got ok=%v %+v", ok, f)
+	}
+	if f, ok := def.FieldByName("transfer_date"); !ok || f.Type != entity.FieldDate || !f.Required {
+		t.Errorf("StockTransfer.transfer_date: expected required FieldDate, got ok=%v %+v", ok, f)
+	}
+	if f, ok := def.FieldByName("notes"); !ok || f.Type != entity.FieldString || f.Required {
+		t.Errorf("StockTransfer.notes: expected optional FieldString, got ok=%v %+v", ok, f)
+	}
+}
+
+// TestStockTransfer_MissingRequiredFields confirms every required field
+// is actually enforced by entity.ValidateRecord, not just declared —
+// TestStockTransfer_Shape only checks the Definition's own shape.
+func TestStockTransfer_MissingRequiredFields(t *testing.T) {
+	def := StockTransfer()
+	full := map[string]any{
+		"item_id":          "00000000-0000-0000-0000-000000000001",
+		"from_facility_id": "00000000-0000-0000-0000-000000000002",
+		"to_facility_id":   "00000000-0000-0000-0000-000000000003",
+		"qty":              float64(5),
+		"transfer_date":    "2026-08-01",
+		"status_id":        "00000000-0000-0000-0000-000000000004",
+	}
+	if err := entity.ValidateRecord(def, full); err != nil {
+		t.Fatalf("a fully-populated StockTransfer must validate, got: %v", err)
+	}
+	for _, missing := range []string{"item_id", "from_facility_id", "to_facility_id", "qty", "transfer_date", "status_id"} {
+		partial := map[string]any{}
+		for k, v := range full {
+			if k != missing {
+				partial[k] = v
+			}
+		}
+		if err := entity.ValidateRecord(def, partial); err == nil {
+			t.Errorf("expected validation to fail with %q missing", missing)
+		}
+	}
+	// notes is optional — omitting it alone must still validate.
+	withoutNotes := map[string]any{}
+	for k, v := range full {
+		withoutNotes[k] = v
+	}
+	if err := entity.ValidateRecord(def, withoutNotes); err != nil {
+		t.Errorf("notes is optional; omitting it alone must still validate, got: %v", err)
 	}
 }

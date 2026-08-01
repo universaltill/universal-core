@@ -181,6 +181,7 @@ var entityIcons = map[string]string{
 	"POLine":               "📝",
 	"InventoryItem":        "🗄️",
 	"Facility":             "🏭",
+	"StockTransfer":        "🔀",
 	"GoodsReceipt":         "🚚",
 	"GoodsReceiptLine":     "📥",
 	"ReorderRule":          "🔔",

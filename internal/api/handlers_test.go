@@ -656,6 +656,52 @@ func TestAPI_UpdateRecord_SelfReferenceCycleIs400(t *testing.T) {
 	}
 }
 
+// TestAPI_CreateRecord_HookRejectionIs400 is
+// TestAPI_UpdateRecord_SelfReferenceCycleIs400's counterpart for
+// crud.ErrHookRejected (added for uc-infra#13's StockTransfer
+// validation hook, internal/kernel/purchasing/ledger.go's
+// ValidateStockTransfer): a generic proof that ANY hook wrapping
+// its rejection in crud.ErrHookRejected reaches the client as a 400 with
+// its own message through writeCrudError, not the generic 500 an
+// unwrapped hook error would fall through to. Uses a throwaway hook on
+// the plain Vendor entity rather than the real purchasing package,
+// keeping this file's own "internal/api stays entity-agnostic" rule
+// intact (RegisterHook's own doc comment) — this is a property of the
+// generic dispatch/error-mapping mechanism, not of StockTransfer
+// specifically, and purchasing.ValidateStockTransfer's own
+// package tests already cover the hook's actual business rules.
+func TestAPI_CreateRecord_HookRejectionIs400(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
+
+	handler := testHandler(t, router)
+	handler.RegisterHook("Vendor", func(ctx context.Context, tx *sql.Tx, def *entity.Definition, rec data.Record, action audit.Action, actor audit.Actor) error {
+		return fmt.Errorf("%w: Vendor name %q is not allowed", crud.ErrHookRejected, rec.Data["name"])
+	})
+	mux := http.NewServeMux()
+	handler.Routes(mux)
+
+	createReq := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{"name":"Acme Textiles"}`))
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a hook rejection, got %d: %s", createRec.Code, createRec.Body.String())
+	}
+	if !strings.Contains(createRec.Body.String(), "Acme Textiles") {
+		t.Errorf("expected the hook's own message to reach the client, got: %s", createRec.Body.String())
+	}
+
+	var count int
+	if err := db.QueryRow(`SELECT count(*) FROM records WHERE entity_type = 'Vendor'`).Scan(&count); err != nil {
+		t.Fatalf("count Vendor records: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected the rejected create to roll back entirely, found %d Vendor records", count)
+	}
+}
+
 // TestAPI_RenderForm_IncludesVersionHiddenField confirms an existing
 // record's edit form actually carries the "_version" hidden field a real
 // browser needs to round-trip for optimistic-locking protection — a new/

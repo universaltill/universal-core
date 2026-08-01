@@ -80,6 +80,7 @@ func main() {
 	engine.SetHook("GoodsReceiptLine", purchasing.PostGoodsReceiptLineToLedger)
 	engine.SetHook("CustomerInvoice", sales.PostCustomerInvoiceToLedger)
 	engine.SetHook("VendorInvoice", purchasing.MatchVendorInvoiceOnUpdate)
+	engine.SetHook("StockTransfer", purchasing.ValidateStockTransfer)
 
 	s := &seeder{
 		ctx:        context.Background(),
@@ -142,7 +143,16 @@ func main() {
 	// pre-#12 single-row shape keeps such a tenant seeding correctly
 	// rather than skipping inventory and gutting the reporting demo.
 	if hasPublished(s.ctx, s.entityDefs, "Facility") {
-		s.seedInventory(items, s.seedFacilities())
+		facilities := s.seedFacilities()
+		s.seedInventory(items, facilities)
+		// Gated separately from Facility, not folded into the check
+		// above: a tenant provisioned before #13 has Facility published
+		// and StockTransfer not (#70), and seeding into an unpublished
+		// type is a log.Fatalf, not a skip — the same separate-gate
+		// shape Case/Opportunity below already uses.
+		if hasPublished(s.ctx, s.entityDefs, "StockTransfer") {
+			s.seedStockTransfers(items, facilities)
+		}
 	} else {
 		log.Printf("Facility is not published for this tenant — seeding inventory without a location dimension (pre-#12 shape); re-run cmd/provision-tenant, then cmd/backfill-inventory-facility, to pick up multi-facility stock")
 		s.seedInventoryWithoutFacilities(items)
@@ -891,6 +901,57 @@ func (s *seeder) seedInventoryWithoutFacilities(items map[string]string) {
 //     does NOT fire — the live demo of BA acceptance #4 (a huge open PO
 //     holds the position up; the goods are already coming).
 //
+// seedStockTransfers gives the demo tenant one real StockTransfer (#13)
+// so the entity's list page, form and validation hook (this file already
+// registers purchasing.ValidateStockTransfer on the seeding engine) have
+// live data behind them instead of an empty state — the same reason
+// every other entity in this file is seeded at all.
+//
+// **Deliberately a single "draft" transfer, not the whole lifecycle.**
+// Moving stock between InventoryItem rows is explicitly NOT built yet
+// (purchasing.StockTransfer's own doc comment: qty_on_hand debit/credit
+// is a later, careful pass), so a seeded "in_transit" or "received"
+// transfer would assert on the dashboard that 25 units left MAIN while
+// every stock report still counts them there — demo data contradicting
+// the reports beside it, which is exactly the class of bug an
+// independent review already caught in seedInventory. "draft" is the one
+// state that is honestly true today: the transfer is recorded, nothing
+// has moved. When the qty_on_hand pass lands, this is where the richer
+// lifecycle belongs.
+//
+// Dedups on item_id, the same "no natural key of its own" shape
+// seedReorderRules below uses — StockTransfer has no transfer number.
+func (s *seeder) seedStockTransfers(items, facilities map[string]string) {
+	itemID, ok := items["SKU-1001"]
+	if !ok {
+		return
+	}
+	from, to := facilities["MAIN"], facilities["STORE-01"]
+	if from == "" || to == "" {
+		return
+	}
+
+	def := s.def("StockTransfer")
+	existing, err := s.crud.ListByField(s.ctx, def, "item_id", itemID)
+	if err != nil {
+		log.Fatalf("list StockTransfer by item_id: %v", err)
+	}
+	if len(existing) > 0 {
+		return
+	}
+	if _, err := s.crud.Create(s.ctx, def, map[string]any{
+		"item_id":          itemID,
+		"from_facility_id": from,
+		"to_facility_id":   to,
+		"qty":              float64(25),
+		"transfer_date":    "2026-07-28",
+		"status_id":        s.statusID("stock_transfer_status", "draft"),
+		"notes":            "Replenishment for the retail store",
+	}, s.actor); err != nil {
+		log.Fatalf("create StockTransfer: %v", err)
+	}
+}
+
 // Dedups on item_id — a ReorderRule has no natural key of its own, and
 // one rule per item is this simplified, warehouse-less model's whole
 // shape (see purchasing.ReorderRule's doc comment on the #12 deferral).

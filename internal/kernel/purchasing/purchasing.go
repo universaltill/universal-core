@@ -248,6 +248,75 @@ func InventoryItem() *entity.Definition {
 	}
 }
 
+// StockTransfer is one movement of a single item from one Facility to
+// another (#13/R19) — the "future stock transfer" InventoryItem's own
+// doc comment already flagged as a consumer of facility_id's required-
+// ness. A first-class entity with its own status graph (stock_transfer_
+// status, seed.go), not a plain quantity edit, because the card asks for
+// an explicit **in-transit** state: stock that has left the source
+// facility but not yet arrived at the destination is neither "still at
+// the source" nor "at the destination," and a status-less edit can't
+// represent that middle state at all.
+//
+// Deliberately single-item, not a header+lines composition like
+// PurchaseOrder/POLine or GoodsReceipt/GoodsReceiptLine: there is no
+// evidence yet (no design-partner ask, no seeded demo scenario) calling
+// for a batched multi-item transfer document, and this module's own
+// established discipline (ReorderRule's deferred warehouse_id, above) is
+// to grow a shape when a second real example demands it, not to guess
+// ahead of one. If that evidence shows up, this becomes StockTransfer
+// (header) + StockTransferLine the same way PurchaseOrder did.
+//
+// Deliberately NOT built in this pass, a real next step not forgotten
+// (same category of gap as GoodsReceipt's own doc comment below):
+// actually debiting/crediting InventoryItem.qty_on_hand at the source and
+// destination facility when a StockTransfer is created or changes
+// status. That's the same "genuine business-logic side effect
+// (concurrency-safe, idempotent against re-edits) worth its own careful
+// pass" GoodsReceipt's qty_on_hand wiring already is — StockTransfer
+// joins it as a second, not-yet-built consumer of that future pass,
+// rather than each entity growing its own separate half of it.
+//
+// Bin/Location (WMS) granularity is explicitly out of scope for this
+// task (the card's own wording) — a transfer moves stock between two
+// Facility rows, nothing finer.
+//
+// ValidateStockTransfer (ledger.go) rejects from_facility_id ==
+// to_facility_id and qty <= 0 on create AND on update — entity.Field has
+// no Min/Max or cross-field-inequality concept yet (#80), so this is a
+// crud.Hook business rule, the same mechanism PostGoodsReceiptLineToLedger
+// and MatchVendorInvoiceOnUpdate already use for entity-specific rules
+// the generic entity/crud engine must not special-case. Both actions,
+// not just create: this entity is editable through the generic
+// PUT /api/records/StockTransfer/{id} route like every other one, so a
+// create-only check would leave the invariant one ordinary edit away
+// from being false in stored data (see the hook's own doc comment).
+func StockTransfer() *entity.Definition {
+	return &entity.Definition{
+		EntityType:     "StockTransfer",
+		Version:        1,
+		Module:         "purchasing",
+		StatusTypeCode: "stock_transfer_status",
+		// No name/title field and no transfer number, so ADR-0013's
+		// closing rule applies exactly as it did to hr.AttendanceRecord:
+		// an entity with no human name must declare its own label rather
+		// than fall back to a raw uuid in a picker or a reference cell.
+		// Nothing references StockTransfer today, so there is no visible
+		// symptom yet; declaring it costs a line and means the first
+		// thing that does reference it works.
+		LabelField: "transfer_date",
+		Fields: []entity.Field{
+			{Name: "item_id", Type: entity.FieldReference, Required: true, Target: "Item"},
+			{Name: "from_facility_id", Type: entity.FieldReference, Required: true, Target: "Facility"},
+			{Name: "to_facility_id", Type: entity.FieldReference, Required: true, Target: "Facility"},
+			{Name: "qty", Type: entity.FieldNumber, Required: true},
+			{Name: "transfer_date", Type: entity.FieldDate, Required: true},
+			{Name: "status_id", Type: entity.FieldReference, Required: true, Target: "Status"},
+			{Name: "notes", Type: entity.FieldString},
+		},
+	}
+}
+
 // GoodsReceipt is the physical arrival of goods against a PurchaseOrder
 // (reference-data-model.md §2, UBL `ReceiptAdvice`) — the next real step
 // this module's own doc comment already named as future work ("the
@@ -556,6 +625,7 @@ func All() []*entity.Definition {
 		POLine(),
 		Facility(),
 		InventoryItem(),
+		StockTransfer(),
 		GoodsReceipt(),
 		GoodsReceiptLine(),
 		VendorInvoice(),

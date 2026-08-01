@@ -42,8 +42,14 @@ func savedRecordID(t *testing.T, ctx context.Context, entityType string) string 
 // async /api/references results to render as .uc-ref-option divs, then
 // click the option whose label matches. chromedp.SetValue on a <select>
 // no longer applies because a reference field is no longer a <select> —
-// this helper is what every reference interaction in this package now goes
-// through, exercising the endpoint + JS + DOM the way a person would.
+// this helper is how a reference field is filled in this package whenever
+// the picker itself is part of what a test is proving, exercising the
+// endpoint + JS + DOM the way a person would. The one deliberate
+// exception is stock_transfer_test.go's setReferenceHiddenValue, which
+// writes the hidden input directly because its subject is a create/update
+// validation hook rather than the widget (reference_picker_test.go covers
+// the widget); if you are adding a test that has any opinion about the
+// picker, use this.
 func pickReference(t *testing.T, ctx context.Context, field, query, label string) {
 	t.Helper()
 	scope := `.uc-ref[data-field="` + cssAttr(field) + `"]`

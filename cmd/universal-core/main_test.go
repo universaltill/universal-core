@@ -556,3 +556,167 @@ func TestUniversalCore_UBLExportRoute_ServedByRealBinary(t *testing.T) {
 		t.Fatalf("expected handler 404 for unsupported type, got %d: %s", unsupResp.StatusCode, unsupBody)
 	}
 }
+
+// TestUniversalCore_StockTransferRoutes_ServedByRealBinary is the smoke
+// layer for uc-infra#13: the real compiled binary (not just internal/api's
+// own httptest-router unit tests) actually serves /api/records/StockTransfer
+// and /forms/StockTransfer/new, and the StockTransfer hook registered in
+// this file's own main() (handler.RegisterHook("StockTransfer",
+// purchasing.ValidateStockTransfer)) is really wired on the
+// production mux — a same-facility create is rejected as a 400 through
+// the real running server, not just through internal/api's own
+// TestAPI_CreateRecord_HookRejectionIs400 (a generic proof of the
+// mapping mechanism with a throwaway hook, not proof this specific hook
+// is actually registered in main()).
+func TestUniversalCore_StockTransferRoutes_ServedByRealBinary(t *testing.T) {
+	controlDSN := testexec.FreshDatabase(t, "uc_test_server_control")
+
+	control := testexec.Open(t, controlDSN)
+	ctx := context.Background()
+	if err := db.ApplyControl(ctx, control); err != nil {
+		t.Fatalf("ApplyControl: %v", err)
+	}
+	router, err := tenantdb.NewRouter(control, controlDSN)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+	defer router.Close()
+	tenantID, err := router.Create(ctx, "StockTransfer Smoke Test", "eu-west")
+	if err != nil {
+		t.Fatalf("router.Create: %v", err)
+	}
+	testexec.DropTenantDatabase(t, testexec.Open(t, controlDSN), tenantID)
+	tenantDB, err := router.Get(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("router.Get: %v", err)
+	}
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "smoke-test-setup"}
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := purchasing.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("purchasing.Publish: %v", err)
+	}
+	if err := purchasing.PublishForms(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("purchasing.PublishForms: %v", err)
+	}
+	if err := purchasing.PublishStatuses(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("purchasing.PublishStatuses: %v", err)
+	}
+
+	defs := data.NewEntityDefinitionRepo(tenantDB)
+	def := func(entityType string) *entity.Definition {
+		v, err := defs.GetPublished(ctx, entityType)
+		if err != nil {
+			t.Fatalf("GetPublished(%s): %v", entityType, err)
+		}
+		d, err := entity.Unmarshal(v.Definition)
+		if err != nil {
+			t.Fatalf("unmarshal %s: %v", entityType, err)
+		}
+		return d
+	}
+	engine := crud.NewEngine(tenantDB)
+	create := func(entityType string, fields map[string]any) string {
+		t.Helper()
+		rec, err := engine.Create(ctx, def(entityType), fields, actor)
+		if err != nil {
+			t.Fatalf("create %s: %v", entityType, err)
+		}
+		return rec.ID
+	}
+	itemID := create("Item", map[string]any{"sku": "SMOKE-ST-1", "name": "Smoke Widget", "item_type": "stock"})
+	facilityAID := create("Facility", map[string]any{"code": "WH-SMOKE-A", "name": "Smoke Warehouse A", "facility_type": "warehouse"})
+	facilityBID := create("Facility", map[string]any{"code": "WH-SMOKE-B", "name": "Smoke Warehouse B", "facility_type": "warehouse"})
+	statusTypes, err := engine.ListByField(ctx, def("StatusType"), "code", "stock_transfer_status")
+	if err != nil || len(statusTypes) == 0 {
+		t.Fatalf("list stock_transfer_status StatusType: %v (n=%d)", err, len(statusTypes))
+	}
+	statuses, err := engine.ListByField(ctx, def("Status"), "status_type_id", statusTypes[0].ID)
+	if err != nil || len(statuses) == 0 {
+		t.Fatalf("list Status: %v (n=%d)", err, len(statuses))
+	}
+	var draftStatusID string
+	for _, s := range statuses {
+		if code, _ := s.Data["code"].(string); code == "draft" {
+			draftStatusID = s.ID
+		}
+	}
+	if draftStatusID == "" {
+		t.Fatal("no draft Status found for stock_transfer_status")
+	}
+	router.Close()
+	control.Close()
+
+	baseURL := startServer(t, controlDSN, "INSECURE_DEV_AUTH=true")
+
+	get := func(path string) (*http.Response, string) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, baseURL+path, nil)
+		if err != nil {
+			t.Fatalf("build request %s: %v", path, err)
+		}
+		req.Header.Set("X-Tenant-ID", tenantID)
+		req.Header.Set("X-Actor-ID", "smoke-test")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return resp, string(body)
+	}
+	post := func(path, body string) (*http.Response, string) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, baseURL+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("build request %s: %v", path, err)
+		}
+		req.Header.Set("X-Tenant-ID", tenantID)
+		req.Header.Set("X-Actor-ID", "smoke-test")
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		respBody, _ := io.ReadAll(resp.Body)
+		return resp, string(respBody)
+	}
+
+	listResp, listBody := get("/api/records/StockTransfer")
+	if listResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from GET /api/records/StockTransfer, got %d: %s", listResp.StatusCode, listBody)
+	}
+	if !strings.Contains(listBody, `"data"`) {
+		t.Fatalf("expected the standard {data,error} envelope, got: %s", listBody)
+	}
+
+	formResp, formBody := get("/forms/StockTransfer/new")
+	if formResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from GET /forms/StockTransfer/new, got %d: %s", formResp.StatusCode, formBody)
+	}
+	if !strings.Contains(formBody, `hx-post="/api/records/StockTransfer"`) {
+		t.Fatalf("expected the new-record form to post to /api/records/StockTransfer, got: %.300s", formBody)
+	}
+
+	// The hook wired in main() actually fires on the real running
+	// server: a same-facility transfer is rejected as a 400, not a raw
+	// 500 (which is exactly what would happen if crud.ErrHookRejected
+	// weren't checked in writeCrudError, or the hook weren't registered
+	// at all).
+	rejectBody := fmt.Sprintf(`{"item_id":%q,"from_facility_id":%q,"to_facility_id":%q,"qty":5,"transfer_date":"2026-08-01","status_id":%q}`,
+		itemID, facilityAID, facilityAID, draftStatusID)
+	rejectResp, rejectRespBody := post("/api/records/StockTransfer", rejectBody)
+	if rejectResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a same-facility StockTransfer, got %d: %s", rejectResp.StatusCode, rejectRespBody)
+	}
+
+	// A valid create actually persists through the real server + hook.
+	validBody := fmt.Sprintf(`{"item_id":%q,"from_facility_id":%q,"to_facility_id":%q,"qty":5,"transfer_date":"2026-08-01","status_id":%q}`,
+		itemID, facilityAID, facilityBID, draftStatusID)
+	validResp, validRespBody := post("/api/records/StockTransfer", validBody)
+	if validResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 for a valid StockTransfer, got %d: %s", validResp.StatusCode, validRespBody)
+	}
+}

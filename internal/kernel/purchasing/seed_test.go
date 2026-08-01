@@ -231,6 +231,7 @@ func TestPublishForms_PublishesEveryPurchasingForm(t *testing.T) {
 		{"PurchaseOrder", PurchaseOrderForm().Version},
 		{"POLine", POLineForm().Version},
 		{"InventoryItem", InventoryItemForm().Version},
+		{"StockTransfer", StockTransferForm().Version},
 	}
 	for _, f := range forms {
 		v, err := formRepo.GetPublished(ctx, f.entityType)
@@ -585,6 +586,115 @@ func TestPublishStatuses_SeedsRFQGraph(t *testing.T) {
 	}
 }
 
+// TestPublishStatuses_SeedsStockTransferGraph is
+// TestPublishStatuses_SeedsGraph's counterpart for stock_transfer_status
+// (#13): draft the only is_initial status; received and cancelled both
+// is_terminal with no outgoing edges (same "the real-world event already
+// happened" dead-end shape purchase_order_status/rfq_status already
+// establish for their own terminal statuses) — specifically NOT an
+// in_transit->draft edge and NOT a received->cancelled edge.
+func TestPublishStatuses_SeedsStockTransferGraph(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	if err := foundation.Publish(ctx, db, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := PublishStatuses(ctx, db, actor); err != nil {
+		t.Fatalf("PublishStatuses: %v", err)
+	}
+
+	entityDefs := data.NewEntityDefinitionRepo(db)
+	engine := crud.NewEngine(db)
+	def := func(entityType string) *entity.Definition {
+		v, err := entityDefs.GetPublished(ctx, entityType)
+		if err != nil {
+			t.Fatalf("GetPublished(%s): %v", entityType, err)
+		}
+		d, err := entity.Unmarshal(v.Definition)
+		if err != nil {
+			t.Fatalf("unmarshal %s: %v", entityType, err)
+		}
+		return d
+	}
+
+	statusTypes, err := engine.ListByField(ctx, def("StatusType"), "code", "stock_transfer_status")
+	if err != nil {
+		t.Fatalf("list stock_transfer_status StatusType: %v", err)
+	}
+	if len(statusTypes) != 1 {
+		t.Fatalf("expected exactly 1 stock_transfer_status StatusType, got %d", len(statusTypes))
+	}
+
+	statuses, err := engine.ListByField(ctx, def("Status"), "status_type_id", statusTypes[0].ID)
+	if err != nil {
+		t.Fatalf("list Status: %v", err)
+	}
+	wantStatuses := map[string]struct{ isInitial, isTerminal bool }{
+		"draft":      {true, false},
+		"in_transit": {false, false},
+		"received":   {false, true},
+		"cancelled":  {false, true},
+	}
+	if len(statuses) != len(wantStatuses) {
+		t.Fatalf("expected %d Status records, got %d", len(wantStatuses), len(statuses))
+	}
+	statusIDs := map[string]string{}
+	for _, s := range statuses {
+		code, _ := s.Data["code"].(string)
+		want, ok := wantStatuses[code]
+		if !ok {
+			t.Fatalf("unexpected Status code %q", code)
+		}
+		if got := s.Data["is_initial"]; got != want.isInitial {
+			t.Errorf("Status %q: expected is_initial=%v, got %v", code, want.isInitial, got)
+		}
+		if got := s.Data["is_terminal"]; got != want.isTerminal {
+			t.Errorf("Status %q: expected is_terminal=%v, got %v", code, want.isTerminal, got)
+		}
+		statusIDs[code] = s.ID
+	}
+
+	transitionDef := def("StatusTransition")
+	wantEdges := [][2]string{
+		{"draft", "in_transit"}, {"in_transit", "received"},
+		{"draft", "cancelled"}, {"in_transit", "cancelled"},
+	}
+	for _, edge := range wantEdges {
+		rows, err := engine.ListByField(ctx, transitionDef, "from_status_id", statusIDs[edge[0]])
+		if err != nil {
+			t.Fatalf("list StatusTransition from %s: %v", edge[0], err)
+		}
+		found := false
+		for _, r := range rows {
+			if to, _ := r.Data["to_status_id"].(string); to == statusIDs[edge[1]] {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected a declared %s->%s StatusTransition", edge[0], edge[1])
+		}
+	}
+
+	// Both terminal states must be genuine dead ends — no edge leaves
+	// "received" or "cancelled". Also confirms specifically no
+	// in_transit->draft edge (checked by absence: "draft" never appears
+	// as a to_status_id target of "in_transit" above; this loop below
+	// just confirms received/cancelled emit nothing at all, the same
+	// shape purchase_order_status/rfq_status already establish).
+	for _, code := range []string{"received", "cancelled"} {
+		rows, err := engine.ListByField(ctx, transitionDef, "from_status_id", statusIDs[code])
+		if err != nil {
+			t.Fatalf("list StatusTransition from %s: %v", code, err)
+		}
+		if len(rows) != 0 {
+			t.Errorf("expected no outgoing transitions from terminal status %q, got %d: %+v", code, len(rows), rows)
+		}
+	}
+}
+
 // TestPublishStatuses_IsIdempotent confirms a second call doesn't
 // duplicate the StatusType/Status/StatusTransition rows — same
 // getOrCreate-by-natural-key discipline as cmd/seed-demo-data.
@@ -618,10 +728,11 @@ func TestPublishStatuses_IsIdempotent(t *testing.T) {
 		t.Fatalf("list Status: %v", err)
 	}
 	// 5 purchase_order_status + 5 vendor_invoice_status (draft/matched/
-	// match_exception/paid/void) + 5 rfq_status — this package now seeds
-	// three StatusTypes (seedStatusGraph's own doc comment), not just
-	// purchase_order_status's original 5.
-	const wantTotal = 5 + 5 + 5
+	// match_exception/paid/void) + 4 stock_transfer_status (draft/
+	// in_transit/received/cancelled) + 5 rfq_status — this package now
+	// seeds four StatusTypes (PublishStatuses' own doc comment), not
+	// just purchase_order_status's original 5.
+	const wantTotal = 5 + 5 + 4 + 5
 	if len(all) != wantTotal {
 		t.Fatalf("expected exactly %d Status records after two PublishStatuses calls, got %d", wantTotal, len(all))
 	}

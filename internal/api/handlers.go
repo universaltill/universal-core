@@ -409,12 +409,20 @@ func writeInternalError(w http.ResponseWriter, logContext string, err error) {
 // already submitted in its own request) rather than a fixed string —
 // the same "safe to describe exactly what's wrong" reasoning this file's
 // other 400-mapped kernel errors (crud.ErrInvalidTransition) already use.
+// crud.ErrHookRejected is the same shape for a Hook's own business-rule
+// rejection (crud.ErrHookRejected's own doc comment) — this file stays
+// entity-agnostic either way, checking one generic kernel sentinel
+// rather than importing purchasing/sales to check an entity-specific one.
 func writeCrudError(w http.ResponseWriter, logContext string, err error) {
 	if errors.Is(err, authz.ErrDenied) {
 		httpx.WriteError(w, http.StatusForbidden, "access denied")
 		return
 	}
 	if errors.Is(err, crud.ErrReferenceCycle) {
+		httpx.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if errors.Is(err, crud.ErrHookRejected) {
 		httpx.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}

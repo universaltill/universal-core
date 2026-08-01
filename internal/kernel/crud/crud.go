@@ -120,6 +120,29 @@ func (e *Engine) Create(ctx context.Context, def *entity.Definition, fields map[
 	return rec, nil
 }
 
+// ErrHookRejected wraps a Hook's own rejection of a write as the
+// caller's bad input rather than an infrastructure failure — a hook
+// wraps its specific reason with %w against this (e.g. purchasing.
+// ValidateStockTransfer rejecting from_facility_id ==
+// to_facility_id), and internal/api's writeCrudError checks errors.Is
+// against this the same way it already does for ErrReferenceCycle,
+// mapping to 400 with the hook's own message rather than falling through
+// to a generic 500. Exists because internal/api/handlers.go is
+// deliberately entity-agnostic (RegisterHook's own doc comment — an
+// independent review already caught and fixed one case of this file
+// importing a concrete kernel module by name) and so cannot check a
+// purchasing- or sales-specific sentinel directly; every hook that wants
+// to reject a write as a 400 needs this one generic, kernel-level
+// sentinel to wrap instead. Not every hook error should use this — a
+// genuine infrastructure failure (PostGoodsReceiptLineToLedger's ledger-
+// posting errors, say) is correctly a 500, and MatchVendorInvoiceOnUpdate
+// deliberately never rejects at all (redirects to match_exception
+// instead, its own doc comment explains why) — this is only for the
+// narrower case of a hook enforcing a real business-rule input
+// constraint the generic entity/crud engine has no field-level mechanism
+// for yet (Min/Max, cross-field inequality — #80).
+var ErrHookRejected = errors.New("hook rejected the write")
+
 // ErrReferenceCycle is returned by Update when a self-referencing
 // FieldReference field (e.g. Account.parent_account_id,
 // Department.parent_department_id, Position.reports_to_position_id)

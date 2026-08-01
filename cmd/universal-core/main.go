@@ -285,6 +285,7 @@ func main() {
 	handler.RegisterHook("GoodsReceiptLine", purchasing.PostGoodsReceiptLineToLedger)
 	handler.RegisterHook("CustomerInvoice", sales.PostCustomerInvoiceToLedger)
 	handler.RegisterHook("VendorInvoice", purchasing.MatchVendorInvoiceOnUpdate)
+	handler.RegisterHook("StockTransfer", purchasing.ValidateStockTransfer)
 	handler.Routes(mux)
 
 	// The durable workflow job queue (internal/kernel/workflow.Queue) has

@@ -8,6 +8,7 @@ import (
 
 	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
+	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/ledger"
 )
@@ -112,6 +113,80 @@ func PostGoodsReceiptLineToLedger(ctx context.Context, tx *sql.Tx, _ *entity.Def
 		return fmt.Errorf("post GoodsReceiptLine %s to ledger: %w", rec.ID, err)
 	}
 	return nil
+}
+
+// ValidateStockTransfer is a crud.Hook (internal/kernel/crud.Hook) —
+// register it for the "StockTransfer" entity type (Engine.SetHook) to
+// reject two business-rule violations entity.Field has no way to express
+// yet (#80: no Min/Max, no cross-field-inequality concept): a transfer
+// whose from_facility_id and to_facility_id are the same (not a transfer
+// at all), and a transfer with qty <= 0.
+//
+// Validation-only, unlike PostGoodsReceiptLineToLedger: no ledger
+// posting, no audit write of its own — a rejection returns
+// crud.ErrHookRejected-wrapped errors, which crud.Engine's own hook
+// wiring rolls the whole write back on (Hook's own doc comment), and
+// internal/api's writeCrudError maps to a 400 with this hook's own
+// message rather than the generic 500 an unwrapped error would produce
+// (crud.ErrHookRejected's own doc comment explains why a generic kernel
+// sentinel is needed here rather than an entity-specific one).
+//
+// Runs on BOTH Create and Update, deliberately — no action gate at all,
+// unlike PostGoodsReceiptLineToLedger (whose posting must happen exactly
+// once, so it genuinely only wants Create). These are invariants of what
+// a StockTransfer *is*, not of how one comes into being: every
+// status-managed entity in this product is editable through the generic
+// PUT /api/records/{type}/{id} route and the rendered edit form the
+// create form itself becomes after a save, so a create-only check is one
+// ordinary edit away from a stored same-facility, negative-quantity
+// transfer — measured, not theorised (independent review of #13). Both
+// paths hand this hook the full replacement field set (Update is a full
+// replacement — crud.Engine.Update), so the same two checks read the
+// same way on either action.
+//
+// Every parameter but rec is deliberately unnamed: this hook reads
+// nothing but the record's own incoming fields — no tx, so no database
+// access at all, so no way for it to reach outside the tenant database
+// crud.Engine already resolved (ADR-0003's per-tenant isolation).
+func ValidateStockTransfer(_ context.Context, _ *sql.Tx, _ *entity.Definition, rec data.Record, _ audit.Action, _ audit.Actor) error {
+	fromFacilityID, _ := rec.Data["from_facility_id"].(string)
+	toFacilityID, _ := rec.Data["to_facility_id"].(string)
+	if fromFacilityID != "" && fromFacilityID == toFacilityID {
+		return fmt.Errorf("%w: StockTransfer from_facility_id and to_facility_id must differ (both %q)", crud.ErrHookRejected, fromFacilityID)
+	}
+
+	qty, ok := numberFieldValue(rec.Data["qty"])
+	if !ok {
+		return fmt.Errorf("%w: StockTransfer qty must be a number, got %T", crud.ErrHookRejected, rec.Data["qty"])
+	}
+	if qty <= 0 {
+		return fmt.Errorf("%w: StockTransfer qty must be greater than zero, got %v", crud.ErrHookRejected, qty)
+	}
+
+	return nil
+}
+
+// numberFieldValue reads a FieldNumber value out of a record's data,
+// accepting exactly the Go types entity.validateFieldValue itself blesses
+// for FieldNumber — float64 (what every JSON, form and CSV path
+// produces), plus int/int64 (what a Go caller writing a literal, e.g.
+// cmd/seed-demo-data, produces). A plain `v.(float64)` assertion — the
+// shape the ledger-posting hooks in this file use, where the consequence
+// is a silently-zero posting rather than a rejection — would read an
+// int-typed qty as 0 here and reject a perfectly valid transfer with
+// "qty must be greater than zero, got 0", i.e. a validator disagreeing
+// with the validator immediately upstream of it about what a number is.
+func numberFieldValue(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	default:
+		return 0, false
+	}
 }
 
 // MatchVendorInvoiceOnUpdate is a crud.Hook (internal/kernel/crud.Hook)

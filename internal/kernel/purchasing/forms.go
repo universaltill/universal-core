@@ -118,6 +118,7 @@ func POLineForm() *form.Definition {
 func AllForms() []*form.Definition {
 	return []*form.Definition{
 		ItemForm(), PurchaseOrderForm(), POLineForm(), FacilityForm(), InventoryItemForm(),
+		StockTransferForm(),
 		GoodsReceiptForm(), GoodsReceiptLineForm(), VendorInvoiceForm(),
 		ReorderRuleForm(),
 		RequestForQuotationForm(), RequestForQuotationLineForm(),
@@ -291,6 +292,35 @@ func VendorInvoiceForm() *form.Definition {
 					{Name: "status_id", Label: "Status"},
 					{Name: "total", Label: "Total"},
 					{Name: "match_exception_reason", Label: "Match Exception Reason"},
+				},
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
+	}
+}
+
+// StockTransferForm is a plain single-section form, same shape as
+// InventoryItemForm/FacilityForm — StockTransfer is a single-item record
+// (StockTransfer's own doc comment on why this stays single-item, not
+// header+lines), so there is no master-detail section to add.
+func StockTransferForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "StockTransfer",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Details",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "item_id", Label: "Item"},
+					{Name: "from_facility_id", Label: "From Facility"},
+					{Name: "to_facility_id", Label: "To Facility"},
+					{Name: "qty", Label: "Quantity"},
+					{Name: "transfer_date", Label: "Transfer Date"},
+					{Name: "status_id", Label: "Status"},
+					{Name: "notes", Label: "Notes"},
 				},
 			},
 		},

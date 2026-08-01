@@ -197,7 +197,7 @@ func TestSeedDemoData_SeedsSampleRecordsAndIsIdempotent(t *testing.T) {
 		"Project", "Task", "TimeEntry",
 		"Employee", "LeaveRequest", "AttendanceRecord",
 		"Case", "Campaign", "Lead", "Opportunity",
-		"Facility", "InventoryItem",
+		"Facility", "InventoryItem", "StockTransfer",
 	} {
 		counts[entityType] = countRecords(t, tenantDB, entityType)
 		if counts[entityType] == 0 {

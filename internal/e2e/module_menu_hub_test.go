@@ -26,10 +26,11 @@ import (
 func TestModuleMenu_RendersAsSearchableHubGraphic(t *testing.T) {
 	withDevAuthEnabled(t)
 	// testServer already publishes purchasing: Item, PurchaseOrder,
-	// POLine, InventoryItem, GoodsReceipt, GoodsReceiptLine,
-	// VendorInvoice, ReorderRule, and (#9) RequestForQuotation,
-	// RequestForQuotationLine, RequestForQuotationVendor,
-	// RequestForQuotationQuoteLine (12 entities).
+	// POLine, Facility, InventoryItem, StockTransfer (#13), GoodsReceipt,
+	// GoodsReceiptLine, VendorInvoice, ReorderRule, and (#9)
+	// RequestForQuotation, RequestForQuotationLine,
+	// RequestForQuotationVendor, RequestForQuotationQuoteLine (14
+	// entities).
 	srv, tenantID, _ := testServer(t)
 	ctx := browserCtx(t, tenantID)
 
@@ -46,8 +47,8 @@ func TestModuleMenu_RendersAsSearchableHubGraphic(t *testing.T) {
 	)); err != nil {
 		t.Fatalf("count hub nodes: %v", err)
 	}
-	if nodeCount != 13 {
-		t.Fatalf("expected 13 entity hub nodes (Item, PurchaseOrder, POLine, Facility, InventoryItem, GoodsReceipt, GoodsReceiptLine, VendorInvoice, ReorderRule, RequestForQuotation, RequestForQuotationLine, RequestForQuotationVendor, RequestForQuotationQuoteLine), got %d", nodeCount)
+	if nodeCount != 14 {
+		t.Fatalf("expected 14 entity hub nodes (Item, PurchaseOrder, POLine, Facility, InventoryItem, StockTransfer, GoodsReceipt, GoodsReceiptLine, VendorInvoice, ReorderRule, RequestForQuotation, RequestForQuotationLine, RequestForQuotationVendor, RequestForQuotationQuoteLine), got %d", nodeCount)
 	}
 
 	// Real, non-overlapping graphical positioning — not just that a
