@@ -621,6 +621,13 @@ func Department() *entity.Definition {
 			{Name: "name", Type: entity.FieldString, Required: true},
 			{Name: "parent_department_id", Type: entity.FieldReference, Target: "Department"},
 		},
+		// QuickCreatable (part 2 of #24, universaltill/uc-infra#51): the
+		// org-chart's own first candidate for inline creation — a
+		// parent_department_id picker on a not-yet-saved Department is
+		// exactly the "the record I need doesn't exist yet" case the
+		// feature targets, and Department has no lifecycle/graph-shaping
+		// fields (unlike Status) that make spontaneous creation risky.
+		QuickCreatable: true,
 	}
 }
 

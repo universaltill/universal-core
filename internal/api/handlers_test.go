@@ -132,6 +132,20 @@ func vendorEntityDef() *entity.Definition {
 	}
 }
 
+// quickCreatableVendorEntityDef is vendorEntityDef with QuickCreatable
+// set — a separate fixture rather than flipping the flag on the shared
+// vendorEntityDef, so every OTHER existing test that publishes a plain
+// Vendor keeps exercising the (more common) non-quick-creatable case
+// unchanged. Used only by the two TestAPI_RenderForm_
+// ReferenceCreateButton* tests below (part 2 of #24,
+// universaltill/uc-infra#51), which are specifically about the
+// QuickCreatable + CanWrite pair of gates.
+func quickCreatableVendorEntityDef() *entity.Definition {
+	def := vendorEntityDef()
+	def.QuickCreatable = true
+	return def
+}
+
 func vendorFormDef() *form.Definition {
 	return &form.Definition{
 		EntityType: "Vendor",
@@ -1594,6 +1608,93 @@ func TestAPI_RenderForm_ReferenceFieldRendersComboboxNotFullList(t *testing.T) {
 	}
 }
 
+// TestAPI_RenderForm_HXRequestGetsFragmentNotFullPage is the direct,
+// isolated regression test for the collateral change renderForm gained
+// as part of #24's part 2 (universaltill/uc-infra#51): an HX-Request:
+// true GET now gets a bare form fragment instead of the full shelled
+// page. This diff's own independent review found the real-browser e2e
+// test (internal/e2e/reference_picker_quick_create_test.go) does NOT
+// actually prove this — chromedp's `body.innerHTML = html` on a full
+// <!doctype html> document silently drops the <html>/<head>/<body> tags
+// and never executes <script>, so every assertion there still passes
+// even with this branch reverted to always returning the full page.
+// This test asserts on the raw response body directly, at the layer
+// that's actually authoritative: no <!doctype>, no <nav> (the shell's
+// own chrome), and a Vary: HX-Request header so an intermediate cache
+// can't serve the wrong representation to the wrong kind of request.
+func TestAPI_RenderForm_HXRequestGetsFragmentNotFullPage(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	// A real browser navigation (no HX-Request) still gets the full
+	// shelled page — the pre-existing, unchanged behaviour.
+	pageReq := newRequest("GET", "/forms/Vendor/new", tenantID, "farshid", nil)
+	pageRec := httptest.NewRecorder()
+	mux.ServeHTTP(pageRec, pageReq)
+	if pageRec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", pageRec.Code, pageRec.Body.String())
+	}
+	pageBody := pageRec.Body.String()
+	if !strings.Contains(pageBody, "<!doctype html>") || !strings.Contains(pageBody, `class="uc-nav"`) {
+		t.Fatalf("expected a real browser navigation to still get the full shelled page, got:\n%s", pageBody)
+	}
+	if got := pageRec.Header().Get("Vary"); got != "HX-Request" {
+		t.Fatalf("expected Vary: HX-Request on the full-page response, got %q", got)
+	}
+
+	// An htmx-issued GET (what the quick-create modal's fetch sends,
+	// layout.go) gets a bare fragment: the form itself, and nothing of
+	// the page shell around it — no <!doctype>, no <nav>. A regression
+	// that started nesting the full page into the modal (exactly the
+	// independent review's concrete worry) would fail this assertion
+	// immediately, unlike the e2e test.
+	fragReq := newRequest("GET", "/forms/Vendor/new", tenantID, "farshid", nil)
+	fragReq.Header.Set("HX-Request", "true")
+	fragRec := httptest.NewRecorder()
+	mux.ServeHTTP(fragRec, fragReq)
+	if fragRec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", fragRec.Code, fragRec.Body.String())
+	}
+	fragBody := fragRec.Body.String()
+	if strings.Contains(fragBody, "<!doctype html>") || strings.Contains(fragBody, `class="uc-nav"`) {
+		t.Fatalf("expected HX-Request to get a bare fragment with no page shell, got:\n%s", fragBody)
+	}
+	if !strings.HasPrefix(strings.TrimSpace(fragBody), `<form class="uc-form"`) {
+		t.Fatalf("expected the fragment to start with the form tag itself, got:\n%s", fragBody)
+	}
+	if got := fragRec.Header().Get("Vary"); got != "HX-Request" {
+		t.Fatalf("expected Vary: HX-Request on the fragment response, got %q", got)
+	}
+
+	// The SAME change applies to the existing-record route
+	// (/forms/{entityType}/{id}), not just /new — confirm it isn't
+	// accidentally scoped to only the new-record path.
+	createReq := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{"name":"Acme Textiles"}`))
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	var created struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal create response: %v", err)
+	}
+	editFragReq := newRequest("GET", "/forms/Vendor/"+created.Data.ID, tenantID, "farshid", nil)
+	editFragReq.Header.Set("HX-Request", "true")
+	editFragRec := httptest.NewRecorder()
+	mux.ServeHTTP(editFragRec, editFragReq)
+	editFragBody := editFragRec.Body.String()
+	if strings.Contains(editFragBody, "<!doctype html>") || strings.Contains(editFragBody, `class="uc-nav"`) {
+		t.Fatalf("expected an existing-record HX-Request GET to also get a bare fragment, got:\n%s", editFragBody)
+	}
+}
+
 // TestAPI_RenderForm_ReferenceCreateButtonRendersWithPermission is the
 // HTTP-level test for part 2 of #24 (universaltill/uc-infra#51): a viewer
 // who can write the referenced entity (here, Vendor is not opted into
@@ -1607,7 +1708,7 @@ func TestAPI_RenderForm_ReferenceCreateButtonRendersWithPermission(t *testing.T)
 	router := newTestRouter(t)
 	withDevAuthEnabled(t)
 	tenantID, db := newTestTenant(t, router)
-	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
+	publishEntityAndForm(t, db, quickCreatableVendorEntityDef(), vendorFormDef())
 	publishEntityAndForm(t, db, orderEntityDefWithVendorReference(), orderFormDefWithVendorReference())
 
 	mux := http.NewServeMux()
@@ -1637,7 +1738,10 @@ func TestAPI_RenderForm_ReferenceCreateButtonHiddenWithoutWritePermission(t *tes
 	router := newTestRouter(t)
 	withDevAuthEnabled(t)
 	tenantID, db := newTestTenant(t, router)
-	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
+	// QuickCreatable — this test's job is to prove CanWrite is enforced
+	// independently of that flag, not merely that the flag itself would
+	// already have hidden the button.
+	publishEntityAndForm(t, db, quickCreatableVendorEntityDef(), vendorFormDef())
 	publishEntityAndForm(t, db, orderEntityDefWithVendorReference(), orderFormDefWithVendorReference())
 
 	seedRBAC(t, db,
@@ -1669,6 +1773,39 @@ func TestAPI_RenderForm_ReferenceCreateButtonHiddenWithoutWritePermission(t *tes
 	// can READ Vendor, just not create one.
 	if !strings.Contains(body, `class="uc-ref" data-target="Vendor" data-field="vendor_id"`) {
 		t.Fatalf("expected the vendor_id combobox to still render, got:\n%s", body)
+	}
+}
+
+// TestAPI_RenderForm_ReferenceCreateButtonHiddenWithoutQuickCreatable is
+// the regression test for the independent review's finding on this
+// feature (part 2 of #24, universaltill/uc-infra#51): CanWrite alone is
+// NOT sufficient to offer quick-create. Vendor here is plain
+// vendorEntityDef() — QuickCreatable defaults false, and RBAC is left
+// entirely unconfigured (default-open, full CanWrite) — the exact shape
+// of foundation's real Status entity, which is a wide-open-by-default
+// FieldReference target with no Permission row denying it, but whose
+// fields (is_initial, is_terminal, status_type_id) are graph-shaping and
+// were never meant to be one click away from an unrelated order form.
+// Before this fix, this exact scenario rendered a quick-create button.
+func TestAPI_RenderForm_ReferenceCreateButtonHiddenWithoutQuickCreatable(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
+	publishEntityAndForm(t, db, orderEntityDefWithVendorReference(), orderFormDefWithVendorReference())
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	req := newRequest("GET", "/forms/Order/new", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, `<button type="button" class="uc-ref-create"`) {
+		t.Fatalf("expected no quick-create button for a non-QuickCreatable target despite full CanWrite, got:\n%s", body)
 	}
 }
 

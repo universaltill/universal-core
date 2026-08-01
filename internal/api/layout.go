@@ -256,9 +256,23 @@ var shellTmpl = template.Must(template.New("shell").Parse(fmt.Sprintf(`<!doctype
   // from and loses none of its in-progress edits.
   var quickCreateBox = null; // the .uc-ref that opened the dialog, so a
                               // successful create knows which picker to fill.
+  var quickCreateIDPrefix = "uc-quick-create-field-";
   document.body.addEventListener("click", function(evt) {
     var btn = evt.target;
     if (!btn.classList.contains("uc-ref-create")) { return; }
+    // One quick-create at a time: without this, clicking a SECOND
+    // picker's button before the first's fetch resolves races two
+    // in-flight requests against a single shared quickCreateBox (found
+    // by this feature's own independent review — whichever response
+    // lands last silently wins, and the created record can be written
+    // into the WRONG picker), and clicking a quick-create button that
+    // happens to be nested inside the dialog's own fetched form (e.g.
+    // Department.parent_department_id, self-referencing) would
+    // reassign quickCreateBox and immediately detach it via the
+    // body.innerHTML reset two lines below, silently discarding
+    // whatever the outer quick-create was doing. Ignoring the click
+    // while one is already open/in-flight closes both holes at once.
+    if (quickCreateBox) { return; }
     quickCreateBox = btn.closest(".uc-ref");
     var dialog = document.getElementById("uc-quick-create");
     var body = document.getElementById("uc-quick-create-body");
@@ -276,6 +290,24 @@ var shellTmpl = template.Must(template.New("shell").Parse(fmt.Sprintf(`<!doctype
       })
       .then(function(html) {
         body.innerHTML = html;
+        // Every id/for in the fetched fragment is rewritten with a
+        // fixed prefix before it ever touches the live document: the
+        // fragment is formrender's normal output, which names every
+        // input id="{fieldName}" — identical to whatever the OUTER
+        // form (still in the DOM behind the modal) already used for
+        // its own fields of the same name. Without this,
+        // <label for="code"> inside the modal resolves, in document
+        // order, to the OUTER form's (inert, hidden-behind-the-dialog)
+        // input instead of the modal's own — clicking a label in the
+        // quick-create modal would silently focus nothing useful, and
+        // assistive tech would compute the wrong accessible name
+        // (found by this feature's own independent review).
+        body.querySelectorAll("[id]").forEach(function(el) {
+          el.id = quickCreateIDPrefix + el.id;
+        });
+        body.querySelectorAll("[for]").forEach(function(el) {
+          el.setAttribute("for", quickCreateIDPrefix + el.getAttribute("for"));
+        });
         // The fetched markup carries hx-post/hx-target attributes that
         // only take effect once htmx has scanned them — a plain innerHTML
         // assignment does not trigger htmx's own mutation observer for
@@ -284,15 +316,37 @@ var shellTmpl = template.Must(template.New("shell").Parse(fmt.Sprintf(`<!doctype
         dialog.showModal();
       })
       .catch(function() {
+        quickCreateBox = null; // release the one-at-a-time guard above —
+                                // the dialog never opened, so there is
+                                // nothing to close.
         showToast({{.ToastFallback}});
       });
   });
+  // The single place quick-create's own DOM state gets torn down.
+  // Idempotent (safe to call more than once, or when already closed) —
+  // it is called directly, SYNCHRONOUSLY, by every close path this code
+  // itself triggers (×, backdrop, successful create, below), and ALSO
+  // wired to the dialog's native "close" event as a safety net purely
+  // for Escape, which closes a <dialog> through the browser's own
+  // internal algorithm and never runs any of this code otherwise. Those
+  // two are NOT redundant in the way they look: a <dialog>'s "close"
+  // event is fired via a QUEUED TASK, not synchronously, even for our
+  // own explicit .close() calls (confirmed the hard way — an earlier
+  // version of this fix relied on the event alone for every path, which
+  // made the real-browser test for the successful-create path flaky,
+  // since it asserts the dialog body is cleared immediately after
+  // create resolves, before that queued task has necessarily run). The
+  // synchronous direct calls keep every path this code controls
+  // deterministic; the event listener only ever does extra, harmless
+  // work for those, and is the sole cleanup for the one path (Escape)
+  // this code cannot intercept directly.
   function closeQuickCreate() {
     var dialog = document.getElementById("uc-quick-create");
     if (dialog.open) { dialog.close(); }
     document.getElementById("uc-quick-create-body").innerHTML = "";
     quickCreateBox = null;
   }
+  document.getElementById("uc-quick-create").addEventListener("close", closeQuickCreate);
   document.getElementById("uc-quick-create-close").addEventListener("click", closeQuickCreate);
   document.getElementById("uc-quick-create").addEventListener("click", function(evt) {
     // A <dialog>'s own backdrop is the dialog element itself outside its
@@ -303,12 +357,12 @@ var shellTmpl = template.Must(template.New("shell").Parse(fmt.Sprintf(`<!doctype
   // Listens on htmx:afterSettle, not htmx:afterSwap: htmx dispatches
   // afterSettle on the swapped element itself, and a handler here that
   // removed the element from the DOM (closeQuickCreate below clears
-  // #uc-quick-create-body's innerHTML) would detach it before that
-  // dispatch — a detached node's dispatched event never bubbles up to
-  // this document.body listener, since bubbling requires the live
-  // ancestor chain. Reacting on afterSettle instead means htmx is fully
-  // done with the element by the time this runs, so removing it here is
-  // safe.
+  // #uc-quick-create-body's innerHTML synchronously) would detach it
+  // before that dispatch — a detached node's dispatched event never
+  // bubbles up to this document.body listener, since bubbling requires
+  // the live ancestor chain. Reacting on afterSettle instead means htmx
+  // is fully done with the element by the time this runs, so removing
+  // it here is safe.
   document.body.addEventListener("htmx:afterSettle", function(evt) {
     var quickCreateBody = document.getElementById("uc-quick-create-body");
     if (!quickCreateBody || !quickCreateBody.contains(evt.detail.elt)) { return; }

@@ -91,10 +91,12 @@ func TestReferencePickerQuickCreate_CreatesAndSelectsWithoutLosingParentForm(t *
 		t.Fatalf("expected the quick-create dialog body to be cleared after close, got %q", bodyHTML)
 	}
 
-	// The picker now holds the id of a REAL record, not a placeholder —
-	// looked up independently via the reference search endpoint the
-	// picker itself uses, so this doesn't just trust whatever the modal
-	// JS wrote back.
+	// The hidden id and visible label are read from the picker's own
+	// inputs — i.e. whatever the modal JS wrote into them. That alone
+	// doesn't prove a Department record actually exists server-side with
+	// that id: the stronger proof (the outer form actually SAVING with
+	// this reference and it resolving back to "Regional Office" on a
+	// fresh page load) follows below.
 	gotID := referenceHiddenValue(t, ctx, "parent_department_id")
 	if gotID == "" {
 		t.Fatal("expected the parent_department_id picker to hold a new record id after quick-create")
@@ -119,6 +121,34 @@ func TestReferencePickerQuickCreate_CreatesAndSelectsWithoutLosingParentForm(t *
 	}
 	if outerCode != "hq" || outerName != "Headquarters" {
 		t.Fatalf("expected the outer form's own fields to survive the quick-create untouched, got code=%q name=%q", outerCode, outerName)
+	}
+
+	// The real proof the quick-created record isn't just client-side
+	// JS state: save the OUTER form (which now references it), reload
+	// its edit page from scratch, and confirm the reference resolved on
+	// a completely fresh page load — the same round trip
+	// TestReferencePicker_SearchNarrowsAndGuardsStaleID's own combobox
+	// already proves for a picked EXISTING record, now for one this
+	// test just quick-created.
+	if err := chromedp.Run(ctx, submitForm()); err != nil {
+		t.Fatalf("submit outer Department form: %v", err)
+	}
+	outerID := savedRecordID(t, ctx, "Department")
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/forms/Department/"+outerID),
+		chromedp.WaitVisible(`form.uc-form`, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("reload saved outer Department: %v", err)
+	}
+	var reloadedLabel string
+	if err := chromedp.Run(ctx, chromedp.Value(scope+` .uc-ref-search`, &reloadedLabel, chromedp.ByQuery)); err != nil {
+		t.Fatalf("read reloaded picker search value: %v", err)
+	}
+	if reloadedLabel != "Regional Office" {
+		t.Fatalf("expected the reloaded parent_department_id picker to resolve the quick-created record's real, persisted name, got %q", reloadedLabel)
+	}
+	if got := referenceHiddenValue(t, ctx, "parent_department_id"); got != gotID {
+		t.Fatalf("expected the persisted parent_department_id to be the same id the quick-create wrote, got %q want %q", got, gotID)
 	}
 }
 
@@ -169,5 +199,105 @@ func TestReferencePickerQuickCreate_HiddenWithoutCreatePermission(t *testing.T) 
 	// widget.
 	if err := chromedp.Run(ctx, chromedp.WaitVisible(`.uc-ref[data-field="department_id"] .uc-ref-search`, chromedp.ByQuery)); err != nil {
 		t.Fatalf("expected the department_id search box to still render: %v", err)
+	}
+}
+
+// TestReferencePickerQuickCreate_NestedClickIgnoredAndLabelsScopedToModal
+// covers two bugs this feature's own independent review found and no
+// other test caught:
+//
+//  1. Department self-references Department (parent_department_id), so
+//     the modal's OWN fetched form renders its own nested
+//     ".uc-ref-create" button. Before the fix, clicking it reassigned
+//     the single shared quickCreateBox and immediately reset the
+//     dialog body's innerHTML — silently discarding whatever the
+//     outer quick-create was mid-way through, with no error and no
+//     visible sign anything went wrong. The same guard also closes the
+//     sibling race (open picker A, then click picker B before A's
+//     fetch resolves) — not independently reproducible from a single
+//     browser tab in a deterministic test, so this covers the nested
+//     case, which is.
+//  2. The modal's fetched fragment reuses formrender's normal
+//     id="{fieldName}" convention — identical to the outer form's own
+//     field ids, since it's the same Department entity twice. Before
+//     the id-prefixing fix, <label for="name"> inside the modal
+//     resolved (by document order) to the OUTER form's input instead
+//     of the modal's own, so clicking a label inside the quick-create
+//     modal focused nothing useful.
+func TestReferencePickerQuickCreate_NestedClickIgnoredAndLabelsScopedToModal(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, tenantDB := testServer(t)
+	if err := foundation.PublishForms(context.Background(), tenantDB, humanActor()); err != nil {
+		t.Fatalf("foundation.PublishForms: %v", err)
+	}
+	ctx := browserCtx(t, tenantID)
+
+	scope := `.uc-ref[data-field="parent_department_id"]`
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/forms/Department/new"),
+		chromedp.WaitVisible(`form.uc-form`, chromedp.ByQuery),
+		chromedp.Click(scope+` .uc-ref-create`, chromedp.ByQuery),
+		chromedp.WaitVisible(`#uc-quick-create[open]`, chromedp.ByQuery),
+		chromedp.WaitVisible(`#uc-quick-create-body form.uc-form`, chromedp.ByQuery),
+		// In-progress edits inside the modal — the thing at stake if a
+		// nested click wrongly resets the dialog body.
+		chromedp.SetValue(`#uc-quick-create-body input[name="code"]`, "reg", chromedp.ByQuery),
+		chromedp.SetValue(`#uc-quick-create-body input[name="name"]`, "Regional Office", chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("open modal and seed its form: %v", err)
+	}
+
+	// The modal's OWN parent_department_id picker (Department
+	// self-references itself) has its own nested quick-create button —
+	// confirm it's really there before proving the click on it is a
+	// no-op, so a selector typo can't make this pass vacuously.
+	nestedScope := `#uc-quick-create-body ` + scope
+	var nestedButtonCount int
+	if err := chromedp.Run(ctx, chromedp.Evaluate(
+		`document.querySelectorAll(`+"`"+nestedScope+` .uc-ref-create`+"`"+`).length`, &nestedButtonCount,
+	)); err != nil {
+		t.Fatalf("count nested quick-create buttons: %v", err)
+	}
+	if nestedButtonCount != 1 {
+		t.Fatalf("expected exactly one nested quick-create button inside the modal, found %d", nestedButtonCount)
+	}
+
+	if err := chromedp.Run(ctx, chromedp.Click(nestedScope+` .uc-ref-create`, chromedp.ByQuery)); err != nil {
+		t.Fatalf("click the nested quick-create button: %v", err)
+	}
+
+	// The nested click must be a complete no-op: the dialog stays open,
+	// the SAME modal form (with the values just typed) is still there
+	// — not reset, not replaced by a second fetch.
+	var dialogOpen bool
+	var code, name string
+	if err := chromedp.Run(ctx,
+		chromedp.Evaluate(`document.getElementById("uc-quick-create").open`, &dialogOpen),
+		chromedp.Value(`#uc-quick-create-body input[name="code"]`, &code, chromedp.ByQuery),
+		chromedp.Value(`#uc-quick-create-body input[name="name"]`, &name, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("read modal state after nested click: %v", err)
+	}
+	if !dialogOpen {
+		t.Fatal("expected the dialog to remain open after an ignored nested quick-create click")
+	}
+	if code != "reg" || name != "Regional Office" {
+		t.Fatalf("expected the modal's in-progress edits to survive the ignored nested click, got code=%q name=%q", code, name)
+	}
+
+	// Clicking the modal's OWN <label> for the name field must focus
+	// the MODAL's input, not the outer form's identically-named-and-id
+	// one sitting behind the dialog.
+	if err := chromedp.Run(ctx, chromedp.Click(`#uc-quick-create-body label[for$="name"]`, chromedp.ByQuery)); err != nil {
+		t.Fatalf("click the modal's own name label: %v", err)
+	}
+	var focusedInModal bool
+	if err := chromedp.Run(ctx, chromedp.Evaluate(
+		`document.getElementById("uc-quick-create-body").contains(document.activeElement)`, &focusedInModal,
+	)); err != nil {
+		t.Fatalf("read document.activeElement: %v", err)
+	}
+	if !focusedInModal {
+		t.Fatal("expected clicking the modal's own label to focus an input inside the modal, not the outer form's identically-id'd one")
 	}
 }

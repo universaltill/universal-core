@@ -148,6 +148,22 @@ type Definition struct {
 	StatusTypeCode string         `json:"status_type_code,omitempty"`
 	Fields         []Field        `json:"fields"`
 	Relationships  []Relationship `json:"relationships,omitempty"`
+	// QuickCreatable opts this entity into the reference-picker's inline
+	// "+ Create new {Entity}" affordance (part 2 of #24,
+	// universaltill/uc-infra#51) when a viewer holds create permission
+	// on it — internal/api's loadReferenceCreateLabels checks both. Off
+	// by default, deliberately: without this, EVERY FieldReference
+	// target would be one click away from spontaneous creation,
+	// including lookup/lifecycle entities like Status whose fields
+	// (is_initial, is_terminal, status_type_id) are graph-shaping, not
+	// something a form-filler picking a PurchaseOrder's status should
+	// improvise from inside an unrelated modal (found by this feature's
+	// own independent review). Set true only where inline creation is
+	// genuinely useful for a business-record target (Department's own
+	// org-chart parent picker is the first) — same opt-in-per-entity
+	// discipline LabelField above already follows, not something a
+	// generic engine should default to "everywhere" on inference.
+	QuickCreatable bool `json:"quick_creatable,omitempty"`
 }
 
 // FieldByName returns the field with the given name, if present.

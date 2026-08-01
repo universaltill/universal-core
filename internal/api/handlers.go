@@ -980,6 +980,15 @@ func (h *Handler) renderForm(w http.ResponseWriter, r *http.Request, id string) 
 	// sends HX-Request (grepped: no hx-boost, every current link here is
 	// a plain <a>), so this is purely additive for real browser
 	// navigation.
+	// Vary: HX-Request — this URL now serves two different
+	// representations of the same resource depending on that request
+	// header (found by this feature's own independent review): without
+	// it, a cache sitting in front of this route could serve a bare
+	// fragment to a real browser navigation (inert markup — the exact
+	// bug layout.go's shellTmpl doc comment says internal/e2e's first
+	// real-browser test exists to catch) or the full shelled page into
+	// the quick-create dialog.
+	w.Header().Set("Vary", "HX-Request")
 	if isHTMXRequest(r) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if err := h.renderer.Render(w, formDef, entDef, renderData, locale); err != nil {
@@ -1066,30 +1075,56 @@ func (h *Handler) buildFormRenderData(ctx context.Context, ts tenantScope, entDe
 }
 
 // loadReferenceCreateLabels builds the "+ Create new {Entity}" button text
-// for each of entDef's FieldReference fields whose target the viewer holds
-// create (write) permission on (part 2 of #24) — RBAC-gated the same way
+// for each of entDef's FieldReference fields whose target BOTH (a) opts
+// into entity.Definition.QuickCreatable and (b) the viewer holds create
+// (write) permission on (part 2 of #24) — RBAC-gated the same way
 // renderForm gates the "new record" page itself (CanWrite), just per
-// target entity instead of per page. Two or more fields pointing at the
-// same target (e.g. two Party references) resolve CanWrite once, not once
-// per field: the permission is a property of the target entity type, not
-// of which field points at it.
+// target entity instead of per page. QuickCreatable is checked first and
+// is the narrower gate in practice: this pipeline's own independent
+// review found that CanWrite alone offers quick-create on every
+// FieldReference target with no explicit Permission row denying it —
+// including lookup/lifecycle entities like Status, which are wide open
+// by RBAC default (not in authz's controlPlaneTypes) but whose fields
+// (is_initial, is_terminal, status_type_id) are graph-shaping, not
+// something to improvise from inside an unrelated form's modal.
+// Two or more fields pointing at the same target (e.g. two Party
+// references) resolve both checks once, not once per field: both are
+// properties of the target entity type, not of which field points at it.
+// A target with no published Definition (a dangling/misconfigured
+// Target string) degrades to no button rather than failing the whole
+// form render — the same graceful-degradation CanWrite failures below
+// don't get, deliberately: a missing Definition is exactly the
+// "unresolvable" case loadCurrentReferenceLabels already treats as
+// non-fatal for the sibling reference-label lookup, for the same reason.
 func (h *Handler) loadReferenceCreateLabels(ctx context.Context, ts tenantScope, entDef *entity.Definition, locale string) (map[string]string, error) {
 	out := map[string]string{}
-	allowedCache := map[string]bool{}
+	type targetState struct {
+		quickCreatable bool
+		canWrite       bool
+	}
+	cache := map[string]targetState{}
 	for _, f := range entDef.Fields {
 		if f.Type != entity.FieldReference {
 			continue
 		}
-		allowed, ok := allowedCache[f.Target]
+		state, ok := cache[f.Target]
 		if !ok {
-			var err error
-			allowed, err = ts.crud.CanWrite(ctx, f.Target)
+			targetDef, err := ts.entityDef(ctx, f.Target)
 			if err != nil {
-				return nil, fmt.Errorf("check create permission for %s (referenced by %s): %w", f.Target, f.Name, err)
+				log.Printf("api: resolve quick-create eligibility for %s.%s -> %s: %v", entDef.EntityType, f.Name, f.Target, err)
+				cache[f.Target] = targetState{}
+				continue
 			}
-			allowedCache[f.Target] = allowed
+			state.quickCreatable = targetDef.QuickCreatable
+			if state.quickCreatable {
+				state.canWrite, err = ts.crud.CanWrite(ctx, f.Target)
+				if err != nil {
+					return nil, fmt.Errorf("check create permission for %s (referenced by %s): %w", f.Target, f.Name, err)
+				}
+			}
+			cache[f.Target] = state
 		}
-		if !allowed {
+		if !state.quickCreatable || !state.canWrite {
 			continue
 		}
 		out[f.Name] = h.catalog.T(locale, "form.reference.create_new") + " " + h.entityDisplayName(locale, f.Target)
