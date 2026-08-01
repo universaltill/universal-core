@@ -290,6 +290,36 @@ func TestApplyTenant_CreatesEverySchemaObjectWithoutTenantID(t *testing.T) {
 	}
 }
 
+// TestApplyTenant_RecordsListSortIndexExists confirms
+// 0005_records_list_sort_index.sql's index actually lands (universaltill/
+// uc-infra#50): every list page's default (unsorted) path filters on
+// entity_type and orders by created_at, so that's exactly the shape this
+// index needs to cover for the planner to use it instead of a seq scan
+// + in-memory sort.
+func TestApplyTenant_RecordsListSortIndexExists(t *testing.T) {
+	db := freshTestDB(t, "uc_test_tenant")
+	ctx := context.Background()
+
+	if err := ApplyTenant(ctx, db); err != nil {
+		t.Fatalf("ApplyTenant: %v", err)
+	}
+
+	var indexdef string
+	err := db.QueryRowContext(ctx,
+		`SELECT indexdef FROM pg_indexes WHERE tablename = 'records' AND indexname = $1`,
+		"idx_records_type_created",
+	).Scan(&indexdef)
+	if err != nil {
+		t.Fatalf("expected index idx_records_type_created on records to exist after ApplyTenant: %v", err)
+	}
+	if !strings.Contains(indexdef, "entity_type") || !strings.Contains(indexdef, "created_at") {
+		t.Fatalf("expected idx_records_type_created to cover (entity_type, created_at), got definition: %s", indexdef)
+	}
+	if !strings.Contains(indexdef, "deleted_at IS NULL") {
+		t.Fatalf("expected idx_records_type_created to be a partial index WHERE deleted_at IS NULL, got definition: %s", indexdef)
+	}
+}
+
 // TestApplyTenant_IsIdempotent mirrors TestApply_IsIdempotent for the
 // per-tenant migration set.
 func TestApplyTenant_IsIdempotent(t *testing.T) {
