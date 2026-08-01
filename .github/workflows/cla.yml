@@ -45,5 +45,11 @@ jobs:
           branch: cla-signatures
           # Only the project owner is exempt; other maintainers sign like
           # any contributor so their work also carries the CLA grant.
-          allowlist: farshid3003,*[bot]
+          # "claude" is the account GitHub maps the pipeline's AI-authored
+          # commits to (author email noreply@anthropic.com) — the
+          # automation is the owner's agent, so its commits are the
+          # owner's work product. Known trade-off: anyone can author
+          # commits with that email and skip the CLA check; accepted for
+          # now, revisit if the check is ever made required for merges.
+          allowlist: farshid3003,claude,*[bot]
           lock-pullrequest-aftermerge: false
