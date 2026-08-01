@@ -312,11 +312,16 @@ func TestApplyTenant_RecordsListSortIndexExists(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected index idx_records_type_created on records to exist after ApplyTenant: %v", err)
 	}
-	if !strings.Contains(indexdef, "entity_type") || !strings.Contains(indexdef, "created_at") {
-		t.Fatalf("expected idx_records_type_created to cover (entity_type, created_at), got definition: %s", indexdef)
-	}
-	if !strings.Contains(indexdef, "deleted_at IS NULL") {
-		t.Fatalf("expected idx_records_type_created to be a partial index WHERE deleted_at IS NULL, got definition: %s", indexdef)
+	// Column ORDER matters here, not just presence: entity_type must lead
+	// (it's the equality predicate) with created_at second (the sort
+	// key) — reversed, the planner falls back to the pre-fix seq-scan
+	// + sort plan for anything but the most common entity type. Asserting
+	// the literal btree clause (rather than two independent Contains
+	// checks) is what actually distinguishes "the fix" from "an index
+	// that happens to mention the same two column names."
+	const wantClause = "USING btree (entity_type, created_at) WHERE (deleted_at IS NULL)"
+	if !strings.Contains(indexdef, wantClause) {
+		t.Fatalf("expected idx_records_type_created to be %q, got definition: %s", wantClause, indexdef)
 	}
 }
 

@@ -83,10 +83,15 @@ func ApplyControl(ctx context.Context, sqlDB *sql.DB) error {
 	return applyFS(ctx, sqlDB, controlFS, "migrations/control", migrationLockKeyControl)
 }
 
-// ApplyTenant brings one tenant's own database up to date. Called once
-// per tenant database — at provisioning time (internal/tenantdb.Router's
-// Create) and again on every later process start, same as Apply/
-// ApplyControl, since an already-applied migration is a no-op.
+// ApplyTenant brings one tenant's own database up to date. Unlike Apply/
+// ApplyControl (both re-run on every cmd/universal-core process start),
+// the only automatic caller is internal/tenantdb.Router's Create, at a
+// brand-new tenant's provisioning time — an already-provisioned tenant's
+// database is opened by Router.Get without re-applying migrations, so a
+// new tenant migration file does NOT reach existing tenants on its own.
+// An operator brings an existing tenant database up to date by running
+// cmd/migrate -target tenant against it directly (see that command's
+// doc comment); nothing in this codebase does that automatically today.
 func ApplyTenant(ctx context.Context, sqlDB *sql.DB) error {
 	return applyFS(ctx, sqlDB, tenantFS, "migrations/tenant", migrationLockKeyTenant)
 }
