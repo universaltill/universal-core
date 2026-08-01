@@ -159,6 +159,7 @@ func (h *Handler) renderPurchasingReport(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	stats := forecast.Compute(leadTimeSamples(leadTimes))
+	onTimeStats := forecast.ComputeOnTime(onTimeSamples(leadTimes))
 
 	signals, err := h.buildReorderSignals(ctx, ts, stats, locale)
 	if err != nil {
@@ -202,6 +203,12 @@ func (h *Handler) renderPurchasingReport(w http.ResponseWriter, r *http.Request)
 		LeadTimeP50Col:     h.catalog.T(locale, "report.purchasing.leadtime_p50_col"),
 		LeadTimeP90Col:     h.catalog.T(locale, "report.purchasing.leadtime_p90_col"),
 
+		OnTimeHeading:    h.catalog.T(locale, "report.purchasing.ontime_heading"),
+		OnTimeEmpty:      h.catalog.T(locale, "report.purchasing.ontime_empty"),
+		OnTimeVendorCol:  h.catalog.TOrDefault(locale, "field.PurchaseOrder.vendor_id", "Vendor"),
+		OnTimeSamplesCol: h.catalog.T(locale, "report.purchasing.ontime_samples_col"),
+		OnTimeRateCol:    h.catalog.T(locale, "report.purchasing.ontime_rate_col"),
+
 		ReorderHeading:     h.catalog.T(locale, "report.purchasing.reorder_heading"),
 		ReorderEmpty:       h.catalog.T(locale, "report.purchasing.reorder_empty"),
 		ReorderItemCol:     h.catalog.TOrDefault(locale, "entity.Item.name", "Item"),
@@ -213,6 +220,7 @@ func (h *Handler) renderPurchasingReport(w http.ResponseWriter, r *http.Request)
 		ReorderRows:        signals,
 	}
 	view.LeadTimeRows = h.buildLeadTimeRows(stats, leadTimes, locale)
+	view.OnTimeRows = h.buildOnTimeRows(onTimeStats, leadTimes, locale)
 	for _, status := range poStatusDisplayOrder {
 		row, ok := byStatus[status]
 		if !ok {
@@ -279,12 +287,47 @@ func leadTimeSamples(rows []data.CompletedPOLeadTime) []forecast.LeadTimeSample 
 	return samples
 }
 
+// onTimeSamples converts the raw completed-PO rows into forecast
+// on-time samples (#11). A row with no promised_delivery_date at all —
+// expected to be most of them, since the field is optional and every PO
+// written before #11 has none — fails to parse ("" is never a valid
+// "2006-01-02") and is skipped here, same as one whose date is present
+// but genuinely unparseable (e.g. a CSV import that bypassed
+// entity.ValidateRecord — same "noisy user input, degrade the sample
+// set" reasoning as leadTimeSamples' own doc comment).
+//
+// Uses LastReceivedDate, NOT ReceivedDate: on-time has to mean the whole
+// order arrived by the promise, not that the first partial shipment did
+// (see CompletedPOLeadTime.LastReceivedDate's own doc comment).
+func onTimeSamples(rows []data.CompletedPOLeadTime) []forecast.OnTimeSample {
+	samples := make([]forecast.OnTimeSample, 0, len(rows))
+	for _, row := range rows {
+		promised, err := time.Parse("2006-01-02", row.PromisedDeliveryDate)
+		if err != nil {
+			continue
+		}
+		received, err := time.Parse("2006-01-02", row.LastReceivedDate)
+		if err != nil {
+			continue
+		}
+		samples = append(samples, forecast.OnTimeSample{VendorID: row.VendorID, PromisedDate: promised, ReceivedDate: received})
+	}
+	return samples
+}
+
 // formatDays renders a fractional day count rounded to one decimal —
 // "10.8", or "11" when the decimal is zero. A quantile interpolation
 // can produce long float tails; a management report showing
 // "10.799999999999999 days" would be noise pretending to be precision.
 func formatDays(days float64) string {
 	return formrender.FormatFieldValue(math.Round(days*10) / 10)
+}
+
+// formatRate renders a [0, 1] fraction as a percentage rounded to one
+// decimal — "66.7%", or "75%" when the decimal is zero — same
+// "one-decimal, no float noise" reasoning as formatDays.
+func formatRate(rate float64) string {
+	return formrender.FormatFieldValue(math.Round(rate*1000)/10) + "%"
 }
 
 // buildLeadTimeRows shapes forecast output into the supplier lead-time
@@ -326,6 +369,62 @@ func (h *Handler) buildLeadTimeRows(stats forecast.Result, rows []data.Completed
 	})
 
 	out := make([]leadTimeRowView, 0, len(vendorIDs)+1)
+	for _, id := range vendorIDs {
+		out = append(out, row(nameByVendor[id], stats.ByVendor[id]))
+	}
+	out = append(out, row(h.catalog.T(locale, "report.purchasing.leadtime_overall_label"), stats.Overall))
+	return out
+}
+
+// buildOnTimeRows shapes forecast.OnTimeResult into the on-time-delivery
+// table (#11): one row per vendor with at least one resolvable promise
+// (alphabetical, stable — same ordering as buildLeadTimeRows) plus an
+// all-vendors summary row last. A vendor below forecast.MinSamples shows
+// the localized insufficient-history text instead of a rate — never a
+// fabricated percentage, same no-fabrication discipline buildLeadTimeRows
+// already applies to quantiles. Unlike buildLeadTimeRows, an empty
+// result here is the COMMON case (most tenants will have no
+// promised_delivery_date set on anything yet), not a sign of no
+// purchasing activity at all — the empty state's own copy says so.
+//
+// Disclosure, not silence (independent review of #11, see
+// forecast.OnTimeResult's own doc comment for the full reasoning): this
+// table only ever sees orders that DID eventually arrive. A vendor with
+// several promised orders that never showed up at all won't have those
+// counted against it here — the "Orders Received" column header (not
+// bare "Orders") is the honest label for what N actually counts.
+func (h *Handler) buildOnTimeRows(stats forecast.OnTimeResult, rows []data.CompletedPOLeadTime, locale string) []onTimeRowView {
+	if stats.Overall.N == 0 {
+		return nil
+	}
+	insufficient := h.catalog.T(locale, "report.purchasing.ontime_insufficient")
+
+	nameByVendor := make(map[string]string, len(rows))
+	for _, r := range rows {
+		nameByVendor[r.VendorID] = r.VendorName
+	}
+
+	row := func(label string, s forecast.OnTimeStats) onTimeRowView {
+		v := onTimeRowView{Vendor: label, N: strconv.Itoa(s.N), Rate: insufficient}
+		if s.Sufficient() {
+			v.Rate = formatRate(s.Rate())
+		}
+		return v
+	}
+
+	vendorIDs := make([]string, 0, len(stats.ByVendor))
+	for id := range stats.ByVendor {
+		vendorIDs = append(vendorIDs, id)
+	}
+	sort.Slice(vendorIDs, func(i, j int) bool {
+		ni, nj := nameByVendor[vendorIDs[i]], nameByVendor[vendorIDs[j]]
+		if ni != nj {
+			return ni < nj
+		}
+		return vendorIDs[i] < vendorIDs[j]
+	})
+
+	out := make([]onTimeRowView, 0, len(vendorIDs)+1)
 	for _, id := range vendorIDs {
 		out = append(out, row(nameByVendor[id], stats.ByVendor[id]))
 	}
@@ -500,6 +599,13 @@ type purchasingReportView struct {
 	LeadTimeP90Col     string
 	LeadTimeRows       []leadTimeRowView
 
+	OnTimeHeading    string
+	OnTimeEmpty      string
+	OnTimeVendorCol  string
+	OnTimeSamplesCol string
+	OnTimeRateCol    string
+	OnTimeRows       []onTimeRowView
+
 	ReorderHeading     string
 	ReorderEmpty       string
 	ReorderItemCol     string
@@ -516,6 +622,12 @@ type leadTimeRowView struct {
 	N      string
 	P50    string
 	P90    string
+}
+
+type onTimeRowView struct {
+	Vendor string
+	N      string
+	Rate   string
 }
 
 type reorderRowView struct {
@@ -618,6 +730,20 @@ var purchasingReportTmpl = template.Must(template.New("purchasingReport").Parse(
 </table>
 {{else}}
 <p class="uc-empty">{{.LeadTimeEmpty}}</p>
+{{end}}
+
+<h2>{{.OnTimeHeading}}</h2>
+{{if .OnTimeRows}}
+<table class="uc-table">
+<thead><tr><th>{{.OnTimeVendorCol}}</th><th>{{.OnTimeSamplesCol}}</th><th>{{.OnTimeRateCol}}</th></tr></thead>
+<tbody>
+{{range .OnTimeRows}}
+<tr><td>{{.Vendor}}</td><td>{{.N}}</td><td>{{.Rate}}</td></tr>
+{{end}}
+</tbody>
+</table>
+{{else}}
+<p class="uc-empty">{{.OnTimeEmpty}}</p>
 {{end}}
 
 <h2>{{.ReorderHeading}}</h2>

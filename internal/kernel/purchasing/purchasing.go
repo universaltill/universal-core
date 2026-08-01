@@ -79,7 +79,7 @@ func Item() *entity.Definition {
 func PurchaseOrder() *entity.Definition {
 	return &entity.Definition{
 		EntityType:     "PurchaseOrder",
-		Version:        5,
+		Version:        6,
 		Module:         "purchasing",
 		StatusTypeCode: "purchase_order_status",
 		Fields: []entity.Field{
@@ -95,6 +95,21 @@ func PurchaseOrder() *entity.Definition {
 			{Name: "po_number", Type: entity.FieldString, Required: true},
 			{Name: "vendor_id", Type: entity.FieldReference, Required: true, Target: "Party"},
 			{Name: "order_date", Type: entity.FieldDate, Required: true},
+			// promised_delivery_date (#11) is the vendor's own commitment
+			// made at order time — a buyer/vendor-agreed date, entered
+			// manually, never derived — as opposed to the six #29 stage
+			// timestamps below, which record what ACTUALLY happened. It is
+			// the only honestly-computable half of #11's original
+			// "SupplierScorecard" ask that this kernel can support today:
+			// on_time_rate compares this promise against the actual
+			// receipt date already surfaced by CompletedPOLeadTimes
+			// (internal/data/reporting.go). Optional, since a PO written
+			// before this Version bump has none, and not every PO
+			// negotiation pins one down. NotBefore: order_date rules out
+			// the nonsensical case of promising delivery before the order
+			// is even placed, same discipline as every stage timestamp
+			// below.
+			{Name: "promised_delivery_date", Type: entity.FieldDate, NotBefore: "order_date"},
 			{Name: "currency_id", Type: entity.FieldReference, Target: "Currency"},
 			{Name: "status_id", Type: entity.FieldReference, Required: true, Target: "Status"},
 			{Name: "total", Type: entity.FieldNumber, Default: float64(0)},
