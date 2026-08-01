@@ -1,0 +1,61 @@
+name: Push image to ACR
+description: >-
+  Authenticate to Azure via OIDC and build+push a multi-arch image.
+  Extracted so build-and-push.yml's branch and release jobs can differ in
+  their authorization (only the release job runs in the `release`
+  environment, ADR-0016) without duplicating the Azure and Buildx tail.
+
+inputs:
+  tags:
+    description: Newline-separated image tags to push.
+    required: true
+  platforms:
+    description: Buildx target platforms.
+    required: true
+  client-id:
+    description: Azure AD application (client) id for OIDC login.
+    required: true
+  tenant-id:
+    description: Azure AD tenant id.
+    required: true
+  subscription-id:
+    description: Azure subscription id.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    # No stored credential: GitHub mints a short-lived OIDC token
+    # describing this run, and Azure trusts it only if the subject claim
+    # matches a federated credential in uc-infra's gh-oidc.tf. The
+    # branch path matches on `ref:refs/heads/main`; the release path
+    # matches on `environment:release`, which is why the caller's job —
+    # not this action — decides the environment (ADR-0016).
+    - name: Azure login (OIDC)
+      uses: azure/login@v2
+      with:
+        client-id: ${{ inputs.client-id }}
+        tenant-id: ${{ inputs.tenant-id }}
+        subscription-id: ${{ inputs.subscription-id }}
+
+    - name: Login to ACR
+      shell: bash
+      run: az acr login --name unitillacr01
+
+    - name: Build and push image
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        target: production
+        platforms: ${{ inputs.platforms }}
+        push: true
+        provenance: false
+        tags: ${{ inputs.tags }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max

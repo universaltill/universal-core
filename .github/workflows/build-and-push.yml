@@ -6,11 +6,15 @@ name: Build & Push to ACR
 on:
   push:
     branches: [main]
-    # Release tags. A tag build pushes :vX.Y.Z + :sha and deliberately
-    # NOT :latest — a release can legitimately be cut on an older commit,
+    # Release tags. A tag build pushes :vX.Y.Z and deliberately NOT
+    # :latest — a release can legitimately be cut on an older commit,
     # and having it drag :latest backwards would make "cut a release"
     # silently roll the live deployment back. Branch pushes own :latest;
     # tags own the pinned version. See uc-infra/docs/RELEASES.md.
+    #
+    # This pattern must stay in step with the `release` environment's
+    # deployment tag rule (ADR-0016) — they enforce the same thing in
+    # two different systems.
     tags: ['v[0-9]*.[0-9]*.[0-9]*']
   workflow_dispatch:
 
@@ -28,13 +32,63 @@ env:
   # entry, which flagged this as a real, not yet triggered, risk.
   PLATFORMS: linux/arm64,linux/amd64
 
+# Two jobs rather than one job with a conditional environment, per
+# ADR-0016. Only the release path runs inside the `release` environment,
+# because that is what the Azure federated credential now matches on —
+# and keeping :latest outside it is what makes it safe to add an
+# approval gate to releases later without gating every merge to main.
+#
+# `environment:` does accept expressions, so this could be one job with
+# `${{ ... && 'release' || '' }}`. Deliberately not: the behaviour of an
+# empty environment name is undocumented, and this expression would be
+# the only thing standing between a branch push and an environment that
+# may later carry a protection rule. An `if:` on two jobs states the
+# boundary in a line anyone can read.
+
 jobs:
-  build-and-push:
+  # Continuous deployment. Unchanged by ADR-0016's split beyond the `if:`
+  # and the extracted tail — deliberately, so :latest cannot regress from
+  # a refactor whose real subject is the release path.
+  build-branch:
+    if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Just build+vet here: ci.yml runs the identical full suite for
+      # branch pushes in parallel, and running it twice would only slow
+      # :latest down.
+      - name: Build and vet
+        run: |
+          go build ./...
+          go vet ./...
+
+      - name: Push image
+        uses: ./.github/actions/push-image
+        with:
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:latest
+          platforms: ${{ env.PLATFORMS }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+  # Release. `environment: release` is what the Azure federated
+  # credential matches on, replacing the per-tag credential list that
+  # required a Terraform change before every tag and failed v0.6.0's
+  # build when it was forgotten (ADR-0016).
+  build-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: release
     services:
-      # Only load-bearing for tag (release) builds — see the release-tests
-      # step below. Cheap to start unconditionally, and conditional
-      # service blocks aren't supported anyway.
       postgres:
         image: postgres:16
         env:
@@ -57,75 +111,33 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Build and test first
+      - name: Build and vet
         run: |
           go build ./...
           go vet ./...
 
+      - name: Install xmllint for SAF-T XSD validation
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxml2-utils
+
       # A release tag never triggers ci.yml (its `on` has no tags entry),
       # so without this a :vX.Y.Z image — the thing RELEASES.md calls the
       # trustworthy rollback target — would ship gated on nothing but
-      # build+vet. Branch pushes skip it here because ci.yml already runs
-      # the identical suite for them in parallel; running it twice would
-      # only slow :latest down. (Independent review flagged the gap.)
-      - name: Install xmllint for SAF-T XSD validation (release builds)
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxml2-utils
-
-      - name: Run the full test suite (release builds)
-        if: startsWith(github.ref, 'refs/tags/v')
+      # build+vet. (Independent review flagged the gap.)
+      - name: Run the full test suite
         env:
           TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/universal_core_test?sslmode=disable
         run: go test ./... -race -count=1 -p 1
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Azure login (OIDC)
-        uses: azure/login@v2
+      # Version tag ONLY — no :latest (a release on an older commit must
+      # not roll the live deployment back) and no :sha (the branch build
+      # already pushed it, and a second independent build is not
+      # byte-identical, so re-pushing would silently repoint :sha at
+      # different bits).
+      - name: Push image
+        uses: ./.github/actions/push-image
         with:
+          tags: ${{ env.IMAGE }}:${{ github.ref_name }}
+          platforms: ${{ env.PLATFORMS }}
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Login to ACR
-        run: az acr login --name unitillacr01
-
-      - name: Compute image tags
-        id: tags
-        run: |
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            VERSION="${GITHUB_REF#refs/tags/}"
-            # Version tag ONLY — no :latest (a release on an older commit
-            # must not roll the live deployment back) and no :sha (the
-            # branch build already pushed it, and a second independent
-            # build is not byte-identical, so re-pushing would silently
-            # repoint :sha at different bits).
-            {
-              echo "tags<<EOF"
-              echo "${IMAGE}:${VERSION}"
-              echo "EOF"
-            } >> "$GITHUB_OUTPUT"
-          else
-            {
-              echo "tags<<EOF"
-              echo "${IMAGE}:${GITHUB_SHA}"
-              echo "${IMAGE}:latest"
-              echo "EOF"
-            } >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Build and push image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          target: production
-          platforms: ${{ env.PLATFORMS }}
-          push: true
-          provenance: false
-          tags: ${{ steps.tags.outputs.tags }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
