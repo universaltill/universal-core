@@ -53,6 +53,31 @@ func TestT_ReturnsKeyWhenNothingMatches(t *testing.T) {
 	}
 }
 
+// TestHasOwn_DoesNotFollowFallbackChain is what makes HasOwn a different
+// tool from T for a completeness check: T("ar-SA", ...) or T("de", ...)
+// happily resolves through ar/en respectively (TestT_FallsBackToBaseLanguage,
+// TestT_FallsBackToFallbackLocale above), which is exactly right for
+// rendering but exactly wrong for a test asking "does THIS locale have
+// its own entry" — a T-based check can never observe a single locale
+// missing a key once the fallback locale has it.
+func TestHasOwn_DoesNotFollowFallbackChain(t *testing.T) {
+	c, err := Load("en")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !c.HasOwn("en", "form.field.required_suffix") {
+		t.Fatal("expected en to have its own required_suffix entry")
+	}
+	// "de" has no locale file at all, only borrows en via T's fallback
+	// chain — HasOwn must say no, not silently agree with T.
+	if c.HasOwn("de", "form.field.required_suffix") {
+		t.Fatal("HasOwn must not report a fallback-only locale as having its own entry")
+	}
+	if c.HasOwn("en", "no.such.key") {
+		t.Fatal("HasOwn must not report a genuinely absent key as present")
+	}
+}
+
 // TestLocales_HaveIdenticalKeySets guards against exactly the kind of
 // drift these hand-maintained JSON files are prone to: a key added to
 // en.json (or fixed/renamed) while updating the other three locales gets

@@ -162,6 +162,48 @@ func TestPurchaseOrderFormStages_RealBrowser(t *testing.T) {
 	}
 }
 
+// TestFormSectionTitlesAndSaveButtonAreLocalized_RealBrowser (#53):
+// section titles and the Save button are real, rendered, translated text
+// in a real browser — not just markup-string assertions, per
+// CLAUDE.md's UI testing rule.
+//
+// Driven in TURKISH (?lang=tr), deliberately, same reasoning as
+// TestPurchaseOrderFormStages_RealBrowser above (that test's own doc
+// comment, and the independent review it cites): PurchaseOrderForm's
+// literal Go Section.Title ("Header") and Action.Label ("Save") equal
+// their English catalog values, so asserting the English text would
+// pass identically whether formrender.SectionCatalogKey/
+// SaveActionCatalogKey are actually wired into the render path or
+// deleted outright.
+func TestFormSectionTitlesAndSaveButtonAreLocalized_RealBrowser(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, _ := testServer(t)
+	ctx := browserCtx(t, tenantID)
+
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/forms/PurchaseOrder/new?lang=tr"),
+		chromedp.WaitVisible(`form.uc-form`, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("open /forms/PurchaseOrder/new?lang=tr: %v", err)
+	}
+
+	var headerTitle string
+	if err := chromedp.Run(ctx, chromedp.Text(`section.uc-section h2`, &headerTitle, chromedp.ByQuery)); err != nil {
+		t.Fatalf("read Header section title: %v", err)
+	}
+	if got := strings.TrimSpace(headerTitle); got != "Başlık" {
+		t.Fatalf("expected the Turkish translation of the Header section title, got %q", got)
+	}
+
+	var saveLabel string
+	if err := chromedp.Run(ctx, chromedp.Text(`form.uc-form button[type="submit"]`, &saveLabel, chromedp.ByQuery)); err != nil {
+		t.Fatalf("read Save button text: %v", err)
+	}
+	if got := strings.TrimSpace(saveLabel); got != "Kaydet" {
+		t.Fatalf("expected the Turkish translation of the Save button, got %q", got)
+	}
+}
+
 // submitForm clicks the form's Save button and waits for htmx's own
 // afterSettle event — see clickAndSettle's doc comment in
 // csv_import_test.go for why WaitVisible on the swapped content isn't

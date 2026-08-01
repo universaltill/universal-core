@@ -1289,3 +1289,97 @@ func TestRender_ChildRowsResolveI18nAndAlignColumns(t *testing.T) {
 		t.Errorf("child table has no header row:\n%s", out)
 	}
 }
+
+// TestRender_SectionTitleResolvesThroughCatalog (#53): a section whose
+// EntityType+Title has a real form.{EntityType}.section.{slug} catalog
+// entry renders the translation, not the Go Definition's literal Title —
+// same proof-of-wiring shape as the field-label tests already establish
+// for field.{EntityType}.{FieldName} (and the same reason
+// TestPurchaseOrderFormStages_RealBrowser in internal/e2e deliberately
+// asserts a non-English string: an English-locale assertion here would
+// pass identically whether the catalog is actually consulted or not,
+// since purchaseOrderForm's own Header/Lines fallback text already
+// equals the en catalog value).
+func TestRender_SectionTitleResolvesThroughCatalog(t *testing.T) {
+	r := testRenderer(t)
+	data := Data{Record: map[string]any{"payment_method": "Wire"}, Children: map[string][]map[string]any{}}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "tr"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if strings.Contains(out, "<h2>Header</h2>") {
+		t.Errorf("Turkish viewer got the literal English section title, catalog not consulted:\n%s", out)
+	}
+	if !strings.Contains(out, "<h2>Başlık</h2>") {
+		t.Errorf("expected the Turkish translation of the Header section title, got:\n%s", out)
+	}
+}
+
+// TestRender_SectionTitleWithoutCatalogKeyFallsBackToLiteral (#53): a
+// section whose EntityType+Title has NO catalog entry yet must still
+// render exactly as before this change — the additive-fallback
+// guarantee TOrDefault gives every other caller (buildFields' field
+// labels, entityDisplayName) applies here too, so introducing this
+// mechanism can never itself break an existing, not-yet-translated
+// form.
+func TestRender_SectionTitleWithoutCatalogKeyFallsBackToLiteral(t *testing.T) {
+	r := testRenderer(t)
+	ent := &entity.Definition{
+		EntityType: "ZzyzxWidget",
+		Fields:     []entity.Field{{Name: "x", Type: entity.FieldString}},
+	}
+	def := &form.Definition{
+		EntityType: "ZzyzxWidget",
+		Version:    1,
+		Sections: []form.Section{
+			{Title: "A Totally Untranslated Section", Component: form.ComponentFields,
+				Fields: []form.FormField{{Name: "x", Label: "X"}}},
+		},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, def, ent, Data{}, "ar"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if !strings.Contains(buf.String(), "<h2>A Totally Untranslated Section</h2>") {
+		t.Errorf("expected the literal title to survive unchanged when no catalog key exists, got:\n%s", buf.String())
+	}
+}
+
+// TestRender_SaveActionLabelResolvesThroughCatalog (#53): the Save
+// button's Label goes through the global form.action.save key exactly
+// like section titles go through their per-entity key — proven the same
+// non-English way, for the same tautology-avoidance reason.
+func TestRender_SaveActionLabelResolvesThroughCatalog(t *testing.T) {
+	r := testRenderer(t)
+	data := Data{Record: map[string]any{"payment_method": "Wire"}, Children: map[string][]map[string]any{}}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "ar"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if !strings.Contains(buf.String(), "<button type=\"submit\">حفظ</button>") {
+		t.Errorf("expected the Arabic translation of the Save action, got:\n%s", buf.String())
+	}
+}
+
+// TestSlugifyTitle locks in the exact deterministic Title->slug
+// transform: both this package's own lookup and whatever authors a
+// locale JSON's keys (internal/i18n/locales/*.json) must agree on it
+// byte-for-byte, since a mismatch would silently look up a key nothing
+// ever populates (TOrDefault degrades to the literal Title rather than
+// erroring, so a slugify drift would NOT fail loudly on its own —
+// i18n_coverage_test.go is the backstop that catches it in practice, but
+// this test pins the transform itself).
+func TestSlugifyTitle(t *testing.T) {
+	cases := []struct{ title, want string }{
+		{"Header", "header"},
+		{"Lead-time stages", "lead_time_stages"},
+		{"Schedule and Budget", "schedule_and_budget"},
+		{"  Trim Me  ", "trim_me"},
+	}
+	for _, c := range cases {
+		if got := slugifyTitle(c.title); got != c.want {
+			t.Errorf("slugifyTitle(%q) = %q, want %q", c.title, got, c.want)
+		}
+	}
+}

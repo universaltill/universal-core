@@ -15,8 +15,10 @@ import (
 	"io"
 	"maps"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/universaltill/universal-core/internal/i18n"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
@@ -33,6 +35,53 @@ type Renderer struct {
 
 func New(catalog *i18n.Catalog) *Renderer {
 	return &Renderer{i18n: catalog, tmpl: template.Must(template.New("form").Parse(tmplSrc))}
+}
+
+// SaveActionCatalogKey is the single global i18n key for every Save
+// button, mirroring form.field.required_suffix's own global-key
+// precedent (RequiredSuffix above). It's global rather than per-entity
+// because every OpSave action in every Definition this kernel ships
+// uses the identical literal Label "Save" — there is no per-entity
+// variation to key on. Other Action ops (workflow.start/report.render/
+// navigate) are NOT resolved through the catalog: no production
+// Definition uses one yet, and each carries a genuinely per-instance
+// Label (e.g. "Submit for Approval"), so this same TOrDefault approach
+// would need a per-entity-and-action key, not this constant — add that
+// the same way SectionCatalogKey works below, when a real form actually
+// needs one. Exported so i18n_coverage_test.go's external test package
+// can enforce every locale actually translates it.
+const SaveActionCatalogKey = "form.action.save"
+
+// sectionSlugRe turns a Section.Title into the slug half of
+// sectionCatalogKey's key. Any run of characters outside [a-z0-9]
+// (spaces, hyphens, "and", punctuation) becomes a single underscore;
+// slugifyTitle then trims a leading/trailing one so "Lead-time stages"
+// -> "lead_time_stages", not "_lead_time_stages_" or two different
+// slugs depending on which non-alnum character happened to separate
+// two words.
+var sectionSlugRe = regexp.MustCompile(`[^a-z0-9]+`)
+
+// slugifyTitle is the deterministic Title->slug transform both this
+// package's own lookup (sectionCatalogKey) and whatever authors a
+// locale JSON's keys must agree on byte-for-byte — see this file's
+// i18n_coverage_test.go sibling, which fails the build the moment the
+// two drift apart for any real Definition.
+func slugifyTitle(title string) string {
+	return strings.Trim(sectionSlugRe.ReplaceAllString(strings.ToLower(title), "_"), "_")
+}
+
+// SectionCatalogKey mirrors internal/api/locale.go's entityDisplayName
+// convention ("entity."+entityType+".name" with the raw value as
+// TOrDefault's fallback): a per-entity-type key so the same English
+// section title on two different entities ("Details" on both Item and
+// POLine) can carry two independently-authored translations, exactly
+// like field."+entityType+"."+fieldName already does for field labels.
+// Exported so i18n_coverage_test.go's external test package can compute
+// the same key this package's own render path looks up, and callers
+// authoring/auditing locale JSON have one canonical way to derive it
+// instead of re-deriving the slugify rule by hand.
+func SectionCatalogKey(entityType, title string) string {
+	return "form." + entityType + ".section." + slugifyTitle(title)
 }
 
 // Data is everything the renderer needs beyond the two Definitions: the
@@ -343,7 +392,8 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 	rendered := make(map[string]bool, len(ent.Fields))
 
 	for _, s := range def.Sections {
-		sv := sectionView{Title: s.Title, Component: s.Component, Target: s.Target}
+		title := r.i18n.TOrDefault(locale, SectionCatalogKey(def.EntityType, s.Title), s.Title)
+		sv := sectionView{Title: title, Component: s.Component, Target: s.Target}
 
 		switch s.Component {
 		case form.ComponentFields:
@@ -382,6 +432,9 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 
 	for _, a := range def.Actions {
 		av := actionView{Label: a.Label, Op: a.Op, Route: a.Route}
+		if a.Op == form.OpSave {
+			av.Label = r.i18n.TOrDefault(locale, SaveActionCatalogKey, a.Label)
+		}
 		switch a.Op {
 		case form.OpWorkflowStart:
 			av.WorkflowHref = "/api/workflows/" + url.PathEscape(a.Workflow) + "/start"

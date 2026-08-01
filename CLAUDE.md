@@ -97,6 +97,34 @@ Same conventions as universal-till: responses `{ "data": …, "error": null }`,
 JSON **snake_case**, dates ISO-8601, money via a `money.Money`-equivalent
 integer-minor-units type. No hardcoded user-facing strings.
 
+Form section titles and the Save action label follow the same
+catalog-with-graceful-fallback pattern field labels already use
+(`field.{EntityType}.{FieldName}`, `entityDisplayName`'s
+`entity.{EntityType}.name`):
+- A section's `Title` resolves via `form.{EntityType}.section.{slug}`
+  (built by `formrender.SectionCatalogKey`), `TOrDefault`-falling back to
+  the literal `Title` declared on the Definition. `slug` lowercases the
+  title and collapses every run of characters outside `[a-z0-9]` to a
+  single underscore, trimming any leading/trailing one (`"Lead-time
+  stages"` → `lead_time_stages`) — never derive this by hand, call
+  `formrender.SectionCatalogKey(entityType, title)`.
+- The Save button's `Label` resolves via one **global**
+  `form.action.save` key (`formrender.SaveActionCatalogKey`), not a
+  per-entity one — every production form's Save button uses the
+  identical literal text, so there is nothing to key per entity on.
+  Other action ops (`workflow.start`/`report.render`/`navigate`) are not
+  wired through the catalog yet; none of today's Definitions use one
+  with a shared label, so add a per-entity-and-action key the same way
+  when a real form needs one, rather than translating hypothetical copy.
+- `internal/kernel/formrender/i18n_coverage_test.go` enforces this: it
+  walks every module's `AllForms()` and fails if any section or Save
+  action is missing a translation in any of the four shipped locales. A
+  new module's `forms.go` must add its `form.*.section.*` (and, if it
+  has a Save action, confirm `form.action.save` still resolves) keys to
+  `internal/i18n/locales/*.json` before this test passes — that's what
+  makes this a convention future modules are held to, not just a
+  docstring.
+
 ## Process
 Document-first (ADR-0007): architectural changes get an ADR in
 `../uc-infra/docs/adr/` before the code lands. Every substantive change

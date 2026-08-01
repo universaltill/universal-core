@@ -75,6 +75,26 @@ func (c *Catalog) T(locale, key string) string {
 	return key
 }
 
+// HasOwn reports whether locale itself (not a fallback language/locale
+// T would otherwise walk to) has its own message for key. Unlike T,
+// this never consults baseLang(locale), c.fallback, or
+// baseLang(c.fallback) — a coverage check that asked T (or TOrDefault)
+// "does this locale have key?" would always answer yes the moment the
+// fallback locale has it, since T's whole point is to hide that gap
+// from a viewer. HasOwn exists for the opposite audience: a build-time
+// completeness check (internal/kernel/formrender's i18n_coverage_test.go)
+// that needs to know THIS locale's own file actually carries the entry,
+// not that some other locale's translation is quietly standing in for
+// it.
+func (c *Catalog) HasOwn(locale, key string) bool {
+	m, ok := c.messages[locale]
+	if !ok {
+		return false
+	}
+	_, ok = m[key]
+	return ok
+}
+
 // TOrDefault is T for a key built from data rather than authored UI
 // copy — an entity type name, a module key, an enum value — where T's
 // own fallback (the literal key string, e.g. "field.Item.item_type.stock")
