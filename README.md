@@ -6,12 +6,12 @@ a human before they're versioned and published. Sibling product to
 Universal Till: Till is the retail/POS edge, Core is the enterprise
 backbone it and other systems connect into.
 
-**Status: early kernel spike, not yet public.** This repo exists only
-locally so far — not pushed to GitHub, pending review (see
-`docs/code-reviews/2026-07-18-universal-core-kernel-spike.md` for why).
-Full architecture decision: `docs/adr/0001-universal-erp-metadata-kernel.md`
-(this repo's own ADR-0001; was unitill `docs` repo ADR-0017 before this
-became a separate product tree).
+**Status: early but moving fast.** The kernel, a first set of business
+modules, and a server-rendered UI exist and are exercised by a full test
+suite (unit, Postgres integration, smoke, and browser E2E). Architecture
+decisions and review records are kept in an internal decision-record
+repo; this README and [`INTEGRATIONS.md`](INTEGRATIONS.md) are the public
+entry points.
 
 ## What exists today
 
@@ -31,22 +31,24 @@ became a separate product tree).
   with conditional `visible_if`, and a closed set of declarative action
   ops. Three distinct section types: plain fields, master-detail
   (composition, with roll-up), and related-list (read-only).
-- `internal/kernel/workflow` — workflow definitions (trigger + a closed
-  set of step kinds) and a synchronous executor that halts at the first
-  approval step rather than running through automatically.
+- `internal/kernel/workflow` + `internal/worker` — workflow definitions
+  (trigger + a closed set of step kinds), approval halting, and a durable
+  Postgres-backed job queue with background dispatchers.
+- `internal/kernel/formrender` — the server-rendered HTMX UI, generated
+  from Form Definitions.
+- Business modules built on the kernel as metadata: finance, purchasing,
+  sales, CRM, HR, projects, and assets, plus UBL and SAF-T export.
 - `internal/data` — repositories (the only place raw SQL is allowed).
 - `internal/db/migrations` — the foundation schema.
-- `cmd/universal-core` — a minimal runnable entrypoint (migrations +
-  health check); not yet a real API surface.
+- `cmd/universal-core` — the server; `cmd/provision-tenant`,
+  `cmd/install-module`, `cmd/seed-demo-data` and friends for operating
+  tenants.
 
 ## What doesn't exist yet
 
-An actual form *renderer* (HTML/HTMX output from a Form Definition), the
-durable/transactional Postgres job queue for workflows (retries,
-dead-letter, resume — today's executor is synchronous and in-memory), the
-prediction service, connector plugins, module entitlements, and the base
-domain models (kept in an internal, non-public reference document) are
-all designed in the ADR but not yet built.
+Connector plugins beyond the first CSV import path, the plugin
+runtime/marketplace integration, and module entitlements are designed
+but not yet built.
 
 ## Integrating with Universal Core
 
@@ -58,10 +60,21 @@ unattended connector can be built.
 ## Running the tests
 
 ```
-go test ./...                    # unit tests only, no database needed
-TEST_DATABASE_URL=... go test ./...  # includes Postgres integration tests
+go test ./... -p 1                        # unit tests only, no database needed
+TEST_DATABASE_URL=... go test ./... -race -count=1 -p 1   # + Postgres integration
 ```
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full pre-push gate
+(`-p 1` is required; packages share one test database).
+
+## Contributing
+
+External contributions are welcome — see
+[`CONTRIBUTING.md`](CONTRIBUTING.md). All contributors sign a lightweight
+CLA ([`CLA.md`](CLA.md)) via a bot comment on their first pull request.
 
 ## License
 
-AGPLv3 (see `LICENSE`) — see ADR-0001 §13 for the reasoning.
+AGPLv3 (see `LICENSE`). The platform is fully open source with no
+feature gating; the commercial offering is operated services (managed
+cloud hosting, support/SLA), never a license flag in the code.
