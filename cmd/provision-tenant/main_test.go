@@ -12,7 +12,6 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/universaltill/universal-core/internal/db"
-	"github.com/universaltill/universal-core/internal/kernel/modulebundle"
 	"github.com/universaltill/universal-core/internal/tenantdb"
 	"github.com/universaltill/universal-core/internal/testexec"
 )
@@ -416,31 +415,6 @@ func TestProvisionTenant_HRModule(t *testing.T) {
 		}
 		if n != g.want {
 			t.Errorf("expected %d %s rows, got %d", g.want, g.code, n)
-		}
-	}
-}
-
-// TestModulePublishers_MatchReservedModules is the parity test
-// modulebundle.ReservedModules' own comment claimed existed and did
-// not. Without it the two lists drifted by three modules, and the
-// independent review showed the consequence: a bundle declaring an
-// unlisted built-in key installs its own Definition, after which the
-// real module's Publish silently no-ops and reports success.
-func TestModulePublishers_MatchReservedModules(t *testing.T) {
-	// foundation is always published and has no entry in
-	// modulePublishers, so it is the one legitimate difference.
-	want := map[string]bool{"foundation": true}
-	for key := range modulePublishers {
-		want[key] = true
-	}
-	for key := range want {
-		if !modulebundle.ReservedModules[key] {
-			t.Errorf("built-in module %q is missing from modulebundle.ReservedModules — a bundle could claim that key and silently pre-empt the real module", key)
-		}
-	}
-	for key := range modulebundle.ReservedModules {
-		if !want[key] {
-			t.Errorf("modulebundle.ReservedModules has %q, which is not a built-in module — bundles are needlessly barred from that key", key)
 		}
 	}
 }

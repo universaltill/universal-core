@@ -377,3 +377,43 @@ func (w *WorkflowDefinitionRepo) GetVersion(ctx context.Context, name string, ve
 func (w *WorkflowDefinitionRepo) ListPublishedNames(ctx context.Context) ([]string, error) {
 	return w.r.listPublishedKeys(ctx)
 }
+
+// PublishedModules returns the distinct module keys this tenant has
+// published entity Definitions for, sorted.
+//
+// **This is how a tenant's module set is known at all** (ADR-0017).
+// Nothing stores it: the control plane's `tenants` row has no module
+// column, and cmd/provision-tenant takes -modules as a flag and forgets
+// it. But entity.Definition carries a `module` key and PublishAll
+// stores the whole marshalled Definition, so each tenant's own registry
+// already records what it has — and unlike a stored list, it cannot
+// drift from reality, because a tenant gains a module's key in the same
+// transaction that gives it the module's entities.
+//
+// Rows whose definition JSON has no module key are skipped rather than
+// yielding an empty-string module: every built-in Definition sets one,
+// so a blank means a hand-written or bundle-installed Definition that
+// omitted it, and inventing a module named "" for it would be worse
+// than ignoring it.
+func (e *EntityDefinitionRepo) PublishedModules(ctx context.Context) ([]string, error) {
+	rows, err := e.r.db.QueryContext(ctx,
+		`SELECT DISTINCT definition->>'module'
+		 FROM entity_definitions
+		 WHERE status = 'published'
+		   AND coalesce(definition->>'module', '') <> ''
+		 ORDER BY 1`)
+	if err != nil {
+		return nil, fmt.Errorf("list published modules: %w", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var m string
+		if err := rows.Scan(&m); err != nil {
+			return nil, fmt.Errorf("scan module: %w", err)
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}

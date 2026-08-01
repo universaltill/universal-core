@@ -37,42 +37,10 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/universaltill/universal-core/internal/db"
-	"github.com/universaltill/universal-core/internal/kernel/assets"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
-	"github.com/universaltill/universal-core/internal/kernel/crm"
-	"github.com/universaltill/universal-core/internal/kernel/finance"
-	"github.com/universaltill/universal-core/internal/kernel/foundation"
-	"github.com/universaltill/universal-core/internal/kernel/hr"
-	"github.com/universaltill/universal-core/internal/kernel/projects"
-	"github.com/universaltill/universal-core/internal/kernel/purchasing"
-	"github.com/universaltill/universal-core/internal/kernel/sales"
+	"github.com/universaltill/universal-core/internal/modules"
 	"github.com/universaltill/universal-core/internal/tenantdb"
 )
-
-// modulePublishers maps a -modules name to its Publish/PublishForms(/
-// PublishStatuses) set. Foundation is not in this map — it's always
-// published, unconditionally, per ADR-0001 §8's "always present"
-// requirement; it's not something an operator opts into per tenant.
-//
-// publishStatuses is nilable: it exists because purchasing.PurchaseOrder
-// is the first entity to opt into foundation.go's Status/StatusType
-// pattern (see purchasing.PublishStatuses's doc comment for why that's
-// required tenant data, not optional like cmd/seed-demo-data's sample
-// business data) — a future module with no status-managed entity simply
-// has nothing to seed here.
-var modulePublishers = map[string]struct {
-	publish         func(ctx context.Context, db *sql.DB, actor audit.Actor) error
-	publishForms    func(ctx context.Context, db *sql.DB, actor audit.Actor) error
-	publishStatuses func(ctx context.Context, db *sql.DB, actor audit.Actor) error
-}{
-	"purchasing": {purchasing.Publish, purchasing.PublishForms, purchasing.PublishStatuses},
-	"sales":      {sales.Publish, sales.PublishForms, sales.PublishStatuses},
-	"finance":    {finance.Publish, finance.PublishForms, nil},
-	"assets":     {assets.Publish, assets.PublishForms, assets.PublishStatuses},
-	"projects":   {projects.Publish, projects.PublishForms, projects.PublishStatuses},
-	"hr":         {hr.Publish, hr.PublishForms, hr.PublishStatuses},
-	"crm":        {crm.Publish, crm.PublishForms, crm.PublishStatuses},
-}
 
 func main() {
 	controlDBURL := os.Getenv("DATABASE_URL")
@@ -80,11 +48,17 @@ func main() {
 		log.Fatal("DATABASE_URL is required (the control-plane database — see this file's own doc comment)")
 	}
 
+	// One derived list, used by both the help text and the unknown-module
+	// error. They were two strings — one derived, one hardcoded — which
+	// is the second-list-drifts smell internal/modules exists to remove
+	// (independent review).
+	available := strings.Join(modules.Keys(), ", ")
+
 	name := flag.String("name", "", "tenant name (required unless -tenant-id reuses an existing tenant)")
 	region := flag.String("region", "eu-west", "tenant region, only used when creating a new tenant")
 	tenantID := flag.String("tenant-id", "", "reuse an existing tenant id instead of creating a new one")
 	actorID := flag.String("actor-id", "", "audit actor id for every Definition this provisions (required)")
-	modulesFlag := flag.String("modules", "", "comma-separated modules to publish besides foundation (available: purchasing, sales, finance, assets, projects, hr, crm)")
+	modulesFlag := flag.String("modules", "", "comma-separated modules to publish besides foundation (available: "+available+")")
 	flag.Parse()
 
 	if *actorID == "" {
@@ -98,16 +72,16 @@ func main() {
 	// repeat would just be redundant work, not incorrect), but there's
 	// no reason to actually do that work or log a module twice for
 	// something as easy to catch as "-modules purchasing,purchasing".
-	var modules []string
+	var selected []string
 	if *modulesFlag != "" {
 		seen := make(map[string]bool)
 		for m := range strings.SplitSeq(*modulesFlag, ",") {
-			if _, ok := modulePublishers[m]; !ok {
-				log.Fatalf("unknown module %q (available: purchasing, sales, finance, assets, projects, hr, crm)", m)
+			if _, ok := modules.Publishers[m]; !ok {
+				log.Fatalf("unknown module %q (available: %s)", m, available)
 			}
 			if !seen[m] {
 				seen[m] = true
-				modules = append(modules, m)
+				selected = append(selected, m)
 			}
 		}
 	}
@@ -148,24 +122,24 @@ func main() {
 		log.Fatalf("resolve tenant %s database: %v", id, err)
 	}
 
-	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
-		log.Fatalf("publish foundation entities: %v", err)
-	}
-	if err := foundation.PublishForms(ctx, tenantDB, actor); err != nil {
-		log.Fatalf("publish foundation forms: %v", err)
+	// Via modules.PublishFoundation rather than the two calls directly,
+	// so this and cmd/sync-tenant-modules cannot disagree about what
+	// "publish foundation" means if it ever grows a third step.
+	if err := modules.PublishFoundation(ctx, tenantDB, actor); err != nil {
+		log.Fatalf("publish foundation: %v", err)
 	}
 	log.Println("foundation layer published (entities + forms)")
 
-	for _, m := range modules {
-		p := modulePublishers[m]
-		if err := p.publish(ctx, tenantDB, actor); err != nil {
+	for _, m := range selected {
+		p := modules.Publishers[m]
+		if err := p.Publish(ctx, tenantDB, actor); err != nil {
 			log.Fatalf("publish %s entities: %v", m, err)
 		}
-		if err := p.publishForms(ctx, tenantDB, actor); err != nil {
+		if err := p.PublishForms(ctx, tenantDB, actor); err != nil {
 			log.Fatalf("publish %s forms: %v", m, err)
 		}
-		if p.publishStatuses != nil {
-			if err := p.publishStatuses(ctx, tenantDB, actor); err != nil {
+		if p.PublishStatuses != nil {
+			if err := p.PublishStatuses(ctx, tenantDB, actor); err != nil {
 				log.Fatalf("publish %s statuses: %v", m, err)
 			}
 		}

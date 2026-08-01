@@ -530,3 +530,39 @@ func (r *RecordRepo) DeleteTx(ctx context.Context, q querier, entityType, id str
 	}
 	return nil
 }
+
+// CountMissingField counts live records of entityType whose JSONB data
+// has no usable value for fieldName — absent, JSON null, or empty
+// string.
+//
+// Used by cmd/sync-tenant-modules to report the data migrations a
+// publish just made necessary (ADR-0017 §5). Publishing a Definition
+// version that adds a Required field does not touch existing records,
+// so they stay readable and start failing on next edit — a silent state
+// this makes loud.
+//
+// Absent and JSON-null both fail entity.ValidateRecord's Required
+// check, which treats a key as satisfied only when present and
+// non-nil. **An empty string currently does not** — Required accepts
+// `""` over the JSON API today, which is #86. It is counted anyway, on
+// purpose: a row holding `"facility_id": ""` is stock at no location
+// whatever the validator currently tolerates, it is exactly the shape a
+// half-finished migration leaves behind, and when #86 tightens Required
+// it becomes a hard failure. So this over-reports by design against
+// today's validator and exactly matches it once #86 lands — the safe
+// direction for a warning whose cost is a human looking, and whose
+// alternative is a tenant broken silently.
+func (r *RecordRepo) CountMissingField(ctx context.Context, entityType, fieldName string) (int, error) {
+	var n int
+	err := r.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM records
+		 WHERE entity_type = $1
+		   AND deleted_at IS NULL
+		   AND coalesce(data->>$2, '') = ''`,
+		entityType, fieldName,
+	).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count %s records missing %s: %w", entityType, fieldName, err)
+	}
+	return n, nil
+}
