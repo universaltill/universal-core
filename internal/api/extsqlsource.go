@@ -155,7 +155,7 @@ func (h *Handler) extSQLSourceSave(w http.ResponseWriter, r *http.Request, id st
 
 	if id == "" {
 		if _, err := ts.crud.Create(r.Context(), def, fields, rc.Actor); err != nil {
-			writeCrudError(w, "create ExternalSQLSource", err)
+			h.writeCrudErrorLocalized(w, r, "create ExternalSQLSource", err)
 			return
 		}
 	} else {
@@ -165,7 +165,7 @@ func (h *Handler) extSQLSourceSave(w http.ResponseWriter, r *http.Request, id st
 				httpx.WriteError(w, http.StatusNotFound, fmt.Sprintf("ExternalSQLSource %q not found", id))
 				return
 			}
-			writeCrudError(w, "update ExternalSQLSource "+id, err)
+			h.writeCrudErrorLocalized(w, r, "update ExternalSQLSource "+id, err)
 			return
 		}
 	}
@@ -203,7 +203,10 @@ func (h *Handler) extSQLSourceDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, found := recordByID(records, id); found {
 		if err := ts.crud.Delete(r.Context(), def, id, rc.Actor); err != nil {
-			writeCrudError(w, "delete ExternalSQLSource "+id, err)
+			// Localized: the guarded Delete refuses a record a read_only
+			// system of record owns (uc-infra#102) — translated 409, not
+			// a generic failure.
+			h.writeCrudErrorLocalized(w, r, "delete ExternalSQLSource "+id, err)
 			return
 		}
 	}

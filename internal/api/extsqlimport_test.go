@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"database/sql"
 	"net/http"
 	"net/http/httptest"
@@ -8,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/form"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
 )
@@ -19,13 +21,21 @@ import (
 // and fetches rows, with no fake driver anywhere.
 func registerTestPGSource(t *testing.T, mux *http.ServeMux, tenantID string, db *sql.DB) string {
 	t.Helper()
+	return registerTestPGSourceNamed(t, mux, tenantID, db, "Legacy")
+}
+
+// registerTestPGSourceNamed is registerTestPGSource with a caller-chosen
+// name — for tests that need TWO registered sources (both genuinely
+// dialing the same test Postgres) distinguishable by name.
+func registerTestPGSourceNamed(t *testing.T, mux *http.ServeMux, tenantID string, db *sql.DB, name string) string {
+	t.Helper()
 	host, port, user, pass, database, options := testExtPGParams(t, db)
 	rec := postExtSQLForm(mux, "/settings/sql-sources", tenantID,
-		extSQLSourceValues("Legacy", "postgres", host, port, database, user, pass, options))
+		extSQLSourceValues(name, "postgres", host, port, database, user, pass, options))
 	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200 registering the test source, got %d: %s", rec.Code, rec.Body.String())
+		t.Fatalf("expected 200 registering the test source %q, got %d: %s", name, rec.Code, rec.Body.String())
 	}
-	id, _ := storedExtSQLSource(t, db, "Legacy")
+	id, _ := storedExtSQLSource(t, db, name)
 	return id
 }
 
@@ -872,6 +882,152 @@ func TestExtSQLImport_Preview_ExplicitNoneKeyColumnSurvivesResubmit(t *testing.T
 	}
 	if strings.Contains(body, "A key column is selected") {
 		t.Fatalf("expected no will-update note with key column explicitly none, got:\n%s", body)
+	}
+}
+
+// TestExtSQLImport_KeyedReImportWorksUnderReadOnlySoR pins uc-infra#102's
+// blocker fix end to end: with a read_only SystemOfRecord row naming the
+// import's own source, the keyed re-import must still succeed — the
+// import is the source's own pen (ForImportFrom's scoped bypass), and
+// without it the SoR check blocked the very sync it protects, per-row.
+func TestExtSQLImport_KeyedReImportWorksUnderReadOnlySoR(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
+	createScratchTable(t, db,
+		`CREATE TABLE ext_vendors ("code" text, "name" text)`,
+		`INSERT INTO ext_vendors VALUES ('V-1', 'Acme Textiles'), ('V-2', 'Beta Supplies')`)
+
+	mux := http.NewServeMux()
+	testHandlerWithSecretCryptor(t, router, testCryptor(t)).Routes(mux)
+	sourceID := registerTestPGSource(t, mux, tenantID, db)
+
+	// The source is declared the read-only owner of Vendor — seeded via
+	// the raw engine (system setup, not what this test is probing).
+	if _, err := crud.NewEngine(db).Create(context.Background(), foundation.SystemOfRecord(), map[string]any{
+		"entity_type": "Vendor", "source_id": sourceID, "mode": "read_only",
+	}, humanActor()); err != nil {
+		t.Fatalf("seed SystemOfRecord: %v", err)
+	}
+
+	vals := url.Values{
+		"source_id":    {sourceID},
+		"schema":       {"public"},
+		"relation":     {"ext_vendors"},
+		"mapping.name": {"name"},
+		"key_column":   {"code"},
+	}
+	first := postExtSQLImport(mux, "/import/Vendor/sql/commit", tenantID, vals)
+	if !strings.Contains(first.Body.String(), "2 created, 0 updated, 0 failed") {
+		t.Fatalf("first keyed import under read_only SoR: expected 2 created, got %d:\n%s", first.Code, first.Body.String())
+	}
+	second := postExtSQLImport(mux, "/import/Vendor/sql/commit", tenantID, vals)
+	if !strings.Contains(second.Body.String(), "0 created, 2 updated, 0 failed") {
+		t.Fatalf("keyed RE-import under read_only SoR: expected 2 updated (the source's own pen), got %d:\n%s", second.Code, second.Body.String())
+	}
+
+	// The protection itself still stands for a human hand-edit.
+	var recordID string
+	if err := db.QueryRow(`SELECT id FROM records WHERE entity_type = 'Vendor' AND deleted_at IS NULL LIMIT 1`).Scan(&recordID); err != nil {
+		t.Fatalf("pick an imported Vendor: %v", err)
+	}
+	editReq := newRequest("POST", "/api/records/Vendor/"+recordID, tenantID, "farshid", []byte(`{"name":"Hand Edited"}`))
+	editRec := httptest.NewRecorder()
+	mux.ServeHTTP(editRec, editReq)
+	if editRec.Code != http.StatusConflict {
+		t.Fatalf("expected the hand-edit to stay blocked (409), got %d: %s", editRec.Code, editRec.Body.String())
+	}
+}
+
+// TestExtSQLImport_KeyedImportFromOtherSourceBlockedPerRowTranslated:
+// ForImportFrom's bypass is scoped to the import's OWN source — a keyed
+// import from a different registered source whose rows resolve to
+// records the read_only source owns fails per-row, with the translated
+// block message in the result rows (never authz's logs-only English
+// Error() text, never a 500, never silent success).
+func TestExtSQLImport_KeyedImportFromOtherSourceBlockedPerRowTranslated(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
+	createScratchTable(t, db,
+		`CREATE TABLE ext_vendors ("code" text, "name" text)`,
+		`INSERT INTO ext_vendors VALUES ('V-1', 'Acme Textiles'), ('V-2', 'Beta Supplies')`)
+
+	mux := http.NewServeMux()
+	testHandlerWithSecretCryptor(t, router, testCryptor(t)).Routes(mux)
+	ownerID := registerTestPGSourceNamed(t, mux, tenantID, db, "Legacy")
+	otherID := registerTestPGSourceNamed(t, mux, tenantID, db, "Other")
+
+	// Owner imports first and is declared read-only owner of Vendor.
+	ownerVals := url.Values{
+		"source_id":    {ownerID},
+		"schema":       {"public"},
+		"relation":     {"ext_vendors"},
+		"mapping.name": {"name"},
+		"key_column":   {"code"},
+	}
+	if rec := postExtSQLImport(mux, "/import/Vendor/sql/commit", tenantID, ownerVals); !strings.Contains(rec.Body.String(), "2 created") {
+		t.Fatalf("owner import: expected 2 created, got %d:\n%s", rec.Code, rec.Body.String())
+	}
+	ctx := context.Background()
+	engine := crud.NewEngine(db)
+	if _, err := engine.Create(ctx, foundation.SystemOfRecord(), map[string]any{
+		"entity_type": "Vendor", "source_id": ownerID, "mode": "read_only",
+	}, humanActor()); err != nil {
+		t.Fatalf("seed SystemOfRecord: %v", err)
+	}
+
+	// The other source's identity rows resolve to the SAME records (a
+	// dual-sourced mirror) — seeded via the raw engine by copying the
+	// owner's identities under the other source's id.
+	rows, err := db.Query(`SELECT data->>'record_id', data->>'external_key' FROM records WHERE entity_type = 'ExternalIdentity' AND deleted_at IS NULL AND data->>'source_id' = $1`, ownerID)
+	if err != nil {
+		t.Fatalf("read owner identities: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var recordID, key string
+		if err := rows.Scan(&recordID, &key); err != nil {
+			t.Fatalf("scan identity: %v", err)
+		}
+		if _, err := engine.Create(ctx, foundation.ExternalIdentity(), map[string]any{
+			"source_id":       otherID,
+			"source_relation": "public.ext_vendors",
+			"entity_type":     "Vendor",
+			"record_id":       recordID,
+			"external_key":    key,
+		}, humanActor()); err != nil {
+			t.Fatalf("seed other-source identity: %v", err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate identities: %v", err)
+	}
+
+	otherVals := url.Values{
+		"source_id":    {otherID},
+		"schema":       {"public"},
+		"relation":     {"ext_vendors"},
+		"mapping.name": {"name"},
+		"key_column":   {"code"},
+	}
+	rec := postExtSQLImport(mux, "/import/Vendor/sql/commit", tenantID, otherVals)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 (per-row errors, not a request failure), got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "0 created, 0 updated, 2 failed") {
+		t.Fatalf("expected every row blocked, got:\n%s", body)
+	}
+	if !strings.Contains(body, "This record is owned by Legacy") {
+		t.Fatalf("expected the translated per-row block message naming the owning source, got:\n%s", body)
+	}
+	if strings.Contains(body, "read-only external source") {
+		t.Fatalf("authz's logs-only Error() text leaked into the result rows:\n%s", body)
 	}
 }
 

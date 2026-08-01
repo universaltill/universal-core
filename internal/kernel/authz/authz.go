@@ -117,6 +117,20 @@ var controlPlaneTypes = map[string]bool{
 	// sqlsource.RecordEngine's doc comment), the same posture workflow
 	// steps and provisioning use.
 	"ExternalIdentity": true,
+	// SystemOfRecord (uc-infra#102) is an authority-redirecting record
+	// too — it is the config that decides whether an entity type's
+	// imported records are user-writable at all, so left open it is
+	// self-disarming: any user could flip a read_only row to
+	// platform_owned, hand-edit the "protected" record, and flip it back
+	// (proven with three HTTP requests in review). Same class as
+	// Delegation/ExternalIdentity above. NOT systemOnlyWriteTypes,
+	// because legitimate hand-writes exist — an admin declaring
+	// ownership IS the feature. And like the rest of the control plane
+	// it stays open in a fully unconfigured tenant: coherent, not a
+	// hole, because a tenant with no RBAC distinguishes no users, so
+	// protecting the declaration from "someone less privileged" only
+	// means anything once RBAC exists at all.
+	"SystemOfRecord": true,
 }
 
 // entityPerm is the memoized per-entity-type resolution result.
@@ -473,6 +487,16 @@ func (r *Resolver) CanWrite(ctx context.Context, entityType string) (bool, error
 type GuardedEngine struct {
 	raw *crud.Engine
 	res *Resolver
+
+	// sorMemo caches SystemOfRecord rows per entity type for this
+	// instance's (per-request) lifetime — see sorRules in sor.go.
+	sorMemo map[string][]sorRule
+
+	// sorBypassSourceID, when non-empty, scopes the system-of-record
+	// read-only check out for records identified against exactly this
+	// ExternalSQLSource — set only by ForImportFrom (sor.go), never
+	// directly. RBAC checks are unaffected by it.
+	sorBypassSourceID string
 }
 
 // Guard wraps raw with res.
@@ -669,6 +693,14 @@ func (g *GuardedEngine) Create(ctx context.Context, def *entity.Definition, fiel
 	if err := g.checkWrite(ctx, def); err != nil {
 		return data.Record{}, err
 	}
+	// No system-of-record read-only check on Create: a NEW record cannot
+	// have been imported from anywhere (no ExternalIdentity row can name
+	// an id that doesn't exist yet) — a read_only declaration mirrors
+	// existing legacy records, it doesn't forbid the tenant creating its
+	// own. Saving a reserved SoR mode is refused, though (sor.go).
+	if err := checkSoRModeReserved(def, fields); err != nil {
+		return data.Record{}, err
+	}
 	effective, err := g.EffectiveWriteFields(ctx, def, "", fields)
 	if err != nil {
 		return data.Record{}, err
@@ -691,6 +723,17 @@ func (g *GuardedEngine) Update(ctx context.Context, def *entity.Definition, id s
 	if err := g.checkWrite(ctx, def); err != nil {
 		return 0, err
 	}
+	// System-of-record checks after RBAC (sor.go): a record imported from
+	// a read_only external source cannot be hand-edited — data ownership,
+	// not privilege, so admins and machine actors are NOT exempt. The one
+	// sanctioned writer is that source's own import, which holds a
+	// scoped bypass for exactly its own source (ForImportFrom, sor.go).
+	if err := checkSoRModeReserved(def, fields); err != nil {
+		return 0, err
+	}
+	if err := g.checkSoRReadOnly(ctx, def, id); err != nil {
+		return 0, err
+	}
 	effective, err := g.EffectiveWriteFields(ctx, def, id, fields)
 	if err != nil {
 		return 0, err
@@ -700,6 +743,13 @@ func (g *GuardedEngine) Update(ctx context.Context, def *entity.Definition, id s
 
 func (g *GuardedEngine) Delete(ctx context.Context, def *entity.Definition, id string, actor audit.Actor) error {
 	if err := g.checkWrite(ctx, def); err != nil {
+		return err
+	}
+	// Deleting an imported read-only record is as much a hand-edit as
+	// updating it — the next sync would just resurrect it (or worse,
+	// re-create it under a new id, breaking every reference). Same check,
+	// same non-exemptions, as Update above.
+	if err := g.checkSoRReadOnly(ctx, def, id); err != nil {
 		return err
 	}
 	return g.raw.Delete(ctx, def, id, actor)

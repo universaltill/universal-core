@@ -776,5 +776,9 @@
   "form.Period.section.details": "Detaylar",
   "form.TaxCode.section.details": "Detaylar",
   "form.CostCenter.section.details": "Detaylar",
-  "form.action.save": "Kaydet"
+  "form.action.save": "Kaydet",
+  "sor.read_only_blocked": "Bu kayıt {source} tarafından sahiplenilmiştir; ana kayıt sistemi salt okunurdur — düzenlemeler bir sonraki içe aktarmada üzerine yazılır.",
+  "sor.read_only_blocked_no_source": "Bu kayıt salt okunur bir harici ana kayıt sistemine aittir — düzenlemeler bir sonraki içe aktarmada üzerine yazılır.",
+  "sor.mode_reserved": "\"bidirectional\" modu, yaklaşan eşitleme motoru için ayrılmıştır ve henüz kaydedilemez.",
+  "form.SystemOfRecord.section.details": "Detaylar"
 }

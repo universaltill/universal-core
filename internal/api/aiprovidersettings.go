@@ -180,14 +180,18 @@ func (h *Handler) aiProviderSettingsSave(w http.ResponseWriter, r *http.Request)
 	if id == "" {
 		rec, err := ts.crud.Create(r.Context(), def, fields, rc.Actor)
 		if err != nil {
-			writeInternalError(w, "create AIProviderConnection", err)
+			// Localized crud mapper, not writeInternalError: the guarded
+			// engine's typed refusals (RBAC denial, a system-of-record
+			// block — uc-infra#102) are the requester's 4xx with a
+			// legible translated message, never a generic 500.
+			h.writeCrudErrorLocalized(w, r, "create AIProviderConnection", err)
 			return
 		}
 		id = rec.ID
 	} else {
 		v := version
 		if _, err := ts.crud.Update(r.Context(), def, id, fields, &v, rc.Actor); err != nil {
-			writeInternalError(w, "update AIProviderConnection", err)
+			h.writeCrudErrorLocalized(w, r, "update AIProviderConnection", err)
 			return
 		}
 	}
@@ -324,7 +328,11 @@ func (h *Handler) aiProviderSettingsClear(w http.ResponseWriter, r *http.Request
 	}
 	if id != "" {
 		if err := ts.crud.Delete(r.Context(), def, id, rc.Actor); err != nil {
-			writeInternalError(w, "delete AIProviderConnection", err)
+			// writeCrudErrorLocalized, not writeInternalError: the guarded
+			// Delete's typed refusals (an RBAC denial, or a system-of-record
+			// block — uc-infra#102) are the requester's 4xx with a legible
+			// message, not a server fault to bury as a 500.
+			h.writeCrudErrorLocalized(w, r, "delete AIProviderConnection", err)
 			return
 		}
 	}

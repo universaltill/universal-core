@@ -776,5 +776,9 @@
   "form.Period.section.details": "التفاصيل",
   "form.TaxCode.section.details": "التفاصيل",
   "form.CostCenter.section.details": "التفاصيل",
-  "form.action.save": "حفظ"
+  "form.action.save": "حفظ",
+  "sor.read_only_blocked": "هذا السجل مملوك لـ {source}؛ نظام السجل الرئيسي للقراءة فقط — ستُستبدل التعديلات عند الاستيراد التالي.",
+  "sor.read_only_blocked_no_source": "هذا السجل مملوك لنظام سجل خارجي للقراءة فقط — ستُستبدل التعديلات عند الاستيراد التالي.",
+  "sor.mode_reserved": "الوضع \"bidirectional\" محجوز لمحرك المزامنة القادم ولا يمكن حفظه بعد.",
+  "form.SystemOfRecord.section.details": "التفاصيل"
 }

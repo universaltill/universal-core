@@ -567,7 +567,19 @@ func (h *Handler) membersRemove(w http.ResponseWriter, r *http.Request) {
 		if rows, err := ts.crud.ListByField(r.Context(), userRoleDef, "user_id", userID); err == nil {
 			for _, row := range rows {
 				if err := ts.crud.Delete(r.Context(), userRoleDef, row.ID, rc.Actor); err != nil {
-					log.Printf("api: members: delete UserRole %s: %v", row.ID, err)
+					// A system-of-record block (uc-infra#102) is a typed,
+					// deliberate refusal — surface it legibly and stop.
+					// Every OTHER failure keeps this loop's documented
+					// best-effort policy (the comment above): log and
+					// continue, because the Zitadel revoke already stands
+					// and orphaned UserRole rows grant nothing — turning a
+					// transient DB error on row 1 into rows 2..n never
+					// being attempted was a review-caught regression.
+					if errors.Is(err, authz.ErrSystemOfRecordReadOnly) {
+						h.writeCrudErrorLocalized(w, r, "delete UserRole "+row.ID, err)
+						return
+					}
+					log.Printf("api: delete UserRole %s during member removal: %v", row.ID, err)
 				}
 			}
 		}
@@ -656,6 +668,14 @@ func (h *Handler) membersRevokeRole(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err := ts.crud.Delete(r.Context(), userRoleDef, recordID, rc.Actor); err != nil {
+		// System-of-record refusals go through the localized crud mapper
+		// (uc-infra#102) — membersActionError's banner would render the
+		// engine's logs-only English Error() text verbatim. Every other
+		// failure keeps the page's own banner treatment.
+		if errors.Is(err, authz.ErrSystemOfRecordReadOnly) || errors.Is(err, authz.ErrSystemOfRecordModeReserved) {
+			h.writeCrudErrorLocalized(w, r, "revoke role", err)
+			return
+		}
 		h.membersActionError(w, r, rc, ts, locale, "revoke role", err)
 		return
 	}

@@ -547,6 +547,65 @@ func ExternalIdentity() *entity.Definition {
 	}
 }
 
+// SystemOfRecord declares who owns an entity type's records (uc-infra#102):
+// the tenant's statement of which system is the master for, say, Item or
+// Party — this platform, or an external legacy database registered as an
+// ExternalSQLSource. It maps to ADR-0001's Observe→Assist→Transact→Own
+// adoption gates: "read_only" is the Observe/Assist posture (Core mirrors
+// the legacy system's records via the import wizard and must never
+// hand-edit them — the legacy system would just overwrite the edit on the
+// next sync, silently), "platform_owned" is the Own posture (Core is the
+// master, edit freely), and "bidirectional" is the Transact posture
+// (two-way sync).
+//
+// "bidirectional" is a declared-but-reserved value: the sync engine that
+// would honor it is a later slice, so the enforcement layer
+// (internal/kernel/authz's guarded-engine check) treats it as
+// invalid-to-save for now — deliberately via that config-level check, NOT
+// by omitting it from this enum, because removing an enum value later
+// would be a breaking change to already-stored rows while reserving it
+// now is purely additive: when the sync engine ships, only the authz
+// rejection is lifted, no entity/schema change.
+//
+// source_id names WHICH external source owns the records — required in
+// spirit for read_only (an ownership claim with no owner names nothing),
+// but not Required at the entity level because it is meaningless for
+// platform_owned (there is no external party to point at), and
+// conditional-on-another-field validation isn't something entity.Field
+// can express (AIProviderConnection.api_key_encrypted documents the same
+// limitation).
+//
+// One row per entity_type is an app-level convention, not a DB constraint
+// — the generic entity/crud layer has no unique-constraint concept, the
+// same limitation ExternalIdentity's uniqueness convention already
+// documents for this kernel. If several rows exist for one entity_type,
+// the most restrictive wins: any read_only row makes the type read_only
+// for records identified against that row's source, regardless of what
+// other rows say. Fail-safe by design — conflicting ownership claims must
+// degrade to "don't let a hand-edit clobber a sync," never the reverse.
+//
+// Enforcement lives in internal/kernel/authz (GuardedEngine's
+// system-of-record check), NOT here and NOT in crud/entity — the generic
+// engines stay free of entity-type-specific behavior per CLAUDE.md's
+// kernel-boundary rule; authz is config-plumbing over its own named
+// types, the same way controlPlaneTypes already names types.
+func SystemOfRecord() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "SystemOfRecord",
+		Version:    1,
+		Module:     "foundation",
+		Fields: []entity.Field{
+			// entity_type is a plain string for Attachment's reason: it
+			// must be able to name any entity type, including ones that
+			// don't exist yet when this Definition is authored.
+			{Name: "entity_type", Type: entity.FieldString, Required: true},
+			{Name: "source_id", Type: entity.FieldReference, Target: "ExternalSQLSource"},
+			{Name: "mode", Type: entity.FieldEnum, Required: true,
+				EnumValues: []string{"read_only", "bidirectional", "platform_owned"}},
+		},
+	}
+}
+
 // Role is a tenant-defined, tenant-customizable access-control role —
 // "Warehouse Supervisor," "Finance Manager," whatever a given tenant
 // actually needs (Farshid, 2026-07-29: "we need lots of role in the
@@ -835,6 +894,7 @@ func All() []*entity.Definition {
 		AIProviderConnection(),
 		ExternalSQLSource(),
 		ExternalIdentity(),
+		SystemOfRecord(),
 		Role(),
 		UserRole(),
 		Permission(),

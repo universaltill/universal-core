@@ -641,3 +641,61 @@ func TestExternalIdentity_RequiresAllFields(t *testing.T) {
 		}
 	}
 }
+
+// TestSystemOfRecord_RequiresEntityTypeAndMode — entity_type and mode are
+// the two halves of an ownership declaration ("Items are read-only
+// here"); a row missing either declares nothing.
+func TestSystemOfRecord_RequiresEntityTypeAndMode(t *testing.T) {
+	def := SystemOfRecord()
+	valid := map[string]any{
+		"entity_type": "Item", "source_id": "src-1", "mode": "read_only",
+	}
+	if err := entity.ValidateRecord(def, valid); err != nil {
+		t.Fatalf("expected a complete SystemOfRecord row to be valid, got %v", err)
+	}
+	for _, missing := range []string{"entity_type", "mode"} {
+		data := map[string]any{}
+		for k, v := range valid {
+			if k != missing {
+				data[k] = v
+			}
+		}
+		if err := entity.ValidateRecord(def, data); err == nil {
+			t.Errorf("expected an error for a SystemOfRecord row missing required %q", missing)
+		}
+	}
+}
+
+// TestSystemOfRecord_SourceIsOptional — source_id is meaningless for
+// platform_owned (no external party to point at), so it is not Required
+// at the entity level; the entity's doc comment covers why the
+// read_only-needs-a-source expectation can't be expressed here either.
+func TestSystemOfRecord_SourceIsOptional(t *testing.T) {
+	def := SystemOfRecord()
+	if err := entity.ValidateRecord(def, map[string]any{
+		"entity_type": "Item", "mode": "platform_owned",
+	}); err != nil {
+		t.Fatalf("expected a sourceless platform_owned row to be valid, got %v", err)
+	}
+}
+
+// TestSystemOfRecord_ModeEnum — all three declared values validate,
+// including the reserved "bidirectional": the ENTITY accepts it (removing
+// it later would be a breaking enum change; reserving it is additive) and
+// the guarded engine, not this layer, is what refuses to save it
+// (authz.ErrSystemOfRecordModeReserved — tested in internal/kernel/authz).
+func TestSystemOfRecord_ModeEnum(t *testing.T) {
+	def := SystemOfRecord()
+	for _, mode := range []string{"read_only", "bidirectional", "platform_owned"} {
+		if err := entity.ValidateRecord(def, map[string]any{
+			"entity_type": "Item", "mode": mode,
+		}); err != nil {
+			t.Errorf("expected declared mode %q to validate at the entity level, got %v", mode, err)
+		}
+	}
+	if err := entity.ValidateRecord(def, map[string]any{
+		"entity_type": "Item", "mode": "write_back_someday",
+	}); err == nil {
+		t.Error("expected an error for an unknown SystemOfRecord mode")
+	}
+}

@@ -39,6 +39,7 @@ import (
 
 	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/httpx"
+	"github.com/universaltill/universal-core/internal/kernel/authz"
 	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/csvimport"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
@@ -141,11 +142,10 @@ func (h *Handler) extSQLImportRelations(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	src, ok := h.extSQLSourceFromRequest(w, r, ts, locale)
+	src, sourceID, ok := h.extSQLSourceFromRequest(w, r, ts, locale)
 	if !ok {
 		return
 	}
-	sourceID := r.PostForm.Get("source_id")
 
 	ctx, cancel := context.WithTimeout(r.Context(), extSQLBrowseTimeout)
 	defer cancel()
@@ -243,11 +243,10 @@ func (h *Handler) extSQLImportPreviewOrCommit(w http.ResponseWriter, r *http.Req
 		def = &visible
 	}
 
-	src, ok := h.extSQLSourceFromRequest(w, r, ts, locale)
+	src, sourceID, ok := h.extSQLSourceFromRequest(w, r, ts, locale)
 	if !ok {
 		return
 	}
-	sourceID := r.PostForm.Get("source_id")
 	schema := r.PostForm.Get("schema")
 	relation := r.PostForm.Get("relation")
 	if schema == "" || relation == "" {
@@ -440,14 +439,21 @@ func (h *Handler) extSQLImportPreviewOrCommit(w http.ResponseWriter, r *http.Req
 		// $Customer and $Vendor imports landing in one entity type never
 		// share a key namespace (sqlsource's package comment).
 		sourceRelation := schema + "." + relation
-		// Target records go through the GUARDED engine (ts.crud) like
-		// every user-driven write; the identity rows go through a raw
-		// engine deliberately: ExternalIdentity is control-plane-gated in
-		// authz (a user authoring one could re-point the next import at
-		// any record), so the importer writes them via the same
-		// system-path side-channel workflow steps and provisioning use —
-		// see tenantScope's own doc comment and sqlsource.RecordEngine's.
-		upserts, err = sqlsource.CommitRowsUpserting(ctx, augHeaders, augRows, def, augMapping, keyColumn, sourceID, sourceRelation, ts.crud, crud.NewEngine(ts.db), identityDef, rc.Actor)
+		// Target records go through the GUARDED engine like every
+		// user-driven write — via ForImportFrom(sourceID), the copy whose
+		// system-of-record read-only check is bypassed ONLY for blocks
+		// attributable to this exact source (uc-infra#102): the import IS
+		// the source's own pen writing its own records, so a read_only
+		// declaration must not block the very sync it protects. Imports
+		// from a DIFFERENT source remain blocked per-row by design (their
+		// rows would be overwriting this source's records), and RBAC
+		// checks run unchanged. The identity rows go through a raw engine
+		// deliberately: ExternalIdentity is control-plane-gated in authz
+		// (a user authoring one could re-point the next import at any
+		// record), so the importer writes them via the same system-path
+		// side-channel workflow steps and provisioning use — see
+		// tenantScope's own doc comment and sqlsource.RecordEngine's.
+		upserts, err = sqlsource.CommitRowsUpserting(ctx, augHeaders, augRows, def, augMapping, keyColumn, sourceID, sourceRelation, ts.crud.ForImportFrom(sourceID), crud.NewEngine(ts.db), identityDef, rc.Actor)
 		if err != nil {
 			writeCrudError(w, fmt.Sprintf("commit %s SQL import rows (keyed)", entityType), err)
 			return
@@ -485,21 +491,30 @@ func (h *Handler) extSQLImportPreviewOrCommit(w http.ResponseWriter, r *http.Req
 		UpdatedLabel: h.catalog.T(locale, "extsql_import.result_updated"),
 		FailedLabel:  h.catalog.T(locale, "import.result_failed"),
 		RowCapNote:   extSQLRowCapNote(h, locale),
-		Rows:         buildUpsertResultRows(upserts, rowCreated, rowUpdated, rowError),
+		Rows:         h.buildUpsertResultRows(locale, upserts, rowCreated, rowUpdated, rowError),
 	})
 }
 
 // buildUpsertResultRows is buildResultRows with the created/updated
 // distinction a keyed commit reports per row (create-only commits pass
-// through it too — every OK row is simply "created").
-func buildUpsertResultRows(results []sqlsource.UpsertResult, createdLabel, updatedLabel, errorLabel string) []previewRowView {
+// through it too — every OK row is simply "created"). A Handler method
+// because a per-row system-of-record refusal — an import from a
+// DIFFERENT source touching records a read_only source owns — must
+// render its translated message, not authz's logs-only Error() text;
+// every other row error keeps the raw text, matching the CSV result
+// table's existing convention.
+func (h *Handler) buildUpsertResultRows(locale string, results []sqlsource.UpsertResult, createdLabel, updatedLabel, errorLabel string) []previewRowView {
 	rows := make([]previewRowView, len(results))
 	for i, res := range results {
 		row := previewRowView{RowNumber: res.RowNumber, Data: fmt.Sprintf("%v", res.Data)}
 		switch {
 		case res.Err != nil:
 			row.Status = errorLabel
-			row.Error = res.Err.Error()
+			if errors.Is(res.Err, authz.ErrSystemOfRecordReadOnly) {
+				row.Error = h.sorReadOnlyMessage(locale, res.Err)
+			} else {
+				row.Error = res.Err.Error()
+			}
 		case res.Updated:
 			row.OK = true
 			row.Status = updatedLabel
@@ -553,30 +568,36 @@ func (h *Handler) listExtSQLSources(w http.ResponseWriter, r *http.Request, ts t
 
 // extSQLSourceFromRequest parses the submitted source_id, loads the
 // record through the guarded engine, and shapes it into a ready-to-dial
-// Source (password decrypted). ok=false means the response was written.
-func (h *Handler) extSQLSourceFromRequest(w http.ResponseWriter, r *http.Request, ts tenantScope, locale string) (sqlsource.Source, bool) {
+// Source (password decrypted), returning the RESOLVED record's id —
+// callers must use that id (not a re-read of the form) wherever the id
+// carries authority, most of all ForImportFrom's system-of-record
+// bypass: the bypass's safety argument is "this is the source the
+// guarded Get verified", which should hold by construction, not by two
+// reads of the same form field happening to agree (review finding).
+// ok=false means the response was written.
+func (h *Handler) extSQLSourceFromRequest(w http.ResponseWriter, r *http.Request, ts tenantScope, locale string) (sqlsource.Source, string, bool) {
 	if err := r.ParseForm(); err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, "invalid form submission: "+err.Error())
-		return sqlsource.Source{}, false
+		return sqlsource.Source{}, "", false
 	}
 	sourceID := r.PostForm.Get("source_id")
 	if !isValidID(sourceID) {
 		httpx.WriteError(w, http.StatusBadRequest, "invalid source id")
-		return sqlsource.Source{}, false
+		return sqlsource.Source{}, "", false
 	}
 	def, err := ts.entityDef(r.Context(), "ExternalSQLSource")
 	if err != nil {
 		writeDefinitionLookupError(w, "ExternalSQLSource", err)
-		return sqlsource.Source{}, false
+		return sqlsource.Source{}, "", false
 	}
 	rec, err := ts.crud.Get(r.Context(), def, sourceID)
 	if errors.Is(err, data.ErrNotFound) {
 		httpx.WriteError(w, http.StatusNotFound, fmt.Sprintf("ExternalSQLSource %q not found", sourceID))
-		return sqlsource.Source{}, false
+		return sqlsource.Source{}, "", false
 	}
 	if err != nil {
 		writeCrudError(w, "get ExternalSQLSource "+sourceID, err)
-		return sqlsource.Source{}, false
+		return sqlsource.Source{}, "", false
 	}
 	src, err := h.extSQLSourceFromFields(rec.Data)
 	if err != nil {
@@ -584,9 +605,9 @@ func (h *Handler) extSQLSourceFromRequest(w http.ResponseWriter, r *http.Request
 		// stay in the log, the user gets the generic failure.
 		log.Printf("api: SQL import: build source %s: %v", sourceID, err)
 		h.writeExtSQLImportError(w, locale)
-		return sqlsource.Source{}, false
+		return sqlsource.Source{}, "", false
 	}
-	return src, true
+	return src, sourceID, true
 }
 
 // openExtSQL composes the DSN and opens the handle. Neither the DSN nor

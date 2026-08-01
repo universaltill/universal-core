@@ -776,5 +776,9 @@
   "form.Period.section.details": "جزئیات",
   "form.TaxCode.section.details": "جزئیات",
   "form.CostCenter.section.details": "جزئیات",
-  "form.action.save": "ذخیره"
+  "form.action.save": "ذخیره",
+  "sor.read_only_blocked": "این رکورد متعلق به {source} است؛ سامانه مرجع فقط‌خواندنی است — ویرایش‌ها با ورود بعدی بازنویسی می‌شوند.",
+  "sor.read_only_blocked_no_source": "این رکورد متعلق به یک سامانه مرجع خارجی فقط‌خواندنی است — ویرایش‌ها با ورود بعدی بازنویسی می‌شوند.",
+  "sor.mode_reserved": "حالت \"bidirectional\" برای موتور همگام‌سازی آینده رزرو شده است و هنوز قابل ذخیره نیست.",
+  "form.SystemOfRecord.section.details": "جزئیات"
 }

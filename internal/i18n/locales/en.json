@@ -776,5 +776,9 @@
   "form.Period.section.details": "Details",
   "form.TaxCode.section.details": "Details",
   "form.CostCenter.section.details": "Details",
-  "form.action.save": "Save"
+  "form.action.save": "Save",
+  "sor.read_only_blocked": "This record is owned by {source}; the system of record is read-only — edits would be overwritten by the next import.",
+  "sor.read_only_blocked_no_source": "This record is owned by a read-only external system of record — edits would be overwritten by the next import.",
+  "sor.mode_reserved": "The \"bidirectional\" mode is reserved for the upcoming sync engine and cannot be saved yet.",
+  "form.SystemOfRecord.section.details": "Details"
 }

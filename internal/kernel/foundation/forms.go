@@ -108,6 +108,38 @@ func AllForms() []*form.Definition {
 		PermissionForm(), FieldPermissionForm(),
 		DepartmentForm(), PositionForm(),
 		DelegationForm(),
+		SystemOfRecordForm(),
+	}
+}
+
+// SystemOfRecordForm is the generated screen for declaring who owns an
+// entity type (SystemOfRecord, foundation.go). Unlike the two
+// secret-bearing settings exceptions (AIProviderConnection,
+// ExternalSQLSource — see AllForms' doc comment above) it holds no
+// secret, and unlike ExternalIdentity it is genuinely tenant-authored
+// configuration, not system bookkeeping — an admin declaring "Items are
+// mastered in NAV, read-only here" is exactly what a generic form is
+// for. Saving mode "bidirectional" is rejected by
+// internal/kernel/authz's guarded-engine check (a reserved value — see
+// the entity's own doc comment), not by this form.
+func SystemOfRecordForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "SystemOfRecord",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Details",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "entity_type", Label: "Entity type"},
+					{Name: "source_id", Label: "External source"},
+					{Name: "mode", Label: "Mode"},
+				},
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
 	}
 }
 

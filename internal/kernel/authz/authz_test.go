@@ -265,6 +265,15 @@ func TestResolver_ControlPlane_SelfProtection(t *testing.T) {
 	got, err = r.CanRead(ctx, "ExternalIdentity")
 	mustCan(t, got, err, true, "bootstrap CanRead(ExternalIdentity)")
 
+	// SystemOfRecord is control-plane (its doc comment on
+	// controlPlaneTypes: the row that decides whether imported records
+	// are writable must not be flippable by anyone it protects against)
+	// but NOT system-only: in the bootstrap window it stays open like
+	// Role — a tenant with no RBAC distinguishes no users, so
+	// self-disarm protection means nothing yet.
+	got, err = r.CanWrite(ctx, "SystemOfRecord")
+	mustCan(t, got, err, true, "bootstrap CanWrite(SystemOfRecord)")
+
 	// Configure RBAC: a real tenant_admin grant.
 	admin := f.role(AdminRoleCode)
 	f.grant("user-admin", admin.ID)
@@ -277,7 +286,7 @@ func TestResolver_ControlPlane_SelfProtection(t *testing.T) {
 	// the import engine writes identities through a raw-engine
 	// side-channel instead (sqlsource.RecordEngine's doc comment).
 	r = humanResolver(f, "user-mallory")
-	for _, ct := range []string{"Role", "UserRole", "Permission", "FieldPermission", "Delegation", "ExternalIdentity"} {
+	for _, ct := range []string{"Role", "UserRole", "Permission", "FieldPermission", "Delegation", "ExternalIdentity", "SystemOfRecord"} {
 		got, err = r.CanWrite(ctx, ct)
 		mustCan(t, got, err, false, "mallory CanWrite("+ct+") once configured")
 	}
@@ -297,6 +306,11 @@ func TestResolver_ControlPlane_SelfProtection(t *testing.T) {
 	// who writes it.
 	got, err = r.CanWrite(ctx, "ExternalIdentity")
 	mustCan(t, got, err, false, "admin CanWrite(ExternalIdentity) — system-only")
+	// SystemOfRecord IS admin-writable once configured — an admin
+	// declaring ownership is the feature, unlike identity rows which
+	// have no legitimate hand-writer.
+	got, err = r.CanWrite(ctx, "SystemOfRecord")
+	mustCan(t, got, err, true, "admin CanWrite(SystemOfRecord)")
 
 	hr := f.role("hr-manager")
 	f.grant("user-hr", hr.ID)

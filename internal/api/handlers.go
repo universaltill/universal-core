@@ -449,6 +449,55 @@ func writeCrudError(w http.ResponseWriter, logContext string, err error) {
 	writeInternalError(w, logContext, err)
 }
 
+// writeCrudErrorLocalized is writeCrudError plus the system-of-record
+// mappings (uc-infra#102), used on the user-driven mutation paths
+// (create/update/delete call sites) where authz's SoR checks can fire.
+// A Handler method, unlike writeCrudError, because these two refusals
+// MUST render translated: authz.SoRReadOnlyError's Error() string is
+// explicitly logs-only (sor.go's own doc comment), and the envelope's
+// error string is exactly what the global error toast shows a browser
+// user on a failed form save — so the translated text has to live in the
+// envelope itself, for the JSON API client and the form-save toast alike.
+//
+//   - SoRReadOnlyError → 409: the record exists and the request was
+//     well-formed; it conflicts with the source's ownership of the data
+//     (the same "state disagrees with your request" family as the
+//     version-conflict 409 above it in updateRecord). The message names
+//     the owning source when the engine could resolve its name, and
+//     falls back to a no-source variant otherwise.
+//   - ErrSystemOfRecordModeReserved → 400: the submitted value itself is
+//     unacceptable today ("bidirectional" is reserved for the sync
+//     engine), same family as every other validation 400.
+func (h *Handler) writeCrudErrorLocalized(w http.ResponseWriter, r *http.Request, logContext string, err error) {
+	if errors.Is(err, authz.ErrSystemOfRecordReadOnly) {
+		// Logged server-side: the engine's Error() text (entity type,
+		// source id) is exactly the "for logs only" detail sor.go
+		// promises, and the translated envelope deliberately carries less.
+		log.Printf("api: %s: %v", logContext, err)
+		httpx.WriteError(w, http.StatusConflict, h.sorReadOnlyMessage(localeFromRequest(w, r), err))
+		return
+	}
+	if errors.Is(err, authz.ErrSystemOfRecordModeReserved) {
+		log.Printf("api: %s: %v", logContext, err)
+		locale := localeFromRequest(w, r)
+		httpx.WriteError(w, http.StatusBadRequest, h.catalog.T(locale, "sor.mode_reserved"))
+		return
+	}
+	writeCrudError(w, logContext, err)
+}
+
+// sorReadOnlyMessage builds the translated system-of-record refusal for
+// the viewer's locale, naming the owning source when the engine resolved
+// its name — shared by the single-record mapping above and the import
+// result table's per-row rendering (extsqlimport.go).
+func (h *Handler) sorReadOnlyMessage(locale string, err error) string {
+	var sorErr *authz.SoRReadOnlyError
+	if errors.As(err, &sorErr) && sorErr.SourceName != "" {
+		return strings.ReplaceAll(h.catalog.T(locale, "sor.read_only_blocked"), "{source}", sorErr.SourceName)
+	}
+	return h.catalog.T(locale, "sor.read_only_blocked_no_source")
+}
+
 // idPattern matches the shape records.id/tenants.id actually are
 // (Postgres gen_random_uuid()). Rejecting a malformed id here means a
 // client typo becomes a clean 400 before ever reaching a query, instead
@@ -606,7 +655,9 @@ func (h *Handler) createRecord(w http.ResponseWriter, r *http.Request) {
 
 	rec, err := ts.crud.Create(r.Context(), entDef, fields, rc.Actor)
 	if err != nil {
-		writeCrudError(w, fmt.Sprintf("create %s record", entityType), err)
+		// Localized variant: the guarded Create can refuse a reserved
+		// SystemOfRecord mode (authz.ErrSystemOfRecordModeReserved).
+		h.writeCrudErrorLocalized(w, r, fmt.Sprintf("create %s record", entityType), err)
 		return
 	}
 	h.triggerWorkflows(r.Context(), ts, entityType, rec.ID, workflow.TriggerOnCreate, rc.Actor)
@@ -710,7 +761,10 @@ func (h *Handler) updateRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeCrudError(w, fmt.Sprintf("update %s %s", entityType, id), err)
+		// Localized variant: the guarded Update can refuse a hand-edit of
+		// a record a read_only system of record owns (409, uc-infra#102)
+		// or a reserved SystemOfRecord mode (400) — both translated.
+		h.writeCrudErrorLocalized(w, r, fmt.Sprintf("update %s %s", entityType, id), err)
 		return
 	}
 	h.triggerWorkflows(r.Context(), ts, entityType, id, workflow.TriggerOnUpdate, rc.Actor)
