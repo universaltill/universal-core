@@ -96,7 +96,7 @@ func testServerWithSecretCryptor(t *testing.T) (srv *httptest.Server, tenantID s
 // helpers don't cross packages. This is what makes the tenant's own
 // database a real, reachable "external" source without assuming a second
 // server exists.
-func extSQLPGParams(t *testing.T, tenantDB *sql.DB) (host, port, user, database, options string) {
+func extSQLPGParams(t *testing.T, tenantDB *sql.DB) (host, port, user, pass, database, options string) {
 	t.Helper()
 	u, err := url.Parse(os.Getenv("TEST_DATABASE_URL"))
 	if err != nil {
@@ -106,21 +106,28 @@ func extSQLPGParams(t *testing.T, tenantDB *sql.DB) (host, port, user, database,
 	port = u.Port()
 	if u.User != nil {
 		user = u.User.Username()
+		// The password must travel too: locally a trust-auth Postgres
+		// has none, but CI's service container requires one — dropping
+		// it made the wizard's dial-out fail only in CI (relations list
+		// never rendered, 30s deadline).
+		pass, _ = u.User.Password()
 	}
 	options = u.RawQuery
 	if err := tenantDB.QueryRow(`SELECT current_database()`).Scan(&database); err != nil {
 		t.Fatalf("resolve tenant database name: %v", err)
 	}
-	return host, port, user, database, options
+	return host, port, user, pass, database, options
 }
 
-// registerPasswordlessPGSource registers the tenant's own database as a
-// passwordless ExternalSQLSource straight over HTTP (the import test's
-// setup — the settings page itself gets its browser coverage in
+// registerTestPGSource registers the tenant's own database as an
+// ExternalSQLSource straight over HTTP (the import test's setup — the
+// settings page itself gets its browser coverage in
 // TestSQLImportSourceSettings_RealBrowser) and returns the record id.
-func registerPasswordlessPGSource(t *testing.T, srv *httptest.Server, tenantID, name string, tenantDB *sql.DB) string {
+// The password is whatever TEST_DATABASE_URL carries: empty on a local
+// trust-auth Postgres, real against CI's service container.
+func registerTestPGSource(t *testing.T, srv *httptest.Server, tenantID, name string, tenantDB *sql.DB) string {
 	t.Helper()
-	host, port, user, database, options := extSQLPGParams(t, tenantDB)
+	host, port, user, pass, database, options := extSQLPGParams(t, tenantDB)
 	vals := url.Values{}
 	vals.Set("name", name)
 	vals.Set("driver", "postgres")
@@ -128,7 +135,7 @@ func registerPasswordlessPGSource(t *testing.T, srv *httptest.Server, tenantID, 
 	vals.Set("port", port)
 	vals.Set("database", database)
 	vals.Set("username", user)
-	vals.Set("password", "")
+	vals.Set("password", pass)
 	vals.Set("options", options)
 
 	req, err := http.NewRequest("POST", srv.URL+"/settings/sql-sources", strings.NewReader(vals.Encode()))
@@ -175,7 +182,7 @@ func storedExtSQLSourceID(t *testing.T, tenantDB *sql.DB, name string) string {
 func TestSQLImportSourceSettings_RealBrowser(t *testing.T) {
 	withDevAuthEnabled(t)
 	srv, tenantID, tenantDB := testServerWithSecretCryptor(t)
-	host, port, user, database, options := extSQLPGParams(t, tenantDB)
+	host, port, user, _, database, options := extSQLPGParams(t, tenantDB)
 	ctx := browserCtx(t, tenantID)
 
 	const plainPassword = "e2e-plain-password-must-never-render"
@@ -284,7 +291,7 @@ func TestSQLImportWizard_NAVTemplate_RealBrowser(t *testing.T) {
 		t.Fatalf("fill NAV-shaped table: %v", err)
 	}
 
-	sourceID := registerPasswordlessPGSource(t, srv, tenantID, "Legacy NAV", tenantDB)
+	sourceID := registerTestPGSource(t, srv, tenantID, "Legacy NAV", tenantDB)
 	ctx := browserCtx(t, tenantID)
 
 	// Step 1: the upload page links to the SQL flow; follow it and pick
