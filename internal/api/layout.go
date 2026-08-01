@@ -128,6 +128,12 @@ var shellTmpl = template.Must(template.New("shell").Parse(fmt.Sprintf(`<!doctype
 <main class="uc-container">
 {{.Body}}
 </main>
+<dialog id="uc-quick-create" class="uc-modal">
+<div class="uc-modal-header">
+<button type="button" id="uc-quick-create-close" class="uc-modal-close" aria-label="{{.QuickCreateCancel}}">×</button>
+</div>
+<div id="uc-quick-create-body" class="uc-modal-body"></div>
+</dialog>
 <script>
 (function() {
   // Stamp every htmx request with the tenant this PAGE was rendered
@@ -239,6 +245,86 @@ var shellTmpl = template.Must(template.New("shell").Parse(fmt.Sprintf(`<!doctype
     search.value = opt.textContent;
     box.querySelector(".uc-ref-results").hidden = true;
   });
+
+  // Inline reference-picker quick-create (part 2 of #24). A .uc-ref box
+  // whose viewer holds create permission on its target (server-decided,
+  // formrender/render.go's CreateNewLabel) renders a ".uc-ref-create"
+  // button. Clicking it opens the target entity's OWN generated create
+  // form (GET /forms/{target}/new, fetched as a bare fragment via
+  // isHTMXRequest — see handlers.go's renderForm) inside a native
+  // <dialog>, so the picker's own parent form is never navigated away
+  // from and loses none of its in-progress edits.
+  var quickCreateBox = null; // the .uc-ref that opened the dialog, so a
+                              // successful create knows which picker to fill.
+  document.body.addEventListener("click", function(evt) {
+    var btn = evt.target;
+    if (!btn.classList.contains("uc-ref-create")) { return; }
+    quickCreateBox = btn.closest(".uc-ref");
+    var dialog = document.getElementById("uc-quick-create");
+    var body = document.getElementById("uc-quick-create-body");
+    body.innerHTML = "";
+    var nav = document.querySelector("[data-uc-tenant]");
+    fetch("/forms/" + encodeURIComponent(btn.getAttribute("data-target")) + "/new", {
+      headers: {
+        "HX-Request": "true",
+        "X-UC-Tenant": nav ? nav.getAttribute("data-uc-tenant") : ""
+      }
+    })
+      .then(function(r) {
+        if (!r.ok) { throw new Error("quick-create form fetch failed: " + r.status); }
+        return r.text();
+      })
+      .then(function(html) {
+        body.innerHTML = html;
+        // The fetched markup carries hx-post/hx-target attributes that
+        // only take effect once htmx has scanned them — a plain innerHTML
+        // assignment does not trigger htmx's own mutation observer for
+        // content it didn't insert itself.
+        htmx.process(body);
+        dialog.showModal();
+      })
+      .catch(function() {
+        showToast({{.ToastFallback}});
+      });
+  });
+  function closeQuickCreate() {
+    var dialog = document.getElementById("uc-quick-create");
+    if (dialog.open) { dialog.close(); }
+    document.getElementById("uc-quick-create-body").innerHTML = "";
+    quickCreateBox = null;
+  }
+  document.getElementById("uc-quick-create-close").addEventListener("click", closeQuickCreate);
+  document.getElementById("uc-quick-create").addEventListener("click", function(evt) {
+    // A <dialog>'s own backdrop is the dialog element itself outside its
+    // content box — a click landing directly on it (not on anything it
+    // contains) is a backdrop click.
+    if (evt.target.id === "uc-quick-create") { closeQuickCreate(); }
+  });
+  // Listens on htmx:afterSettle, not htmx:afterSwap: htmx dispatches
+  // afterSettle on the swapped element itself, and a handler here that
+  // removed the element from the DOM (closeQuickCreate below clears
+  // #uc-quick-create-body's innerHTML) would detach it before that
+  // dispatch — a detached node's dispatched event never bubbles up to
+  // this document.body listener, since bubbling requires the live
+  // ancestor chain. Reacting on afterSettle instead means htmx is fully
+  // done with the element by the time this runs, so removing it here is
+  // safe.
+  document.body.addEventListener("htmx:afterSettle", function(evt) {
+    var quickCreateBody = document.getElementById("uc-quick-create-body");
+    if (!quickCreateBody || !quickCreateBody.contains(evt.detail.elt)) { return; }
+    // Any swap reaching the modal body IS a successful save: htmx's
+    // default responseHandling only swaps on a 2xx response (4xx/5xx
+    // trigger htmx:responseError instead, already handled by the global
+    // toast listener above) — a validation failure never reaches here.
+    var savedForm = quickCreateBody.querySelector("form.uc-form[data-record-id]");
+    if (!savedForm || !quickCreateBox) { return; }
+    var hidden = quickCreateBox.querySelector('input[type="hidden"]');
+    var search = quickCreateBox.querySelector(".uc-ref-search");
+    hidden.value = savedForm.getAttribute("data-record-id");
+    search.value = savedForm.getAttribute("data-record-label") || hidden.value;
+    quickCreateBox.querySelector(".uc-ref-results").hidden = true;
+    closeQuickCreate();
+  });
 })();
 </script>
 </body>
@@ -257,6 +343,11 @@ type shellView struct {
 	// any Go-rendered HTML).
 	ToastFallback     string
 	ToastNetworkError string
+	// QuickCreateCancel labels the reference-picker quick-create dialog's
+	// close button (part 2 of #24, aria-label only — the button itself is
+	// a plain "×") — same "translate every JS-embedded string" reasoning
+	// as ToastFallback above.
+	QuickCreateCancel string
 }
 
 // renderShell writes fragment wrapped in shellTmpl, with nav as the
@@ -280,6 +371,7 @@ func (h *Handler) renderShell(w http.ResponseWriter, locale string, nav, fragmen
 		Body:              fragment,
 		ToastFallback:     h.catalog.T(locale, "toast.error_fallback"),
 		ToastNetworkError: h.catalog.T(locale, "toast.network_error"),
+		QuickCreateCancel: h.catalog.T(locale, "action.cancel"),
 	}
 	if err := shellTmpl.Execute(w, view); err != nil {
 		return fmt.Errorf("render page shell: %w", err)

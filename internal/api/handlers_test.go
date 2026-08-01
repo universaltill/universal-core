@@ -1594,6 +1594,84 @@ func TestAPI_RenderForm_ReferenceFieldRendersComboboxNotFullList(t *testing.T) {
 	}
 }
 
+// TestAPI_RenderForm_ReferenceCreateButtonRendersWithPermission is the
+// HTTP-level test for part 2 of #24 (universaltill/uc-infra#51): a viewer
+// who can write the referenced entity (here, Vendor is not opted into
+// RBAC at all — the default-open behaviour TestAPI_RBAC_EntityLevel_
+// Enforced403 already covers) sees the "+ Create new {Entity}"
+// affordance on the picker. formrender's own tests (render_test.go)
+// cover the template logic for CreateNewLabel in isolation; this proves
+// the real handler wiring — CanWrite resolution, entityDisplayName,
+// i18n — actually reaches the rendered page.
+func TestAPI_RenderForm_ReferenceCreateButtonRendersWithPermission(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
+	publishEntityAndForm(t, db, orderEntityDefWithVendorReference(), orderFormDefWithVendorReference())
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	req := newRequest("GET", "/forms/Order/new", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `<button type="button" class="uc-ref-create" data-target="Vendor">`) {
+		t.Fatalf("expected a quick-create button targeting Vendor, got:\n%s", body)
+	}
+}
+
+// TestAPI_RenderForm_ReferenceCreateButtonHiddenWithoutWritePermission is
+// the negative counterpart, over real RBAC (not a hand-built formrender.
+// Data): Order itself stays open to everyone (so the page renders at
+// all) but Vendor is opted into RBAC with can_write=false for the
+// requesting actor's role — the quick-create button for vendor_id must
+// not render, the same CanWrite gate renderForm's own "new record" page
+// already applies to itself (denyPageUnless), just scoped to the
+// referenced entity instead of the page's own entity.
+func TestAPI_RenderForm_ReferenceCreateButtonHiddenWithoutWritePermission(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
+	publishEntityAndForm(t, db, orderEntityDefWithVendorReference(), orderFormDefWithVendorReference())
+
+	seedRBAC(t, db,
+		map[string][]string{"order_clerk": {"user-order-clerk"}},
+		[]map[string]any{
+			{"role": "order_clerk", "entity_type": "Vendor", "can_read": true, "can_write": false},
+		},
+	)
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	req := newRequest("GET", "/forms/Order/new", tenantID, "user-order-clerk", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 (Order itself is unrestricted), got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	// The literal opening tag, not a bare "uc-ref-create" substring check
+	// — the page's own shell script (layout.go) always contains that
+	// class name in its click-delegation JS regardless of whether any
+	// button actually rendered, so a bare substring match would pass
+	// even with the fix reverted.
+	if strings.Contains(body, `<button type="button" class="uc-ref-create"`) {
+		t.Fatalf("expected no quick-create button without Vendor write permission, got:\n%s", body)
+	}
+	// The search/select half of the picker must still work — this actor
+	// can READ Vendor, just not create one.
+	if !strings.Contains(body, `class="uc-ref" data-target="Vendor" data-field="vendor_id"`) {
+		t.Fatalf("expected the vendor_id combobox to still render, got:\n%s", body)
+	}
+}
+
 // TestAPI_ReferenceSearch_WithoutNameFieldFallsBackToID confirms the
 // search endpoint labels a target entity with no "name" field by its raw
 // id, rather than an error or an empty label. The label-fallback chain

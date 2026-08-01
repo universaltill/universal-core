@@ -562,6 +562,28 @@ th a.uc-sort:hover { text-decoration: underline; }
 .uc-ref-option { padding: 0.4rem 0.6rem; cursor: pointer; font-size: 0.9rem; }
 .uc-ref-option:hover { background: var(--uc-bg); }
 
+/* Inline reference-picker quick-create (part 2 of #24): the "+ Create
+   new {Entity}" affordance below the search box, and the <dialog> its
+   click opens (see layout.go's shellTmpl for the markup/JS). */
+.uc-ref-create {
+  display: block; margin-top: 0.3rem; padding: 0; border: none; background: none;
+  color: var(--uc-accent, #1c7ed6); font-size: 0.85rem; cursor: pointer; text-align: start;
+}
+.uc-ref-create:hover { text-decoration: underline; }
+
+.uc-modal {
+  border: 1px solid var(--uc-border); border-radius: 8px; padding: 0;
+  width: min(32rem, 92vw); max-height: 85vh; box-shadow: 0 12px 32px rgba(0, 0, 0, 0.25);
+}
+.uc-modal::backdrop { background: rgba(0, 0, 0, 0.45); }
+.uc-modal-header { display: flex; justify-content: flex-end; padding: 0.5rem 0.5rem 0; }
+.uc-modal-close {
+  border: none; background: none; font-size: 1.4rem; line-height: 1; cursor: pointer;
+  color: var(--uc-muted); padding: 0.25rem 0.5rem;
+}
+.uc-modal-close:hover { color: inherit; }
+.uc-modal-body { padding: 0 1.25rem 1.25rem; overflow-y: auto; }
+
 /* Multilingual (i18n_text) field: one input per locale (ADR-0009, #23). */
 .uc-i18n { display: flex; flex-direction: column; gap: 0.3rem; }
 .uc-i18n-row { display: flex; align-items: center; gap: 0.5rem; }

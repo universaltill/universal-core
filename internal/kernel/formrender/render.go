@@ -87,6 +87,23 @@ type Data struct {
 	// because sending it to a browser that must not see it is the thing
 	// being prevented.
 	RedactedFields map[string]bool
+	// RecordLabel is the current record's own human-readable label (the
+	// caller's recordLabel logic — same "name"/"title"/LabelField
+	// convention ReferenceOptions' labels already use), set only when
+	// RecordID != "". It renders as a data-record-label attribute on the
+	// form tag purely so the inline reference-picker quick-create modal
+	// (part 2 of #24, see layout.go) can read the just-created record's
+	// label straight off the swapped-in success fragment without a
+	// second round trip — formrender has no other use for it.
+	RecordLabel string
+	// ReferenceCreateLabels carries the "+ Create new {Entity}" button
+	// label for each FieldReference field whose viewer holds create
+	// permission on the field's target entity, keyed by field name. A
+	// field with no entry here renders no quick-create affordance at
+	// all — the caller (internal/api) is the only thing with access to
+	// the RBAC engine and the entity-display-name/i18n lookups needed to
+	// build this text, so it is precomputed the same way CurrentLabel is.
+	ReferenceCreateLabels map[string]string
 }
 
 // Render writes the HTML/HTMX form for def against ent's field shapes and
@@ -106,6 +123,8 @@ func (r *Renderer) Render(w io.Writer, def *form.Definition, ent *entity.Definit
 type viewModel struct {
 	EntityType string
 	RecordID   string
+	// RecordLabel mirrors Data.RecordLabel — see that field's doc comment.
+	RecordLabel string
 	// Version renders as a hidden "_version" input when RecordID != "" —
 	// see Data.Version's doc comment. Zero value (0) for a new record,
 	// but VersionKnown gates whether the template emits the input at all,
@@ -189,6 +208,11 @@ type fieldView struct {
 	// the user searches.
 	RefTarget    string
 	CurrentLabel string
+	// CreateNewLabel is the "+ Create new {Entity}" quick-create button's
+	// text (part 2 of #24) — empty means the viewer has no create
+	// permission on RefTarget (or the target has none configured) and no
+	// button renders at all. See Data.ReferenceCreateLabels.
+	CreateNewLabel string
 	// I18nInputs is set only for FieldI18nText (ADR-0009): one entry per
 	// supported locale, each rendered as its own text input named
 	// "{Name}.{Locale}" so the form decoder can reassemble the per-locale
@@ -271,6 +295,7 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 	vm := viewModel{
 		EntityType:           def.EntityType,
 		RecordID:             data.RecordID,
+		RecordLabel:          data.RecordLabel,
 		Version:              data.Version,
 		VersionKnown:         data.RecordID != "",
 		PostHref:             postHref,
@@ -322,7 +347,7 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 
 		switch s.Component {
 		case form.ComponentFields:
-			fields, err := r.buildFields(s, ent, effective, data.ReferenceOptions, data.RedactedFields, locale)
+			fields, err := r.buildFields(s, ent, effective, data.ReferenceOptions, data.ReferenceCreateLabels, data.RedactedFields, locale)
 			if err != nil {
 				return viewModel{}, fmt.Errorf("section %q: %w", s.Title, err)
 			}
@@ -453,7 +478,7 @@ func FormatFieldValue(v any) string {
 	}
 }
 
-func (r *Renderer) buildFields(s form.Section, ent *entity.Definition, record map[string]any, referenceOptions map[string][]ReferenceOption, redacted map[string]bool, locale string) ([]fieldView, error) {
+func (r *Renderer) buildFields(s form.Section, ent *entity.Definition, record map[string]any, referenceOptions map[string][]ReferenceOption, referenceCreateLabels map[string]string, redacted map[string]bool, locale string) ([]fieldView, error) {
 	var out []fieldView
 	for _, ff := range s.Fields {
 		if redacted[ff.Name] {
@@ -548,6 +573,7 @@ func (r *Renderer) buildFields(s form.Section, ent *entity.Definition, record ma
 			// no synthetic blank <option> needed.
 			current, _ := record[ff.Name].(string)
 			fv.RefTarget = ef.Target
+			fv.CreateNewLabel = referenceCreateLabels[ff.Name]
 			for _, opt := range referenceOptions[ff.Name] {
 				if opt.ID == current {
 					fv.CurrentLabel = opt.Label
@@ -661,7 +687,7 @@ func childCellValue(child map[string]any, name string, childDef *entity.Definiti
 	return v
 }
 
-const tmplSrc = `<form class="uc-form" data-entity-type="{{.EntityType}}" hx-post="{{.PostHref}}" hx-target="this" hx-swap="outerHTML">
+const tmplSrc = `<form class="uc-form" data-entity-type="{{.EntityType}}"{{if .RecordID}} data-record-id="{{.RecordID}}" data-record-label="{{.RecordLabel}}"{{end}} hx-post="{{.PostHref}}" hx-target="this" hx-swap="outerHTML">
 {{if .VersionKnown}}<input type="hidden" name="_version" value="{{.Version}}">
 {{end}}
 {{range .HiddenFields}}<input type="hidden" name="{{.Name}}" value="{{.Value}}">
@@ -678,6 +704,7 @@ const tmplSrc = `<form class="uc-form" data-entity-type="{{.EntityType}}" hx-pos
 <input type="hidden" name="{{.Name}}" value="{{.Value}}">
 <input type="text" id="{{.Name}}" class="uc-ref-search" autocomplete="off" value="{{.CurrentLabel}}" placeholder="{{$.RefSearchPlaceholder}}"{{if .Required}} required{{end}}>
 <div class="uc-ref-results" hidden></div>
+{{if .CreateNewLabel}}<button type="button" class="uc-ref-create" data-target="{{.RefTarget}}">{{.CreateNewLabel}}</button>{{end}}
 </div>
 {{else if eq .Type "i18n_text"}}<div class="uc-i18n" data-field="{{.Name}}">
 {{$fname := .Name}}{{range $i, $inp := .I18nInputs}}<div class="uc-i18n-row"><span class="uc-i18n-locale">{{$inp.Locale}}</span><input type="text"{{if eq $i 0}} id="{{$fname}}"{{end}} name="{{$fname}}.{{$inp.Locale}}" value="{{$inp.Value}}" autocomplete="off" aria-label="{{$fname}} {{$inp.Locale}}"{{if $inp.Required}} required{{end}}></div>

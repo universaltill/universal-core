@@ -131,6 +131,144 @@ func TestRender_ReferenceFieldRendersAsSearchableCombobox(t *testing.T) {
 	}
 }
 
+// TestRender_ReferenceFieldCreateNewButtonRendersWhenLabelProvided is the
+// formrender-layer test for part 2 of #24 (universaltill/uc-infra#51):
+// when the caller (internal/api) has decided the viewer may create the
+// referenced entity and hands down a label for it via
+// Data.ReferenceCreateLabels, the combobox renders a quick-create
+// button carrying that exact text and the field's own RefTarget as
+// data-target — the JS in layout.go reads data-target to know which
+// entity's /forms/{target}/new to fetch.
+func TestRender_ReferenceFieldCreateNewButtonRendersWhenLabelProvided(t *testing.T) {
+	r := testRenderer(t)
+	ent := &entity.Definition{
+		EntityType: "PurchaseOrder",
+		Fields:     []entity.Field{{Name: "vendor_id", Type: entity.FieldReference, Target: "Party"}},
+	}
+	def := &form.Definition{
+		EntityType: "PurchaseOrder",
+		Sections: []form.Section{{
+			Title: "Header", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "vendor_id", Label: "Vendor"}},
+		}},
+	}
+	data := Data{
+		Record:                map[string]any{},
+		ReferenceCreateLabels: map[string]string{"vendor_id": "+ Create new Party"},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, def, ent, data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	body := buf.String()
+	// "+" renders HTML-entity-escaped ("&#43;", Go html/template's own
+	// text-node escaping table) — a browser decodes it right back to "+"
+	// (confirmed via the real-browser test, internal/e2e's
+	// TestReferencePickerQuickCreate_..., which reads .textContent and
+	// sees plain "+"), so this is what the served HTML source actually
+	// looks like, not a bug in this feature.
+	if !strings.Contains(body, `<button type="button" class="uc-ref-create" data-target="Party">&#43; Create new Party</button>`) {
+		t.Fatalf("expected a quick-create button for Party, got:\n%s", body)
+	}
+}
+
+// TestRender_ReferenceFieldNoCreateButtonWithoutLabel is the inverse of
+// the above: a field with no entry in ReferenceCreateLabels (the viewer
+// lacks create permission on the target, or the caller simply never
+// populated it) must render no quick-create affordance at all — the
+// button's mere presence in the DOM is what part 2 of #24's RBAC
+// requirement rests on, so its absence has to be just as deliberate as
+// its presence.
+func TestRender_ReferenceFieldNoCreateButtonWithoutLabel(t *testing.T) {
+	r := testRenderer(t)
+	ent := &entity.Definition{
+		EntityType: "PurchaseOrder",
+		Fields:     []entity.Field{{Name: "vendor_id", Type: entity.FieldReference, Target: "Party"}},
+	}
+	def := &form.Definition{
+		EntityType: "PurchaseOrder",
+		Sections: []form.Section{{
+			Title: "Header", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "vendor_id", Label: "Vendor"}},
+		}},
+	}
+	data := Data{Record: map[string]any{}}
+	var buf strings.Builder
+	if err := r.Render(&buf, def, ent, data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if strings.Contains(buf.String(), "uc-ref-create") {
+		t.Fatalf("expected no quick-create button without a ReferenceCreateLabels entry, got:\n%s", buf.String())
+	}
+}
+
+// TestRender_SavedRecordCarriesDataRecordIDAndLabel proves the two data
+// attributes the quick-create modal's JS relies on to read back a just-
+// created record (layout.go's htmx:afterSettle handler) actually appear
+// on a saved record's form tag: data-record-id (the new id) and
+// data-record-label (the human label, resolved by the caller the same
+// way an existing reference's CurrentLabel already is).
+func TestRender_SavedRecordCarriesDataRecordIDAndLabel(t *testing.T) {
+	r := testRenderer(t)
+	ent := &entity.Definition{
+		EntityType: "Party",
+		Fields:     []entity.Field{{Name: "name", Type: entity.FieldString}},
+	}
+	def := &form.Definition{
+		EntityType: "Party",
+		Sections: []form.Section{{
+			Title: "Header", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "name", Label: "Name"}},
+		}},
+	}
+	data := Data{
+		RecordID:    "party-7",
+		RecordLabel: "Acme Textiles",
+		Record:      map[string]any{"name": "Acme Textiles"},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, def, ent, data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	body := buf.String()
+	if !strings.Contains(body, `data-record-id="party-7"`) {
+		t.Fatalf("expected data-record-id on the saved form, got:\n%s", body)
+	}
+	if !strings.Contains(body, `data-record-label="Acme Textiles"`) {
+		t.Fatalf("expected data-record-label on the saved form, got:\n%s", body)
+	}
+}
+
+// TestRender_NewRecordHasNoDataRecordIDAttribute is the negative
+// counterpart: a brand-new, unsaved record (RecordID == "") must not
+// carry data-record-id/data-record-label at all — the quick-create
+// modal's success detection (layout.go: `form.uc-form[data-record-id]`)
+// depends on this attribute being entirely absent, not merely empty,
+// for an unsaved form (e.g. a failed validation re-render must not look
+// like a success).
+func TestRender_NewRecordHasNoDataRecordIDAttribute(t *testing.T) {
+	r := testRenderer(t)
+	ent := &entity.Definition{
+		EntityType: "Party",
+		Fields:     []entity.Field{{Name: "name", Type: entity.FieldString}},
+	}
+	def := &form.Definition{
+		EntityType: "Party",
+		Sections: []form.Section{{
+			Title: "Header", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "name", Label: "Name"}},
+		}},
+	}
+	data := Data{Record: map[string]any{}}
+	var buf strings.Builder
+	if err := r.Render(&buf, def, ent, data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if strings.Contains(buf.String(), "data-record-id") {
+		t.Fatalf("expected no data-record-id attribute on a new/unsaved record's form, got:\n%s", buf.String())
+	}
+}
+
 // TestRender_OptionalReferenceFieldGetsEmptyOption confirms an
 // optional (not required) reference field always offers a real "leave
 // unset" choice — without this, a browser's own <select> default

@@ -968,6 +968,27 @@ func (h *Handler) renderForm(w http.ResponseWriter, r *http.Request, id string) 
 		return
 	}
 
+	// isHTMXRequest(r) here means this GET was itself htmx-issued, not a
+	// real browser navigation — today that only happens when the inline
+	// reference-picker quick-create modal (part 2 of #24) fetches
+	// /forms/{RefTarget}/new to embed inside its <dialog> (see layout.go's
+	// uc-ref-create handler). A bare fragment is exactly what a modal
+	// body swap needs, the same reasoning writeRecordFormFragment already
+	// applies to a post-create/update swap — wrapping it in the full
+	// <html> shell below would nest a second <head>/<body>/nav inside the
+	// dialog instead of just the form. No existing caller of this route
+	// sends HX-Request (grepped: no hx-boost, every current link here is
+	// a plain <a>), so this is purely additive for real browser
+	// navigation.
+	if isHTMXRequest(r) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if err := h.renderer.Render(w, formDef, entDef, renderData, locale); err != nil {
+			log.Printf("api: render %s form fragment (id=%q): %v", entityType, id, err)
+			httpx.WriteError(w, http.StatusInternalServerError, "internal error")
+		}
+		return
+	}
+
 	// Rendered into a buffer first, not straight to w: this is a
 	// top-level page navigation (GET /forms/{entityType}/new|{id}), not
 	// an htmx-swap response, so it needs the real <html><head> shell
@@ -1015,6 +1036,7 @@ func (h *Handler) buildFormRenderData(ctx context.Context, ts tenantScope, entDe
 		renderData.RecordID = rec.ID
 		renderData.Version = rec.Version
 		renderData.Record = rec.Data
+		renderData.RecordLabel = h.recordLabel(entDef, rec, locale)
 
 		children, childDefs, err := h.loadMasterDetailChildren(ctx, ts, entDef, formDef, id)
 		if err != nil {
@@ -1031,7 +1053,48 @@ func (h *Handler) buildFormRenderData(ctx context.Context, ts tenantScope, entDe
 	// /api/references. This is the whole point of the task: form render no
 	// longer lists every target record.
 	renderData.ReferenceOptions = h.loadCurrentReferenceLabels(ctx, ts, entDef, renderData.Record, locale)
+	// Independent of whether there's a current value: the quick-create
+	// affordance (part 2 of #24) is offered per reference FIELD, not per
+	// selection — even a brand-new, unset picker on a "new record" form
+	// should offer to create the target inline if the viewer is allowed
+	// to.
+	renderData.ReferenceCreateLabels, err = h.loadReferenceCreateLabels(ctx, ts, entDef, locale)
+	if err != nil {
+		return formrender.Data{}, fmt.Errorf("resolve reference create labels for %s: %w", entDef.EntityType, err)
+	}
 	return renderData, nil
+}
+
+// loadReferenceCreateLabels builds the "+ Create new {Entity}" button text
+// for each of entDef's FieldReference fields whose target the viewer holds
+// create (write) permission on (part 2 of #24) — RBAC-gated the same way
+// renderForm gates the "new record" page itself (CanWrite), just per
+// target entity instead of per page. Two or more fields pointing at the
+// same target (e.g. two Party references) resolve CanWrite once, not once
+// per field: the permission is a property of the target entity type, not
+// of which field points at it.
+func (h *Handler) loadReferenceCreateLabels(ctx context.Context, ts tenantScope, entDef *entity.Definition, locale string) (map[string]string, error) {
+	out := map[string]string{}
+	allowedCache := map[string]bool{}
+	for _, f := range entDef.Fields {
+		if f.Type != entity.FieldReference {
+			continue
+		}
+		allowed, ok := allowedCache[f.Target]
+		if !ok {
+			var err error
+			allowed, err = ts.crud.CanWrite(ctx, f.Target)
+			if err != nil {
+				return nil, fmt.Errorf("check create permission for %s (referenced by %s): %w", f.Target, f.Name, err)
+			}
+			allowedCache[f.Target] = allowed
+		}
+		if !allowed {
+			continue
+		}
+		out[f.Name] = h.catalog.T(locale, "form.reference.create_new") + " " + h.entityDisplayName(locale, f.Target)
+	}
+	return out, nil
 }
 
 // loadCurrentReferenceLabels resolves ONLY the label of each reference
