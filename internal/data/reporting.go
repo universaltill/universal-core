@@ -137,23 +137,63 @@ func (r *ReportingRepo) TopVendorsBySpend(ctx context.Context, limit int) ([]Ven
 }
 
 // StockSummary is the roll-up over every InventoryItem row.
+//
+// **Every figure here is per ITEM, not per InventoryItem row.** Since
+// #12/ADR-0015 re-keyed InventoryItem by (item, facility), one item can
+// hold several rows, and this report is an organization-level summary:
+// re-keying how stock is stored must not silently change what a
+// dashboard number means. So ItemCount counts distinct items rather
+// than rows, and StockoutCount counts items whose availability summed
+// ACROSS facilities is exhausted — an item sitting empty in one depot
+// while another is full is not an organization-level stockout.
+//
+// Per-facility stock reporting is a genuinely useful and genuinely
+// different report, with a facility column and a filter. It is
+// deliberately not this one.
+//
+// Two edge cases the grouping made easy to get wrong, both found by
+// independent review and both pinned by tests:
+//
+//   - **Rows with no item_id are excluded**, matching OnHandQtyByItem's
+//     long-standing guard. Without it, GROUP BY collapses every such
+//     row into a single NULL group that count(*) then reports as an
+//     "item" — a phantom that joins to no Item record, so the headline
+//     count and the StockoutRiskItems table below it would disagree
+//     about what exists.
+//   - **A missing qty_available_to_promise is not a stockout.** sum()
+//     over no non-null values is NULL, and the FILTER checks IS NOT
+//     NULL explicitly, preserving the old per-row behaviour where
+//     `NULL <= 0` was simply not counted. Wrapping the sum in coalesce
+//     would turn "unknown" into "zero available", which reads as an
+//     alert. Barely reachable — the field is Required with default 0 —
+//     but this report's whole design rule is that re-keying storage
+//     must not silently change what a number means.
 type StockSummary struct {
 	ItemCount     int
 	TotalOnHand   float64
 	TotalATP      float64
-	StockoutCount int // items with qty_available_to_promise <= 0
+	StockoutCount int // distinct items whose ATP, summed across facilities, is <= 0
 }
 
 func (r *ReportingRepo) StockSummary(ctx context.Context) (StockSummary, error) {
 	var s StockSummary
 	err := r.db.QueryRowContext(ctx,
-		`SELECT
+		`WITH per_item AS (
+		   SELECT data->>'item_id' AS item_id,
+		          coalesce(sum((data->>'qty_on_hand')::numeric), 0) AS on_hand,
+		          sum((data->>'qty_available_to_promise')::numeric) AS atp
+		   FROM records
+		   WHERE entity_type = 'InventoryItem'
+		     AND deleted_at IS NULL
+		     AND coalesce(data->>'item_id', '') <> ''
+		   GROUP BY data->>'item_id'
+		 )
+		 SELECT
 		   count(*),
-		   coalesce(sum((data->>'qty_on_hand')::numeric), 0),
-		   coalesce(sum((data->>'qty_available_to_promise')::numeric), 0),
-		   count(*) FILTER (WHERE (data->>'qty_available_to_promise')::numeric <= 0)
-		 FROM records
-		 WHERE entity_type = 'InventoryItem' AND deleted_at IS NULL`,
+		   coalesce(sum(on_hand), 0),
+		   coalesce(sum(atp), 0),
+		   count(*) FILTER (WHERE atp IS NOT NULL AND atp <= 0)
+		 FROM per_item`,
 	).Scan(&s.ItemCount, &s.TotalOnHand, &s.TotalATP, &s.StockoutCount)
 	if err != nil {
 		return StockSummary{}, fmt.Errorf("stock summary: %w", err)
@@ -169,6 +209,13 @@ func (r *ReportingRepo) StockSummary(ctx context.Context) (StockSummary, error) 
 // service, explicitly out of scope for this kernel today) — just "this
 // item is at or below zero available right now," computed directly from
 // data that already exists.
+//
+// **One row per Item, summed across facilities** (#12/ADR-0015). Since
+// InventoryItem became keyed by (item, facility), a per-row query would
+// list an item as at risk because one depot happens to be empty while
+// another is full — and list it more than once, in a table that has no
+// facility column to explain why. Aggregating first keeps this report
+// meaning exactly what it meant when there was one row per item.
 type StockoutRiskItem struct {
 	ItemID    string
 	SKU       string
@@ -432,19 +479,25 @@ func (r *ReportingRepo) LatestPOVendorByItem(ctx context.Context) (map[string]st
 // as TopVendorsBySpend.
 func (r *ReportingRepo) StockoutRiskItems(ctx context.Context, limit int) ([]StockoutRiskItem, error) {
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT i.id, coalesce(i.data->>'sku', ''), coalesce(i.data->>'name', i.id::text),
-		        coalesce((inv.data->>'qty_on_hand')::numeric, 0),
-		        coalesce((inv.data->>'qty_available_to_promise')::numeric, 0)
-		 FROM records inv
+		`WITH per_item AS (
+		   SELECT (inv.data->>'item_id')::uuid AS item_id,
+		          coalesce(sum((inv.data->>'qty_on_hand')::numeric), 0) AS on_hand,
+		          coalesce(sum((inv.data->>'qty_available_to_promise')::numeric), 0) AS atp
+		   FROM records inv
+		   WHERE inv.entity_type = 'InventoryItem'
+		     AND inv.deleted_at IS NULL
+		     AND inv.data->>'item_id' ~ $2
+		   GROUP BY inv.data->>'item_id'
+		 )
+		 SELECT i.id, coalesce(i.data->>'sku', ''), coalesce(i.data->>'name', i.id::text),
+		        p.on_hand, p.atp
+		 FROM per_item p
 		 JOIN records i
 		   ON i.entity_type = 'Item'
 		  AND i.deleted_at IS NULL
-		  AND i.id = (inv.data->>'item_id')::uuid
-		 WHERE inv.entity_type = 'InventoryItem'
-		   AND inv.deleted_at IS NULL
-		   AND inv.data->>'item_id' ~ $2
-		   AND (inv.data->>'qty_available_to_promise')::numeric <= 0
-		 ORDER BY (inv.data->>'qty_available_to_promise')::numeric, i.id
+		  AND i.id = p.item_id
+		 WHERE p.atp <= 0
+		 ORDER BY p.atp, i.id
 		 LIMIT $1`,
 		limit, uuidPattern,
 	)

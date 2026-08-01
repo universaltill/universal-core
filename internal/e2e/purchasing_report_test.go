@@ -65,8 +65,20 @@ func TestPurchasingReport_LeadTimeAndReorderSections_RealBrowser(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed Item: %v", err)
 	}
+	// InventoryItem is keyed by (item, facility) since #12, so stock
+	// needs somewhere to be. One facility here on purpose: this test is
+	// about the reorder signal, and the cross-facility aggregation it
+	// depends on is pinned separately in internal/data's
+	// TestStockReports_AggregateAcrossFacilities.
+	facility, err := engine.Create(ctx, purchasing.Facility(), map[string]any{
+		"code": "E2E-MAIN", "name": "E2E Main Warehouse", "facility_type": "warehouse", "is_active": true,
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed Facility: %v", err)
+	}
 	if _, err := engine.Create(ctx, purchasing.InventoryItem(), map[string]any{
-		"item_id": item.ID, "qty_on_hand": 5, "qty_available_to_promise": 5,
+		"item_id": item.ID, "facility_id": facility.ID,
+		"qty_on_hand": 5, "qty_available_to_promise": 5,
 	}, actor); err != nil {
 		t.Fatalf("seed InventoryItem: %v", err)
 	}

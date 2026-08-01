@@ -12,13 +12,22 @@
 // breakdown drops it entirely (status_id NULL, excluded by the join
 // guard).
 //
-// This is deliberately a targeted, one-off tool for this one migration,
-// not a generic backfill framework — there is exactly one case that
-// needs one today; a speculative generic mechanism for hypothetical
-// future Version bumps would be exactly the premature abstraction
-// CLAUDE.md warns against. If a second entity ever needs the same kind
-// of fix, generalize then, against two real examples instead of one
-// imagined one.
+// This was deliberately a targeted, one-off tool when it was written:
+// there was exactly one case that needed one, and a speculative generic
+// mechanism for hypothetical future Version bumps would have been the
+// premature abstraction CLAUDE.md warns against. The comment here ended
+// with a standing instruction — "if a second entity ever needs the same
+// kind of fix, generalize then, against two real examples instead of
+// one imagined one."
+//
+// **That happened.** InventoryItem v2->v3 (#12, ADR-0015) added a
+// required facility_id and needed the same loop, so the shared parts now
+// live in internal/kernel/recordmigrate and this command is written
+// against it — as is cmd/backfill-inventory-facility. What stayed here
+// is the PurchaseOrder-specific half: resolving purchase_order_status
+// codes to Status ids, and the transform that swaps the field. Anyone
+// facing a third migration should reuse recordmigrate rather than write
+// a fourth loop.
 //
 // Idempotent: a record that already has status_id is left untouched, so
 // running this against an already-migrated tenant (or re-running after a
@@ -44,6 +53,7 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/audit"
 	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
+	"github.com/universaltill/universal-core/internal/kernel/recordmigrate"
 )
 
 func main() {
@@ -120,77 +130,38 @@ func main() {
 		}
 	}
 
-	orders, err := engine.List(ctx, poDef)
-	if err != nil {
-		log.Fatalf("list PurchaseOrder records: %v", err)
-	}
-
-	var migrated, alreadyDone, skipped int
-	for _, po := range orders {
-		if sid, ok := po.Data["status_id"].(string); ok && sid != "" {
-			alreadyDone++
-			continue
-		}
-		oldStatus, ok := po.Data["status"].(string)
-		if !ok || oldStatus == "" {
-			log.Printf("WARNING: PurchaseOrder %s has neither status_id nor a recognizable old status value (%v) — skipped, needs manual review", po.ID, po.Data["status"])
-			skipped++
-			continue
-		}
-		newStatusID, ok := statusIDByCode[oldStatus]
-		if !ok {
-			log.Printf("WARNING: PurchaseOrder %s has unrecognized old status %q — skipped, needs manual review", po.ID, oldStatus)
-			skipped++
-			continue
-		}
-
-		// Full field replacement, same discipline as every other
-		// crud.Engine.Update call in this kernel (cmd/seed-demo-data's
-		// own PurchaseOrder update is the closest precedent) — copy
-		// every existing field forward unchanged except swapping
-		// status for status_id; the old "status" key is dropped simply
-		// by not including it in the new map (Update's SET data = $1
-		// replaces the whole blob, see data.RecordRepo.UpdateTx).
-		fields := make(map[string]any, len(po.Data))
-		for k, v := range po.Data {
-			if k == "status" {
-				continue
+	res, err := recordmigrate.Run(ctx, engine, poDef,
+		func(po data.Record) (map[string]any, recordmigrate.Action, string) {
+			if sid, ok := po.Data["status_id"].(string); ok && sid != "" {
+				return nil, recordmigrate.AlreadyDone, ""
 			}
-			fields[k] = v
-		}
-		fields["status_id"] = newStatusID
-
-		// Validated explicitly first — same reasoning
-		// internal/api/handlers.go's createRecord/updateRecord already
-		// give for the same pattern, and checked before the *dryRun
-		// branch so a dry run's preview matches what a real run would
-		// actually do: a legacy row missing some other Required field
-		// (this migration only ever supplies status_id, it doesn't
-		// invent values for anything else that's missing) is a bad-data
-		// problem with *that one record*, not a reason to abort a batch
-		// migration that's otherwise fine — skip it for manual review
-		// like an unrecognized status, don't Fatal the whole run over
-		// one row. An error past this point (DB/tenant/version-
-		// conflict) is a real infrastructure problem, not a bad record,
-		// and still aborts the run.
-		if err := entity.ValidateRecord(poDef, fields); err != nil {
-			log.Printf("WARNING: PurchaseOrder %s would fail validation after adding status_id (%v) — skipped, needs manual review", po.ID, err)
-			skipped++
-			continue
-		}
-
-		if *dryRun {
-			log.Printf("DRY RUN: would migrate PurchaseOrder %s: status %q -> status_id %s (%s)", po.ID, oldStatus, newStatusID, oldStatus)
-			migrated++
-			continue
-		}
-
-		expectedVersion := po.Version
-		if _, err := engine.Update(ctx, poDef, po.ID, fields, &expectedVersion, actor); err != nil {
-			log.Fatalf("update PurchaseOrder %s: %v", po.ID, err)
-		}
-		migrated++
+			oldStatus, ok := po.Data["status"].(string)
+			if !ok || oldStatus == "" {
+				return nil, recordmigrate.Skip,
+					fmt.Sprintf("neither status_id nor a recognizable old status value (%v)", po.Data["status"])
+			}
+			newStatusID, ok := statusIDByCode[oldStatus]
+			if !ok {
+				return nil, recordmigrate.Skip, fmt.Sprintf("unrecognized old status %q", oldStatus)
+			}
+			// The old "status" key is dropped by omitting it — Update
+			// replaces the whole blob (see recordmigrate's own comment
+			// on full field replacement).
+			fields := recordmigrate.CopyExcept(po.Data, "status")
+			fields["status_id"] = newStatusID
+			// The mapping is the whole reason to dry-run a STATUS
+			// migration — a bare record id tells an operator nothing the
+			// tally didn't.
+			return fields, recordmigrate.Migrate,
+				fmt.Sprintf("status %q -> status_id %s", oldStatus, newStatusID)
+		},
+		actor,
+		recordmigrate.Options{DryRun: *dryRun, Logf: log.Printf},
+	)
+	if err != nil {
+		log.Fatalf("backfill PurchaseOrder status: %v", err)
 	}
+	migrated, alreadyDone, skipped := res.Migrated, res.AlreadyDone, res.Skipped
 
 	verb := "Migrated"
 	if *dryRun {

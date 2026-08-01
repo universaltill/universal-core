@@ -117,7 +117,7 @@ func POLineForm() *form.Definition {
 // second, separately-maintained list).
 func AllForms() []*form.Definition {
 	return []*form.Definition{
-		ItemForm(), PurchaseOrderForm(), POLineForm(), InventoryItemForm(),
+		ItemForm(), PurchaseOrderForm(), POLineForm(), FacilityForm(), InventoryItemForm(),
 		GoodsReceiptForm(), GoodsReceiptLineForm(), VendorInvoiceForm(),
 		ReorderRuleForm(),
 		RequestForQuotationForm(), RequestForQuotationLineForm(),
@@ -352,16 +352,43 @@ func GoodsReceiptLineForm() *form.Definition {
 	}
 }
 
+// FacilityForm is a plain single-section form — a facility is a short
+// record of identity and status, with no child rows and nothing to
+// stage across sections.
+func FacilityForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "Facility",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Facility",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "code", Label: "Code"},
+					{Name: "name", Label: "Name"},
+					{Name: "facility_type", Label: "Type"},
+					{Name: "address_id", Label: "Address"},
+					{Name: "is_active", Label: "Active"},
+				},
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
+	}
+}
+
 func InventoryItemForm() *form.Definition {
 	return &form.Definition{
 		EntityType: "InventoryItem",
-		Version:    1,
+		Version:    2,
 		Sections: []form.Section{
 			{
 				Title:     "Details",
 				Component: form.ComponentFields,
 				Fields: []form.FormField{
 					{Name: "item_id", Label: "Item"},
+					{Name: "facility_id", Label: "Facility"},
 					{Name: "qty_on_hand", Label: "Qty On Hand"},
 					{Name: "qty_available_to_promise", Label: "Qty Available to Promise"},
 				},

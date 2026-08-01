@@ -133,7 +133,20 @@ func main() {
 	}
 	vendors, customers := s.seedParties()
 	items := s.seedItems(uoms)
-	s.seedInventory(items)
+	// Gated like every other post-provisioning entity: a tenant
+	// provisioned before #12 has purchasing published but no Facility
+	// (the #70 gap), and s.def log.Fatalfs on an unpublished type — so
+	// without this the seeder died AFTER creating Items and BEFORE
+	// purchase orders, sales orders and everything downstream, leaving a
+	// half-seeded tenant (independent review). Falling back to the
+	// pre-#12 single-row shape keeps such a tenant seeding correctly
+	// rather than skipping inventory and gutting the reporting demo.
+	if hasPublished(s.ctx, s.entityDefs, "Facility") {
+		s.seedInventory(items, s.seedFacilities())
+	} else {
+		log.Printf("Facility is not published for this tenant — seeding inventory without a location dimension (pre-#12 shape); re-run cmd/provision-tenant, then cmd/backfill-inventory-facility, to pick up multi-facility stock")
+		s.seedInventoryWithoutFacilities(items)
+	}
 	s.seedReorderRules(items)
 	s.seedPurchaseOrders(vendors, currencies, items)
 	s.seedGoodsReceipts()
@@ -651,33 +664,201 @@ func (s *seeder) seedItems(uoms map[string]string) map[string]string {
 	return ids
 }
 
+// inventoryLevel is one item's stock at one facility.
+type inventoryLevel struct {
+	facility string
+	onHand   float64
+	atp      float64
+}
+
+// inventoryLevels is the single declaration of what the demo tenant's
+// stock looks like — shared by seedInventory and the pre-#12 fallback
+// so the two can never drift into disagreeing about the numbers.
+var inventoryLevels = map[string][]inventoryLevel{
+	// Split across two locations: total ATP is healthy, and neither
+	// row alone tells the whole story.
+	"SKU-1001": {{"MAIN", 400, 400}, {"STORE-01", 100, 100}},
+	"SKU-1002": {{"MAIN", 120, 120}},
+	"SKU-1003": {{"MAIN", 250, 250}, {"STORE-01", 50, 50}},
+	"SKU-1004": {{"MAIN", 80, 0}}, // fully committed — stockout risk
+	"SKU-1005": {{"MAIN", 45, 45}},
+	"SKU-1006": {{"MAIN", 600, 600}},
+	"SKU-1007": {{"MAIN", 25, -10}}, // over-committed — stockout risk
+	"SKU-1008": {{"STORE-01", 200, 200}},
+	"SKU-1009": {{"MAIN", 0, 0}}, // never restocked — stockout risk
+	"SKU-1010": {{"MAIN", 60, 60}},
+}
+
+// seedFacilities gives the demo tenant three stock locations — a main
+// warehouse, a retail store and a virtual bucket — so the (item,
+// facility) key #12 introduced has more than one facility to be a key
+// over. A single-facility demo would let a per-facility bug through
+// unnoticed, which is the whole reason the multi-location work exists.
+//
+// The virtual facility is not filler: reference-data-model.md §3 lists
+// `virtual` as a facility type precisely for stock that is owned but
+// not in a countable place — goods in transit, consignment, quarantine
+// — and #13's stock transfer needs somewhere for in-transit stock to
+// live.
+func (s *seeder) seedFacilities() map[string]string {
+	ids := map[string]string{}
+	for _, f := range []struct{ code, name, facilityType string }{
+		{"MAIN", "Main Warehouse", "warehouse"},
+		{"STORE-01", "Doha Retail Store", "store"},
+		{"TRANSIT", "In Transit", "virtual"},
+	} {
+		ids[f.code] = s.getOrCreate("Facility", "code", f.code, map[string]any{
+			"code": f.code, "name": f.name, "facility_type": f.facilityType, "is_active": true,
+		})
+	}
+	return ids
+}
+
 // seedInventory gives every stock Item an on-hand + available-to-promise
 // level — service items (no natural inventory concept) are deliberately
 // skipped, same as InventoryItem's own doc comment describes the
 // entity's scope. onHand and availableToPromise deliberately differ for
 // a few SKUs (fully or over-committed against existing sales
-// allocations, not modeled by this simplified kernel — see
-// InventoryItem's own doc comment) so the mgmt reporting workbench's
-// stockout-risk table (internal/api/reporting.go, qty_available_to_promise
-// <= 0) has real rows to show, not just a demo of an empty state.
-func (s *seeder) seedInventory(items map[string]string) {
+// allocations, not modeled by this simplified kernel) so the mgmt
+// reporting workbench's stockout-risk table has real rows to show, not
+// just a demo of an empty state.
+//
+// **The stockout SKUs are stocked at ONE facility on purpose.** The
+// stockout report sums availability across facilities (#12/ADR-0015),
+// so an item that is empty in the store but full in the warehouse must
+// NOT appear as at risk. If every SKU were split across locations, that
+// aggregation would be untested by the demo data and a regression to
+// per-row counting would still produce a plausible-looking dashboard.
+// SKU-1001 and SKU-1003 are split across two facilities and remain
+// healthy; the three at-risk SKUs are single-facility and genuinely
+// exhausted everywhere.
+func (s *seeder) seedInventory(items, facilities map[string]string) {
 	def := s.def("InventoryItem")
-	levels := map[string]struct{ onHand, atp float64 }{
-		"SKU-1001": {500, 500},
-		"SKU-1002": {120, 120},
-		"SKU-1003": {300, 300},
-		"SKU-1004": {80, 0}, // fully committed — stockout risk
-		"SKU-1005": {45, 45},
-		"SKU-1006": {600, 600},
-		"SKU-1007": {25, -10}, // over-committed — stockout risk
-		"SKU-1008": {200, 200},
-		"SKU-1009": {0, 0}, // never restocked — stockout risk
-		"SKU-1010": {60, 60},
-	}
+	levels := inventoryLevels
 	for sku, itemID := range items {
-		level, ok := levels[sku]
+		rows, ok := levels[sku]
 		if !ok {
 			continue
+		}
+		existing, err := s.crud.ListByField(s.ctx, def, "item_id", itemID)
+		if err != nil {
+			log.Fatalf("list InventoryItem by item_id: %v", err)
+		}
+
+		// This CONVERGES on the table above rather than only inserting
+		// what is missing, and the difference is not academic — an
+		// independent review measured the insert-only version inflating
+		// the demo tenant's stock on the upgrade path ADR-0015 itself
+		// prescribes (re-provision, then backfill, then re-seed). Two
+		// ways it went wrong, both structural:
+		//
+		//   - a pre-#12 row carries the OLD quantity (SKU-1001 held 500
+		//     before this card split it into 400 + 100). The backfill
+		//     stamps it at MAIN, an insert-only seeder sees MAIN covered
+		//     and skips, so the stale 500 stands while the new STORE-01
+		//     row is added on top;
+		//   - SKU-1008 MOVED facility in this card, MAIN -> STORE-01. The
+		//     backfilled MAIN row is stock at a facility the table no
+		//     longer declares, and STORE-01 gets created beside it.
+		//     Doubled.
+		//
+		// So: a row already at a declared facility has its quantities
+		// corrected; a row that is facility-less or sits at an undeclared
+		// facility is REUSED — re-pointed at a declared facility that has
+		// no row yet — rather than left to rot beside a new one.
+		// Re-pointing rather than deleting keeps this non-destructive,
+		// and genuine surplus is reported rather than silently removed:
+		// a seeder quietly deleting stock rows in a tenant someone has
+		// been clicking around in is worse than a loud warning.
+		type want struct {
+			facilityID string
+			onHand     float64
+			atp        float64
+		}
+		desired := make([]want, 0, len(rows))
+		declared := map[string]bool{}
+		for _, row := range rows {
+			facilityID := facilities[row.facility]
+			if facilityID == "" {
+				log.Fatalf("seedInventory: no facility seeded for code %q", row.facility)
+			}
+			desired = append(desired, want{facilityID, row.onHand, row.atp})
+			declared[facilityID] = true
+		}
+
+		atFacility := map[string]data.Record{}
+		var loose []data.Record
+		for _, e := range existing {
+			fid, _ := e.Data["facility_id"].(string)
+			if _, taken := atFacility[fid]; fid != "" && declared[fid] && !taken {
+				atFacility[fid] = e
+				continue
+			}
+			loose = append(loose, e)
+		}
+
+		set := func(rec data.Record, w want) {
+			curFacility, _ := rec.Data["facility_id"].(string)
+			curOnHand, _ := rec.Data["qty_on_hand"].(float64)
+			curATP, _ := rec.Data["qty_available_to_promise"].(float64)
+			if curFacility == w.facilityID && curOnHand == w.onHand && curATP == w.atp {
+				return // already correct — don't churn the version or the audit trail
+			}
+			version := rec.Version
+			if _, err := s.crud.Update(s.ctx, def, rec.ID, map[string]any{
+				"item_id": itemID, "facility_id": w.facilityID,
+				"qty_on_hand": w.onHand, "qty_available_to_promise": w.atp,
+			}, &version, s.actor); err != nil {
+				log.Fatalf("reconcile InventoryItem %s: %v", rec.ID, err)
+			}
+		}
+
+		for _, w := range desired {
+			if rec, ok := atFacility[w.facilityID]; ok {
+				set(rec, w)
+				continue
+			}
+			if len(loose) > 0 {
+				set(loose[0], w)
+				loose = loose[1:]
+				continue
+			}
+			if _, err := s.crud.Create(s.ctx, def, map[string]any{
+				"item_id": itemID, "facility_id": w.facilityID,
+				"qty_on_hand": w.onHand, "qty_available_to_promise": w.atp,
+			}, s.actor); err != nil {
+				log.Fatalf("create InventoryItem: %v", err)
+			}
+		}
+		for _, extra := range loose {
+			fid, _ := extra.Data["facility_id"].(string)
+			log.Printf("WARNING: InventoryItem %s for %s sits at facility %q, which the demo data does not declare — left in place; it will skew stock totals",
+				extra.ID, sku, fid)
+		}
+	}
+}
+
+// seedInventoryWithoutFacilities is the pre-#12 shape, kept for a
+// tenant that has purchasing published but not Facility yet (#70).
+// One row per item carrying the item's TOTAL across the facilities the
+// current table splits it into, so the stock figures such a tenant
+// reports match a fully-provisioned one — the location dimension is
+// what it lacks, not the quantities.
+//
+// This exists to be deleted. Once #70 makes existing tenants pick up new
+// Definitions automatically, no tenant can be in this state and the
+// fallback becomes dead code.
+func (s *seeder) seedInventoryWithoutFacilities(items map[string]string) {
+	def := s.def("InventoryItem")
+	for sku, itemID := range items {
+		rows, ok := inventoryLevels[sku]
+		if !ok {
+			continue
+		}
+		var onHand, atp float64
+		for _, r := range rows {
+			onHand += r.onHand
+			atp += r.atp
 		}
 		existing, err := s.crud.ListByField(s.ctx, def, "item_id", itemID)
 		if err != nil {
@@ -687,7 +868,7 @@ func (s *seeder) seedInventory(items map[string]string) {
 			continue
 		}
 		if _, err := s.crud.Create(s.ctx, def, map[string]any{
-			"item_id": itemID, "qty_on_hand": level.onHand, "qty_available_to_promise": level.atp,
+			"item_id": itemID, "qty_on_hand": onHand, "qty_available_to_promise": atp,
 		}, s.actor); err != nil {
 			log.Fatalf("create InventoryItem: %v", err)
 		}

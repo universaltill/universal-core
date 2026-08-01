@@ -525,3 +525,94 @@ func TestPurchaseOrderForm_RollsUpLineTotalsIntoTotal(t *testing.T) {
 		t.Fatalf("RollUpTarget field %q doesn't exist on PurchaseOrder", lines.RollUpTarget)
 	}
 }
+
+// Facility is the location dimension #12/R19 added. Pinned as shape
+// rather than behaviour because it has no behaviour of its own — it is
+// the thing InventoryItem is keyed by.
+func TestFacility_Shape(t *testing.T) {
+	def := Facility()
+	if def.Module != "purchasing" {
+		t.Errorf("Facility.Module = %q, want purchasing (ADR-0015 — relocating it to foundation later is a Definition change, but until a second module needs it, it lives here)", def.Module)
+	}
+	// Labelled by `name` through the kernel's default name/title
+	// convention. Employee shipped without a label and rendered as a
+	// raw UUID in every picker (#16); a facility picker is exactly where
+	// that would bite again.
+	f, ok := def.FieldByName("name")
+	if !ok || f.Type != entity.FieldString || !f.Required {
+		t.Errorf("Facility needs a required string `name` to be labellable; got ok=%v %+v", ok, f)
+	}
+	code, ok := def.FieldByName("code")
+	if !ok || !code.Required {
+		t.Error("Facility.code is the natural key a human quotes and the handle the backfill resolves by; it must be required")
+	}
+	ftype, ok := def.FieldByName("facility_type")
+	if !ok || ftype.Type != entity.FieldEnum || ftype.Default != "warehouse" {
+		t.Errorf("facility_type must be an enum defaulting to warehouse; got %+v", ftype)
+	}
+	want := map[string]bool{"warehouse": true, "store": true, "virtual": true}
+	if len(ftype.EnumValues) != len(want) {
+		t.Errorf("facility_type values = %v, want exactly %v (reference-data-model.md §3)", ftype.EnumValues, want)
+	}
+	for _, v := range ftype.EnumValues {
+		if !want[v] {
+			t.Errorf("unexpected facility_type %q", v)
+		}
+	}
+	// A closed depot must stop appearing in pickers without deleting
+	// the stock history pointing at it.
+	if act, ok := def.FieldByName("is_active"); !ok || act.Type != entity.FieldBool || act.Default != true {
+		t.Errorf("Facility.is_active must be a bool defaulting to true; got ok=%v %+v", ok, act)
+	}
+	if def.StatusTypeCode != "" {
+		t.Errorf("Facility declares StatusTypeCode %q — open/closed is is_active, not a four-state graph (ADR-0015)", def.StatusTypeCode)
+	}
+}
+
+func TestFacility_RejectsUnknownType(t *testing.T) {
+	def := Facility()
+	if err := entity.ValidateRecord(def, map[string]any{
+		"code": "X", "name": "X", "facility_type": "spaceport",
+	}); err == nil {
+		t.Fatal("expected an error for a facility_type outside the declared enum")
+	}
+}
+
+// The heart of #12: InventoryItem is keyed by (item, facility), and
+// facility_id is REQUIRED. Optional would make "stock at no location" a
+// permanently legal state and mean the entity was never really re-keyed
+// (ADR-0015) — so this asserts required-ness explicitly rather than
+// merely that the field exists.
+func TestInventoryItem_IsKeyedByItemAndFacility(t *testing.T) {
+	def := InventoryItem()
+	if def.Version != 3 {
+		t.Errorf("InventoryItem is v%d, want v3 — the facility bump", def.Version)
+	}
+	f, ok := def.FieldByName("facility_id")
+	if !ok {
+		t.Fatal("InventoryItem has no facility_id field")
+	}
+	if f.Type != entity.FieldReference || f.Target != "Facility" {
+		t.Errorf("facility_id = %+v, want a reference to Facility", f)
+	}
+	if !f.Required {
+		t.Error("facility_id must be REQUIRED — an optional facility is the same entity with a hint attached, not a re-keyed one (ADR-0015)")
+	}
+
+	// A v2-shaped record — the thing every pre-existing row looks like
+	// — must now fail validation. That failure is exactly what
+	// cmd/backfill-inventory-facility exists to resolve, and if it
+	// stopped failing, the backfill would silently become a no-op while
+	// rows stayed unkeyed.
+	legacy := map[string]any{
+		"item_id":     "00000000-0000-0000-0000-000000000001",
+		"qty_on_hand": float64(5), "qty_available_to_promise": float64(5),
+	}
+	if err := entity.ValidateRecord(def, legacy); err == nil {
+		t.Fatal("a v2-shaped InventoryItem (no facility_id) must fail validation under v3")
+	}
+	legacy["facility_id"] = "00000000-0000-0000-0000-000000000002"
+	if err := entity.ValidateRecord(def, legacy); err != nil {
+		t.Fatalf("the same record with a facility_id must validate: %v", err)
+	}
+}

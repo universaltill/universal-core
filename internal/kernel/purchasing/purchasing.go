@@ -14,11 +14,15 @@
 // reorder alerts reference-data-model.md's PurchaseOrder/ReorderRule
 // rows describe — those are R9 (workflow engine wiring) and R10 (a
 // whole prediction service) laid on top of this base model, not part of
-// it. InventoryItem here is a single qty_on_hand/qty_available_to_promise
-// pair per Item — no Warehouse/Facility/Bin (reference-data-model.md's
-// per-item×facility×lot shape) — multi-location stock is real future
-// work, not needed for a first demo of "the kernel can model purchasing
-// data at all."
+// it.
+//
+// InventoryItem was a single qty_on_hand/qty_available_to_promise pair
+// per Item until #12/R19 gave it the facility dimension
+// reference-data-model.md §3 always described: it is now keyed by
+// (item, facility), with Facility as a real entity in this module and
+// facility_id required (ADR-0015). Still no Bin/Lot — bin-level (WMS)
+// granularity and lot/serial traceability are the later, harder slices
+// R19 itself says not to conflate with this one.
 package purchasing
 
 import "github.com/universaltill/universal-core/internal/kernel/entity"
@@ -74,8 +78,12 @@ func Item() *entity.Definition {
 // change (idempotent, dry-run supported) rather than wiping and
 // re-seeding. A generic migration framework was deliberately not built
 // for this one case (that would be exactly the premature abstraction
-// CLAUDE.md warns against) — if a second entity ever needs the same
-// kind of fix, generalize then, against two real examples.
+// CLAUDE.md warns against) — the comment here used to say "if a second
+// entity ever needs the same kind of fix, generalize then, against two
+// real examples." That happened: InventoryItem v2->v3 (#12, ADR-0015)
+// was the second, so the shared loop now lives in
+// internal/kernel/recordmigrate and both backfill commands are written
+// against it.
 func PurchaseOrder() *entity.Definition {
 	return &entity.Definition{
 		EntityType:     "PurchaseOrder",
@@ -165,17 +173,75 @@ func POLine() *entity.Definition {
 	}
 }
 
-// InventoryItem is on-hand + available-to-promise quantity per Item —
-// deliberately simplified from reference-data-model.md's per-item×
-// facility×lot shape (see package doc comment): one row per Item,
-// global, no Warehouse/Bin/Lot yet.
+// Facility is a physical or logical stock location — a warehouse, a
+// shop floor, or a virtual bucket (reference-data-model.md §3's
+// Warehouse/Facility row, OFBiz's Facility). Labelled by `name` through
+// the kernel's default name/title convention, so no LabelField.
+//
+// **This lives in purchasing, not foundation**, and ADR-0015 records
+// why: §3 groups it with the inventory entities, and every consumer
+// that exists today is in this module. The decision is cheap to
+// reverse — Definition.Module drives dashboard grouping and
+// module-bundle ownership, not record storage, so relocating Facility
+// to foundation if sales or assets later need it without licensing
+// purchasing is a Definition change and a version bump, with no data
+// migration.
+//
+// No status graph. A facility is open or closed, which is_active says;
+// unlike a campaign there is no cancelled-versus-completed distinction
+// to lose, and a four-state graph would be ceremony. is_active exists
+// rather than deletion because a closed depot must stop appearing in
+// pickers without destroying the stock history pointing at it.
+func Facility() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "Facility",
+		Version:    1,
+		Module:     "purchasing",
+		Fields: []entity.Field{
+			// The natural key a human quotes, and the handle
+			// cmd/backfill-inventory-facility resolves by. Not
+			// schema-unique — same application-level convention as
+			// Item.sku and po_number (#81).
+			{Name: "code", Type: entity.FieldString, Required: true},
+			{Name: "name", Type: entity.FieldString, Required: true},
+			// facility_type, not `type`: bare "type" reads as a kernel
+			// concept sitting next to entity.FieldType.
+			{Name: "facility_type", Type: entity.FieldEnum, Required: true,
+				EnumValues: []string{"warehouse", "store", "virtual"}, Default: "warehouse"},
+			// Reuses foundation's typed Address rather than inlining
+			// street fields, the same choice Party's addressing makes.
+			{Name: "address_id", Type: entity.FieldReference, Target: "Address"},
+			{Name: "is_active", Type: entity.FieldBool, Default: true},
+		},
+	}
+}
+
+// InventoryItem is on-hand + available-to-promise quantity per Item AND
+// Facility (reference-data-model.md §3, R19) — v3 added the facility
+// dimension the package comment had always flagged as a deliberate
+// first-slice omission.
+//
+// **facility_id is required, and that required-ness is the point**
+// (ADR-0015). An optional facility would make "stock at no location" a
+// permanently legal state every report, picker and future stock
+// transfer has to handle, which is the same entity with a hint attached
+// rather than a re-keyed one. The cost is that records written before
+// v3 are invalid until stamped: cmd/backfill-inventory-facility does
+// that, asserting all pre-existing stock sat at one location — safe by
+// construction, since the old model could not express anything else.
+//
+// **(item_id, facility_id) uniqueness is NOT enforced** (#81). Two rows
+// for the same pair are accepted; every aggregate over this entity sums
+// rather than picking a winner, so a duplicate inflates a quantity
+// rather than hiding one.
 func InventoryItem() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "InventoryItem",
-		Version:    2,
+		Version:    3,
 		Module:     "purchasing",
 		Fields: []entity.Field{
 			{Name: "item_id", Type: entity.FieldReference, Required: true, Target: "Item"},
+			{Name: "facility_id", Type: entity.FieldReference, Required: true, Target: "Facility"},
 			{Name: "qty_on_hand", Type: entity.FieldNumber, Required: true, Default: float64(0)},
 			{Name: "qty_available_to_promise", Type: entity.FieldNumber, Required: true, Default: float64(0)},
 		},
@@ -488,6 +554,7 @@ func All() []*entity.Definition {
 		Item(),
 		PurchaseOrder(),
 		POLine(),
+		Facility(),
 		InventoryItem(),
 		GoodsReceipt(),
 		GoodsReceiptLine(),

@@ -46,8 +46,8 @@ func TestModuleMenu_RendersAsSearchableHubGraphic(t *testing.T) {
 	)); err != nil {
 		t.Fatalf("count hub nodes: %v", err)
 	}
-	if nodeCount != 12 {
-		t.Fatalf("expected 12 entity hub nodes (Item, PurchaseOrder, POLine, InventoryItem, GoodsReceipt, GoodsReceiptLine, VendorInvoice, ReorderRule, RequestForQuotation, RequestForQuotationLine, RequestForQuotationVendor, RequestForQuotationQuoteLine), got %d", nodeCount)
+	if nodeCount != 13 {
+		t.Fatalf("expected 13 entity hub nodes (Item, PurchaseOrder, POLine, Facility, InventoryItem, GoodsReceipt, GoodsReceiptLine, VendorInvoice, ReorderRule, RequestForQuotation, RequestForQuotationLine, RequestForQuotationVendor, RequestForQuotationQuoteLine), got %d", nodeCount)
 	}
 
 	// Real, non-overlapping graphical positioning — not just that a
@@ -64,8 +64,8 @@ func TestModuleMenu_RendersAsSearchableHubGraphic(t *testing.T) {
 	)); err != nil {
 		t.Fatalf("read hub node bounding boxes: %v", err)
 	}
-	if len(centers) != 12 {
-		t.Fatalf("expected 12 node centers, got %d", len(centers))
+	if len(centers) != nodeCount {
+		t.Fatalf("expected %d node centers, got %d", nodeCount, len(centers))
 	}
 	for i := range centers {
 		for j := i + 1; j < len(centers); j++ {
@@ -106,16 +106,32 @@ func TestModuleMenu_RendersAsSearchableHubGraphic(t *testing.T) {
 	// The connecting spoke line for each hidden node must hide too — a
 	// node filtered out but its line left drawn to now-empty space was
 	// a real, visible gap found in this feature's own first review pass.
-	var hiddenLines int
-	if err := chromedp.Run(ctx, chromedp.EvaluateAsDevTools(
-		`Array.from(document.querySelectorAll('.uc-hub-lines line')).filter(function(el) {
-			return el.style.display === 'none';
-		}).length`, &hiddenLines,
-	)); err != nil {
+	//
+	// Counted against the hidden NODES rather than a literal, because
+	// the property is "one hidden line per hidden node" — pinning the
+	// number instead meant this failed the day the purchasing module
+	// gained an entity (Facility, #12), reporting a spoke-line bug that
+	// did not exist.
+	var hiddenNodes, hiddenLines int
+	if err := chromedp.Run(ctx,
+		chromedp.EvaluateAsDevTools(
+			`Array.from(document.querySelectorAll('.uc-hub-node')).filter(function(el) {
+				return el.style.display === 'none';
+			}).length`, &hiddenNodes,
+		),
+		chromedp.EvaluateAsDevTools(
+			`Array.from(document.querySelectorAll('.uc-hub-lines line')).filter(function(el) {
+				return el.style.display === 'none';
+			}).length`, &hiddenLines,
+		),
+	); err != nil {
 		t.Fatalf("count hidden spoke lines: %v", err)
 	}
-	if hiddenLines != 10 {
-		t.Fatalf("expected exactly 10 spoke lines hidden (matching the 10 filtered-out nodes: PurchaseOrder, POLine, GoodsReceipt, GoodsReceiptLine, VendorInvoice, ReorderRule, RequestForQuotation, RequestForQuotationLine, RequestForQuotationVendor, RequestForQuotationQuoteLine — none of their SearchKeys contain \"item\"), got %d", hiddenLines)
+	if hiddenNodes == 0 {
+		t.Fatal("searching \"item\" hid no nodes at all — the filter is not running")
+	}
+	if hiddenLines != hiddenNodes {
+		t.Fatalf("expected one hidden spoke line per hidden node: %d nodes hidden, %d lines hidden", hiddenNodes, hiddenLines)
 	}
 }
 

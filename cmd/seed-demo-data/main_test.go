@@ -197,11 +197,22 @@ func TestSeedDemoData_SeedsSampleRecordsAndIsIdempotent(t *testing.T) {
 		"Project", "Task", "TimeEntry",
 		"Employee", "LeaveRequest", "AttendanceRecord",
 		"Case", "Campaign", "Lead", "Opportunity",
+		"Facility", "InventoryItem",
 	} {
 		counts[entityType] = countRecords(t, tenantDB, entityType)
 		if counts[entityType] == 0 {
 			t.Fatalf("expected at least one %s record after seeding, got 0", entityType)
 		}
+	}
+
+	// The declared demo stock: 400+100 + 120 + 250+50 + 80 + 45 + 600 +
+	// 25 + 200 + 0 + 60 (cmd/seed-demo-data's inventoryLevels). Pinned
+	// as a figure rather than a row count because #12's re-keying made
+	// "one row per item" false, and an independent review measured the
+	// first version of that reconcile inflating this to 2280 on the
+	// documented upgrade path while every row count still looked right.
+	if got := totalOnHand(t, tenantDB); got != wantTotalOnHand {
+		t.Fatalf("total qty_on_hand = %v, want %v", got, wantTotalOnHand)
 	}
 
 	// gl_accounts (the ledger core's own typed chart, ADR-0004) is a
@@ -336,6 +347,13 @@ func TestSeedDemoData_SeedsSampleRecordsAndIsIdempotent(t *testing.T) {
 	}
 	if got := countGLAccounts(t, tenantDB); got != glAccountCount {
 		t.Fatalf("gl_accounts count changed after re-running seed-demo-data: had %d, now %d (not idempotent)", glAccountCount, got)
+	}
+	// Counts alone would not catch seedInventory drifting the
+	// QUANTITIES — a reconcile that mangled a figure while keeping the
+	// row count stable reads as idempotent. The total is the number the
+	// stock dashboard actually shows, so pin it.
+	if got := totalOnHand(t, tenantDB); got != wantTotalOnHand {
+		t.Fatalf("total qty_on_hand = %v after re-run, want %v — seedInventory must converge on its declared levels", got, wantTotalOnHand)
 	}
 	if got := countJournalEntries(t, tenantDB); got != journalEntryCount {
 		t.Fatalf("journal entry count changed after re-running seed-demo-data: had %d, now %d (not idempotent — a hook may have double-posted)", journalEntryCount, got)
@@ -900,5 +918,103 @@ func TestSeedDemoData_PipelineModelsTheContactShape(t *testing.T) {
 	}
 	if campaignName != "Gulf Expo 2026" {
 		t.Errorf("event-sourced lead points at campaign %q, want the event campaign", campaignName)
+	}
+}
+
+// wantTotalOnHand is the sum of cmd/seed-demo-data's inventoryLevels
+// table: 400+100 (SKU-1001) + 120 + 250+50 (SKU-1003) + 80 + 45 + 600 +
+// 25 + 200 + 0 + 60.
+const wantTotalOnHand = 1930.0
+
+func totalOnHand(t *testing.T, tenantDB *sql.DB) float64 {
+	t.Helper()
+	var total float64
+	if err := tenantDB.QueryRowContext(context.Background(),
+		`SELECT coalesce(sum((data->>'qty_on_hand')::numeric), 0)
+		 FROM records WHERE entity_type = 'InventoryItem' AND deleted_at IS NULL`,
+	).Scan(&total); err != nil {
+		t.Fatalf("sum qty_on_hand: %v", err)
+	}
+	return total
+}
+
+// TestSeedDemoData_ConvergesOnTheDocumentedUpgradePath is the
+// regression test for the second blocker #12's independent review
+// found: the seeder must CONVERGE on its declared inventory levels, not
+// merely insert what is missing.
+//
+// ADR-0015 prescribes re-provision → backfill → re-seed for a tenant
+// that predates the (item, facility) re-keying. This reproduces the
+// state that path leaves behind and asserts the seeder repairs it:
+//
+//   - SKU-1001 carrying its OLD pre-split total (500) at MAIN, with no
+//     STORE-01 row. An insert-only seeder sees MAIN covered, skips, and
+//     adds STORE-01's 100 on top of a stale 500.
+//   - SKU-1008 sitting at MAIN when the table now declares it at
+//     STORE-01. An insert-only seeder creates the STORE-01 row beside
+//     the orphan, doubling it.
+//
+// Measured against the insert-only version: total on-hand 2030 instead
+// of 1930. Every row count still looked right, which is why the
+// idempotency test alone could not catch it.
+func TestSeedDemoData_ConvergesOnTheDocumentedUpgradePath(t *testing.T) {
+	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance", "assets", "projects", "hr", "crm")
+	if _, stderr, code := run(t, []string{"DATABASE_URL=" + controlDSN}, "-tenant-id="+id, "-actor-id=smoke-test"); code != 0 {
+		t.Fatalf("first seed: exit %d: %s", code, stderr)
+	}
+	control := testexec.Open(t, controlDSN)
+	router, err := tenantdb.NewRouter(control, controlDSN)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+	t.Cleanup(func() { router.Close() })
+	tenantDB, err := router.Get(context.Background(), id)
+	if err != nil {
+		t.Fatalf("router.Get: %v", err)
+	}
+	ctx := context.Background()
+
+	for _, sku := range []string{"SKU-1001", "SKU-1008"} {
+		if _, err := tenantDB.ExecContext(ctx,
+			`DELETE FROM records WHERE entity_type='InventoryItem'
+			   AND data->>'item_id' = (SELECT id::text FROM records WHERE entity_type='Item' AND data->>'sku'=$1)`, sku); err != nil {
+			t.Fatalf("clear %s inventory: %v", sku, err)
+		}
+	}
+	for _, row := range []struct {
+		sku string
+		qty int
+	}{
+		{"SKU-1001", 500}, // the pre-split total, backfilled to MAIN
+		{"SKU-1008", 200}, // at MAIN, but the table now declares STORE-01
+	} {
+		if _, err := tenantDB.ExecContext(ctx,
+			`INSERT INTO records (entity_type, data) VALUES ('InventoryItem', jsonb_build_object(
+			   'item_id', (SELECT id::text FROM records WHERE entity_type='Item' AND data->>'sku'=$1),
+			   'facility_id', (SELECT id::text FROM records WHERE entity_type='Facility' AND data->>'code'='MAIN'),
+			   'qty_on_hand', $2::numeric, 'qty_available_to_promise', $2::numeric))`, row.sku, row.qty); err != nil {
+			t.Fatalf("insert legacy %s row: %v", row.sku, err)
+		}
+	}
+
+	if _, stderr, code := run(t, []string{"DATABASE_URL=" + controlDSN}, "-tenant-id="+id, "-actor-id=smoke-test"); code != 0 {
+		t.Fatalf("re-seed: exit %d: %s", code, stderr)
+	}
+	if got := totalOnHand(t, tenantDB); got != wantTotalOnHand {
+		t.Errorf("total qty_on_hand = %v after the upgrade path ADR-0015 prescribes, want %v — the seeder must converge, not only insert", got, wantTotalOnHand)
+	}
+	// And SKU-1008's stock ends up where the table says it is, with no
+	// orphan left at MAIN.
+	var mainRows int
+	if err := tenantDB.QueryRowContext(ctx,
+		`SELECT count(*) FROM records inv
+		 WHERE inv.entity_type='InventoryItem' AND inv.deleted_at IS NULL
+		   AND inv.data->>'item_id' = (SELECT id::text FROM records WHERE entity_type='Item' AND data->>'sku'='SKU-1008')
+		   AND inv.data->>'facility_id' = (SELECT id::text FROM records WHERE entity_type='Facility' AND data->>'code'='MAIN')`,
+	).Scan(&mainRows); err != nil {
+		t.Fatalf("count SKU-1008 rows at MAIN: %v", err)
+	}
+	if mainRows != 0 {
+		t.Errorf("SKU-1008 still has %d row(s) at MAIN — a row at an undeclared facility must be re-pointed, not left beside a new one", mainRows)
 	}
 }

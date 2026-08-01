@@ -619,3 +619,211 @@ func TestStockSummaryAndStockoutRiskItems(t *testing.T) {
 		t.Errorf("rank 1 = %+v, want SKU-LOW at 0", risk[1])
 	}
 }
+
+// Since #12/ADR-0015 re-keyed InventoryItem by (item, facility), one
+// item can hold several rows — and the stock reports are organization
+// level, so they must aggregate to the item before counting.
+//
+// This test exists because the pre-existing fixtures could not catch a
+// regression here: they give every item exactly one InventoryItem row,
+// so per-row and per-item aggregation produce identical numbers and
+// both the correct and the broken query pass. Every assertion below is
+// chosen so that counting ROWS gives a different answer from counting
+// ITEMS.
+func TestStockReports_AggregateAcrossFacilities(t *testing.T) {
+	ctx := context.Background()
+	tenantDB := freshTenantDB(t)
+	records := data.NewRecordRepo(tenantDB)
+	reporting := data.NewReportingRepo(tenantDB)
+
+	mkItem := func(sku, name string) string {
+		t.Helper()
+		rec, err := records.Create(ctx, "Item", map[string]any{"sku": sku, "name": name, "item_type": "stock"})
+		if err != nil {
+			t.Fatalf("create Item %s: %v", sku, err)
+		}
+		return rec.ID
+	}
+	mkFacility := func(code string) string {
+		t.Helper()
+		rec, err := records.Create(ctx, "Facility", map[string]any{
+			"code": code, "name": code, "facility_type": "warehouse", "is_active": true,
+		})
+		if err != nil {
+			t.Fatalf("create Facility %s: %v", code, err)
+		}
+		return rec.ID
+	}
+	mkInv := func(itemID, facilityID string, onHand, atp float64) {
+		t.Helper()
+		if _, err := records.Create(ctx, "InventoryItem", map[string]any{
+			"item_id": itemID, "facility_id": facilityID,
+			"qty_on_hand": onHand, "qty_available_to_promise": atp,
+		}); err != nil {
+			t.Fatalf("create InventoryItem: %v", err)
+		}
+	}
+
+	main := mkFacility("MAIN")
+	store := mkFacility("STORE")
+
+	// The discriminating case: empty in the store, plentiful in the
+	// warehouse. Per row this looks like a stockout; per item it is
+	// nothing of the kind.
+	split := mkItem("SKU-SPLIT", "Split Across Facilities")
+	mkInv(split, main, 100, 100)
+	mkInv(split, store, 0, 0)
+
+	// Genuinely exhausted everywhere — two rows, both empty. Must be
+	// reported once, not twice.
+	gone := mkItem("SKU-GONE", "Exhausted Everywhere")
+	mkInv(gone, main, 0, 0)
+	mkInv(gone, store, 0, -5)
+
+	// Net negative only when summed: positive in one place, more
+	// negative in another. Per row, neither is the worst; per item it
+	// is the worst at -10.
+	oversold := mkItem("SKU-OVERSOLD", "Oversold Overall")
+	mkInv(oversold, main, 50, 20)
+	mkInv(oversold, store, 10, -30)
+
+	summary, err := reporting.StockSummary(ctx)
+	if err != nil {
+		t.Fatalf("StockSummary: %v", err)
+	}
+	// Six InventoryItem rows, three items. Counting rows gives 6.
+	if summary.ItemCount != 3 {
+		t.Errorf("ItemCount = %d, want 3 — it counts items, not item×facility rows (there are 6 rows)", summary.ItemCount)
+	}
+	if summary.TotalOnHand != 160 {
+		t.Errorf("TotalOnHand = %v, want 160", summary.TotalOnHand)
+	}
+	if summary.TotalATP != 85 {
+		t.Errorf("TotalATP = %v, want 85", summary.TotalATP)
+	}
+	// Counting rows with ATP <= 0 gives 3 (split@store, gone@main,
+	// gone@store... plus oversold@store = 4). Per item it is 2.
+	if summary.StockoutCount != 2 {
+		t.Errorf("StockoutCount = %d, want 2 (SKU-GONE and SKU-OVERSOLD); SKU-SPLIT has stock in another facility", summary.StockoutCount)
+	}
+
+	risk, err := reporting.StockoutRiskItems(ctx, 10)
+	if err != nil {
+		t.Fatalf("StockoutRiskItems: %v", err)
+	}
+	if len(risk) != 2 {
+		t.Fatalf("got %d stockout rows, want 2 (one per item, not one per facility): %+v", len(risk), risk)
+	}
+	bySKU := map[string]data.StockoutRiskItem{}
+	for _, r := range risk {
+		if _, dup := bySKU[r.SKU]; dup {
+			t.Errorf("%s appears more than once — the report must be one row per item", r.SKU)
+		}
+		bySKU[r.SKU] = r
+	}
+	if _, ok := bySKU["SKU-SPLIT"]; ok {
+		t.Error("SKU-SPLIT is empty in one facility but full in another — it is not an organization-level stockout")
+	}
+	if got := bySKU["SKU-OVERSOLD"]; got.QtyATP != -10 {
+		t.Errorf("SKU-OVERSOLD ATP = %v, want -10 (20 + -30 summed across facilities)", got.QtyATP)
+	}
+	if got := bySKU["SKU-OVERSOLD"]; got.QtyOnHand != 60 {
+		t.Errorf("SKU-OVERSOLD on-hand = %v, want 60 (50 + 10)", got.QtyOnHand)
+	}
+	if got := bySKU["SKU-GONE"]; got.QtyATP != -5 {
+		t.Errorf("SKU-GONE ATP = %v, want -5 (0 + -5)", got.QtyATP)
+	}
+	// Worst first, by the summed figure.
+	if risk[0].SKU != "SKU-OVERSOLD" {
+		t.Errorf("rank 0 = %s, want SKU-OVERSOLD at -10 — ordering must use the summed ATP", risk[0].SKU)
+	}
+
+	// OnHandQtyByItem already summed before this change; pinned here so
+	// the three stock aggregates are covered by one fixture.
+	onHand, err := reporting.OnHandQtyByItem(ctx)
+	if err != nil {
+		t.Fatalf("OnHandQtyByItem: %v", err)
+	}
+	if onHand[split] != 100 {
+		t.Errorf("OnHandQtyByItem[SKU-SPLIT] = %v, want 100", onHand[split])
+	}
+	if onHand[oversold] != 60 {
+		t.Errorf("OnHandQtyByItem[SKU-OVERSOLD] = %v, want 60", onHand[oversold])
+	}
+}
+
+// Two edge cases in StockSummary's per-item grouping, both of which
+// looked fine and were wrong (independent review of #12).
+func TestStockSummary_GroupingEdgeCases(t *testing.T) {
+	ctx := context.Background()
+	tenantDB := freshTenantDB(t)
+	records := data.NewRecordRepo(tenantDB)
+	reporting := data.NewReportingRepo(tenantDB)
+
+	real, err := records.Create(ctx, "Item", map[string]any{"sku": "SKU-REAL", "name": "Real", "item_type": "stock"})
+	if err != nil {
+		t.Fatalf("create Item: %v", err)
+	}
+	if _, err := records.Create(ctx, "InventoryItem", map[string]any{
+		"item_id": real.ID, "qty_on_hand": 10.0, "qty_available_to_promise": 10.0,
+	}); err != nil {
+		t.Fatalf("create InventoryItem: %v", err)
+	}
+	// Two rows with no item_id at all. GROUP BY collapses them into one
+	// NULL group, which count(*) would report as an "item" that joins to
+	// no Item record — so the headline count and the risk table below it
+	// would disagree about what exists.
+	for i := 0; i < 2; i++ {
+		if _, err := records.Create(ctx, "InventoryItem", map[string]any{
+			"qty_on_hand": 3.0, "qty_available_to_promise": -1.0,
+		}); err != nil {
+			t.Fatalf("create item-less InventoryItem: %v", err)
+		}
+	}
+
+	summary, err := reporting.StockSummary(ctx)
+	if err != nil {
+		t.Fatalf("StockSummary: %v", err)
+	}
+	if summary.ItemCount != 1 {
+		t.Errorf("ItemCount = %d, want 1 — rows with no item_id must be excluded, not grouped into a phantom item", summary.ItemCount)
+	}
+	if summary.StockoutCount != 0 {
+		t.Errorf("StockoutCount = %d, want 0 — the item-less rows must not raise an alert about an item that does not exist", summary.StockoutCount)
+	}
+	if summary.TotalOnHand != 10 {
+		t.Errorf("TotalOnHand = %v, want 10 (the item-less rows are excluded entirely)", summary.TotalOnHand)
+	}
+}
+
+// A row with no qty_available_to_promise means "unknown", not "zero
+// available". Old per-row behaviour: NULL <= 0 is NULL, so uncounted.
+// Naively wrapping the grouped sum in coalesce(...,0) turns every such
+// item into a stockout alert.
+func TestStockSummary_MissingATPIsNotAStockout(t *testing.T) {
+	ctx := context.Background()
+	tenantDB := freshTenantDB(t)
+	records := data.NewRecordRepo(tenantDB)
+	reporting := data.NewReportingRepo(tenantDB)
+
+	item, err := records.Create(ctx, "Item", map[string]any{"sku": "SKU-NOATP", "name": "No ATP", "item_type": "stock"})
+	if err != nil {
+		t.Fatalf("create Item: %v", err)
+	}
+	if _, err := records.Create(ctx, "InventoryItem", map[string]any{
+		"item_id": item.ID, "qty_on_hand": 10.0,
+	}); err != nil {
+		t.Fatalf("create InventoryItem: %v", err)
+	}
+
+	summary, err := reporting.StockSummary(ctx)
+	if err != nil {
+		t.Fatalf("StockSummary: %v", err)
+	}
+	if summary.ItemCount != 1 {
+		t.Errorf("ItemCount = %d, want 1", summary.ItemCount)
+	}
+	if summary.StockoutCount != 0 {
+		t.Errorf("StockoutCount = %d, want 0 — an absent qty_available_to_promise is unknown, not exhausted", summary.StockoutCount)
+	}
+}
