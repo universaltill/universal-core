@@ -72,6 +72,7 @@ var ReservedModules = map[string]bool{
 	"assets":     true,
 	"projects":   true,
 	"hr":         true,
+	"crm":        true,
 }
 
 // manifest is the raw file shape. Definitions stay json.RawMessage so

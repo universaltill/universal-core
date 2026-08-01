@@ -444,3 +444,58 @@ func TestModulePublishers_MatchReservedModules(t *testing.T) {
 		}
 	}
 }
+
+// TestProvisionTenant_CRMModule is the smoke layer for the CRM module
+// (universaltill/uc-infra#15).
+func TestProvisionTenant_CRMModule(t *testing.T) {
+	dsn := freshControlDB(t)
+
+	stdout, stderr, code := run(t, []string{"DATABASE_URL=" + dsn}, "-name=CRM Smoke Test", "-actor-id=smoke-test", "-modules=crm")
+	if code != 0 {
+		t.Fatalf("run: exit %d, stderr: %s", code, stderr)
+	}
+	id := strings.TrimSpace(stdout)
+	testexec.DropTenantDatabase(t, testexec.Open(t, dsn), id)
+
+	router := openRouter(t, dsn)
+	tenantDB, err := router.Get(context.Background(), id)
+	if err != nil {
+		t.Fatalf("resolve tenant database: %v", err)
+	}
+	ctx := context.Background()
+
+	var count int
+	if err := tenantDB.QueryRowContext(ctx,
+		`SELECT count(*) FROM entity_definitions WHERE entity_type = 'Case' AND status = 'published'`,
+	).Scan(&count); err != nil {
+		t.Fatalf("count published Case: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected 1 published Case definition, got %d", count)
+	}
+	// CRM references Item and SalesOrder, which this tenant does NOT
+	// have — publishing must still work (the module's own claim).
+	var foreign int
+	if err := tenantDB.QueryRowContext(ctx,
+		`SELECT count(*) FROM entity_definitions WHERE entity_type IN ('Item','SalesOrder')`,
+	).Scan(&foreign); err != nil {
+		t.Fatalf("count foreign definitions: %v", err)
+	}
+	if foreign != 0 {
+		t.Errorf("expected no purchasing/sales definitions in a crm-only tenant, got %d", foreign)
+	}
+
+	var statuses int
+	if err := tenantDB.QueryRowContext(ctx,
+		`SELECT count(*) FROM records r
+		 WHERE r.entity_type = 'Status' AND r.deleted_at IS NULL
+		   AND r.data->>'status_type_id' IN (
+		     SELECT id::text FROM records
+		     WHERE entity_type = 'StatusType' AND data->>'code' = 'case_status' AND deleted_at IS NULL)`,
+	).Scan(&statuses); err != nil {
+		t.Fatalf("count case statuses: %v", err)
+	}
+	if statuses != 6 {
+		t.Errorf("expected 6 seeded case_status rows, got %d", statuses)
+	}
+}

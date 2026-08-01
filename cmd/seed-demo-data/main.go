@@ -24,6 +24,7 @@ import (
 	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/kernel/assets"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
+	"github.com/universaltill/universal-core/internal/kernel/crm"
 	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/finance"
@@ -141,6 +142,12 @@ func main() {
 	s.seedCustomerInvoices(customers, currencies, soIDs)
 	if hasPublished(s.ctx, s.entityDefs, "FixedAsset") {
 		s.seedFixedAssets(currencies, accounts, vendors)
+	}
+	if hasPublished(s.ctx, s.entityDefs, "Case") {
+		if err := crm.PublishStatuses(context.Background(), sqlDB, s.actor); err != nil {
+			log.Fatalf("publish crm statuses: %v", err)
+		}
+		s.seedCases(customers, items, soIDs)
 	}
 	if hasPublished(s.ctx, s.entityDefs, "Employee") {
 		if err := hr.PublishStatuses(context.Background(), sqlDB, s.actor); err != nil {
@@ -1401,5 +1408,66 @@ func (s *seeder) seedHR() {
 		"days":           5.0,
 		"reason":         "Summer holiday",
 		"status_id":      s.statusID("leave_request_status", "submitted"),
+	})
+}
+
+// seedCases gives the demo tenant two support cases: one with genuine,
+// coherent warranty context (a customer, a product, and the order that
+// customer actually bought it on — see the named constants below) and
+// one with none, because a case about an account or a delivery is just
+// as real and the context fields are optional for exactly that reason.
+func (s *seeder) seedCases(customers, items, soIDs map[string]string) {
+	// Named keys, like every other seeder in this file. An earlier
+	// draft picked one of each map by `range … break`, which Go
+	// randomises — so the "warranty context" was three independently
+	// random pointers and the cited order belonged to a different
+	// customer on every run, with the item never a line on it. That is
+	// the exact unenforced gap crm.go documents (#78), reproduced by
+	// the demo data with near-certainty, and it made the tenant
+	// non-reproducible between seeds (independent review).
+	//
+	// This triple is coherent: SO-2026-0001 is Doha Retail Group's
+	// order and SKU-1001 is its only line.
+	const (
+		caseCustomer = "Doha Retail Group"
+		caseItemSKU  = "SKU-1001"
+		caseOrder    = "SO-2026-0001"
+	)
+	customerID := customers[caseCustomer]
+	itemID := items[caseItemSKU]
+	soID := soIDs[caseOrder]
+
+	withContext := map[string]any{
+		"case_number": "CASE-2026-001",
+		"subject":     "Delivered unit fails self-test",
+		"description": "Customer reports the unit powers on but fails its self-test on start-up.",
+		"customer_id": customerID,
+		"priority":    "high",
+		"opened_date": "2026-07-29",
+		"sla_due_at":  "2026-07-31",
+		"status_id":   s.statusID("case_status", "in_progress"),
+		// A Party, not an hr.Employee — ADR-0013 rule 4, and the demo
+		// data should show the decision rather than leave the field
+		// blank while a comment argues about it.
+		"assignee_id": s.getOrCreate("Party", "name", "Demo Support Agent", map[string]any{
+			"party_type": "person", "name": "Demo Support Agent", "status": "active",
+		}),
+	}
+	// No emptiness guards: seedItems and seedSalesOrders run
+	// unconditionally before this, and s.def log.Fatalfs on an
+	// unpublished type, so reaching here without them is impossible —
+	// a guard would only imply a partial-licensing path this seeder
+	// does not have (independent review).
+	withContext["item_id"] = itemID
+	withContext["sales_order_id"] = soID
+	s.getOrCreate("Case", "case_number", "CASE-2026-001", withContext)
+
+	s.getOrCreate("Case", "case_number", "CASE-2026-002", map[string]any{
+		"case_number": "CASE-2026-002",
+		"subject":     "Invoice address needs correcting",
+		"customer_id": customerID,
+		"priority":    "low",
+		"opened_date": "2026-07-30",
+		"status_id":   s.statusID("case_status", "new"),
 	})
 }

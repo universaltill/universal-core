@@ -18,6 +18,7 @@ import (
 	"github.com/universaltill/universal-core/internal/db"
 	"github.com/universaltill/universal-core/internal/kernel/assets"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
+	"github.com/universaltill/universal-core/internal/kernel/crm"
 	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/finance"
@@ -61,6 +62,7 @@ var moduleSeeds = map[string]moduleSeed{
 	"assets":     {assets.Publish, assets.PublishForms, assets.PublishStatuses},
 	"projects":   {projects.Publish, projects.PublishForms, projects.PublishStatuses},
 	"hr":         {hr.Publish, hr.PublishForms, hr.PublishStatuses},
+	"crm":        {crm.Publish, crm.PublishForms, crm.PublishStatuses},
 }
 
 // provisionedTenant creates a fresh control database plus a new tenant
@@ -132,7 +134,7 @@ func TestSeedDemoData_MissingDatabaseURL_FailsFast(t *testing.T) {
 }
 
 func TestSeedDemoData_MissingTenantID_FailsFast(t *testing.T) {
-	controlDSN, _ := provisionedTenant(t, "purchasing", "sales", "finance", "assets", "projects", "hr")
+	controlDSN, _ := provisionedTenant(t, "purchasing", "sales", "finance", "assets", "projects", "hr", "crm")
 	_, stderr, code := run(t, []string{"DATABASE_URL=" + controlDSN}, "-actor-id=a")
 	if code == 0 {
 		t.Fatal("expected non-zero exit with -tenant-id unset")
@@ -143,7 +145,7 @@ func TestSeedDemoData_MissingTenantID_FailsFast(t *testing.T) {
 }
 
 func TestSeedDemoData_MissingActorID_FailsFast(t *testing.T) {
-	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance", "assets", "projects", "hr")
+	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance", "assets", "projects", "hr", "crm")
 	_, stderr, code := run(t, []string{"DATABASE_URL=" + controlDSN}, "-tenant-id="+id)
 	if code == 0 {
 		t.Fatal("expected non-zero exit with -actor-id unset")
@@ -169,7 +171,7 @@ func TestSeedDemoData_UnprovisionedModule_FailsCleanly(t *testing.T) {
 }
 
 func TestSeedDemoData_SeedsSampleRecordsAndIsIdempotent(t *testing.T) {
-	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance", "assets", "projects", "hr")
+	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance", "assets", "projects", "hr", "crm")
 
 	_, stderr, code := run(t, []string{"DATABASE_URL=" + controlDSN}, "-tenant-id="+id, "-actor-id=smoke-test")
 	if code != 0 {
@@ -194,6 +196,7 @@ func TestSeedDemoData_SeedsSampleRecordsAndIsIdempotent(t *testing.T) {
 		"FixedAsset", "DepreciationSchedule", "MaintenanceOrder",
 		"Project", "Task", "TimeEntry",
 		"Employee", "LeaveRequest", "AttendanceRecord",
+		"Case",
 	} {
 		counts[entityType] = countRecords(t, tenantDB, entityType)
 		if counts[entityType] == 0 {
@@ -360,7 +363,7 @@ func TestSeedDemoData_SeedsSampleRecordsAndIsIdempotent(t *testing.T) {
 // untouched. This is the "re-run the seeder against the live Demo
 // Organization tenant" convention working on a real pre-#29 row.
 func TestSeedDemoData_BackfillsStagesOnPreexistingPurchaseOrder(t *testing.T) {
-	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance", "assets", "projects", "hr")
+	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance", "assets", "projects", "hr", "crm")
 	control := testexec.Open(t, controlDSN)
 	router, err := tenantdb.NewRouter(control, controlDSN)
 	if err != nil {
@@ -592,7 +595,7 @@ func countJournalEntries(t *testing.T, tenantDB *sql.DB) int {
 // converged backfill must fill ONLY the missing stages and never touch
 // ones that already hold a value.
 func TestSeedDemoData_ExtendsPartialStagePrefix(t *testing.T) {
-	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance", "assets", "projects", "hr")
+	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance", "assets", "projects", "hr", "crm")
 	control := testexec.Open(t, controlDSN)
 	router, err := tenantdb.NewRouter(control, controlDSN)
 	if err != nil {
@@ -687,7 +690,7 @@ func TestSeedDemoData_ExtendsPartialStagePrefix(t *testing.T) {
 // it, and this repo had already set the opposite bar with
 // TestSeedDemoData_ExtendsPartialStagePrefix.
 func TestSeedDemoData_RepairsPartialDepreciationSchedule(t *testing.T) {
-	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance", "assets", "projects", "hr")
+	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance", "assets", "projects", "hr", "crm")
 	seed := func(label string) {
 		t.Helper()
 		if _, stderr, code := run(t, []string{"DATABASE_URL=" + controlDSN}, "-tenant-id="+id, "-actor-id=smoke-test"); code != 0 {
@@ -724,5 +727,62 @@ func TestSeedDemoData_RepairsPartialDepreciationSchedule(t *testing.T) {
 	seed("repair seed")
 	if repaired := countRecords(t, tenantDB, "DepreciationSchedule"); repaired != full {
 		t.Errorf("re-run left the schedule short: %d rows, want %d", repaired, full)
+	}
+}
+
+// TestSeedDemoData_CaseWarrantyContextIsCoherent pins what an earlier
+// draft got wrong: the demo case's customer, product and order were
+// picked by `range … break` over three maps, which Go randomises — so
+// the cited order belonged to a different customer on every run and
+// the item was never a line on it. That is precisely the unenforced
+// gap crm.go documents, reproduced by the demo data, and it made the
+// tenant non-reproducible between seeds.
+func TestSeedDemoData_CaseWarrantyContextIsCoherent(t *testing.T) {
+	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance", "assets", "projects", "hr", "crm")
+	if _, stderr, code := run(t, []string{"DATABASE_URL=" + controlDSN}, "-tenant-id="+id, "-actor-id=smoke-test"); code != 0 {
+		t.Fatalf("seed: exit %d: %s", code, stderr)
+	}
+	control := testexec.Open(t, controlDSN)
+	router, err := tenantdb.NewRouter(control, controlDSN)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+	t.Cleanup(func() { router.Close() })
+	tenantDB, err := router.Get(context.Background(), id)
+	if err != nil {
+		t.Fatalf("router.Get: %v", err)
+	}
+	ctx := context.Background()
+
+	var caseCustomer, caseItem, caseOrder string
+	if err := tenantDB.QueryRowContext(ctx,
+		`SELECT data->>'customer_id', data->>'item_id', data->>'sales_order_id'
+		 FROM records WHERE entity_type = 'Case' AND data->>'case_number' = 'CASE-2026-001' AND deleted_at IS NULL`,
+	).Scan(&caseCustomer, &caseItem, &caseOrder); err != nil {
+		t.Fatalf("read seeded case: %v", err)
+	}
+
+	// The cited order must belong to the case's own customer.
+	var orderCustomer string
+	if err := tenantDB.QueryRowContext(ctx,
+		`SELECT data->>'customer_id' FROM records WHERE id = $1::uuid AND entity_type = 'SalesOrder'`, caseOrder,
+	).Scan(&orderCustomer); err != nil {
+		t.Fatalf("read cited sales order: %v", err)
+	}
+	if orderCustomer != caseCustomer {
+		t.Errorf("the case cites an order belonging to a different customer: case=%s order=%s", caseCustomer, orderCustomer)
+	}
+
+	// And the cited item must actually be a line on that order.
+	var lines int
+	if err := tenantDB.QueryRowContext(ctx,
+		`SELECT count(*) FROM records
+		 WHERE entity_type = 'SOLine' AND deleted_at IS NULL
+		   AND data->>'sales_order_id' = $1 AND data->>'item_id' = $2`, caseOrder, caseItem,
+	).Scan(&lines); err != nil {
+		t.Fatalf("count matching order lines: %v", err)
+	}
+	if lines == 0 {
+		t.Error("the case cites a product that was never a line on the order it cites")
 	}
 }

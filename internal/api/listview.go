@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"html/template"
 	"net/http"
@@ -338,6 +339,17 @@ func visibleFields(def *entity.Definition, redacted map[string]bool) []entity.Fi
 // worse than an empty result a user can see and correct.
 func (h *Handler) referenceIDsMatching(ctx context.Context, ts tenantScope, targetType, text string) ([]string, error) {
 	targetDef, err := ts.entityDef(ctx, targetType)
+	if errors.Is(err, data.ErrNotFound) {
+		// The target's module is not licensed in this tenant — a real,
+		// supported configuration (crm references Item and SalesOrder,
+		// and can be licensed without purchasing or sales). Filtering by
+		// it matches nothing, which is the truthful answer; 500ing the
+		// whole list page is not. Every neighbouring resolution path
+		// (loadCurrentReferenceLabels, pageReferenceLabels) already
+		// degrades rather than failing — this one was the odd one out
+		// (independent review).
+		return []string{}, nil
+	}
 	if err != nil {
 		return nil, fmt.Errorf("look up %s definition: %w", targetType, err)
 	}
