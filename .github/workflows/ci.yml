@@ -160,7 +160,10 @@ jobs:
         # never lower this number to make a change pass; close the gap
         # with tests instead. Baseline set 2026-08-02 from this same
         # measurement, with a real browser present so internal/e2e's 49
-        # tests actually ran rather than skipping (see
+        # tests actually ran rather than skipping: 84.5% measured, floor
+        # set to 83.5 (1.0pp headroom — independent review flagged the
+        # first attempt's 0.1pp as too thin a margin for a single-run
+        # measurement) (see
         # uc-infra/docs/code-reviews/2026-08-02-tdd-coverage-gate.md for
         # the full baseline run and why the first attempt was discarded).
         # `if: always()`: run even if the Test step above already failed,
@@ -171,9 +174,9 @@ jobs:
             exit 1
           fi
           echo "--- Lowest-covered functions (bottom 15) ---"
-          go tool cover -func=coverage.out | grep -v '^total:' | sort -t$'\t' -k3 -n | head -15
+          go tool cover -func=coverage.out | grep -v '^total:' | awk -F'\t+' '{pct=$NF; gsub("%","",pct); print pct"\t"$0}' | sort -n -k1,1 | cut -f2- | head -15 || true
           echo "---"
-          COVERAGE_FLOOR=CI_BASELINE_PLACEHOLDER
+          COVERAGE_FLOOR=83.5
           TOTAL=$(go tool cover -func=coverage.out | tail -1 | awk '{print $NF}' | tr -d '%')
           echo "Whole-program coverage: ${TOTAL}% (floor: ${COVERAGE_FLOOR}%)"
           awk -v t="$TOTAL" -v f="$COVERAGE_FLOOR" 'BEGIN { exit (t+0 >= f+0) ? 0 : 1 }' || {
