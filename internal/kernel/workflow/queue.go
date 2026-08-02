@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"maps"
 	"time"
@@ -49,7 +50,9 @@ type DefinitionLookup func(ctx context.Context, name string, version int) (*Defi
 // step N", so factoring them together would mean threading unused
 // durability concerns through the simple synchronous path.
 type Queue struct {
+	db       *sql.DB
 	jobs     *data.WorkflowJobRepo
+	auditLog *data.AuditRepo
 	handlers map[StepKind]StepHandler
 	backoff  func(attempt int) time.Duration
 }
@@ -70,7 +73,9 @@ func NewQueue(db *sql.DB, handlers map[StepKind]StepHandler) (*Queue, error) {
 	}
 	maps.Copy(h, handlers)
 	return &Queue{
+		db:       db,
 		jobs:     data.NewWorkflowJobRepo(db),
+		auditLog: data.NewAuditRepo(db),
 		handlers: h,
 		backoff:  defaultBackoff,
 	}, nil
@@ -217,4 +222,149 @@ func (q *Queue) ListByStatus(ctx context.Context, status string) ([]data.Workflo
 // resumed, despite that being this package's whole reason to exist.
 func (q *Queue) ReclaimStale(ctx context.Context, leaseTimeout time.Duration) ([]string, error) {
 	return q.jobs.ReclaimStale(ctx, leaseTimeout)
+}
+
+// EscalateOverdueApprovals widens approver eligibility (uc-infra#64,
+// internal/api/workflow.go's userMayApprove) for every waiting_approval
+// job whose require_approval step set escalate_after_hours and has sat
+// past that threshold. Call this periodically (e.g. once per worker tick,
+// alongside ReclaimStale/Scheduler.FireDue) from whatever process runs
+// the queue — internal/worker does, once per tenant per tick.
+//
+// Unlike ReclaimStale's single WHERE-clause sweep, the threshold isn't a
+// fixed duration: it's a per-step Definition param, so each candidate's
+// Definition must be resolved and its step's escalate_after_hours read
+// before deciding whether it's actually overdue. One job's Definition
+// failing to resolve (a dangling/unpublished workflow_name+version, e.g.)
+// is logged and skipped rather than aborting the whole sweep — the same
+// per-row resilience ReclaimStale gets for free from operating in pure
+// SQL, reproduced here in Go since this method can't.
+//
+// now is threaded in (not time.Now()) for the same reproducibility reason
+// Scheduler.FireDue takes it — a fixed instant makes the "past threshold"
+// decision deterministic and testable.
+func (q *Queue) EscalateOverdueApprovals(ctx context.Context, now time.Time, lookup DefinitionLookup, actor audit.Actor) ([]string, error) {
+	candidates, err := q.jobs.ListWaitingApproval(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list waiting-approval jobs: %w", err)
+	}
+
+	// Memoized per definition (name@version), not per job: an unmemoized
+	// lookup here is a fresh registry SELECT (RegistryDefinitionLookup)
+	// per candidate, every tick — the exact N+1 shape this codebase has
+	// already paid down twice elsewhere (internal/api/workflow.go's own
+	// defCache for this identical problem; worker.go's ScheduleSyncInterval
+	// throttling schedule Sync for the same "O(n) scan on every tick"
+	// reason). Most waiting_approval jobs share a handful of workflow
+	// definitions and most steps have no escalate_after_hours at all, so
+	// this collapses what would be O(candidates) registry reads to
+	// O(distinct definitions actually seen this sweep).
+	defs := map[string]*Definition{}
+	defErrs := map[string]error{}
+	resolve := func(name string, version int) (*Definition, error) {
+		key := fmt.Sprintf("%s@%d", name, version)
+		if d, ok := defs[key]; ok {
+			return d, nil
+		}
+		if err, ok := defErrs[key]; ok {
+			return nil, err
+		}
+		d, err := lookup(ctx, name, version)
+		if err != nil {
+			defErrs[key] = err
+			return nil, err
+		}
+		defs[key] = d
+		return d, nil
+	}
+
+	var escalated []string
+	for _, job := range candidates {
+		def, err := resolve(job.WorkflowName, job.WorkflowVersion)
+		if err != nil {
+			// A bad job shouldn't block the rest of the sweep — see the
+			// method doc comment. Nothing durable happens to this job;
+			// it's simply reconsidered next tick.
+			continue
+		}
+		if job.StepIndex < 0 || job.StepIndex >= len(def.Steps) {
+			continue
+		}
+		step := def.Steps[job.StepIndex]
+		if step.Kind != StepRequireApproval {
+			continue
+		}
+		rawHours, ok := step.Params["escalate_after_hours"]
+		if !ok {
+			continue
+		}
+		hours, ok := rawHours.(float64)
+		// Definition.Validate() rejects a non-positive or out-of-range
+		// value at publish time (see its own doc comment on the upper
+		// bound and why); this is the same "a lookup can still return
+		// something Validate would have refused" defense-in-depth this
+		// package's own tests already exercise for a malformed role
+		// param. hours<=0 alone would not catch NaN (NaN<=0 is false)
+		// or a value whose *time.Duration conversion overflows/saturates
+		// to a negative duration — both would make this branch compute a
+		// negative or zero threshold and escalate immediately, the exact
+		// inverse of "essentially never" a huge escalate_after_hours is
+		// supposed to mean. validEscalateAfterHours applies the same
+		// bound Validate does, so a corrupted Definition returned by a
+		// bad lookup can't reach the threshold math with a poisoned value
+		// either.
+		if !ok || !validEscalateAfterHours(hours) {
+			continue
+		}
+		threshold := time.Duration(hours * float64(time.Hour))
+		if now.Sub(job.UpdatedAt) < threshold {
+			continue
+		}
+
+		if err := q.escalateOne(ctx, job, actor); err != nil {
+			if errors.Is(err, data.ErrNotFound) {
+				// Already escalated or resumed by a concurrent
+				// caller/tick between the list and here — not this
+				// sweep's job to report.
+				continue
+			}
+			// A per-job failure (e.g. a transient DB error inside this
+			// one job's transaction) must not starve every candidate
+			// after it in iteration order — same per-row resilience as
+			// the lookup-failure branch above. Reconsidered next tick.
+			continue
+		}
+		escalated = append(escalated, job.ID)
+	}
+	return escalated, nil
+}
+
+// escalateOne marks one job escalated and writes its audit row in the
+// same transaction (CLAUDE.md: audit written from the same transaction as
+// the mutation, never bolted on after) — mirrors
+// internal/kernel/crud.Engine.Create's BeginTx -> mutate -> audit.New ->
+// auditLog.Insert -> Commit shape.
+func (q *Queue) escalateOne(ctx context.Context, job data.WorkflowJob, actor audit.Actor) error {
+	tx, err := q.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // rollback is a no-op after a successful commit
+
+	if err := q.jobs.MarkEscalatedTx(ctx, tx, job.ID); err != nil {
+		return err
+	}
+
+	entry, err := audit.New(job.EntityType, job.RecordID, audit.ActionUpdate, actor, map[string]any{"escalated": true})
+	if err != nil {
+		return fmt.Errorf("build audit entry: %w", err)
+	}
+	if err := q.auditLog.Insert(ctx, tx, entry); err != nil {
+		return fmt.Errorf("write audit entry: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+	return nil
 }

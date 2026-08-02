@@ -25,7 +25,14 @@ type WorkflowJob struct {
 	MaxAttempts     int
 	LastError       string
 	RunAfter        time.Time
-	Actor           audit.Actor
+	UpdatedAt       time.Time
+	// Escalated is set once Queue.EscalateOverdueApprovals (uc-infra#64)
+	// has widened this job's approver eligibility past its
+	// escalate_after_hours threshold — see MarkEscalatedTx and
+	// internal/api/workflow.go's userMayApprove. Meaningless outside
+	// status='waiting_approval'; always false otherwise.
+	Escalated bool
+	Actor     audit.Actor
 }
 
 // ErrNoJobAvailable is returned by ClaimNext when no job is currently due.
@@ -215,10 +222,19 @@ func (r *WorkflowJobRepo) MarkFailed(ctx context.Context, id string, stepErr err
 // match. Only valid from 'waiting_approval'; returns ErrNotFound if the
 // job isn't in that state (already resumed, never halted, or doesn't
 // exist in this database).
+//
+// Also resets `escalated` back to false (uc-infra#64 regression an
+// independent review caught): without this, a job whose FIRST
+// require_approval step escalated would carry that flag straight into
+// its NEXT require_approval step — that step's own escalate_role holder
+// would be granted approval with zero elapsed time, and the step would
+// also become permanently invisible to ListWaitingApproval's
+// `escalated = false` filter. Each require_approval step gets its own
+// escalation clock, starting fresh.
 func (r *WorkflowJobRepo) ResumeAfterApproval(ctx context.Context, id string) error {
 	n, err := execRows(ctx, r.db,
 		`UPDATE workflow_jobs
-		 SET status = 'queued', step_index = step_index + 1, run_after = now(), updated_at = now()
+		 SET status = 'queued', step_index = step_index + 1, run_after = now(), updated_at = now(), escalated = false
 		 WHERE id = $1 AND status = 'waiting_approval'`,
 		id)
 	if err != nil {
@@ -236,12 +252,12 @@ func (r *WorkflowJobRepo) Get(ctx context.Context, id string) (WorkflowJob, erro
 	err := r.db.QueryRowContext(ctx,
 		`SELECT id, workflow_name, workflow_version, entity_type, record_id,
 		        step_index, status, attempts, max_attempts, last_error, run_after,
-		        actor_type, actor_id, model_version
+		        updated_at, escalated, actor_type, actor_id, model_version
 		 FROM workflow_jobs WHERE id = $1`,
 		id,
 	).Scan(&j.ID, &j.WorkflowName, &j.WorkflowVersion, &nullEntityType{&j.EntityType}, &nullEntityType{&j.RecordID},
 		&j.StepIndex, &j.Status, &j.Attempts, &j.MaxAttempts, &lastError, &j.RunAfter,
-		&j.Actor.Type, &j.Actor.ID, &modelVersion)
+		&j.UpdatedAt, &j.Escalated, &j.Actor.Type, &j.Actor.ID, &modelVersion)
 	if errors.Is(err, sql.ErrNoRows) {
 		return WorkflowJob{}, ErrNotFound
 	}
@@ -267,7 +283,7 @@ func (r *WorkflowJobRepo) ListByStatus(ctx context.Context, status string) ([]Wo
 	rows, err := r.db.QueryContext(ctx,
 		`SELECT id, workflow_name, workflow_version, entity_type, record_id,
 		        step_index, status, attempts, max_attempts, last_error, run_after,
-		        actor_type, actor_id, model_version
+		        updated_at, escalated, actor_type, actor_id, model_version
 		 FROM workflow_jobs WHERE status = $1 ORDER BY created_at`,
 		status,
 	)
@@ -282,7 +298,7 @@ func (r *WorkflowJobRepo) ListByStatus(ctx context.Context, status string) ([]Wo
 		var modelVersion, lastError sql.NullString
 		if err := rows.Scan(&j.ID, &j.WorkflowName, &j.WorkflowVersion, &nullEntityType{&j.EntityType}, &nullEntityType{&j.RecordID},
 			&j.StepIndex, &j.Status, &j.Attempts, &j.MaxAttempts, &lastError, &j.RunAfter,
-			&j.Actor.Type, &j.Actor.ID, &modelVersion); err != nil {
+			&j.UpdatedAt, &j.Escalated, &j.Actor.Type, &j.Actor.ID, &modelVersion); err != nil {
 			return nil, fmt.Errorf("scan workflow job: %w", err)
 		}
 		if modelVersion.Valid {
@@ -294,6 +310,79 @@ func (r *WorkflowJobRepo) ListByStatus(ctx context.Context, status string) ([]Wo
 		out = append(out, j)
 	}
 	return out, rows.Err()
+}
+
+// ListWaitingApproval returns every job currently parked at
+// waiting_approval that has not yet escalated — the candidate set
+// Queue.EscalateOverdueApprovals (uc-infra#64) sweeps each tick. Unlike
+// ReclaimStale, the elapsed-time-vs-threshold comparison can't happen in
+// this query: escalate_after_hours lives on the step's own Params in the
+// workflow.Definition, not on the job row, so the caller resolves each
+// job's Definition/Step and compares against UpdatedAt itself. Scoped to
+// this database only, same as every other method here (ADR-0003).
+func (r *WorkflowJobRepo) ListWaitingApproval(ctx context.Context) ([]WorkflowJob, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT id, workflow_name, workflow_version, entity_type, record_id,
+		        step_index, status, attempts, max_attempts, last_error, run_after,
+		        updated_at, escalated, actor_type, actor_id, model_version
+		 FROM workflow_jobs WHERE status = 'waiting_approval' AND escalated = false ORDER BY created_at`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list waiting-approval workflow jobs: %w", err)
+	}
+	defer rows.Close()
+
+	var out []WorkflowJob
+	for rows.Next() {
+		var j WorkflowJob
+		var modelVersion, lastError sql.NullString
+		if err := rows.Scan(&j.ID, &j.WorkflowName, &j.WorkflowVersion, &nullEntityType{&j.EntityType}, &nullEntityType{&j.RecordID},
+			&j.StepIndex, &j.Status, &j.Attempts, &j.MaxAttempts, &lastError, &j.RunAfter,
+			&j.UpdatedAt, &j.Escalated, &j.Actor.Type, &j.Actor.ID, &modelVersion); err != nil {
+			return nil, fmt.Errorf("scan workflow job: %w", err)
+		}
+		if modelVersion.Valid {
+			j.Actor.ModelVersion = modelVersion.String
+		}
+		if lastError.Valid {
+			j.LastError = lastError.String
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
+// MarkEscalatedTx flips a waiting_approval job's Escalated flag, within a
+// caller-supplied transaction so the flag and its audit row commit or
+// roll back together (CLAUDE.md: audit written from the same transaction
+// as the mutation, never bolted on after) — see
+// Queue.EscalateOverdueApprovals, the only caller. Guarded by
+// `status = 'waiting_approval' AND escalated = false`, the same
+// optimistic idiom as every other Mark* method: a second sweep tick (or
+// a racing approval that resumed the job first) affects zero rows and
+// gets ErrNotFound back rather than double-escalating or resurrecting a
+// job that already moved on.
+func (r *WorkflowJobRepo) MarkEscalatedTx(ctx context.Context, tx *sql.Tx, id string) error {
+	// Deliberately does NOT touch updated_at, unlike every other Mark*
+	// method here: this column doubles as "entered waiting_approval at"
+	// (see this file's own package doc / the migration's comment on why
+	// no separate timestamp column exists), and escalating a job must not
+	// reset that clock — an independent review flagged an earlier draft
+	// that did as contradicting the exact invariant the whole
+	// no-new-column decision rests on. escalated=false already excludes
+	// this row from ListWaitingApproval's candidate set once escalated,
+	// so there is nothing left to time here anyway.
+	n, err := execRows(ctx, tx,
+		`UPDATE workflow_jobs SET escalated = true
+		 WHERE id = $1 AND status = 'waiting_approval' AND escalated = false`,
+		id)
+	if err != nil {
+		return fmt.Errorf("mark workflow job escalated: %w", err)
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // ReclaimStale requeues jobs stuck in 'running' whose updated_at is older

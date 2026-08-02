@@ -1,6 +1,9 @@
 package workflow
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 // poApprovalWorkflow is the worked example from ADR-0017's purchasing
 // scenario: a PO over a threshold requires approval, then finance is
@@ -98,6 +101,118 @@ func TestDefinitionValidate_RequireApprovalWithNoRoleParamIsValid(t *testing.T) 
 	}
 	if err := d.Validate(); err != nil {
 		t.Fatalf("expected a require_approval step with no role param to stay valid, got %v", err)
+	}
+}
+
+// uc-infra#64: escalation timers. escalate_after_hours/escalate_role/
+// escalate_department follow the exact same fail-at-publish discipline as
+// role/department above — a malformed value here must be rejected at
+// Validate, not silently discovered hours later when the sweep
+// (Queue.EscalateOverdueApprovals) or the approval gate first reads it.
+
+func TestDefinitionValidate_EscalateAfterHoursRequiresEscalateRole(t *testing.T) {
+	d := &Definition{
+		Name:    "x",
+		Trigger: Trigger{Type: TriggerManual},
+		Steps:   []Step{{Kind: StepRequireApproval, Params: map[string]any{"role": "cfo", "escalate_after_hours": 24.0}}},
+	}
+	if err := d.Validate(); err == nil {
+		t.Fatal("expected error: escalate_after_hours with no escalate_role must be rejected")
+	}
+}
+
+// TestDefinitionValidate_EscalateAfterHoursMustBePositiveNumber's "huge"
+// and "NaN" cases are the regression test for a real fail-open bug an
+// independent review caught: hours<=0 alone rejects neither NaN
+// (NaN<=0 is false) nor a value so large that
+// Queue.EscalateOverdueApprovals' hours*time.Hour conversion to
+// time.Duration overflows int64 nanoseconds and saturates to a NEGATIVE
+// duration — turning an intended "essentially never" threshold into
+// "escalate on the very next tick." Reviewer measured 2.6e6 hours and
+// 1e9 hours both saturating to the same negative duration; "huge" here
+// uses a value comfortably past maxEscalateAfterHours but still well
+// under where the float64->int64 overflow itself would kick in, so this
+// asserts Validate's OWN bound is doing the rejecting, not incidentally
+// relying on the overflow to produce a signed value some other check
+// happens to catch.
+func TestDefinitionValidate_EscalateAfterHoursMustBePositiveNumber(t *testing.T) {
+	cases := map[string]any{
+		"non-number": "24",
+		"zero":       0.0,
+		"negative":   -1.0,
+		"huge":       maxEscalateAfterHours + 1,
+		"NaN":        math.NaN(),
+		"+Inf":       math.Inf(1),
+	}
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			d := &Definition{
+				Name:    "x",
+				Trigger: Trigger{Type: TriggerManual},
+				Steps:   []Step{{Kind: StepRequireApproval, Params: map[string]any{"escalate_after_hours": raw, "escalate_role": "cfo"}}},
+			}
+			if err := d.Validate(); err == nil {
+				t.Fatalf("expected error: escalate_after_hours %v must be rejected", raw)
+			}
+		})
+	}
+}
+
+func TestDefinitionValidate_EscalateDepartmentRequiresEscalateRole(t *testing.T) {
+	d := &Definition{
+		Name:    "x",
+		Trigger: Trigger{Type: TriggerManual},
+		Steps:   []Step{{Kind: StepRequireApproval, Params: map[string]any{"escalate_after_hours": 24.0, "escalate_department": "department_id"}}},
+	}
+	if err := d.Validate(); err == nil {
+		t.Fatal("expected error: escalate_after_hours with no escalate_role must be rejected, even with escalate_department set")
+	}
+}
+
+func TestDefinitionValidate_EscalateRoleMustBeNonEmptyString(t *testing.T) {
+	d := &Definition{
+		Name:    "x",
+		Trigger: Trigger{Type: TriggerManual},
+		Steps:   []Step{{Kind: StepRequireApproval, Params: map[string]any{"escalate_after_hours": 24.0, "escalate_role": ""}}},
+	}
+	if err := d.Validate(); err == nil {
+		t.Fatal("expected error: an explicit empty-string escalate_role param must be rejected")
+	}
+}
+
+func TestDefinitionValidate_EscalateDepartmentMustBeNonEmptyString(t *testing.T) {
+	d := &Definition{
+		Name:    "x",
+		Trigger: Trigger{Type: TriggerManual},
+		Steps:   []Step{{Kind: StepRequireApproval, Params: map[string]any{"escalate_after_hours": 24.0, "escalate_role": "cfo", "escalate_department": ""}}},
+	}
+	if err := d.Validate(); err == nil {
+		t.Fatal("expected error: an explicit empty-string escalate_department param must be rejected")
+	}
+}
+
+func TestDefinitionValidate_ValidEscalationCombination(t *testing.T) {
+	d := &Definition{
+		Name:    "x",
+		Trigger: Trigger{Type: TriggerManual},
+		Steps: []Step{{Kind: StepRequireApproval, Params: map[string]any{
+			"role": "finance_manager", "department": "department_id",
+			"escalate_after_hours": 24.0, "escalate_role": "cfo", "escalate_department": "department_id",
+		}}},
+	}
+	if err := d.Validate(); err != nil {
+		t.Fatalf("expected valid escalation step, got %v", err)
+	}
+}
+
+func TestDefinitionValidate_RequireApprovalWithNoEscalateParamsIsValid(t *testing.T) {
+	d := &Definition{
+		Name:    "x",
+		Trigger: Trigger{Type: TriggerManual},
+		Steps:   []Step{{Kind: StepRequireApproval, Params: map[string]any{"role": "cfo"}}},
+	}
+	if err := d.Validate(); err != nil {
+		t.Fatalf("expected a require_approval step with no escalation params to stay valid, got %v", err)
 	}
 }
 

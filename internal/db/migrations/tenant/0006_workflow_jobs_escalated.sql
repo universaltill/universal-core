@@ -1,0 +1,17 @@
+-- uc-infra#64: escalation timers for require_approval workflow steps.
+--
+-- Records whether a waiting_approval job's approver eligibility has been
+-- widened past its step's escalate_after_hours threshold (see
+-- internal/kernel/workflow/queue.go's EscalateOverdueApprovals and
+-- internal/api/workflow.go's userMeetsApproval). No new timestamp column
+-- is needed alongside it: MarkWaitingApproval already sets updated_at =
+-- now() exactly on entering waiting_approval, and nothing else touches
+-- updated_at while status stays waiting_approval (ResumeAfterApproval /
+-- MarkFailed / ReclaimStale are all guarded to other statuses) — so
+-- updated_at is already a reliable "entered waiting_approval at" clock,
+-- the same precedent ReclaimStale itself relies on for lease-elapsed.
+--
+-- Defaults false so every pre-existing row (and every row inserted by
+-- the unmodified Enqueue path) starts non-escalated, matching current
+-- behavior exactly until a step actually opts into escalate_after_hours.
+ALTER TABLE workflow_jobs ADD COLUMN escalated BOOLEAN NOT NULL DEFAULT false;

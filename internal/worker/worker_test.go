@@ -279,6 +279,108 @@ func TestRunner_ReclaimsStaleJobsEachTick(t *testing.T) {
 	}
 }
 
+// TestRunner_EscalatesOverdueApprovalsEachTick confirms
+// Queue.EscalateOverdueApprovals (uc-infra#64) is actually wired into
+// tickTenant, not just unit-tested in isolation — the same "prove the
+// wiring, not just the mechanism" property TestRunner_
+// ReclaimsStaleJobsEachTick establishes for ReclaimStale and
+// TestRunner_FiresScheduledWorkflowEndToEnd establishes for FireDue.
+func TestRunner_EscalatesOverdueApprovalsEachTick(t *testing.T) {
+	router, control := newTestRouter(t)
+	_, tenantDB := newTestTenant(t, router)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	def := &workflow.Definition{
+		Name: "escalation_wiring_test", Version: 1,
+		Trigger: workflow.Trigger{Type: workflow.TriggerManual},
+		Steps: []workflow.Step{{Kind: workflow.StepRequireApproval, Params: map[string]any{
+			"role": "cfo", "escalate_after_hours": 1.0, "escalate_role": "vp",
+		}}},
+	}
+	actor := humanActor()
+	publish(t, tenantDB, def, actor)
+
+	q, err := workflow.NewQueue(tenantDB, nil)
+	if err != nil {
+		t.Fatalf("NewQueue: %v", err)
+	}
+	job, err := q.Enqueue(ctx, def, "PurchaseOrder", "66666666-6666-6666-6666-666666666666", actor)
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	r := New(router, control, nil, fastTestConfig())
+	stop := startRunner(r, ctx)
+	defer func() { cancel(); stop() }()
+
+	repo := data.NewWorkflowJobRepo(tenantDB)
+
+	// Wait for the runner to actually halt the job at waiting_approval
+	// (require_approval never gets a handler call — Queue always
+	// intercepts it, see queue.go's ProcessOne doc comment) before
+	// backdating it, same two-phase wait TestRunner_
+	// FiresScheduledWorkflowEndToEnd uses for the schedule to register
+	// before forcing it due.
+	waitFor(t, ctx, 3*time.Second, func() bool {
+		got, err := repo.Get(ctx, job.ID)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		return got.Status == "waiting_approval"
+	})
+
+	if _, err := tenantDB.ExecContext(ctx,
+		`UPDATE workflow_jobs SET updated_at = now() - interval '2 hours' WHERE id = $1`, job.ID,
+	); err != nil {
+		t.Fatalf("backdate updated_at: %v", err)
+	}
+
+	waitFor(t, ctx, 3*time.Second, func() bool {
+		got, err := repo.Get(ctx, job.ID)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		return got.Escalated
+	})
+
+	// An audit row backs the escalation (CLAUDE.md: every mutation writes
+	// an audit row), attributed to the system actor, the same identity
+	// FireDue's own audit rows use.
+	var actorType string
+	if err := tenantDB.QueryRowContext(ctx,
+		`SELECT actor_type FROM audit_log WHERE record_id = $1 AND action = 'update'`,
+		"66666666-6666-6666-6666-666666666666",
+	).Scan(&actorType); err != nil {
+		t.Fatalf("read audit row for escalation: %v", err)
+	}
+	if actorType != "system" {
+		t.Fatalf("expected the escalation's audit row attributed to 'system', got %q", actorType)
+	}
+}
+
+// waitFor polls cond every 20ms until it returns true or timeout elapses,
+// failing the test on timeout — the shared shape TestRunner_
+// FiresScheduledWorkflowEndToEnd and TestRunner_
+// ProcessesMultipleTenantsIndependentlyInOneTick each inline their own
+// copy of; factored out here since this test needs it twice.
+func waitFor(t *testing.T, ctx context.Context, timeout time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if cond() {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for condition")
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("context cancelled while waiting for condition")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
 func TestRunner_StopsOnContextCancellation(t *testing.T) {
 	router, control := newTestRouter(t)
 	ctx, cancel := context.WithCancel(context.Background())

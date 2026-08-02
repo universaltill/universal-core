@@ -215,6 +215,18 @@ func (r *Runner) tickTenant(ctx context.Context, tenantID string, q *workflow.Qu
 		log.Printf("worker: tenant %s: reclaimed %d stale job(s): %v", tenantID, len(reclaimed), reclaimed)
 	}
 
+	// uc-infra#64: widen approver eligibility for any waiting_approval job
+	// whose require_approval step has sat past its escalate_after_hours
+	// threshold. Same clock-driven-firing nature as FireDue above, so it
+	// reuses schedulerActor() rather than inventing a second system
+	// identity for what is, from the audit trail's point of view, the
+	// same kind of event: the clock came round, nobody clicked anything.
+	if escalated, err := q.EscalateOverdueApprovals(ctx, time.Now().UTC(), lookup, schedulerActor()); err != nil {
+		log.Printf("worker: tenant %s: escalate overdue approvals: %v", tenantID, err)
+	} else if len(escalated) > 0 {
+		log.Printf("worker: tenant %s: escalated %d overdue approval(s): %v", tenantID, len(escalated), escalated)
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
