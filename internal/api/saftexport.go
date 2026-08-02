@@ -11,14 +11,20 @@
 // tables no entity Definition governs — plus Party/PartyRole/TaxCode
 // records through the guarded engine. Access is therefore gated
 // explicitly up front on read permission for every entity type whose
-// data the file discloses (saftEntityTypes), the same whole-report
-// gate reporting.go's requireReportRead applies and for the same
-// reason: the file is one unit, per-field redaction inside a statutory
-// schema is not meaningful.
+// data the file discloses (saftEntityTypes), the same whole-report gate
+// reporting.go's requireReportRead applies: the file is one unit, so a
+// missing read grant refuses the whole export, not a redacted section.
+// A field the file discloses that is individually hidden (FieldPermission,
+// not just entity-level read) gets the same refusal (saftFieldReads) —
+// the guarded engine would otherwise silently strip it and the
+// serializer would render a schema-valid file with a false empty value
+// (uc-infra#67, same hole #27's independent review found on the UBL
+// export).
 package api
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"html/template"
 	"net/http"
@@ -43,6 +49,68 @@ import (
 // the entries are unreadable without the chart they post to.
 var saftEntityTypes = []string{"Account", "TaxCode", "Party", "PartyRole"}
 
+// saftFieldReads is every field ts.crud actually reads for the entity
+// types in saftEntityTypes — the field-level half of the whole-file gate
+// (uc-infra#67, same hole #27's independent review found on the UBL
+// export). The correct test for membership is "does the guarded engine's
+// redact() delete this field when hidden", NOT "is this field literally
+// serialized into the file" — hiding a field the code merely branches or
+// joins on is exactly as silent a failure as hiding a rendered one, just
+// with a different symptom. Two ways a deleted field surfaces:
+//   - rendered as ""/0 in a schema-valid file (Party.name/tax_id,
+//     TaxCode's own fields): the #27-shaped case this fix was written for.
+//   - silently dropped from the file instead: saftParties keys its lookup
+//     on PartyRole's own party_id and switches on role_type, so hiding
+//     EITHER makes every role fail to resolve or classify — the file
+//     would ship with empty Customers/Suppliers master files, a false
+//     "this tenant has no trading partners" statutory claim, which is
+//     worse than a rendered blank (independent review finding, this
+//     card's own fix pass).
+//
+// Account gets no entry: its fields come from gl_accounts (a typed table
+// no FieldPermission governs — see the package doc comment), never
+// through ts.crud, so nothing here is ever silently redacted.
+var saftFieldReads = map[string][]string{
+	"Party":     {"name", "tax_id"},
+	"PartyRole": {"party_id", "role_type"},
+	"TaxCode":   {"code", "name", "jurisdiction", "rate"},
+}
+
+// saftAccessDenial runs the whole-file gate shared by the export, its
+// landing page, and the Finance module menu's link to that page
+// (modulemenu.go's moduleReportLinks.ExtraDenied): read access to every
+// entity type in saftEntityTypes, plus — for the subset with a
+// saftFieldReads entry — that no field the file actually reads is
+// hidden for this actor. Returns ("", nil) when access is fine, or a
+// message that should reach the actor (never wrapped, since it is not a
+// mistake) once it is not. Not a Handler method: nothing here reads
+// handler state, only the tenant scope every caller already has.
+func saftAccessDenial(ctx context.Context, ts tenantScope) (string, error) {
+	for _, entityType := range saftEntityTypes {
+		allowed, err := ts.crud.CanRead(ctx, entityType)
+		if err != nil {
+			return "", fmt.Errorf("check %s read permission for SAF-T export: %w", entityType, err)
+		}
+		if !allowed {
+			return "SAF-T export requires read access to " + entityType, nil
+		}
+		fields, ok := saftFieldReads[entityType]
+		if !ok {
+			continue
+		}
+		hidden, err := ts.crud.HiddenFields(ctx, entityType)
+		if err != nil {
+			return "", fmt.Errorf("resolve hidden %s fields for SAF-T export: %w", entityType, err)
+		}
+		for _, f := range fields {
+			if hidden[f] {
+				return "SAF-T export requires unredacted access to " + entityType + "." + f, nil
+			}
+		}
+	}
+	return "", nil
+}
+
 // exportSAFT streams the tenant's SAF-T Financial file for the
 // inclusive ?from=&to= date range. The file is fully assembled in
 // memory before the first response byte: unlike the CSV export's
@@ -62,16 +130,12 @@ func (h *Handler) exportSAFT(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, "resolve tenant scope", err)
 		return
 	}
-	for _, entityType := range saftEntityTypes {
-		allowed, err := ts.crud.CanRead(r.Context(), entityType)
-		if err != nil {
-			writeInternalError(w, "check "+entityType+" read permission for SAF-T export", err)
-			return
-		}
-		if !allowed {
-			httpx.WriteError(w, http.StatusForbidden, "SAF-T export requires read access to "+entityType)
-			return
-		}
+	if msg, err := saftAccessDenial(r.Context(), ts); err != nil {
+		writeInternalError(w, "check SAF-T export access", err)
+		return
+	} else if msg != "" {
+		httpx.WriteError(w, http.StatusForbidden, msg)
+		return
 	}
 
 	from, to := r.URL.Query().Get("from"), r.URL.Query().Get("to")
@@ -341,11 +405,9 @@ func (h *Handler) saftExportPage(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, "resolve tenant scope", err)
 		return
 	}
-	for _, entityType := range saftEntityTypes {
-		allowed, err := ts.crud.CanRead(r.Context(), entityType)
-		if !h.denyPageUnless(w, r, &rc, locale, allowed, err, "check "+entityType+" read permission for SAF-T export page") {
-			return
-		}
+	msg, err := saftAccessDenial(r.Context(), ts)
+	if !h.denyPageUnless(w, r, &rc, locale, msg == "", err, "check SAF-T export page access") {
+		return
 	}
 
 	now := time.Now().UTC()

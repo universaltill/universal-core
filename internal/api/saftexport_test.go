@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/universaltill/universal-core/internal/data"
+	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/finance"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
 	"github.com/universaltill/universal-core/internal/kernel/saft"
@@ -320,6 +321,171 @@ func TestSAFTExport_RBACDenied(t *testing.T) {
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 for the granted actor, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestSAFTExport_FieldRedactionRefused403: read permission alone is not
+// enough — a field-level hide on any field ts.crud reads for this file
+// must refuse the whole export, the same hole #27's independent review
+// found on the UBL export (TestUBLExport_FieldRedactionRefused403 is the
+// shape this mirrors) and uc-infra#67 reported for SAF-T specifically.
+// Covers all six saftFieldReads entries, not just the two that render as
+// ""/0: PartyRole.party_id/role_type are the case an independent review
+// pass on this fix's own first draft found missing — hiding either does
+// not render blank, it makes saftParties' role→party join or
+// customer/vendor switch fail silently, so the file would ship with
+// EMPTY Customers/Suppliers master files (a false "no trading partners"
+// statutory claim) instead of refusing. Every case must be reachable
+// through the same clerk role with every OTHER field left visible, or
+// the 403 could be coming from something else entirely — the loop drops
+// the case's own field from a fully-open grant to keep it isolated.
+func TestSAFTExport_FieldRedactionRefused403(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		entityType string
+		field      string
+	}{
+		{"Party.name hidden", "Party", "name"},
+		{"Party.tax_id hidden", "Party", "tax_id"},
+		{"PartyRole.party_id hidden", "PartyRole", "party_id"},
+		{"PartyRole.role_type hidden", "PartyRole", "role_type"},
+		{"TaxCode.code hidden", "TaxCode", "code"},
+		{"TaxCode.name hidden", "TaxCode", "name"},
+		{"TaxCode.jurisdiction hidden", "TaxCode", "jurisdiction"},
+		{"TaxCode.rate hidden", "TaxCode", "rate"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			router := newTestRouter(t)
+			withDevAuthEnabled(t)
+			tenantID, db := newTestTenant(t, router)
+			mux := http.NewServeMux()
+			testHandler(t, router).Routes(mux)
+			setupSAFTTenant(t, tenantID, db, mux)
+
+			roleIDs := seedRBAC(t, db,
+				map[string][]string{"clerk": {"user-clerk"}},
+				[]map[string]any{
+					{"role": "clerk", "entity_type": "Account", "can_read": true},
+					{"role": "clerk", "entity_type": "TaxCode", "can_read": true},
+					{"role": "clerk", "entity_type": "Party", "can_read": true},
+					{"role": "clerk", "entity_type": "PartyRole", "can_read": true},
+				},
+			)
+			ctx := context.Background()
+			engine := crud.NewEngine(db)
+			actor := humanActor()
+			if _, err := engine.Create(ctx, foundation.FieldPermission(), map[string]any{
+				"role_id": roleIDs["clerk"], "entity_type": tc.entityType, "field_name": tc.field, "hidden": true,
+			}, actor); err != nil {
+				t.Fatalf("create FieldPermission: %v", err)
+			}
+
+			req := newRequest("GET", "/export/saft?from=2026-01-01&to=2026-12-31", tenantID, "user-clerk", nil)
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("expected 403 for redacted %s.%s, got %d: %s", tc.entityType, tc.field, rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), tc.entityType+"."+tc.field) {
+				t.Errorf("403 body should name the redacted field: %s", rec.Body.String())
+			}
+
+			// The form page runs the same gate (denyPageUnless → localized
+			// 403 page) — a redacted actor must not see the form either,
+			// same reasoning TestSAFTExport_RBACDenied already applies to
+			// the entity-level case. Asserting the localized denial markup
+			// (not just the status code) rules out a coincidental 403 from
+			// something else on the page.
+			formReq := newRequest("GET", "/export/saft/form", tenantID, "user-clerk", nil)
+			formRec := httptest.NewRecorder()
+			mux.ServeHTTP(formRec, formReq)
+			if formRec.Code != http.StatusForbidden {
+				t.Fatalf("expected 403 from the form page for redacted %s.%s, got %d: %s", tc.entityType, tc.field, formRec.Code, formRec.Body.String())
+			}
+			if !strings.Contains(formRec.Body.String(), "uc-denied") {
+				t.Errorf("form page 403 should be the rendered access-denied page for redacted %s.%s: %s", tc.entityType, tc.field, formRec.Body.String())
+			}
+		})
+	}
+}
+
+// TestSAFTExport_NoFieldPermissionRowsStillSucceeds is the positive
+// control for TestSAFTExport_FieldRedactionRefused403: the same clerk
+// role, granted the same entity-level reads, but with no FieldPermission
+// row at all (a tenant that has never touched field-level RBAC) must
+// still get its file — proving the gate above refuses ONLY on an actual
+// hide, not on the mere presence of the saftFieldReads/HiddenFields
+// machinery. TestSAFTExport_RBACDenied already proves this shape for
+// unrelated entity-level denials; this proves it for the field-level
+// gate specifically.
+func TestSAFTExport_NoFieldPermissionRowsStillSucceeds(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+	setupSAFTTenant(t, tenantID, db, mux)
+
+	seedRBAC(t, db,
+		map[string][]string{"clerk": {"user-clerk"}},
+		[]map[string]any{
+			{"role": "clerk", "entity_type": "Account", "can_read": true},
+			{"role": "clerk", "entity_type": "TaxCode", "can_read": true},
+			{"role": "clerk", "entity_type": "Party", "can_read": true},
+			{"role": "clerk", "entity_type": "PartyRole", "can_read": true},
+		},
+	)
+
+	req := newRequest("GET", "/export/saft?from=2026-01-01&to=2026-12-31", tenantID, "user-clerk", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 with entity-level read granted and no field hides, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestSAFTExport_ModuleMenuHidesLinkWhenFieldRedacted is the module-menu
+// analog of TestSAFTExport_FieldRedactionRefused403, mirroring
+// TestAPI_PurchasingReport_ModuleMenuHidesReportLinkWhenDenied's shape
+// for the field-level case: an independent review of this fix's own
+// first draft found modulemenu.go's Finance link still offered the
+// SAF-T link unconditionally to a field-redacted actor — the "tile that
+// leads to a 403" outcome moduleReportLinks' RequiredRead exists to
+// prevent, just one gate deeper (field-level, not just entity-level)
+// than RequiredRead alone expresses. moduleReportLinks.ExtraDenied
+// closes that gap.
+func TestSAFTExport_ModuleMenuHidesLinkWhenFieldRedacted(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+	setupSAFTTenant(t, tenantID, db, mux)
+
+	roleIDs := seedRBAC(t, db,
+		map[string][]string{"clerk": {"user-clerk"}},
+		[]map[string]any{
+			{"role": "clerk", "entity_type": "Account", "can_read": true},
+			{"role": "clerk", "entity_type": "TaxCode", "can_read": true},
+			{"role": "clerk", "entity_type": "Party", "can_read": true},
+			{"role": "clerk", "entity_type": "PartyRole", "can_read": true},
+		},
+	)
+	ctx := context.Background()
+	engine := crud.NewEngine(db)
+	actor := humanActor()
+	if _, err := engine.Create(ctx, foundation.FieldPermission(), map[string]any{
+		"role_id": roleIDs["clerk"], "entity_type": "Party", "field_name": "name", "hidden": true,
+	}, actor); err != nil {
+		t.Fatalf("create FieldPermission: %v", err)
+	}
+
+	rec := getAs(t, mux, "/modules/finance", tenantID, "user-clerk")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for the module menu itself (only a field, not an entity, is redacted), got %d: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "/export/saft/form") {
+		t.Fatalf("field-redacted actor still saw the SAF-T link, which leads to a guaranteed 403:\n%s", rec.Body.String())
 	}
 }
 
