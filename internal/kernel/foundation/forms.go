@@ -12,10 +12,14 @@ import "github.com/universaltill/universal-core/internal/kernel/form"
 // entity now has one too (AllForms' own doc comment below covers why
 // that took until 2026-07-26 and what gap it closed) — this file no
 // longer has a "not built yet" foundation entity left.
+// v2 (uc-infra#63) added registration_number/contact_first_name/
+// contact_last_name to the existing Details section — the tenant
+// statutory identity fields Party's own v3 entity Definition added,
+// surfaced on the same form rather than a new section.
 func PartyForm() *form.Definition {
 	return &form.Definition{
 		EntityType: "Party",
-		Version:    1,
+		Version:    2,
 		Sections: []form.Section{
 			{
 				Title:     "Details",
@@ -26,6 +30,9 @@ func PartyForm() *form.Definition {
 					{Name: "tax_id", Label: "Tax ID"},
 					{Name: "status", Label: "Status"},
 					{Name: "preferred_language", Label: "Preferred Language"},
+					{Name: "registration_number", Label: "Registration Number"},
+					{Name: "contact_first_name", Label: "Contact First Name"},
+					{Name: "contact_last_name", Label: "Contact Last Name"},
 				},
 			},
 		},

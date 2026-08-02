@@ -121,6 +121,92 @@ func TestBuild_EmptyLedgerValidatesAgainstXSD(t *testing.T) {
 	validateAgainstXSD(t, payload)
 }
 
+// TestBuild_CompanyContactFallback covers uc-infra#63's Company/Contact
+// wiring: RegistrationNumber, TaxRegistrationNumber, and the Contact
+// person's FirstName/LastName each fall back to the spec's "NA" marker
+// independently when blank, and pass through untouched when set — never
+// an all-or-nothing block.
+func TestBuild_CompanyContactFallback(t *testing.T) {
+	base := func() Input {
+		return Input{Created: "2026-07-31", From: "2026-01-01", To: "2026-12-31", DefaultCurrency: "USD"}
+	}
+
+	t.Run("everything blank falls back to NA, byte-identical to before #63", func(t *testing.T) {
+		f, err := Build(base())
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		c := f.Header.Company
+		if c.RegistrationNumber != "NA" || c.Name != "NA" {
+			t.Errorf("RegistrationNumber/Name = %q/%q, want NA/NA", c.RegistrationNumber, c.Name)
+		}
+		if len(c.TaxRegistration) != 0 {
+			t.Errorf("TaxRegistration = %+v, want omitted when blank", c.TaxRegistration)
+		}
+		if len(c.Contact) != 1 || c.Contact[0].ContactPerson.FirstName != "NA" || c.Contact[0].ContactPerson.LastName != "NA" {
+			t.Errorf("Contact = %+v, want a single NA/NA ContactPerson", c.Contact)
+		}
+	})
+
+	t.Run("contact first name set, last name blank: per-field fallback", func(t *testing.T) {
+		in := base()
+		in.ContactFirstName = "Jane"
+		f, err := Build(in)
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		got := f.Header.Company.Contact[0].ContactPerson
+		if got.FirstName != "Jane" || got.LastName != "NA" {
+			t.Errorf("ContactPerson = %+v, want FirstName=Jane LastName=NA", got)
+		}
+	})
+
+	t.Run("full statutory identity set: all real values, no NA", func(t *testing.T) {
+		in := base()
+		in.RegistrationNumber = "REG-12345"
+		in.TaxRegistrationNumber = "TAX-98765"
+		in.ContactFirstName = "Jane"
+		in.ContactLastName = "Doe"
+		f, err := Build(in)
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		c := f.Header.Company
+		if c.RegistrationNumber != "REG-12345" {
+			t.Errorf("RegistrationNumber = %q, want REG-12345", c.RegistrationNumber)
+		}
+		if len(c.TaxRegistration) != 1 || c.TaxRegistration[0].TaxRegistrationNumber != "TAX-98765" {
+			t.Errorf("TaxRegistration = %+v, want [{TAX-98765}]", c.TaxRegistration)
+		}
+		got := c.Contact[0].ContactPerson
+		if got.FirstName != "Jane" || got.LastName != "Doe" {
+			t.Errorf("ContactPerson = %+v, want Jane/Doe", got)
+		}
+		payload, err := Marshal(f)
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+		validateAgainstXSD(t, payload)
+	})
+
+	t.Run("contact names past the schema's 35/70 char caps are truncated, not rejected", func(t *testing.T) {
+		in := base()
+		in.ContactFirstName = strings.Repeat("A", 40)
+		in.ContactLastName = strings.Repeat("B", 80)
+		f, err := Build(in)
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		got := f.Header.Company.Contact[0].ContactPerson
+		if len(got.FirstName) != 35 {
+			t.Errorf("FirstName len = %d, want truncated to 35", len(got.FirstName))
+		}
+		if len(got.LastName) != 70 {
+			t.Errorf("LastName len = %d, want truncated to 70", len(got.LastName))
+		}
+	})
+}
+
 func TestBuild_TotalsSumAllLines(t *testing.T) {
 	f, err := Build(fullInput())
 	if err != nil {
