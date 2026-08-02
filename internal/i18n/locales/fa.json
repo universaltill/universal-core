@@ -716,6 +716,7 @@
   "form.RequestForQuotation.section.header": "سربرگ",
   "form.RequestForQuotation.section.vendors": "تأمین‌کنندگان",
   "form.RequestForQuotation.section.lines": "ردیف‌ها",
+  "form.RequestForQuotation.action.compare_quotes": "مقایسه قیمت‌ها",
   "form.RequestForQuotationLine.section.details": "جزئیات",
   "form.RequestForQuotationVendor.section.details": "جزئیات",
   "form.RequestForQuotationQuoteLine.section.details": "جزئیات",

@@ -716,6 +716,7 @@
   "form.RequestForQuotation.section.header": "الترويسة",
   "form.RequestForQuotation.section.vendors": "الموردون",
   "form.RequestForQuotation.section.lines": "البنود",
+  "form.RequestForQuotation.action.compare_quotes": "مقارنة العروض",
   "form.RequestForQuotationLine.section.details": "التفاصيل",
   "form.RequestForQuotationVendor.section.details": "التفاصيل",
   "form.RequestForQuotationQuoteLine.section.details": "التفاصيل",

@@ -139,10 +139,19 @@ func AllForms() []*form.Definition {
 // section: there's no header total field to roll a line sum into — an
 // RFQ line has no unit_price at all (RequestForQuotationLine's own doc
 // comment: this is a request for pricing, not a priced commitment).
+//
+// The "Compare Quotes" navigate action (v2, uc-infra#69) mirrors
+// PurchaseOrderForm's "Download UBL file" action: GET /reports/rfq/{id}
+// (the vendor quote comparison report, #9) has existed since before this
+// form did, it was just unreachable from any rendered page — the {id}
+// placeholder is formrender's per-record navigate substitution
+// (form.Action.Route's own doc comment), so it's simply absent on the
+// "new" form (nothing to compare on an unsaved RFQ) rather than a dead
+// link.
 func RequestForQuotationForm() *form.Definition {
 	return &form.Definition{
 		EntityType: "RequestForQuotation",
-		Version:    1,
+		Version:    2,
 		Sections: []form.Section{
 			{
 				Title:     "Header",
@@ -166,6 +175,7 @@ func RequestForQuotationForm() *form.Definition {
 		},
 		Actions: []form.Action{
 			{Label: "Save", Op: form.OpSave},
+			{Label: "Compare Quotes", Op: form.OpNavigate, Route: "/reports/rfq/{id}"},
 		},
 	}
 }

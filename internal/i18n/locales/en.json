@@ -716,6 +716,7 @@
   "form.RequestForQuotation.section.header": "Header",
   "form.RequestForQuotation.section.vendors": "Vendors",
   "form.RequestForQuotation.section.lines": "Lines",
+  "form.RequestForQuotation.action.compare_quotes": "Compare Quotes",
   "form.RequestForQuotationLine.section.details": "Details",
   "form.RequestForQuotationVendor.section.details": "Details",
   "form.RequestForQuotationQuoteLine.section.details": "Details",

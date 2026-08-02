@@ -212,6 +212,31 @@ func TestRequestForQuotationForm_VendorsAndLinesAreMasterDetailWithNoRollUp(t *t
 	}
 }
 
+// TestRequestForQuotationForm_HasCompareQuotesNavigateAction pins the
+// unit layer for uc-infra#69: internal/api/rfq_compare_quotes_link_test.go
+// and internal/e2e/rfq_compare_quotes_link_test.go already prove the
+// rendered link works end to end, but neither pins the Definition's own
+// shape the way TestPurchaseOrderForm_RollsUpLineTotalsIntoTotal does for
+// its sibling "Download UBL file" action — this closes that gap.
+func TestRequestForQuotationForm_HasCompareQuotesNavigateAction(t *testing.T) {
+	f := RequestForQuotationForm()
+	var action *form.Action
+	for i := range f.Actions {
+		if f.Actions[i].Op == form.OpNavigate {
+			action = &f.Actions[i]
+		}
+	}
+	if action == nil {
+		t.Fatal("expected a navigate action on RequestForQuotationForm")
+	}
+	if action.Label != "Compare Quotes" {
+		t.Errorf("expected navigate action label %q, got %q", "Compare Quotes", action.Label)
+	}
+	if action.Route != "/reports/rfq/{id}" {
+		t.Errorf("expected navigate action route %q, got %q", "/reports/rfq/{id}", action.Route)
+	}
+}
+
 // TestRequestForQuotationEntitiesAreInAll confirms All() actually
 // carries all four new Definitions — a Definition that exists as a Go
 // function but isn't in All() is invisible to Publish (seed.go) and

@@ -716,6 +716,7 @@
   "form.RequestForQuotation.section.header": "Başlık",
   "form.RequestForQuotation.section.vendors": "Tedarikçiler",
   "form.RequestForQuotation.section.lines": "Kalemler",
+  "form.RequestForQuotation.action.compare_quotes": "Teklifleri Karşılaştır",
   "form.RequestForQuotationLine.section.details": "Detaylar",
   "form.RequestForQuotationVendor.section.details": "Detaylar",
   "form.RequestForQuotationQuoteLine.section.details": "Detaylar",
