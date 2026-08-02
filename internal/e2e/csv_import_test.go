@@ -13,10 +13,17 @@
 // would be a second language/package-manager surface for a Go kernel.
 // Skips (not fails) when TEST_DATABASE_URL isn't set, same convention
 // as every other integration test in this repo, plus a second skip if
-// no Chrome/Chromium binary is found — this test needs a real browser,
-// which isn't guaranteed on every machine running `go test ./...`
-// (ubuntu-latest GitHub Actions runners ship Chrome pre-installed;
-// verified in CI, not just assumed).
+// no Chrome/Chromium binary is found and CI isn't set — this test needs
+// a real browser, which isn't guaranteed on every machine running
+// `go test ./...` (ubuntu-latest GitHub Actions runners ship Chrome
+// pre-installed; verified in CI, not just assumed). In CI itself
+// (detected via the CI env var GitHub Actions and most CI systems set),
+// a missing browser is a hard failure, not a skip — see
+// browserMissingAction below. Found 2026-08-02, via uc-infra#56's
+// coverage-gate independent review: a coverage baseline measured on a
+// machine with no browser silently skipped all 49 of this package's
+// tests and would have gone uncaught the same way in CI if its ambient
+// Chrome ever disappeared.
 package e2e
 
 import (
@@ -157,8 +164,49 @@ func findBrowser(t *testing.T) string {
 			return macPath
 		}
 	}
-	t.Skip("no Chrome/Chromium binary found; skipping browser E2E test")
+	if fail, msg := browserMissingAction(os.Getenv("CI")); fail {
+		t.Fatal(msg)
+	} else {
+		t.Skip(msg)
+	}
 	return ""
+}
+
+// browserMissingAction decides what happens when no Chrome/Chromium
+// binary is found: a hard failure when CI is set (GitHub Actions and
+// most CI systems set this by default), never a silent skip — a runner
+// image that quietly drops its browser must not let all 49 of this
+// package's tests quietly skip along with it (CLAUDE.md's "CI must
+// never silently skip" rule, applied to the browser dependency itself,
+// not just the tests that need it). Skips locally so a laptop without
+// Chrome installed doesn't block an ordinary `go test ./...`. A pure
+// function so the branch is unit-testable without needing a real
+// missing-browser environment.
+func browserMissingAction(ciEnv string) (fail bool, message string) {
+	if ciEnv != "" {
+		return true, "no Chrome/Chromium binary found on PATH in CI — internal/e2e's real-browser tests must never silently skip"
+	}
+	return false, "no Chrome/Chromium binary found; skipping browser E2E test"
+}
+
+func TestBrowserMissingAction_CIEnvironment_Fails(t *testing.T) {
+	fail, msg := browserMissingAction("true")
+	if !fail {
+		t.Fatal("expected fail=true when the CI env var is set, got fail=false")
+	}
+	if msg == "" {
+		t.Fatal("expected a non-empty failure message")
+	}
+}
+
+func TestBrowserMissingAction_NoCIEnvironment_Skips(t *testing.T) {
+	fail, msg := browserMissingAction("")
+	if fail {
+		t.Fatal("expected fail=false when the CI env var is unset, got fail=true")
+	}
+	if msg == "" {
+		t.Fatal("expected a non-empty skip message")
+	}
 }
 
 // testServer provisions a brand-new tenant (via router.Create — the real

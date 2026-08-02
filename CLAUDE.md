@@ -79,6 +79,30 @@ you touch is debt to close, not a precedent to match. Gate every commit
 on the full suite passing (`go build`, `go vet`, `go test ./... -p 1`
 against a real local Postgres).
 
+**Test-first, and a regression test the moment a bug is found.** Write
+the test before (or alongside) the code it exercises, not after — this
+applies to new features and bug fixes alike. The moment a bug is found,
+in code from this session or from history, the first change is a test
+that reproduces it and fails; only then fix it, and confirm the same
+test now passes. This is what makes a class of bug unable to recur
+silently — a fix without a preceding failing test is not confirmed to
+fix the thing it claims to.
+
+**CI enforces a coverage floor.** `ci.yml`'s `Test` step measures
+whole-program coverage across every package except `cmd/*`'s thin
+main()-wrapper binaries (a plain per-package number is misleading here,
+since `internal/data`'s repositories are exercised transitively through
+the kernel modules that call them, not their own test binary — see
+`-coverpkg`'s own comment in `ci.yml` for the exact scope), and the
+`Coverage gate` step fails the build below a floor tracked in that same
+file. The floor only ever ratchets up — never lower it to make a
+change pass; close the gap with tests instead. If a change genuinely
+regresses coverage for a defensible reason, that is a Reviewer-level
+call, not something to route around silently. (Don't hardcode the
+current floor value here — `ci.yml` is the single source of truth for
+it, so there's exactly one place to update instead of two that can
+drift apart.)
+
 ## Audit — AI-actor identity is first-class (ADR-0001 §14)
 Every mutation writes an audit row carrying `actor_type` (`human` |
 `ai_agent`), `actor_id`, and — when `ai_agent` — `model_version` and an
