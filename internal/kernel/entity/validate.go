@@ -13,10 +13,18 @@ import (
 func ValidateRecord(def *Definition, data map[string]any) error {
 	for _, f := range def.Fields {
 		v, present := data[f.Name]
-		if !present || v == nil {
-			if f.Required {
-				return fmt.Errorf("field %q is required", f.Name)
-			}
+		absent := !present || v == nil
+		// Required additionally rejects an empty string (#86): the form
+		// handler and CSV importer both convert a blank input to absent
+		// before it ever reaches here, but a direct JSON call can submit
+		// "" instead of omitting the key. `v == ""` only matches a `v`
+		// whose dynamic type is string, so a required bool `false` or
+		// number `0` is unaffected — this tightens Required only, never
+		// loosens the type check below for an optional field's `""`.
+		if f.Required && (absent || v == "") {
+			return fmt.Errorf("field %q is required", f.Name)
+		}
+		if absent {
 			continue
 		}
 		if err := validateFieldValue(f, v); err != nil {

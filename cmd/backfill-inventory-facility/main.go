@@ -134,22 +134,15 @@ func main() {
 // returns a synthetic all-zero id purely so the preview validates rows
 // against a facility-shaped value.
 //
-// **An earlier version of this comment justified that with a claim that
-// is false** (caught by independent review): it said an empty
-// facility_id would fail the Required check, making a dry run report
-// "skipped" where a real run migrates. It would not.
-// entity.ValidateRecord treats a key as satisfying Required when it is
-// present and non-nil, and FieldReference only asserts the value is a
-// string — "" passes both. Removing the placeholder changes no test and
-// no behaviour today.
-//
-// It is kept anyway, for one honest reason rather than the invented
-// one: a synthetic, obviously-fake id keeps the preview meaningful if
-// Required is ever tightened to reject blanks (#78's declarative
-// reference constraints are the likely occasion), and it makes the
-// dry-run log say which facility rows *would* point at. It can never be
-// written — it is returned only under dryRun, and recordmigrate.Run
-// returns before engine.Update on the same flag.
+// This placeholder is load-bearing, not cosmetic: InventoryItem's
+// facility_id is Required, and entity.ValidateRecord now rejects an
+// empty string the same as an absent/nil value (#86) — an empty
+// facility_id here would make every previewed row report "skipped" in
+// a dry run that a real run would actually migrate. The synthetic,
+// obviously-fake id also makes the dry-run log say which facility rows
+// *would* point at. It can never be written — it is returned only
+// under dryRun, and recordmigrate.Run returns before engine.Update on
+// the same flag.
 func getOrCreateFacility(
 	ctx context.Context,
 	engine *crud.Engine,

@@ -171,12 +171,12 @@ func (h *Handler) issueReportSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 	// An empty form value is NOT set into fields at all — same "empty
 	// means absent, not a zero value" discipline csvimport.buildRowData's
-	// own doc comment establishes for exactly this reason: entity.
-	// ValidateRecord only treats an absent key (or a nil value) as
-	// missing for a Required field, not a present-but-empty string, so
-	// setting fields["title"] = "" unconditionally would let a blank
-	// title silently pass validation instead of being rejected. status
-	// is the one field set outside this loop — always "new" for a fresh
+	// own doc comment establishes for exactly this reason: it keeps a
+	// blank "title" indistinguishable from an omitted one, which matters
+	// on any Definition where NotBefore or similar treats presence and
+	// absence differently, even though entity.ValidateRecord's Required
+	// check (#86) would now catch an explicit "" here too. status is the
+	// one field set outside this loop — always "new" for a fresh
 	// submission, never sourced from the form.
 	fields := map[string]any{"status": "new"}
 	for name, value := range map[string]string{
