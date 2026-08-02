@@ -1527,6 +1527,148 @@ func TestRender_SaveActionLabelResolvesThroughCatalog(t *testing.T) {
 	}
 }
 
+// TestRender_NavigateActionSubstitutesRecordID (uc-infra#66): a navigate
+// Route carrying "{id}" resolves against the current record's own id —
+// the mechanism the "Download UBL file" action on PurchaseOrder/
+// SalesOrder/CustomerInvoice relies on to link at
+// /export/{EntityType}/{id}/ubl (already-shipped, #27) instead of a
+// dead static route.
+func TestRender_NavigateActionSubstitutesRecordID(t *testing.T) {
+	r := testRenderer(t)
+	ent := &entity.Definition{EntityType: "ZzyzxWidget", Fields: []entity.Field{{Name: "x", Type: entity.FieldString}}}
+	def := &form.Definition{
+		EntityType: "ZzyzxWidget",
+		Sections: []form.Section{{
+			Title: "Header", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "x", Label: "X"}},
+		}},
+		Actions: []form.Action{
+			{Label: "Download UBL file", Op: form.OpNavigate, Route: "/export/ZzyzxWidget/{id}/ubl"},
+		},
+	}
+	data := Data{RecordID: "widget-77", Record: map[string]any{}}
+	var buf strings.Builder
+	if err := r.Render(&buf, def, ent, data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if !strings.Contains(buf.String(), `<a href="/export/ZzyzxWidget/widget-77/ubl">Download UBL file</a>`) {
+		t.Fatalf("expected the {id} placeholder substituted with the record id, got:\n%s", buf.String())
+	}
+}
+
+// TestRender_NavigateActionWithIDPlaceholderOmittedOnNewRecord
+// (uc-infra#66): the same action on a not-yet-saved record (RecordID ==
+// "", the "new" form) has nothing to substitute — it must not render a
+// dead "/export/ZzyzxWidget//ubl" link, so the whole action is omitted,
+// same degrade-rather-than-dead-link reasoning form.Action.Route's own
+// doc comment gives.
+func TestRender_NavigateActionWithIDPlaceholderOmittedOnNewRecord(t *testing.T) {
+	r := testRenderer(t)
+	ent := &entity.Definition{EntityType: "ZzyzxWidget", Fields: []entity.Field{{Name: "x", Type: entity.FieldString}}}
+	def := &form.Definition{
+		EntityType: "ZzyzxWidget",
+		Sections: []form.Section{{
+			Title: "Header", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "x", Label: "X"}},
+		}},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+			{Label: "Download UBL file", Op: form.OpNavigate, Route: "/export/ZzyzxWidget/{id}/ubl"},
+		},
+	}
+	data := Data{Record: map[string]any{}}
+	var buf strings.Builder
+	if err := r.Render(&buf, def, ent, data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if strings.Contains(buf.String(), "Download UBL file") || strings.Contains(buf.String(), "/export/ZzyzxWidget/") {
+		t.Fatalf("expected no download action on a new/unsaved record, got:\n%s", buf.String())
+	}
+	if !strings.Contains(buf.String(), `<button type="submit">Save</button>`) {
+		t.Fatalf("expected the unrelated Save action to still render, got:\n%s", buf.String())
+	}
+}
+
+// TestRender_NavigateActionWithoutIDPlaceholderIgnoresRecordID confirms
+// the {id} substitution is opt-in per Route, not a blanket behavior
+// change to every navigate action: a plain static route (e.g.
+// render_test.go's own "Back" fixture, "/purchase-orders") must render
+// unconditionally on a new/unsaved record exactly as it always has —
+// the omit-on-empty-RecordID rule above only fires when the Route
+// actually contains "{id}".
+func TestRender_NavigateActionWithoutIDPlaceholderIgnoresRecordID(t *testing.T) {
+	r := testRenderer(t)
+	ent := &entity.Definition{EntityType: "ZzyzxWidget", Fields: []entity.Field{{Name: "x", Type: entity.FieldString}}}
+	def := &form.Definition{
+		EntityType: "ZzyzxWidget",
+		Sections: []form.Section{{
+			Title: "Header", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "x", Label: "X"}},
+		}},
+		Actions: []form.Action{
+			{Label: "Back", Op: form.OpNavigate, Route: "/widgets"},
+		},
+	}
+	data := Data{Record: map[string]any{}} // RecordID == "" — new/unsaved
+	var buf strings.Builder
+	if err := r.Render(&buf, def, ent, data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if !strings.Contains(buf.String(), `<a href="/widgets">Back</a>`) {
+		t.Fatalf("expected the static-route action to render unconditionally, got:\n%s", buf.String())
+	}
+}
+
+// TestRender_NonSaveActionLabelResolvesThroughCatalog (uc-infra#66)
+// proves the general case ActionCatalogKey documents: any non-Save
+// action's Label resolves through its own per-entity-and-action key,
+// not just the ones this card happens to add. Uses the real Arabic
+// translation the "Download UBL file" action shipped with (locales/
+// ar.json) on the real production entity type, the same
+// non-tautological proof
+// TestRender_SaveActionLabelResolvesThroughCatalog gives for Save.
+func TestRender_NonSaveActionLabelResolvesThroughCatalog(t *testing.T) {
+	r := testRenderer(t)
+	ent := &entity.Definition{EntityType: "PurchaseOrder", Fields: []entity.Field{{Name: "po_number", Type: entity.FieldString}}}
+	def := &form.Definition{
+		EntityType: "PurchaseOrder",
+		Sections: []form.Section{{
+			Title: "Header", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "po_number", Label: "PO Number"}},
+		}},
+		Actions: []form.Action{
+			{Label: "Download UBL file", Op: form.OpNavigate, Route: "/export/PurchaseOrder/{id}/ubl"},
+		},
+	}
+	data := Data{RecordID: "po-1", Record: map[string]any{}}
+	var buf strings.Builder
+	if err := r.Render(&buf, def, ent, data, "ar"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if !strings.Contains(buf.String(), `<a href="/export/PurchaseOrder/po-1/ubl">تنزيل ملف UBL</a>`) {
+		t.Errorf("expected the Arabic translation of the Download UBL file action, got:\n%s", buf.String())
+	}
+}
+
+// TestRender_NonSaveActionLabelWithoutCatalogKeyFallsBackToLiteral is
+// TestRender_SectionTitleWithoutCatalogKeyFallsBackToLiteral's
+// counterpart for actions: introducing ActionCatalogKey resolution must
+// not break an existing, not-yet-translated action (e.g.
+// render_test.go's own "Submit for Approval"/"Print"/"Back" fixture
+// actions, none of which carry a catalog key) — same additive-fallback
+// guarantee TOrDefault gives everywhere else.
+func TestRender_NonSaveActionLabelWithoutCatalogKeyFallsBackToLiteral(t *testing.T) {
+	r := testRenderer(t)
+	data := Data{Record: map[string]any{"payment_method": "Wire"}, Children: map[string][]map[string]any{}}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "ar"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if !strings.Contains(buf.String(), `<a href="/purchase-orders">Back</a>`) {
+		t.Errorf("expected the untranslated Back action to fall back to its literal label, got:\n%s", buf.String())
+	}
+}
+
 // TestSlugifyTitle locks in the exact deterministic Title->slug
 // transform: both this package's own lookup and whatever authors a
 // locale JSON's keys (internal/i18n/locales/*.json) must agree on it
