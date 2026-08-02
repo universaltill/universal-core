@@ -83,6 +83,24 @@ jobs:
       - name: Install xmllint for SAF-T XSD validation
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxml2-utils
 
+      # internal/e2e's 49 real-browser tests need Chrome/Chromium on
+      # PATH (internal/e2e/csv_import_test.go's findBrowser) — ubuntu-
+      # latest ships google-chrome-stable today, but this asserts it
+      # explicitly (same reasoning as xmllint above) instead of trusting
+      # that ambient fact silently forever. Belt-and-suspenders with
+      # findBrowser's own CI-env hard-failure: if this step ever starts
+      # failing, that's the loud signal; if the runner image changes in
+      # some way this miss, findBrowser fails the build too, rather than
+      # 49 tests quietly skipping (found 2026-08-02, independent review
+      # of uc-infra#56 — a coverage baseline measured on a machine
+      # without a browser had silently skipped all of them).
+      - name: Confirm a real browser is available for internal/e2e
+        run: |
+          command -v google-chrome-stable || command -v google-chrome || command -v chromium || command -v chromium-browser || {
+            echo "::error::No Chrome/Chromium binary found on PATH — internal/e2e's 49 real-browser tests need one. findBrowser will now hard-fail (not skip) in CI, so this step existing separately is just an earlier, clearer signal of the same problem."
+            exit 1
+          }
+
       - name: Test
         env:
           GOMODCACHE: ${{ runner.temp }}/gomodcache
@@ -101,31 +119,61 @@ jobs:
         # 2026-07-21, several merges after internal/worker landed, not on
         # every run). -p 1 serializes package-level test execution so the
         # two can never overlap; -race stays for the same-package data-race
-        # detection it's always done, unaffected by this.
+        # detection it's always done, unaffected by this. -timeout=30m:
+        # explicit rather than relying on `go test`'s 10-minute default —
+        # internal/api alone runs ~5 minutes DB-backed, and this runner
+        # also carries internal/e2e's real-Chrome tests on top of it.
         #
-        # -coverpkg excludes cmd/*: those are thin main()-wrapper binaries
-        # (own tests still run as part of ./..., just not counted toward
-        # the coverage total below) — same exclusion the 2026-07-29
-        # coverage audit used, because a plain per-package number is
-        # misleading here (internal/data's repositories are exercised
-        # transitively through the kernel modules that call them, not
-        # their own test binary, so -coverpkg=./... is what makes that
-        # coverage attributed at all instead of invisible).
+        # -coverpkg covers every package EXCEPT cmd/*: those are thin
+        # main()-wrapper binaries (their own tests still run as part of
+        # ./... below — this only affects what's attributed toward the
+        # coverage total, not what actually executes). This is NOT the
+        # same exclusion the 2026-07-29 coverage audit used (that audit
+        # excluded cmd/ from the test run itself, `./...` minus cmd/, and
+        # kept `-coverpkg=./...` — i.e. cmd/ out of both the numerator
+        # AND denominator differently than here); this workflow's number
+        # and that audit's 82.9%/78.7% are measured on different scopes
+        # and are NOT directly comparable. Don't diff them expecting to
+        # see whether coverage rose or fell — this gate's own floor
+        # (below) is the only number this measurement should ever be
+        # compared against.
+        #
+        # set -euo pipefail: without it, a `go list` failure would empty
+        # COVERPKGS silently and `-coverpkg=""` is accepted by `go test`
+        # (falls back to plain per-package coverage) rather than erroring
+        # — found in independent review, verified by reproducing it.
         run: |
+          set -euo pipefail
           COVERPKGS=$(go list ./... | grep -v '/cmd/' | tr '\n' ',' | sed 's/,$//')
-          go test ./... -race -count=1 -p 1 -coverprofile=coverage.out -coverpkg="$COVERPKGS" -covermode=atomic
+          if [ -z "$COVERPKGS" ]; then
+            echo "::error::go list produced no non-cmd packages — refusing to run with an empty -coverpkg (would silently fall back to plain per-package coverage)."
+            exit 1
+          fi
+          go test ./... -race -count=1 -p 1 -timeout=30m -coverprofile=coverage.out -coverpkg="$COVERPKGS" -covermode=atomic
 
       - name: Coverage gate
+        if: always()
         env:
           GOMODCACHE: ${{ runner.temp }}/gomodcache
           GOCACHE: ${{ runner.temp }}/gobuildcache
         # Floor only ever ratchets up (CLAUDE.md's "Testing" section) —
         # never lower this number to make a change pass; close the gap
         # with tests instead. Baseline set 2026-08-02 from this same
-        # -coverpkg=./...-minus-cmd measurement (see
-        # uc-infra/docs/code-reviews/2026-08-02-tdd-coverage-gate.md).
+        # measurement, with a real browser present so internal/e2e's 49
+        # tests actually ran rather than skipping (see
+        # uc-infra/docs/code-reviews/2026-08-02-tdd-coverage-gate.md for
+        # the full baseline run and why the first attempt was discarded).
+        # `if: always()`: run even if the Test step above already failed,
+        # so a failing build still gets a coverage breakdown to look at.
         run: |
-          COVERAGE_FLOOR=84.0
+          if [ ! -f coverage.out ]; then
+            echo "::error::coverage.out not found — the Test step above did not produce one (likely failed before finishing); nothing to gate."
+            exit 1
+          fi
+          echo "--- Lowest-covered functions (bottom 15) ---"
+          go tool cover -func=coverage.out | grep -v '^total:' | sort -t$'\t' -k3 -n | head -15
+          echo "---"
+          COVERAGE_FLOOR=CI_BASELINE_PLACEHOLDER
           TOTAL=$(go tool cover -func=coverage.out | tail -1 | awk '{print $NF}' | tr -d '%')
           echo "Whole-program coverage: ${TOTAL}% (floor: ${COVERAGE_FLOOR}%)"
           awk -v t="$TOTAL" -v f="$COVERAGE_FLOOR" 'BEGIN { exit (t+0 >= f+0) ? 0 : 1 }' || {

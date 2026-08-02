@@ -88,16 +88,20 @@ test now passes. This is what makes a class of bug unable to recur
 silently — a fix without a preceding failing test is not confirmed to
 fix the thing it claims to.
 
-**CI enforces a coverage floor.** `ci.yml` measures whole-program
-coverage (`go test ./... -coverprofile=... -coverpkg=./...` — a
-per-package number is misleading in this codebase, since
-`internal/data`'s repositories are exercised transitively through the
-kernel modules that call them, not their own test binary) and fails the
-build below a checked-in threshold. The threshold only ever ratchets
-up — never lower it to make a change pass; close the gap with tests
-instead. If a change genuinely regresses coverage for a defensible
-reason, that is a Reviewer-level call, not something to route around
-silently.
+**CI enforces a coverage floor.** `ci.yml`'s `Test` step measures
+whole-program coverage across every package except `cmd/*`'s thin
+main()-wrapper binaries (a plain per-package number is misleading here,
+since `internal/data`'s repositories are exercised transitively through
+the kernel modules that call them, not their own test binary — see
+`-coverpkg`'s own comment in `ci.yml` for the exact scope), and the
+`Coverage gate` step fails the build below a floor tracked in that same
+file. The floor only ever ratchets up — never lower it to make a
+change pass; close the gap with tests instead. If a change genuinely
+regresses coverage for a defensible reason, that is a Reviewer-level
+call, not something to route around silently. (Don't hardcode the
+current floor value here — `ci.yml` is the single source of truth for
+it, so there's exactly one place to update instead of two that can
+drift apart.)
 
 ## Audit — AI-actor identity is first-class (ADR-0001 §14)
 Every mutation writes an audit row carrying `actor_type` (`human` |
