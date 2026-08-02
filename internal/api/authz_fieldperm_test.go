@@ -368,7 +368,7 @@ func TestAPI_RBAC_DeniedPageIsLocalized(t *testing.T) {
 			t.Fatalf("denial page is not a real shell-rendered page (missing %q):\n%s", want, body)
 		}
 	}
-	if strings.Contains(body, `"error"`) {
+	if isJSONEnvelope(body) {
 		t.Fatalf("denial page rendered the JSON envelope instead of a page:\n%s", body)
 	}
 

@@ -1440,6 +1440,49 @@ func TestAPI_Dashboard_OmitsEntityWithoutPublishedForm(t *testing.T) {
 	}
 }
 
+// isJSONEnvelope reports whether body is the API's {"data":...,"error":...}
+// JSON envelope (CLAUDE.md's API convention) — as opposed to a rendered
+// HTML page that merely happens to contain the substring "error" somewhere
+// (an inline <script>, a CSS class, user-facing copy), which a bare
+// strings.Contains(body, `"error"`) check can't tell apart.
+func isJSONEnvelope(body string) bool {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(body), &m); err != nil {
+		return false
+	}
+	_, hasData := m["data"]
+	_, hasError := m["error"]
+	return hasData && hasError
+}
+
+func TestIsJSONEnvelope(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"empty body", "", false},
+		{"whitespace only", "   \n", false},
+		{"bare null", "null", false},
+		{"empty object", "{}", false},
+		{"real envelope", `{"data":null,"error":null}`, true},
+		{"real envelope with trailing newline", "{\"data\":{\"id\":\"1\"},\"error\":null}\n", true},
+		{"envelope plus an extra key", `{"data":null,"error":null,"meta":{"page":1}}`, true},
+		{"html containing the word error", `<html><body class="error-banner">"error" is not JSON</body></html>`, false},
+		{"html with a trailing json-looking blob", "<!doctype html>\n{\"data\":null,\"error\":\"x\"}", false},
+		{"json array, not an object", `[{"data":null,"error":null}]`, false},
+		{"data only, no error key", `{"data":null}`, false},
+		{"error only, no data key", `{"error":null}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isJSONEnvelope(tc.body); got != tc.want {
+				t.Fatalf("isJSONEnvelope(%q) = %v, want %v", tc.body, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestAPI_Dashboard_AnonymousShowsWelcomePage confirms "/" never returns
 // the raw {"data":null,"error":...} JSON blob every other route does on
 // a 401 — a browser landing on the site with no session gets a real HTML
@@ -1456,11 +1499,18 @@ func TestAPI_Dashboard_AnonymousShowsWelcomePage(t *testing.T) {
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
+	body := rec.Body.String()
 	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200 with a welcome page, got %d: %s", rec.Code, rec.Body.String())
+		t.Fatalf("expected 200 with a welcome page, got %d: %s", rec.Code, body)
 	}
-	if strings.Contains(rec.Body.String(), `"error"`) {
-		t.Fatalf("expected HTML, not a JSON error body, got:\n%s", rec.Body.String())
+	if !strings.Contains(body, "<html") {
+		t.Fatalf("expected a real HTML shell, got:\n%s", body)
+	}
+	if !strings.Contains(body, "developer auth enabled") {
+		t.Fatalf("expected the dev-auth welcome hint, got:\n%s", body)
+	}
+	if isJSONEnvelope(body) {
+		t.Fatalf("expected HTML, not a JSON error body, got:\n%s", body)
 	}
 }
 
@@ -1487,7 +1537,7 @@ func TestAPI_Dashboard_NoAuthBackendConfigured_ShowsWelcomeNotJSON(t *testing.T)
 		t.Fatalf("expected 200 with a welcome page, got %d: %s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	if strings.Contains(body, `"error"`) {
+	if isJSONEnvelope(body) {
 		t.Fatalf("expected HTML, not a JSON error body, got:\n%s", body)
 	}
 	if !strings.Contains(body, "does not have sign-in configured") {
