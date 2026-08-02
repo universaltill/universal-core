@@ -275,10 +275,15 @@ func checkReferenceTargetConstraints(ctx context.Context, tx queryable, records 
 // edit-and-save of one of those records then 400s with no warning this
 // was coming.
 //
-// Read-only and takes a plain *sql.DB — unlike checkReferenceTargetConstraints's
-// transaction-scoped write-path callers, this never writes and has
-// nothing to be atomic with, so forcing a throwaway *sql.Tx into
-// existence would add nothing (see queryable's own doc comment). Walks
+// Read-only and takes the same queryable interface checkReferenceTargetConstraints
+// itself does (widened from a plain *sql.DB during uc-infra#112's coverage
+// pass so a test can substitute a stub that fails deterministically,
+// reaching the genuine-DB-error branch below without sabotaging a real
+// connection) — unlike checkReferenceTargetConstraints's transaction-scoped
+// write-path callers, this never writes and has nothing to be atomic
+// with, so forcing a throwaway *sql.Tx into existence would add nothing
+// (see queryable's own doc comment); *sql.DB already satisfies queryable,
+// so cmd/sync-tenant-modules' existing call site is unaffected. Walks
 // every live record of def.EntityType a page at a time rather than
 // loading them all into memory at once — this can run against a
 // tenant's full table, potentially large, and this is a reporting path,
@@ -296,7 +301,7 @@ func checkReferenceTargetConstraints(ctx context.Context, tx queryable, records 
 // one specific field at a time (mirroring how the sync command calls
 // CountMissingField once per newly-Required field, not once per
 // record).
-func CountTargetConstraintViolations(ctx context.Context, db *sql.DB, records *data.RecordRepo, def *entity.Definition, fieldName string) (int, error) {
+func CountTargetConstraintViolations(ctx context.Context, db queryable, records *data.RecordRepo, def *entity.Definition, fieldName string) (int, error) {
 	f, ok := def.FieldByName(fieldName)
 	if !ok || f.Type != entity.FieldReference || (len(f.TargetFilter) == 0 && f.MustMatchParentField == "") {
 		return 0, nil

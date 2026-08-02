@@ -2,7 +2,10 @@ package crud
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/universaltill/universal-core/internal/data"
@@ -712,5 +715,302 @@ func TestEngine_Update_MustMatchParentField_SoftDeletedParentAllowed(t *testing.
 		"name": "child", "group_id": "group-b", "parent_item_id": parent.ID,
 	}, nil, actor); err != nil {
 		t.Fatalf("expected a soft-deleted (dangling) parent to be allowed regardless of group mismatch, got %v", err)
+	}
+}
+
+// --- CountTargetConstraintViolations (uc-infra#112): the read-only
+// reporting counterpart to the write-path enforcement above — the
+// FieldReference equivalent of RecordRepo.CountMissingField, used to warn
+// an operator about EXISTING records that already fail a
+// TargetFilter/MustMatchParentField constraint newly added or tightened
+// on a live tenant, before they hit a 400 on next edit. ---
+
+// The three early-return tests below deliberately pass nil for BOTH db
+// and records: the guard at the top of CountTargetConstraintViolations
+// must return before touching either. Independent review verified by
+// mutation that calling them against an empty live table (the original
+// shape) made all three pass even with the guard's conditions deleted
+// entirely — 0 came back either way, since there was nothing in the
+// table regardless of whether the guard fired. Against nil, a removed
+// or weakened guard panics on the first dereference instead of silently
+// returning 0, and these need no TEST_DATABASE_URL at all.
+
+func TestCountTargetConstraintViolations_FieldNotFound(t *testing.T) {
+	n, err := CountTargetConstraintViolations(context.Background(), nil, nil, assignmentDef(), "no_such_field")
+	if err != nil {
+		t.Fatalf("CountTargetConstraintViolations: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("expected 0 for an unknown field name, got %d", n)
+	}
+}
+
+func TestCountTargetConstraintViolations_NotAFieldReference(t *testing.T) {
+	n, err := CountTargetConstraintViolations(context.Background(), nil, nil, assignmentDef(), "title")
+	if err != nil {
+		t.Fatalf("CountTargetConstraintViolations: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("expected 0 for a non-FieldReference field, got %d", n)
+	}
+}
+
+func TestCountTargetConstraintViolations_NoConstraintConfigured(t *testing.T) {
+	// A FieldReference field with neither TargetFilter nor
+	// MustMatchParentField declared has nothing this function can report.
+	def := &entity.Definition{
+		EntityType: "Assignment",
+		Fields: []entity.Field{
+			{Name: "plain_ref", Type: entity.FieldReference, Target: "Person"},
+		},
+	}
+	n, err := CountTargetConstraintViolations(context.Background(), nil, nil, def, "plain_ref")
+	if err != nil {
+		t.Fatalf("CountTargetConstraintViolations: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("expected 0 when the field declares no constraint, got %d", n)
+	}
+}
+
+// TestCountTargetConstraintViolations_NoRecordsAtAll is the true "empty
+// page" case (line 314's `if len(page) == 0 { break }`) as distinct from
+// the early-return tests above: this DOES reach ListPage — the
+// constrained field is real and configured, there just happen to be no
+// records of the entity type yet.
+func TestCountTargetConstraintViolations_NoRecordsAtAll(t *testing.T) {
+	db := freshTenantDB(t)
+	records := data.NewRecordRepo(db)
+
+	n, err := CountTargetConstraintViolations(context.Background(), db, records, assignmentDef(), "assignee_id")
+	if err != nil {
+		t.Fatalf("CountTargetConstraintViolations: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("expected 0 when no records exist yet, got %d", n)
+	}
+}
+
+// TestCountTargetConstraintViolations_CountsOnlyLiveViolations is the main
+// case: records inserted via the raw repo (records.Create), bypassing
+// Engine.Create's own enforcement — modeling data that predates a
+// TargetFilter being added/tightened on a live tenant, exactly the
+// scenario this reporting function exists to surface. Each fixture is
+// asserted as one contribution to a single count (same "deltas cannot
+// cancel" discipline as data.TestCountMissingField): a satisfying record,
+// two violating records, a dangling reference, a record with no value
+// set, and a soft-deleted violation that must NOT be counted.
+func TestCountTargetConstraintViolations_CountsOnlyLiveViolations(t *testing.T) {
+	db := freshTenantDB(t)
+	records := data.NewRecordRepo(db)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	employee, err := engine.Create(ctx, personDef(), map[string]any{"name": "Jamie Employee"}, actor)
+	if err != nil {
+		t.Fatalf("create employee: %v", err)
+	}
+	if _, err := engine.Create(ctx, personRoleDef(), map[string]any{"person_id": employee.ID, "role_type": "employee"}, actor); err != nil {
+		t.Fatalf("create employee role: %v", err)
+	}
+	nonEmployee, err := engine.Create(ctx, personDef(), map[string]any{"name": "Acme Vendor"}, actor)
+	if err != nil {
+		t.Fatalf("create non-employee person: %v", err)
+	}
+
+	if _, err := records.Create(ctx, "Assignment", map[string]any{"title": "valid", "assignee_id": employee.ID}); err != nil {
+		t.Fatalf("create valid assignment: %v", err)
+	}
+	violatingToDelete, err := records.Create(ctx, "Assignment", map[string]any{"title": "violating, later deleted", "assignee_id": nonEmployee.ID})
+	if err != nil {
+		t.Fatalf("create violating assignment: %v", err)
+	}
+	// TWO violating records stay live, deliberately, not one: a count that
+	// merely SET a "found a violation" flag to 1 instead of actually
+	// incrementing would still pass a single-live-violation assertion —
+	// this needs at least two live violations to distinguish "count" from
+	// "detect".
+	if _, err := records.Create(ctx, "Assignment", map[string]any{"title": "violating, stays live 1", "assignee_id": nonEmployee.ID}); err != nil {
+		t.Fatalf("create second violating assignment: %v", err)
+	}
+	if _, err := records.Create(ctx, "Assignment", map[string]any{"title": "violating, stays live 2", "assignee_id": nonEmployee.ID}); err != nil {
+		t.Fatalf("create third violating assignment: %v", err)
+	}
+	if _, err := records.Create(ctx, "Assignment", map[string]any{"title": "dangling", "assignee_id": "00000000-0000-0000-0000-000000000000"}); err != nil {
+		t.Fatalf("create dangling assignment: %v", err)
+	}
+	if _, err := records.Create(ctx, "Assignment", map[string]any{"title": "no assignee set"}); err != nil {
+		t.Fatalf("create assignment with no assignee: %v", err)
+	}
+	if err := engine.Delete(ctx, assignmentDef(), violatingToDelete.ID, actor); err != nil {
+		t.Fatalf("soft-delete violating assignment: %v", err)
+	}
+
+	n, err := CountTargetConstraintViolations(ctx, db, records, assignmentDef(), "assignee_id")
+	if err != nil {
+		t.Fatalf("CountTargetConstraintViolations: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("expected exactly 2 live violations (the soft-deleted one excluded), got %d", n)
+	}
+}
+
+// TestCountTargetConstraintViolations_MustMatchParentField_CountsAcrossGroups
+// is the MustMatchParentField twin of the TargetFilter-based main case
+// above — the same reporting function, exercised via the OTHER
+// constraint mechanism, using groupedItemDef's self-reference shape.
+func TestCountTargetConstraintViolations_MustMatchParentField_CountsAcrossGroups(t *testing.T) {
+	db := freshTenantDB(t)
+	records := data.NewRecordRepo(db)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	def := groupedItemDef()
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	parentA, err := engine.Create(ctx, def, map[string]any{"name": "A-root", "group_id": "group-a"}, actor)
+	if err != nil {
+		t.Fatalf("create parent in group A: %v", err)
+	}
+	parentB, err := engine.Create(ctx, def, map[string]any{"name": "B-root", "group_id": "group-b"}, actor)
+	if err != nil {
+		t.Fatalf("create parent in group B: %v", err)
+	}
+
+	// Same-group children: satisfy MustMatchParentField, not counted.
+	if _, err := records.Create(ctx, "GroupedItem", map[string]any{"name": "same-group child", "group_id": "group-a", "parent_item_id": parentA.ID}); err != nil {
+		t.Fatalf("create same-group child: %v", err)
+	}
+	// Cross-group children: violate MustMatchParentField.
+	if _, err := records.Create(ctx, "GroupedItem", map[string]any{"name": "cross-group child 1", "group_id": "group-b", "parent_item_id": parentA.ID}); err != nil {
+		t.Fatalf("create cross-group child 1: %v", err)
+	}
+	if _, err := records.Create(ctx, "GroupedItem", map[string]any{"name": "cross-group child 2", "group_id": "group-a", "parent_item_id": parentB.ID}); err != nil {
+		t.Fatalf("create cross-group child 2: %v", err)
+	}
+
+	n, err := CountTargetConstraintViolations(ctx, db, records, def, "parent_item_id")
+	if err != nil {
+		t.Fatalf("CountTargetConstraintViolations: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("expected exactly 2 cross-group violations, got %d", n)
+	}
+}
+
+// TestCountTargetConstraintViolations_PaginatesAcrossMultiplePages seeds
+// more records than the function's internal pageSize (200) so the second
+// ListPage call (offset=200) and the loop's continuation past a full
+// first page are actually exercised, not just the single-page path every
+// other test above takes. Also exercises the direct-field (Entity=="")
+// TargetFilter shape, which the tests above never routed through Count.
+func TestCountTargetConstraintViolations_PaginatesAcrossMultiplePages(t *testing.T) {
+	db := freshTenantDB(t)
+	records := data.NewRecordRepo(db)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	active, err := engine.Create(ctx, personDef(), map[string]any{"name": "Live Co", "status": "active"}, actor)
+	if err != nil {
+		t.Fatalf("create active supplier: %v", err)
+	}
+	inactive, err := engine.Create(ctx, personDef(), map[string]any{"name": "Retired Co", "status": "inactive"}, actor)
+	if err != nil {
+		t.Fatalf("create inactive supplier: %v", err)
+	}
+
+	const total = 205 // > pageSize (200): forces a second ListPage call
+	const wantViolations = 7
+	for i := 0; i < total; i++ {
+		supplier := active.ID
+		if i < wantViolations {
+			supplier = inactive.ID
+		}
+		if _, err := records.Create(ctx, "GizmoOrder", map[string]any{
+			"name": fmt.Sprintf("Order %d", i), "supplier_id": supplier,
+		}); err != nil {
+			t.Fatalf("create order %d: %v", i, err)
+		}
+	}
+
+	n, err := CountTargetConstraintViolations(ctx, db, records, widgetWithStatusFilterDef(), "supplier_id")
+	if err != nil {
+		t.Fatalf("CountTargetConstraintViolations: %v", err)
+	}
+	if n != wantViolations {
+		t.Fatalf("expected %d violations across %d records spanning multiple pages, got %d", wantViolations, total, n)
+	}
+}
+
+// erroringQueryable wraps a real *sql.DB but ignores every query it is
+// given, substituting one against a table that does not exist — a
+// genuine, deterministic driver error on every call, without needing a
+// hand-rolled driver. Used only to reach CountTargetConstraintViolations'
+// non-ErrTargetConstraintViolation error branch (line 326): records.ListPage
+// itself runs against the RecordRepo's OWN connection, entirely separate
+// from this stub, so the page still lists successfully — only the
+// per-record target-loading query below (routed through this stub) fails.
+type erroringQueryable struct{ real *sql.DB }
+
+func (e erroringQueryable) QueryRowContext(ctx context.Context, _ string, _ ...any) *sql.Row {
+	return e.real.QueryRowContext(ctx, "SELECT 1 FROM uc_test_table_that_does_not_exist")
+}
+
+func (e erroringQueryable) QueryContext(ctx context.Context, _ string, _ ...any) (*sql.Rows, error) {
+	return e.real.QueryContext(ctx, "SELECT 1 FROM uc_test_table_that_does_not_exist")
+}
+
+func (e erroringQueryable) ExecContext(ctx context.Context, _ string, _ ...any) (sql.Result, error) {
+	return e.real.ExecContext(ctx, "SELECT 1 FROM uc_test_table_that_does_not_exist")
+}
+
+func TestCountTargetConstraintViolations_NonViolationErrorPropagates(t *testing.T) {
+	db := freshTenantDB(t)
+	records := data.NewRecordRepo(db)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	// A live record with a real, resolvable target — loadTarget must
+	// actually attempt the query below for the stub's failure to be
+	// reached; a dangling/absent reference would short-circuit first.
+	person, err := engine.Create(ctx, personDef(), map[string]any{"name": "Jamie"}, actor)
+	if err != nil {
+		t.Fatalf("create person: %v", err)
+	}
+	if _, err := records.Create(ctx, "Assignment", map[string]any{"title": "t", "assignee_id": person.ID}); err != nil {
+		t.Fatalf("create assignment: %v", err)
+	}
+
+	stub := erroringQueryable{real: db}
+	_, err = CountTargetConstraintViolations(ctx, stub, records, assignmentDef(), "assignee_id")
+	if err == nil {
+		t.Fatal("expected a genuine DB error to propagate, got nil")
+	}
+	if errors.Is(err, ErrTargetConstraintViolation) {
+		t.Fatalf("expected a genuine DB error, not ErrTargetConstraintViolation: %v", err)
+	}
+}
+
+// TestCountTargetConstraintViolations_ListPageErrorPropagates covers the
+// ListPage error path: a canceled context makes the underlying query fail
+// deterministically, without needing to sabotage the connection itself.
+func TestCountTargetConstraintViolations_ListPageErrorPropagates(t *testing.T) {
+	db := freshTenantDB(t)
+	records := data.NewRecordRepo(db)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := CountTargetConstraintViolations(ctx, db, records, assignmentDef(), "assignee_id")
+	if err == nil {
+		t.Fatal("expected an error from ListPage when the context is already canceled, got nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected the error to wrap context.Canceled, got %v", err)
+	}
+	if got := err.Error(); !strings.Contains(got, "Assignment") || !strings.Contains(got, "assignee_id") {
+		t.Fatalf("expected the wrapped error to name Assignment.assignee_id, got %q", got)
 	}
 }
