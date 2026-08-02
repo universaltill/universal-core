@@ -122,6 +122,50 @@ func TestPartyRole_RejectsUnknownRoleType(t *testing.T) {
 	}
 }
 
+// TestPartyRole_OwnOrganizationIsALegalRoleType is the regression test
+// for uc-infra#63's v3 enum addition: a PartyRole record marking a Party
+// as the tenant's own legal entity must validate, the same as any other
+// role_type value.
+func TestPartyRole_OwnOrganizationIsALegalRoleType(t *testing.T) {
+	roleDef := PartyRole()
+	data := map[string]any{"party_id": "party-123", "role_type": "own_organization"}
+	if err := entity.ValidateRecord(roleDef, data); err != nil {
+		t.Fatalf("own_organization role should validate: %v", err)
+	}
+}
+
+// TestParty_ExistingRecordsStillValidateAfterV3 confirms uc-infra#63's
+// field additions are additive-only: a Party record written before v3
+// existed (no registration_number/contact_first_name/contact_last_name
+// keys at all, not even blank ones) still validates against the v3
+// Definition, the same guarantee every other Version bump in this
+// package documents ("rows written against vN still hold legal values").
+func TestParty_ExistingRecordsStillValidateAfterV3(t *testing.T) {
+	partyDef := Party()
+	preV3Record := map[string]any{"party_type": "organization", "name": "Demo Organization"}
+	if err := entity.ValidateRecord(partyDef, preV3Record); err != nil {
+		t.Fatalf("pre-v3 Party record (no statutory fields) should still validate: %v", err)
+	}
+}
+
+// TestParty_AcceptsStatutoryProfileFields is the happy path for the
+// fields internal/api/saftexport.go's saftCompanyProfile reads off the
+// Party holding the own_organization PartyRole (uc-infra#63).
+func TestParty_AcceptsStatutoryProfileFields(t *testing.T) {
+	partyDef := Party()
+	record := map[string]any{
+		"party_type":          "organization",
+		"name":                "Demo Organization",
+		"tax_id":              "TAX-98765",
+		"registration_number": "REG-12345",
+		"contact_first_name":  "Jane",
+		"contact_last_name":   "Doe",
+	}
+	if err := entity.ValidateRecord(partyDef, record); err != nil {
+		t.Fatalf("Party record with statutory profile fields should validate: %v", err)
+	}
+}
+
 func TestCurrency_DefaultMinorUnit(t *testing.T) {
 	def := Currency()
 	f, ok := def.FieldByName("minor_unit")

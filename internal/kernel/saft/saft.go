@@ -43,9 +43,10 @@ const Namespace = "urn:StandardAuditFile-Taxation-Financial:NO"
 
 // notAvailable is the Norwegian SAF-T documentation's convention for a
 // mandatory text element whose value the producing system genuinely does
-// not hold ("NA"). Used for company registration data this kernel does
-// not model yet (a tenant statutory profile is follow-up work, tracked
-// on the board) — never as a lazy default for data that does exist.
+// not hold ("NA"). Since uc-infra#63 the kernel DOES model a tenant
+// statutory profile (foundation.Party + the own_organization PartyRole),
+// so this is now the fallback for a tenant that has not configured one —
+// never a lazy default for data that does exist.
 const notAvailable = "NA"
 
 // Input is everything Build needs, already read from storage. Amounts
@@ -65,11 +66,22 @@ type Input struct {
 	// CompanyName is the exporting tenant's display name.
 	CompanyName string
 	// RegistrationNumber / TaxRegistrationNumber are the tenant's
-	// statutory identifiers. This kernel has no tenant statutory
-	// profile yet, so callers usually pass "" and the file carries the
-	// spec's "NA" marker.
+	// statutory identifiers, sourced from the foundation.Party holding
+	// the "own_organization" PartyRole (uc-infra#63) when exactly one
+	// such Party exists for the tenant. Callers pass "" when it doesn't
+	// (no statutory profile configured yet, or an ambiguous/deleted
+	// one) and the file carries the spec's "NA" marker, same as before.
 	RegistrationNumber    string
 	TaxRegistrationNumber string
+	// ContactFirstName / ContactLastName are the statutory contact
+	// person's name, from the same own_organization Party (uc-infra#63).
+	// Each falls back to the spec's "NA" marker independently when
+	// blank — a party with a first name but no last name on file still
+	// gets a real first name in the file rather than losing it to an
+	// all-or-nothing check, same per-field fallback RegistrationNumber
+	// and CompanyName already use via orNA.
+	ContactFirstName string
+	ContactLastName  string
 
 	// DefaultCurrency is the ISO 4217 code for file amounts. The ledger
 	// is single-currency today (see finance.SyncGLAccounts's
@@ -367,10 +379,15 @@ func Build(in Input) (*AuditFile, error) {
 			Company: Company{
 				RegistrationNumber: orNA(truncate(in.RegistrationNumber, 35)),
 				Name:               orNA(truncate(in.CompanyName, 256)),
-				// The schema demands a contact person; the kernel has no
-				// tenant contact concept yet (statutory-profile follow-up),
-				// so the spec's NA marker fills both name parts.
-				Contact: []Contact{{ContactPerson: ContactPerson{FirstName: notAvailable, LastName: notAvailable}}},
+				// The schema demands a contact person. 35/70 are the
+				// Norwegian XSD's SAFmiddle1textType/SAFmiddle2textType
+				// caps for FirstName/LastName (testdata/Norwegian_SAF-T_
+				// Financial_Schema_v_1.30.xsd) — each falls back to the
+				// spec's NA marker independently when blank (uc-infra#63).
+				Contact: []Contact{{ContactPerson: ContactPerson{
+					FirstName: orNA(truncate(in.ContactFirstName, 35)),
+					LastName:  orNA(truncate(in.ContactLastName, 70)),
+				}}},
 			},
 			DefaultCurrencyCode: currency,
 			SelectionCriteria:   SelectionCriteria{SelectionStartDate: in.From, SelectionEndDate: in.To},

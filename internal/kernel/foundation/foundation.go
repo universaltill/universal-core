@@ -17,10 +17,21 @@ import "github.com/universaltill/universal-core/internal/kernel/entity"
 // prevents the classic ERP failure of the same real-world company
 // existing three times because finance, purchasing, and HR each created
 // their own master record for it.
+// v3 (uc-infra#63) added registration_number/contact_first_name/
+// contact_last_name — the tenant's statutory identity, consumed by
+// internal/kernel/saft.Build's Company/Contact block instead of the
+// spec's "NA" markers. These three fields are meaningful only on the
+// Party record that also holds the new own_organization PartyRole
+// (below) — the same "optional/contextual field on the shared Party
+// shape" pattern tax_id/preferred_language already establish (not every
+// Party has a tax_id either). tax_id itself is reused as the VAT/tax
+// registration number for that record rather than adding a fourth,
+// redundant field. Additive fields, no data migration: rows written
+// against v2 still hold legal values.
 func Party() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "Party",
-		Version:    2,
+		Version:    3,
 		Module:     "foundation",
 		Fields: []entity.Field{
 			{Name: "party_type", Type: entity.FieldEnum, Required: true,
@@ -30,6 +41,9 @@ func Party() *entity.Definition {
 			{Name: "status", Type: entity.FieldEnum,
 				EnumValues: []string{"active", "inactive"}, Default: "active"},
 			{Name: "preferred_language", Type: entity.FieldString, Default: "en"},
+			{Name: "registration_number", Type: entity.FieldString},
+			{Name: "contact_first_name", Type: entity.FieldString},
+			{Name: "contact_last_name", Type: entity.FieldString},
 		},
 	}
 }
@@ -37,15 +51,32 @@ func Party() *entity.Definition {
 // PartyRole records that a Party holds a given role — many-to-many, so
 // one Party can be a vendor and a customer simultaneously (e.g. a
 // supplier who also buys after-sales service).
+//
+// v3 (uc-infra#63) added own_organization: the Party holding this role
+// is the tenant's own legal entity, resolved by
+// internal/api/saftexport.go's saftCompanyProfile to populate
+// internal/kernel/saft.Input's RegistrationNumber/TaxRegistrationNumber/
+// ContactFirstName/ContactLastName instead of the spec's "NA" markers.
+// Exactly one Party is expected to hold it per tenant, but — like every
+// other one-row-per-tenant convention in this package
+// (AIProviderConnection, SystemOfRecord) — that is an application-level
+// convention, not a DB constraint the generic entity/crud layer can
+// express (nor is there any uniqueness mechanism to stop the same Party
+// holding the role twice); a caller finding zero, or rows naming more
+// than one DISTINCT Party, degrades to treating it as absent rather than
+// guessing, the same fail-safe posture SystemOfRecord's own doc comment
+// already argues for. Additive
+// enum value, no data migration: rows written against v2 still hold
+// legal values.
 func PartyRole() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "PartyRole",
-		Version:    2,
+		Version:    3,
 		Module:     "foundation",
 		Fields: []entity.Field{
 			{Name: "party_id", Type: entity.FieldReference, Required: true, Target: "Party"},
 			{Name: "role_type", Type: entity.FieldEnum, Required: true,
-				EnumValues: []string{"customer", "vendor", "employee", "contact", "prospect"}},
+				EnumValues: []string{"customer", "vendor", "employee", "contact", "prospect", "own_organization"}},
 		},
 	}
 }
@@ -72,11 +103,18 @@ func PartyRole() *entity.Definition {
 // v3 added contact_for: a CRM contact is a person Party holding the
 // `contact` PartyRole, joined to an organization Party by one of these
 // rows (reference-data-model.md §6, ADR-0014). Reusing `employs` for it
-// was rejected because nothing in this schema identifies the tenant's
-// own organization Party (#63 is unbuilt), so one value would have had
-// to carry both "our staff" and "their staff" with no field able to
-// separate them. Additive enum value, no data migration: rows written
-// against v2 still hold legal values.
+// was rejected because at the time nothing in this schema identified the
+// tenant's own organization Party, so one value would have had to carry
+// both "our staff" and "their staff" with no field able to separate
+// them. That gap is closed now — PartyRole's own_organization value
+// (v3, uc-infra#63) — but contact_for still isn't reused for the
+// statutory contact person question #63 actually needed: that's a
+// single first/last name pair on the org Party itself
+// (Party.contact_first_name/contact_last_name), not a second Party+
+// relationship graph, since modeling a full CRM-style contact for one
+// statutory field pair was judged overkill for that task. Additive enum
+// value, no data migration: rows written against v2 still hold legal
+// values.
 func PartyRelationship() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "PartyRelationship",

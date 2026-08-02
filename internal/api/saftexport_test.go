@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"encoding/xml"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -285,6 +286,373 @@ func TestSAFTExport_EmptyTenantStillValidFile(t *testing.T) {
 	validateSAFTAgainstXSD(t, rec.Body.Bytes())
 }
 
+// TestSAFTExport_OwnOrganizationPopulatesCompanyProfile is uc-infra#63's
+// core acceptance case: a Party holding the own_organization PartyRole,
+// with its statutory fields set, flows through to the file's Company/
+// Contact block instead of the spec's NA markers.
+func TestSAFTExport_OwnOrganizationPopulatesCompanyProfile(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+	setupSAFTTenant(t, tenantID, db, mux)
+
+	post := func(path string, body string) map[string]any {
+		t.Helper()
+		req := newRequest("POST", path, tenantID, "farshid", []byte(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("POST %s: expected 201, got %d: %s", path, rec.Code, rec.Body.String())
+		}
+		var envelope struct {
+			Data map[string]any `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+			t.Fatalf("decode %s response: %v", path, err)
+		}
+		return envelope.Data
+	}
+
+	org := post("/api/records/Party", `{"party_type":"organization","name":"Demo Organization",`+
+		`"tax_id":"TAX-98765","registration_number":"REG-12345",`+
+		`"contact_first_name":"Jane","contact_last_name":"Doe"}`)
+	post("/api/records/PartyRole", `{"party_id":"`+org["id"].(string)+`","role_type":"own_organization"}`)
+
+	req := newRequest("GET", "/export/saft?from=2026-01-01&to=2026-12-31", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var file saft.AuditFile
+	if err := xml.Unmarshal(rec.Body.Bytes(), &file); err != nil {
+		t.Fatalf("response is not parseable SAF-T XML: %v\n%s", err, rec.Body.String())
+	}
+	c := file.Header.Company
+	if c.RegistrationNumber != "REG-12345" {
+		t.Errorf("RegistrationNumber = %q, want REG-12345 (not NA)", c.RegistrationNumber)
+	}
+	if len(c.TaxRegistration) != 1 || c.TaxRegistration[0].TaxRegistrationNumber != "TAX-98765" {
+		t.Errorf("TaxRegistration = %+v, want [{TAX-98765}]", c.TaxRegistration)
+	}
+	if len(c.Contact) != 1 || c.Contact[0].ContactPerson.FirstName != "Jane" || c.Contact[0].ContactPerson.LastName != "Doe" {
+		t.Errorf("Contact = %+v, want Jane/Doe", c.Contact)
+	}
+	validateSAFTAgainstXSD(t, rec.Body.Bytes())
+}
+
+// TestSAFTExport_NoOwnOrganizationFallsBackToNA is the regression case
+// for every tenant that existed before uc-infra#63: no Party holds the
+// own_organization role, so the file keeps the exact pre-#63 NA-marker
+// behavior — setupSAFTTenant's fixture never creates one.
+func TestSAFTExport_NoOwnOrganizationFallsBackToNA(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+	setupSAFTTenant(t, tenantID, db, mux)
+
+	req := newRequest("GET", "/export/saft?from=2026-01-01&to=2026-12-31", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var file saft.AuditFile
+	if err := xml.Unmarshal(rec.Body.Bytes(), &file); err != nil {
+		t.Fatalf("response is not parseable SAF-T XML: %v\n%s", err, rec.Body.String())
+	}
+	c := file.Header.Company
+	if c.RegistrationNumber != "NA" {
+		t.Errorf("RegistrationNumber = %q, want NA (no own_organization Party configured)", c.RegistrationNumber)
+	}
+	if len(c.Contact) != 1 || c.Contact[0].ContactPerson.FirstName != "NA" || c.Contact[0].ContactPerson.LastName != "NA" {
+		t.Errorf("Contact = %+v, want NA/NA", c.Contact)
+	}
+}
+
+// TestSAFTExport_AmbiguousOwnOrganizationFallsBackToNA: two Parties both
+// holding own_organization is a data-quality problem the export has no
+// business guessing at (see foundation.PartyRole's own doc comment) — it
+// must degrade to NA exactly like the zero-match case, never pick one.
+func TestSAFTExport_AmbiguousOwnOrganizationFallsBackToNA(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+	setupSAFTTenant(t, tenantID, db, mux)
+
+	post := func(path string, body string) map[string]any {
+		t.Helper()
+		req := newRequest("POST", path, tenantID, "farshid", []byte(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("POST %s: expected 201, got %d: %s", path, rec.Code, rec.Body.String())
+		}
+		var envelope struct {
+			Data map[string]any `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+			t.Fatalf("decode %s response: %v", path, err)
+		}
+		return envelope.Data
+	}
+
+	for i, name := range []string{"Org One", "Org Two"} {
+		org := post("/api/records/Party", `{"party_type":"organization","name":"`+name+`","registration_number":"REG-`+string(rune('A'+i))+`"}`)
+		post("/api/records/PartyRole", `{"party_id":"`+org["id"].(string)+`","role_type":"own_organization"}`)
+	}
+
+	req := newRequest("GET", "/export/saft?from=2026-01-01&to=2026-12-31", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var file saft.AuditFile
+	if err := xml.Unmarshal(rec.Body.Bytes(), &file); err != nil {
+		t.Fatalf("response is not parseable SAF-T XML: %v\n%s", err, rec.Body.String())
+	}
+	if got := file.Header.Company.RegistrationNumber; got != "NA" {
+		t.Errorf("RegistrationNumber = %q, want NA (ambiguous: two own_organization Parties)", got)
+	}
+}
+
+// TestSAFTExport_OwnOrganizationPartyDeletedAfterRoleFallsBackToNA: the
+// PartyRole row survives a Party delete (no cascade in this generic
+// storage layer), so saftCompanyProfile's Get against the dangling
+// party_id must degrade to NA like the zero-match case, not 500.
+func TestSAFTExport_OwnOrganizationPartyDeletedAfterRoleFallsBackToNA(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+	setupSAFTTenant(t, tenantID, db, mux)
+
+	post := func(path string, body string) map[string]any {
+		t.Helper()
+		req := newRequest("POST", path, tenantID, "farshid", []byte(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("POST %s: expected 201, got %d: %s", path, rec.Code, rec.Body.String())
+		}
+		var envelope struct {
+			Data map[string]any `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+			t.Fatalf("decode %s response: %v", path, err)
+		}
+		return envelope.Data
+	}
+
+	org := post("/api/records/Party", `{"party_type":"organization","name":"Demo Organization","registration_number":"REG-12345"}`)
+	post("/api/records/PartyRole", `{"party_id":"`+org["id"].(string)+`","role_type":"own_organization"}`)
+
+	if err := data.NewRecordRepo(db).Delete(context.Background(), "Party", org["id"].(string)); err != nil {
+		t.Fatalf("delete Party: %v", err)
+	}
+
+	req := newRequest("GET", "/export/saft?from=2026-01-01&to=2026-12-31", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 (dangling role should degrade, not error), got %d: %s", rec.Code, rec.Body.String())
+	}
+	var file saft.AuditFile
+	if err := xml.Unmarshal(rec.Body.Bytes(), &file); err != nil {
+		t.Fatalf("response is not parseable SAF-T XML: %v\n%s", err, rec.Body.String())
+	}
+	if got := file.Header.Company.RegistrationNumber; got != "NA" {
+		t.Errorf("RegistrationNumber = %q, want NA (own_organization role points at a deleted Party)", got)
+	}
+}
+
+// TestSAFTExport_DuplicateOwnOrganizationRolesOnOneParty (independent
+// review, uc-infra#63): nothing in the generic entity/crud layer makes
+// PartyRole rows unique, so assigning the own_organization role twice to
+// the SAME Party is a click away. Two rows naming one party is not the
+// ambiguity the degrade-to-NA rule exists for — every row agrees on which
+// Party is the tenant, so resolving it is not a guess. Counting ROWS
+// rather than distinct parties would quietly swap a configured company
+// profile back to NA (a statutory misstatement with no visible cause);
+// saftParties already dedupes its own role→party join by party id for
+// exactly this reason.
+func TestSAFTExport_DuplicateOwnOrganizationRolesOnOneParty(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+	setupSAFTTenant(t, tenantID, db, mux)
+
+	post := func(path string, body string) map[string]any {
+		t.Helper()
+		req := newRequest("POST", path, tenantID, "farshid", []byte(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("POST %s: expected 201, got %d: %s", path, rec.Code, rec.Body.String())
+		}
+		var envelope struct {
+			Data map[string]any `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+			t.Fatalf("decode %s response: %v", path, err)
+		}
+		return envelope.Data
+	}
+
+	org := post("/api/records/Party", `{"party_type":"organization","name":"Demo Organization",`+
+		`"registration_number":"REG-12345","contact_first_name":"Jane","contact_last_name":"Doe"}`)
+	post("/api/records/PartyRole", `{"party_id":"`+org["id"].(string)+`","role_type":"own_organization"}`)
+	post("/api/records/PartyRole", `{"party_id":"`+org["id"].(string)+`","role_type":"own_organization"}`)
+
+	req := newRequest("GET", "/export/saft?from=2026-01-01&to=2026-12-31", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var file saft.AuditFile
+	if err := xml.Unmarshal(rec.Body.Bytes(), &file); err != nil {
+		t.Fatalf("response is not parseable SAF-T XML: %v\n%s", err, rec.Body.String())
+	}
+	c := file.Header.Company
+	if c.RegistrationNumber != "REG-12345" {
+		t.Errorf("RegistrationNumber = %q, want REG-12345 (two roles naming one Party is unambiguous)", c.RegistrationNumber)
+	}
+	if len(c.Contact) != 1 || c.Contact[0].ContactPerson.FirstName != "Jane" || c.Contact[0].ContactPerson.LastName != "Doe" {
+		t.Errorf("Contact = %+v, want Jane/Doe", c.Contact)
+	}
+}
+
+// TestSAFTExport_OwnOrganizationRoleWithUnresolvablePartyIDFallsBackToNA
+// (independent review, uc-infra#63): PartyRole.party_id carries no
+// TargetFilter/MustMatchParentField, so crud's own reference-target check
+// skips it entirely (checkReferenceTargetConstraints returns early) and
+// entity.ValidateRecord only asserts "is a non-nil string" — a role row
+// whose party_id is blank or not UUID-shaped is therefore creatable
+// through the ordinary API by any actor with PartyRole write access.
+// records.id is a uuid column, so a Get on such a value returns a raw
+// Postgres "invalid input syntax for type uuid" driver error rather than
+// data.ErrNotFound: without the shape guard, ONE junk role row 500s the
+// whole statutory export for the entire tenant. Must degrade to NA, the
+// same tolerated-dangling-reference posture crud.looksLikeUUID's own doc
+// comment and saftParties' missing-party skip already take.
+func TestSAFTExport_OwnOrganizationRoleWithUnresolvablePartyIDFallsBackToNA(t *testing.T) {
+	for _, partyID := range []string{"", "not-a-uuid"} {
+		t.Run("party_id="+partyID, func(t *testing.T) {
+			router := newTestRouter(t)
+			withDevAuthEnabled(t)
+			tenantID, db := newTestTenant(t, router)
+			mux := http.NewServeMux()
+			testHandler(t, router).Routes(mux)
+			setupSAFTTenant(t, tenantID, db, mux)
+
+			req := newRequest("POST", "/api/records/PartyRole", tenantID, "farshid",
+				[]byte(`{"party_id":"`+partyID+`","role_type":"own_organization"}`))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+			if rec.Code != http.StatusCreated {
+				// Not a skip: if a future write-path guard starts rejecting
+				// this shape, that is a BETTER outcome, but this test must
+				// then be retired deliberately rather than silently passing.
+				t.Fatalf("POST PartyRole with party_id=%q: expected 201 (no write-path guard rejects this shape today), got %d: %s",
+					partyID, rec.Code, rec.Body.String())
+			}
+
+			req = newRequest("GET", "/export/saft?from=2026-01-01&to=2026-12-31", tenantID, "farshid", nil)
+			rec = httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("expected 200 (unresolvable party_id should degrade, not error), got %d: %s", rec.Code, rec.Body.String())
+			}
+			var file saft.AuditFile
+			if err := xml.Unmarshal(rec.Body.Bytes(), &file); err != nil {
+				t.Fatalf("response is not parseable SAF-T XML: %v\n%s", err, rec.Body.String())
+			}
+			if got := file.Header.Company.RegistrationNumber; got != "NA" {
+				t.Errorf("RegistrationNumber = %q, want NA (own_organization role points at an unresolvable party_id)", got)
+			}
+		})
+	}
+}
+
+// TestSAFTExport_OwnOrganizationRoleWithNonCanonicalPartyIDStillResolves
+// is the other half of the shape guard above, and the exact regression
+// uc-infra#107's review caught in ITS first-draft fix: Postgres's uuid_in
+// accepts brace-wrapped and unhyphenated spellings of the same id, so a
+// guard built on a strict canonical-form regex would reject a party_id
+// that really does resolve — silently turning a configured company
+// profile into NA. ids.Canonical accepts what uuid_in accepts, so both
+// spellings must still find the Party.
+func TestSAFTExport_OwnOrganizationRoleWithNonCanonicalPartyIDStillResolves(t *testing.T) {
+	for _, spelling := range []struct{ name, format string }{
+		{"brace-wrapped", "{%s}"},
+		{"unhyphenated uppercase", "%s"},
+	} {
+		t.Run(spelling.name, func(t *testing.T) {
+			router := newTestRouter(t)
+			withDevAuthEnabled(t)
+			tenantID, db := newTestTenant(t, router)
+			mux := http.NewServeMux()
+			testHandler(t, router).Routes(mux)
+			setupSAFTTenant(t, tenantID, db, mux)
+
+			post := func(path string, body string) map[string]any {
+				t.Helper()
+				req := newRequest("POST", path, tenantID, "farshid", []byte(body))
+				req.Header.Set("Content-Type", "application/json")
+				rec := httptest.NewRecorder()
+				mux.ServeHTTP(rec, req)
+				if rec.Code != http.StatusCreated {
+					t.Fatalf("POST %s: expected 201, got %d: %s", path, rec.Code, rec.Body.String())
+				}
+				var envelope struct {
+					Data map[string]any `json:"data"`
+				}
+				if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+					t.Fatalf("decode %s response: %v", path, err)
+				}
+				return envelope.Data
+			}
+
+			org := post("/api/records/Party", `{"party_type":"organization","name":"Demo Organization","registration_number":"REG-12345"}`)
+			id := org["id"].(string)
+			if spelling.name == "unhyphenated uppercase" {
+				id = strings.ToUpper(strings.ReplaceAll(id, "-", ""))
+			}
+			post("/api/records/PartyRole", `{"party_id":"`+fmt.Sprintf(spelling.format, id)+`","role_type":"own_organization"}`)
+
+			req := newRequest("GET", "/export/saft?from=2026-01-01&to=2026-12-31", tenantID, "farshid", nil)
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+			}
+			var file saft.AuditFile
+			if err := xml.Unmarshal(rec.Body.Bytes(), &file); err != nil {
+				t.Fatalf("response is not parseable SAF-T XML: %v\n%s", err, rec.Body.String())
+			}
+			if got := file.Header.Company.RegistrationNumber; got != "REG-12345" {
+				t.Errorf("RegistrationNumber = %q, want REG-12345 (a %s party_id is the same id to Postgres)", got, spelling.name)
+			}
+		})
+	}
+}
+
 // TestSAFTExport_RBACDenied: once any Permission row exists for an
 // entity type the file discloses, an actor without that grant gets a
 // 403 — the whole-file gate, mirroring the purchasing report's.
@@ -329,16 +697,21 @@ func TestSAFTExport_RBACDenied(t *testing.T) {
 // must refuse the whole export, the same hole #27's independent review
 // found on the UBL export (TestUBLExport_FieldRedactionRefused403 is the
 // shape this mirrors) and uc-infra#67 reported for SAF-T specifically.
-// Covers all six saftFieldReads entries, not just the two that render as
+// Covers every saftFieldReads entry, not just the ones that render as
 // ""/0: PartyRole.party_id/role_type are the case an independent review
 // pass on this fix's own first draft found missing — hiding either does
 // not render blank, it makes saftParties' role→party join or
 // customer/vendor switch fail silently, so the file would ship with
 // EMPTY Customers/Suppliers master files (a false "no trading partners"
-// statutory claim) instead of refusing. Every case must be reachable
-// through the same clerk role with every OTHER field left visible, or
-// the 403 could be coming from something else entirely — the loop drops
-// the case's own field from a fully-open grant to keep it isolated.
+// statutory claim) instead of refusing. Party.registration_number/
+// contact_first_name/contact_last_name (uc-infra#63) are the newest
+// three: without a case here, a hidden statutory field would silently
+// degrade to the file's own "NA" marker instead of refusing, indistinguishable
+// from "no company profile configured" — exactly the kind of false-negative
+// this whole test exists to catch. Every case must be reachable through
+// the same clerk role with every OTHER field left visible, or the 403
+// could be coming from something else entirely — the loop drops the
+// case's own field from a fully-open grant to keep it isolated.
 func TestSAFTExport_FieldRedactionRefused403(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -347,6 +720,9 @@ func TestSAFTExport_FieldRedactionRefused403(t *testing.T) {
 	}{
 		{"Party.name hidden", "Party", "name"},
 		{"Party.tax_id hidden", "Party", "tax_id"},
+		{"Party.registration_number hidden", "Party", "registration_number"},
+		{"Party.contact_first_name hidden", "Party", "contact_first_name"},
+		{"Party.contact_last_name hidden", "Party", "contact_last_name"},
 		{"PartyRole.party_id hidden", "PartyRole", "party_id"},
 		{"PartyRole.role_type hidden", "PartyRole", "role_type"},
 		{"TaxCode.code hidden", "TaxCode", "code"},

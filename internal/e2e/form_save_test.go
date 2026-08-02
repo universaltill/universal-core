@@ -108,6 +108,69 @@ func TestFormSaveButton_RealBrowser(t *testing.T) {
 	}
 }
 
+// TestPartyStatutoryProfileFields_RealBrowser (uc-infra#63) proves the
+// three new Party fields — registration_number/contact_first_name/
+// contact_last_name — are real, visible, editable <input> elements on
+// the generated form and that saving them actually persists, the same
+// create->edit->reload round trip TestFormSaveButton_RealBrowser proves
+// generically for Item. A rendered-HTML-string test would prove the
+// fields are declared on PartyForm; it would not prove a real browser
+// shows working inputs a user can type into and have survive a save.
+func TestPartyStatutoryProfileFields_RealBrowser(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, tenantDB := testServer(t)
+	// testServer publishes foundation's entities but only purchasing's
+	// forms (its own doc comment) — Party's Form Definition needs its
+	// own publish call, the same gap TestMasterDetailColumnHeadersAnd
+	// RollUpLabelAreLocalized_RealBrowser's own comment documents for
+	// PurchaseOrder's status graph.
+	if err := foundation.PublishForms(context.Background(), tenantDB, humanActor()); err != nil {
+		t.Fatalf("foundation.PublishForms: %v", err)
+	}
+	ctx := browserCtx(t, tenantID)
+
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/forms/Party/new"),
+		chromedp.WaitVisible(`form.uc-form`, chromedp.ByQuery),
+		chromedp.SetValue(`select[name="party_type"]`, "organization", chromedp.ByQuery),
+		chromedp.SetValue(`input[name="name"]`, "Demo Organization", chromedp.ByQuery),
+		chromedp.SetValue(`input[name="registration_number"]`, "REG-12345", chromedp.ByQuery),
+		chromedp.SetValue(`input[name="contact_first_name"]`, "Jane", chromedp.ByQuery),
+		chromedp.SetValue(`input[name="contact_last_name"]`, "Doe", chromedp.ByQuery),
+		submitForm(),
+	); err != nil {
+		t.Fatalf("fill + save new Party: %v", err)
+	}
+
+	var postHref string
+	if err := chromedp.Run(ctx, chromedp.AttributeValue(`form.uc-form`, "hx-post", &postHref, nil, chromedp.ByQuery)); err != nil {
+		t.Fatalf("read hx-post after save: %v", err)
+	}
+	if postHref == "/api/records/Party" {
+		t.Fatalf("expected the form to now target its own record id (create -> edit), still targets the create route: %s", postHref)
+	}
+
+	// Reload the record's own edit URL fresh (a new page navigation, not
+	// an htmx swap) to confirm the values persisted to Postgres, not just
+	// the client-side DOM the swap left behind.
+	recordID := path.Base(postHref)
+	if err := chromedp.Run(ctx, chromedp.Navigate(srv.URL+"/forms/Party/"+recordID)); err != nil {
+		t.Fatalf("re-navigate to record: %v", err)
+	}
+	var regNum, contactFirst, contactLast string
+	if err := chromedp.Run(ctx,
+		chromedp.WaitVisible(`form.uc-form`, chromedp.ByQuery),
+		chromedp.Value(`input[name="registration_number"]`, &regNum, chromedp.ByQuery),
+		chromedp.Value(`input[name="contact_first_name"]`, &contactFirst, chromedp.ByQuery),
+		chromedp.Value(`input[name="contact_last_name"]`, &contactLast, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("read statutory profile fields after reload: %v", err)
+	}
+	if regNum != "REG-12345" || contactFirst != "Jane" || contactLast != "Doe" {
+		t.Fatalf("expected persisted values REG-12345/Jane/Doe, got %q/%q/%q", regNum, contactFirst, contactLast)
+	}
+}
+
 // TestPurchaseOrderFormStages_RealBrowser (#29): the six staged
 // lead-time date inputs are actually present and *visible* on
 // /forms/PurchaseOrder/new — rendered as real <input type="date">
