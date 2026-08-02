@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"html/template"
 	"net/http"
 	"strings"
@@ -96,6 +97,14 @@ func (h *Handler) renderModuleMenu(w http.ResponseWriter, r *http.Request) {
 				visible = false
 				break
 			}
+		}
+		if visible && link.ExtraDenied != nil {
+			msg, err := link.ExtraDenied(r.Context(), ts)
+			if err != nil {
+				writeInternalError(w, "check report link visibility", err)
+				return
+			}
+			visible = msg == ""
 		}
 		if !visible {
 			// Same "don't link to it if you can't reach it" reasoning
@@ -212,12 +221,23 @@ func entityIcon(entityType string) string {
 // still offering the link unconditionally: exactly the "tile that leads
 // to a 403" outcome dashboard.go's own CanRead filtering exists to
 // prevent for entity nodes, just not yet applied to report links).
+//
+// ExtraDenied is an optional second check beyond RequiredRead's plain
+// entity-level CanRead, for a link whose target also refuses on
+// something RequiredRead cannot express — SAF-T's own field-level
+// redaction gate (saftAccessDenial), added after an independent review
+// found this menu could still offer the SAF-T link to an actor the
+// export itself would 403 (uc-infra#67): the same "tile that leads to a
+// 403" outcome RequiredRead exists to prevent, just one gate deeper than
+// RequiredRead alone can check. nil for a link RequiredRead fully covers.
 var moduleReportLinks = map[string][]struct {
 	LabelKey, Href string
 	RequiredRead   []string
+	ExtraDenied    func(ctx context.Context, ts tenantScope) (string, error)
 }{
-	"purchasing": {{"report.purchasing.nav_label", "/reports/purchasing", purchasingReportEntityTypes}},
-	"finance":    {{"saft.nav_label", "/export/saft/form", saftEntityTypes}},
+	"purchasing": {{LabelKey: "report.purchasing.nav_label", Href: "/reports/purchasing", RequiredRead: purchasingReportEntityTypes}},
+	"finance": {{LabelKey: "saft.nav_label", Href: "/export/saft/form", RequiredRead: saftEntityTypes,
+		ExtraDenied: saftAccessDenial}},
 }
 
 type moduleMenuView struct {
