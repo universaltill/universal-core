@@ -14,6 +14,7 @@ import (
 	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
+	"github.com/universaltill/universal-core/internal/kernel/ids"
 )
 
 // Hook is a post-write callback the caller who constructs an Engine may
@@ -171,25 +172,42 @@ func selfReferenceFields(def *entity.Definition) []entity.Field {
 const maxReferenceChainWalk = 10_000
 
 // checkSelfReferenceCycle walks a self-referencing field's chain starting
-// at newParentID, following the same field name up through each visited
-// record, and fails only if the walk reaches back to recordID itself (the
-// record being updated — a direct or indirect cycle this write would
-// introduce). If the walk instead revisits some OTHER id first, that's a
-// pre-existing cycle elsewhere in the chain that this write neither
-// causes nor perpetuates — recordID provably can never be reached from a
-// node once it repeats (each node has exactly one outgoing edge, so a
-// repeat makes the remaining walk exactly periodic among nodes already
-// ruled out) — so the walk stops and the write is allowed, the same
-// "not this guard's concern" posture already taken for a dangling
-// reference. This is the generic fix for the gap
-// `finance.Account.parent_account_id` already had and
-// `Department.parent_department_id`/`Position.reports_to_position_id`
+// at newParentID (already ids.Canonical-normalized by Update, its only
+// caller), following the same field name up through each visited record,
+// and fails only if the walk reaches back to recordID itself (the record
+// being updated — a direct or indirect cycle this write would introduce).
+// If the walk instead revisits some OTHER id first, that's a pre-existing
+// cycle elsewhere in the chain that this write neither causes nor
+// perpetuates — recordID provably can never be reached from a node once
+// it repeats (each node has exactly one outgoing edge, so a repeat makes
+// the remaining walk exactly periodic among nodes already ruled out) — so
+// the walk stops and the write is allowed, the same "not this guard's
+// concern" posture already taken for a dangling reference. This is the
+// generic fix for the gap `finance.Account.parent_account_id` already had
+// and `Department.parent_department_id`/`Position.reports_to_position_id`
 // inherited: none of them had any protection against a chain that loops
 // back on itself, which would be an infinite loop the moment anything
 // (e.g. R17 approval routing) walks the chain upward. Lives in
 // crud.Engine, not internal/kernel/entity, because it needs the record
 // repo to walk stored data — entity.ValidateRecord is pure field-shape
 // validation with no DB access (see ADR-0007).
+//
+// Every id compared, stored in visited, or queried by is passed through
+// ids.Canonical first — records.id is a uuid column, so a stored field
+// value that reached it through, say, a legacy CSV import (or any write
+// that predates a shape check) can be a different-but-equivalent spelling
+// of the same id (mixed case, no hyphens, brace-wrapped) as well as
+// outright garbage. Comparing raw, un-canonicalized strings would both
+// crash on garbage (uc-infra#107's original 500: GetTxIncludingDeleted's
+// `WHERE id = $1` runs against a uuid column, so a genuinely non-uuid
+// value surfaces as a raw Postgres "invalid input syntax for type uuid"
+// driver error, not data.ErrNotFound) AND silently miss a real cycle
+// routed through a differently-spelled-but-valid id (a review of the
+// #107 fix's first draft caught this: the walk would treat
+// "{<recordID>}" as an unrelated, resolvable id instead of recordID
+// itself, letting a live cycle through). ids.Canonical's ok=false return
+// is the tolerated-dangling-reference case (ADR-0007): a value that can
+// never be a real records.id is treated exactly like "target not found".
 //
 // Reads via GetTxIncludingDeleted, not GetTx: a soft-deleted record's data
 // is still physically stored, and a chain routed through one can still
@@ -222,7 +240,11 @@ func checkSelfReferenceCycle(ctx context.Context, tx *sql.Tx, records *data.Reco
 		if !ok || next == "" {
 			return nil // reached the top of the chain
 		}
-		currentID = next
+		canonicalNext, validShape := ids.Canonical(next)
+		if !validShape {
+			return nil // tolerated dangling reference — see doc comment above
+		}
+		currentID = canonicalNext
 	}
 	return fmt.Errorf("%s.%s: reference chain exceeded %d hops (possibly corrupted): %w", entityType, fieldName, maxReferenceChainWalk, ErrReferenceCycle)
 }
@@ -281,10 +303,26 @@ func (e *Engine) Update(ctx context.Context, def *entity.Definition, id string, 
 		if !ok || newParentID == "" {
 			continue
 		}
-		if newParentID == id {
+		// Canonicalize both sides before comparing: id is this record's own
+		// DB-generated id (always canonical), but newParentID is caller
+		// input and can be a different-but-equivalent spelling of the same
+		// id (mixed case, no hyphens, brace-wrapped) — a raw string compare
+		// would miss a direct self-reference spelled that way. ok=false
+		// means newParentID can never be a real records.id at all: a
+		// tolerated dangling reference (ADR-0007), not a cycle to check —
+		// see checkSelfReferenceCycle's own doc comment (uc-infra#107).
+		canonicalParentID, validShape := ids.Canonical(newParentID)
+		if !validShape {
+			continue
+		}
+		canonicalID, ok := ids.Canonical(id)
+		if !ok {
+			canonicalID = id
+		}
+		if canonicalParentID == canonicalID {
 			return 0, fmt.Errorf("%s.%s: %w", def.EntityType, f.Name, ErrReferenceCycle)
 		}
-		if err := checkSelfReferenceCycle(ctx, tx, e.records, def.EntityType, id, f.Name, newParentID); err != nil {
+		if err := checkSelfReferenceCycle(ctx, tx, e.records, def.EntityType, canonicalID, f.Name, canonicalParentID); err != nil {
 			return 0, err
 		}
 	}
