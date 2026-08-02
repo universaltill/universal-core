@@ -67,6 +67,13 @@ func setUpCustomerInvoiceFixture(t *testing.T) customerInvoiceFixture {
 	if err != nil {
 		t.Fatalf("create Party: %v", err)
 	}
+	// uc-infra#78: SalesOrder.customer_id now requires the referenced
+	// Party to hold the customer PartyRole.
+	if _, err := engine.Create(ctx, defFor(t, tenantDB, "PartyRole"), map[string]any{
+		"party_id": customer.ID, "role_type": "customer",
+	}, actor); err != nil {
+		t.Fatalf("create customer PartyRole: %v", err)
+	}
 
 	statusTypes, err := engine.ListByField(ctx, defFor(t, tenantDB, "StatusType"), "code", "customer_invoice_status")
 	if err != nil || len(statusTypes) == 0 {

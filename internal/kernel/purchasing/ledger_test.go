@@ -42,6 +42,27 @@ func defFor(t *testing.T, tenantDB *sql.DB, entityType string) *entity.Definitio
 	return d
 }
 
+// createVendorParty creates a Party AND tags it with the vendor
+// PartyRole — required (uc-infra#78) since PurchaseOrder.vendor_id now
+// declares a TargetFilter requiring the referenced Party to actually
+// hold that role; a bare Party (this file's fixtures all used to create
+// before that change) is no longer a valid vendor_id.
+func createVendorParty(t *testing.T, ctx context.Context, engine *crud.Engine, tenantDB *sql.DB, name string, actor audit.Actor) data.Record {
+	t.Helper()
+	party, err := engine.Create(ctx, defFor(t, tenantDB, "Party"), map[string]any{
+		"party_type": "organization", "name": name, "status": "active",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create Party: %v", err)
+	}
+	if _, err := engine.Create(ctx, defFor(t, tenantDB, "PartyRole"), map[string]any{
+		"party_id": party.ID, "role_type": "vendor",
+	}, actor); err != nil {
+		t.Fatalf("create vendor PartyRole: %v", err)
+	}
+	return party
+}
+
 // statusIDByCode looks up a Status record's id by its code, scoped to a
 // specific StatusType code — needed once more than one StatusType exists
 // (see purchasing.seedStatusGraph's own doc comment for why a plain
@@ -96,12 +117,7 @@ func setUpGoodsReceiptFixture(t *testing.T, unitPrice float64) goodsReceiptFixtu
 	}
 
 	engine := crud.NewEngine(tenantDB)
-	vendor, err := engine.Create(ctx, defFor(t, tenantDB, "Party"), map[string]any{
-		"party_type": "organization", "name": "Acme Textiles", "status": "active",
-	}, actor)
-	if err != nil {
-		t.Fatalf("create Party: %v", err)
-	}
+	vendor := createVendorParty(t, ctx, engine, tenantDB, "Acme Textiles", actor)
 	item, err := engine.Create(ctx, defFor(t, tenantDB, "Item"), map[string]any{
 		"sku": "SKU-1", "name": "Widget", "item_type": "stock",
 	}, actor)
@@ -163,12 +179,7 @@ func setUpVendorInvoiceFixture(t *testing.T, qty, unitPrice, receivedQty float64
 	}
 
 	engine := crud.NewEngine(tenantDB)
-	vendor, err := engine.Create(ctx, defFor(t, tenantDB, "Party"), map[string]any{
-		"party_type": "organization", "name": "Acme Textiles", "status": "active",
-	}, actor)
-	if err != nil {
-		t.Fatalf("create Party: %v", err)
-	}
+	vendor := createVendorParty(t, ctx, engine, tenantDB, "Acme Textiles", actor)
 	item, err := engine.Create(ctx, defFor(t, tenantDB, "Item"), map[string]any{
 		"sku": "SKU-1", "name": "Widget", "item_type": "stock",
 	}, actor)
@@ -1081,12 +1092,7 @@ func TestMatchVendorInvoiceOnUpdate_NoPOLines_RedirectsToMatchException(t *testi
 	engine := crud.NewEngine(tenantDB)
 	engine.SetHook("VendorInvoice", MatchVendorInvoiceOnUpdate)
 
-	vendor, err := engine.Create(ctx, defFor(t, tenantDB, "Party"), map[string]any{
-		"party_type": "organization", "name": "Acme Textiles", "status": "active",
-	}, actor)
-	if err != nil {
-		t.Fatalf("create Party: %v", err)
-	}
+	vendor := createVendorParty(t, ctx, engine, tenantDB, "Acme Textiles", actor)
 	draftPOStatusID := statusIDByCode(t, engine, tenantDB, "purchase_order_status", "draft")
 	po, err := engine.Create(ctx, defFor(t, tenantDB, "PurchaseOrder"), map[string]any{
 		"po_number": "PO-1", "vendor_id": vendor.ID, "order_date": "2026-01-01",

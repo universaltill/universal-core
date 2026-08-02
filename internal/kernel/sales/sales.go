@@ -54,10 +54,16 @@ import "github.com/universaltill/universal-core/internal/kernel/entity"
 // PurchaseOrder itself did (see that Definition's own doc comment on the
 // backfill this caused). The transition graph is seeded as real tenant
 // data by sales.PublishStatuses (seed.go), not part of this Definition.
+//
+// customer_id's TargetFilter (v2, uc-infra#78) requires the referenced
+// Party to actually hold the customer PartyRole — before this, a vendor
+// Party (never having done business as a customer) could be picked here
+// just as easily as a real customer, the same gap PurchaseOrder.vendor_id
+// had in the other direction.
 func SalesOrder() *entity.Definition {
 	return &entity.Definition{
 		EntityType:     "SalesOrder",
-		Version:        1,
+		Version:        2,
 		Module:         "sales",
 		StatusTypeCode: "sales_order_status",
 		Fields: []entity.Field{
@@ -67,7 +73,9 @@ func SalesOrder() *entity.Definition {
 			// application-level convention as po_number/Item.sku/
 			// Currency.code).
 			{Name: "so_number", Type: entity.FieldString, Required: true},
-			{Name: "customer_id", Type: entity.FieldReference, Required: true, Target: "Party"},
+			{Name: "customer_id", Type: entity.FieldReference, Required: true, Target: "Party", TargetFilter: []entity.TargetFilterCondition{
+				{Entity: "PartyRole", EntityField: "party_id", Field: "role_type", Value: "customer"},
+			}},
 			{Name: "order_date", Type: entity.FieldDate, Required: true},
 			{Name: "currency_id", Type: entity.FieldReference, Target: "Currency"},
 			{Name: "status_id", Type: entity.FieldReference, Required: true, Target: "Status"},

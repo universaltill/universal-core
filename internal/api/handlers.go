@@ -433,6 +433,11 @@ func writeInternalError(w http.ResponseWriter, logContext string, err error) {
 // rejection (crud.ErrHookRejected's own doc comment) — this file stays
 // entity-agnostic either way, checking one generic kernel sentinel
 // rather than importing purchasing/sales to check an entity-specific one.
+// crud.ErrTargetConstraintViolation (uc-infra#78) is the same family
+// again: a FieldReference value that fails its Definition-declared
+// TargetFilter/MustMatchParentField is the caller's own bad input, not
+// a server fault, so it too gets its own descriptive text rather than a
+// fixed string.
 func writeCrudError(w http.ResponseWriter, logContext string, err error) {
 	if errors.Is(err, authz.ErrDenied) {
 		httpx.WriteError(w, http.StatusForbidden, "access denied")
@@ -443,6 +448,10 @@ func writeCrudError(w http.ResponseWriter, logContext string, err error) {
 		return
 	}
 	if errors.Is(err, crud.ErrHookRejected) {
+		httpx.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if errors.Is(err, crud.ErrTargetConstraintViolation) {
 		httpx.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}

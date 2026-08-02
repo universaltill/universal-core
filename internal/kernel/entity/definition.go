@@ -90,6 +90,64 @@ type Field struct {
 	// ValidateRecord pure; declare chronology only where that's
 	// acceptable data hygiene, never as a ledger-grade invariant.
 	NotBefore string `json:"not_before,omitempty"`
+	// TargetFilter constrains which records of Target are valid values
+	// for this FieldReference field — e.g. TimeEntry.employee_id's
+	// [{Entity: "PartyRole", EntityField: "party_id", Field: "role_type",
+	// Value: "employee"}] restricts the field (and its picker) to a
+	// Party that actually holds the employee PartyRole, not any Party
+	// whatsoever (uc-infra#78). Only valid on FieldReference; every
+	// condition in the slice must hold (AND) for a candidate to qualify.
+	// See TargetFilterCondition's own doc comment for what Entity/
+	// EntityField mean and why a filter is not always a plain field on
+	// Target itself.
+	TargetFilter []TargetFilterCondition `json:"target_filter,omitempty"`
+	// MustMatchParentField names a field that must exist on BOTH this
+	// Definition and Target, whose value on the candidate target record
+	// must equal this record's OWN value of the same field — "the
+	// target must share a field value with the record doing the
+	// referencing" (uc-infra#78). Task.parent_task_id's
+	// MustMatchParentField: "project_id" is the motivating case: a
+	// parent task must be in the SAME project as the child, so a
+	// candidate/submitted parent_task_id is only valid when its own
+	// project_id matches the Task being created/updated's project_id.
+	// Only valid on FieldReference; the named field must also be
+	// declared on this same Definition (Validate below checks that much
+	// statically — it cannot check Target's shape, a different
+	// Definition entirely, without a registry this package doesn't have
+	// access to).
+	MustMatchParentField string `json:"must_match_parent_field,omitempty"`
+}
+
+// TargetFilterCondition is one field/value condition a candidate target
+// record must satisfy — see Field.TargetFilter.
+//
+// Grounded in how PartyRole actually models "a Party holds a role"
+// (foundation.go): role_type is NOT a field on Party itself, it lives on
+// a separate many-to-many PartyRole row (party_id, role_type), the same
+// pattern vendor_id/customer_id/employee_id all need to filter by. A
+// plain "field on the target record itself" condition cannot express
+// that, so this type supports two shapes:
+//
+//   - Entity == "": Field/Value are checked directly against the
+//     candidate target record's own data (a field genuinely declared on
+//     Target itself).
+//   - Entity != "": a DIFFERENT entity type must hold at least one
+//     record where EntityField equals the candidate target's own id AND
+//     Field equals Value — the PartyRole join shape above. EntityField
+//     is required in this case (Definition.Validate rejects Entity set
+//     without it).
+//
+// Both shapes are evaluated generically (by field name/value, via
+// reflection-free map lookups on the generic JSONB record data) —
+// nothing here or in the engines that evaluate it names "Party",
+// "PartyRole", "employee", or any other entity-specific literal; those
+// live only in the Definition that declares a condition (CLAUDE.md's
+// kernel/deterministic-core boundary rule).
+type TargetFilterCondition struct {
+	Entity      string `json:"entity,omitempty"`
+	EntityField string `json:"entity_field,omitempty"`
+	Field       string `json:"field"`
+	Value       string `json:"value"`
 }
 
 // Relationship declares a composition or related-list link to another
@@ -258,6 +316,25 @@ func (d *Definition) Validate() error {
 		}
 		if f.Type == FieldReference && f.Target == "" {
 			return fmt.Errorf("field %q is type reference but has no target", f.Name)
+		}
+		if len(f.TargetFilter) > 0 && f.Type != FieldReference {
+			return fmt.Errorf("field %q has target_filter but is type %q, not reference", f.Name, f.Type)
+		}
+		for _, cond := range f.TargetFilter {
+			if cond.Field == "" || cond.Value == "" {
+				return fmt.Errorf("field %q has a target_filter condition missing field or value", f.Name)
+			}
+			if cond.Entity != "" && cond.EntityField == "" {
+				return fmt.Errorf("field %q has a target_filter condition on entity %q with no entity_field", f.Name, cond.Entity)
+			}
+		}
+		if f.MustMatchParentField != "" {
+			if f.Type != FieldReference {
+				return fmt.Errorf("field %q has must_match_parent_field but is type %q, not reference", f.Name, f.Type)
+			}
+			if _, ok := d.FieldByName(f.MustMatchParentField); !ok {
+				return fmt.Errorf("field %q must_match_parent_field %q is not a field of %s", f.Name, f.MustMatchParentField, d.EntityType)
+			}
 		}
 	}
 	// NotBefore checked in a second pass: it may reference a field

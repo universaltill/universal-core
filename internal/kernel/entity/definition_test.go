@@ -266,6 +266,111 @@ func TestDefinitionValidate(t *testing.T) {
 			},
 			wantErr: false,
 		},
+		{
+			name: "target_filter on a non-reference field",
+			def: Definition{
+				EntityType: "TimeEntry",
+				Fields: []Field{
+					{Name: "hours", Type: FieldNumber, TargetFilter: []TargetFilterCondition{
+						{Field: "role_type", Value: "employee"},
+					}},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "target_filter condition missing value",
+			def: Definition{
+				EntityType: "TimeEntry",
+				Fields: []Field{
+					{Name: "employee_id", Type: FieldReference, Target: "Party", TargetFilter: []TargetFilterCondition{
+						{Field: "role_type"},
+					}},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "target_filter condition missing field",
+			def: Definition{
+				EntityType: "TimeEntry",
+				Fields: []Field{
+					{Name: "employee_id", Type: FieldReference, Target: "Party", TargetFilter: []TargetFilterCondition{
+						{Value: "employee"},
+					}},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "target_filter with entity but no entity_field",
+			def: Definition{
+				EntityType: "TimeEntry",
+				Fields: []Field{
+					{Name: "employee_id", Type: FieldReference, Target: "Party", TargetFilter: []TargetFilterCondition{
+						{Entity: "PartyRole", Field: "role_type", Value: "employee"},
+					}},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "valid target_filter with entity join",
+			def: Definition{
+				EntityType: "TimeEntry",
+				Fields: []Field{
+					{Name: "employee_id", Type: FieldReference, Target: "Party", TargetFilter: []TargetFilterCondition{
+						{Entity: "PartyRole", EntityField: "party_id", Field: "role_type", Value: "employee"},
+					}},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "valid direct-field target_filter (no entity)",
+			def: Definition{
+				EntityType: "Vendor",
+				Fields: []Field{
+					{Name: "risk_level", Type: FieldEnum, EnumValues: []string{"low", "high"}},
+					{Name: "primary_contact_id", Type: FieldReference, Target: "Party", TargetFilter: []TargetFilterCondition{
+						{Field: "status", Value: "active"},
+					}},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "must_match_parent_field on a non-reference field",
+			def: Definition{
+				EntityType: "Task",
+				Fields: []Field{
+					{Name: "project_id", Type: FieldReference, Target: "Project"},
+					{Name: "title", Type: FieldString, MustMatchParentField: "project_id"},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "must_match_parent_field referencing a field that does not exist",
+			def: Definition{
+				EntityType: "Task",
+				Fields: []Field{
+					{Name: "parent_task_id", Type: FieldReference, Target: "Task", MustMatchParentField: "project_id"},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "valid must_match_parent_field",
+			def: Definition{
+				EntityType: "Task",
+				Fields: []Field{
+					{Name: "project_id", Type: FieldReference, Required: true, Target: "Project"},
+					{Name: "parent_task_id", Type: FieldReference, Target: "Task", MustMatchParentField: "project_id"},
+				},
+			},
+			wantErr: false,
+		},
 	}
 
 	for _, tc := range cases {

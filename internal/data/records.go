@@ -299,8 +299,37 @@ type ListPageOptions struct {
 	// filter". Collapsing the two would turn a search with no hits into
 	// a search with no filter, which is the more dangerous default.
 	FilterIn []string
-	Limit    int
-	Offset   int
+	// EqualsFilters are additional exact-match (data->>field = value)
+	// conditions ANDed onto the query, independent of FilterField's own
+	// substring search — the mechanism a FieldReference's declared
+	// TargetFilter direct-field condition (Field.TargetFilter with
+	// Entity == "") uses to narrow a reference picker's candidates
+	// (uc-infra#78), alongside the picker's own free-text search on the
+	// label field. Every field name is bound as a parameter, the same
+	// discipline FilterField/SortField already follow.
+	EqualsFilters []FieldEquals
+	// IDIn optionally restricts results to only these ids — independent
+	// of FilterField/FilterValue/FilterIn (which test a DECLARED
+	// field's own value against the query), used to intersect a
+	// reference picker's free-text label search with a
+	// separately-resolved candidate-id set — e.g. TargetFilter's
+	// role-holding join condition, resolved via
+	// RecordRepo.DistinctFieldValues to the set of Party ids that hold
+	// the required PartyRole (uc-infra#78). Nil means no restriction. A
+	// non-nil EMPTY slice means "resolved to no matches" and returns no
+	// rows — the same convention FilterIn already documents, for the
+	// same reason: collapsing "no matches" into "no restriction" is the
+	// more dangerous default.
+	IDIn   []string
+	Limit  int
+	Offset int
+}
+
+// FieldEquals is one exact-match field/value condition — see
+// ListPageOptions.EqualsFilters.
+type FieldEquals struct {
+	Field string
+	Value string
 }
 
 // CountFiltered is Count with the same optional filter ListPageFiltered
@@ -308,30 +337,52 @@ type ListPageOptions struct {
 // returned. Without it, filtering to 3 rows would still show "Page 1 of
 // 40".
 func (r *RecordRepo) CountFiltered(ctx context.Context, entityType string, opts ListPageOptions) (int, error) {
-	if opts.FilterField == "" {
+	if opts.FilterField == "" && len(opts.EqualsFilters) == 0 && opts.IDIn == nil {
 		return r.CountByEntityType(ctx, entityType)
 	}
+	where, args := filterWhereClause(entityType, opts)
 	var n int
-	var err error
-	if opts.FilterIn != nil {
-		err = r.db.QueryRowContext(ctx,
-			`SELECT count(*) FROM records
-			 WHERE entity_type = $1 AND deleted_at IS NULL
-			   AND data->>$2 = ANY($3)`,
-			entityType, opts.FilterField, opts.FilterIn,
-		).Scan(&n)
-	} else {
-		err = r.db.QueryRowContext(ctx,
-			`SELECT count(*) FROM records
-			 WHERE entity_type = $1 AND deleted_at IS NULL
-			   AND data->>$2 ILIKE $3 ESCAPE '\'`,
-			entityType, opts.FilterField, "%"+escapeLike(opts.FilterValue)+"%",
-		).Scan(&n)
-	}
+	err := r.db.QueryRowContext(ctx,
+		fmt.Sprintf(`SELECT count(*) FROM records WHERE %s`, where),
+		args...,
+	).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("count filtered records: %w", err)
 	}
 	return n, nil
+}
+
+// filterWhereClause builds the shared WHERE clause + bind args
+// ListPageFiltered and CountFiltered both need: the entity/deleted_at
+// scope every query here has, plus opts' optional label-search filter
+// (FilterField/FilterValue or FilterIn), EqualsFilters, and IDIn — ANDed
+// together so a reference-picker search's free-text filter and a
+// FieldReference's declared TargetFilter/MustMatchParentField narrowing
+// (uc-infra#78) compose instead of one replacing the other. Every
+// caller-supplied field name and value is bound as a parameter, never
+// concatenated into the query text, matching every other generic
+// field-name-driven query in this file.
+func filterWhereClause(entityType string, opts ListPageOptions) (string, []any) {
+	args := []any{entityType}
+	where := "entity_type = $1 AND deleted_at IS NULL"
+	if opts.FilterField != "" {
+		if opts.FilterIn != nil {
+			args = append(args, opts.FilterField, opts.FilterIn)
+			where += fmt.Sprintf(` AND data->>$%d = ANY($%d)`, len(args)-1, len(args))
+		} else {
+			args = append(args, opts.FilterField, "%"+escapeLike(opts.FilterValue)+"%")
+			where += fmt.Sprintf(` AND data->>$%d ILIKE $%d ESCAPE '\'`, len(args)-1, len(args))
+		}
+	}
+	for _, eq := range opts.EqualsFilters {
+		args = append(args, eq.Field, eq.Value)
+		where += fmt.Sprintf(` AND data->>$%d = $%d`, len(args)-1, len(args))
+	}
+	if opts.IDIn != nil {
+		args = append(args, opts.IDIn)
+		where += fmt.Sprintf(` AND id::text = ANY($%d)`, len(args))
+	}
+	return where, args
 }
 
 // escapeLike neutralises LIKE/ILIKE wildcards in a user filter value so a
@@ -354,17 +405,7 @@ func escapeLike(s string) string {
 // parameters. `id` stays the final tiebreaker so a page boundary is
 // deterministic even when many rows share the sort value.
 func (r *RecordRepo) ListPageFiltered(ctx context.Context, entityType string, opts ListPageOptions) ([]Record, error) {
-	args := []any{entityType}
-	where := "entity_type = $1 AND deleted_at IS NULL"
-	if opts.FilterField != "" {
-		if opts.FilterIn != nil {
-			args = append(args, opts.FilterField, opts.FilterIn)
-			where += fmt.Sprintf(` AND data->>$%d = ANY($%d)`, len(args)-1, len(args))
-		} else {
-			args = append(args, opts.FilterField, "%"+escapeLike(opts.FilterValue)+"%")
-			where += fmt.Sprintf(` AND data->>$%d ILIKE $%d ESCAPE '\'`, len(args)-1, len(args))
-		}
-	}
+	where, args := filterWhereClause(entityType, opts)
 
 	// created_at is a real column; a declared field sorts by its JSON
 	// value. NULLS LAST keeps records missing the sort field from
@@ -450,6 +491,79 @@ func (r *RecordRepo) ListByField(ctx context.Context, entityType, fieldName, val
 			return nil, fmt.Errorf("unmarshal record data: %w", err)
 		}
 		out = append(out, Record{ID: id, EntityType: entityType, Data: data, Version: version})
+	}
+	return out, rows.Err()
+}
+
+// ExistsByFieldsQ reports whether any non-deleted record of entityType
+// has data[field] == value for EVERY field/value pair in equals — the
+// query a FieldReference's declared TargetFilter join condition needs
+// (uc-infra#78): does a PartyRole exist with party_id == this candidate
+// Party's id AND role_type == "employee"? Used by crud.Engine
+// (validating a write) and the reference-picker search endpoint
+// (narrowing candidates) alike, so the two never risk diverging.
+//
+// Every field name and value is bound as a parameter to the ->>
+// operator, never concatenated into the query text, the same discipline
+// every other generic field-name-driven query in this file follows — a
+// caller-controlled field name can only ever fail to match, never alter
+// the query's structure.
+//
+// Takes the generic querier interface (not just *sql.DB) so crud.Engine
+// can call it against its own write transaction — same reasoning as
+// GetTx's own doc comment.
+func (r *RecordRepo) ExistsByFieldsQ(ctx context.Context, q querier, entityType string, equals map[string]string) (bool, error) {
+	if len(equals) == 0 {
+		return false, fmt.Errorf("exists by fields on %s: at least one field/value pair is required", entityType)
+	}
+	args := []any{entityType}
+	where := "entity_type = $1 AND deleted_at IS NULL"
+	for field, value := range equals {
+		args = append(args, field, value)
+		where += fmt.Sprintf(" AND data->>$%d = $%d", len(args)-1, len(args))
+	}
+	var exists bool
+	err := q.QueryRowContext(ctx,
+		fmt.Sprintf(`SELECT EXISTS(SELECT 1 FROM records WHERE %s)`, where),
+		args...,
+	).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("exists by fields on %s: %w", entityType, err)
+	}
+	return exists, nil
+}
+
+// DistinctFieldValues returns the distinct, non-empty string values
+// resultField holds across every non-deleted record of entityType whose
+// data has matchField == matchValue — resolves a FieldReference's
+// declared TargetFilter join condition (e.g. every PartyRole.party_id
+// whose role_type == "employee") to the candidate-id set the
+// reference-picker search endpoint intersects its own label search
+// against (see ListPageOptions.IDIn). A value that isn't a JSON string,
+// or is empty, is skipped: resultField is always an id/reference column
+// in every real use, so anything else there indicates corrupted data,
+// not a match — the same "don't error the whole query over one bad row"
+// posture ListPageFiltered's guarded numeric sort already takes.
+func (r *RecordRepo) DistinctFieldValues(ctx context.Context, entityType, matchField, matchValue, resultField string) ([]string, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT DISTINCT data->>$1 FROM records
+		 WHERE entity_type = $2 AND deleted_at IS NULL AND data->>$3 = $4`,
+		resultField, entityType, matchField, matchValue,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("distinct field values on %s: %w", entityType, err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var v sql.NullString
+		if err := rows.Scan(&v); err != nil {
+			return nil, fmt.Errorf("scan distinct field value: %w", err)
+		}
+		if v.Valid && v.String != "" {
+			out = append(out, v.String)
+		}
 	}
 	return out, rows.Err()
 }

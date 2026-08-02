@@ -103,6 +103,41 @@ func (h *Handler) searchReferenceOptions(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
+	// Honour the field's own declared Field.TargetFilter/
+	// MustMatchParentField (uc-infra#78) — the picker must itself filter
+	// candidates, not just have crud.Engine reject a bad pick after the
+	// fact. sourceEntityType/sourceField identify WHICH reference field
+	// is searching (a Party picker serves many different fields —
+	// TimeEntry.employee_id and SalesOrder.customer_id both target
+	// Party with different constraints — so entityType, the TARGET
+	// type, is not enough on its own to know which constraint applies).
+	// Both are supplied by the picker's own rendered markup
+	// (formrender's data-entity-type/data-field attributes), not typed
+	// by the user, and siblingValue is the SOURCE record's own current
+	// value of MustMatchParentField (formrender's data-must-match-field
+	// attribute tells the client which sibling input to read) — empty
+	// when unknown, in which case MustMatchParentField simply
+	// contributes no narrowing yet (see ResolveReferenceFilter's own
+	// doc comment). A source field that doesn't resolve, or isn't
+	// actually a FieldReference targeting entityType, is ignored rather
+	// than failing the whole search — the same graceful-degradation
+	// posture the label/sort logic above already takes.
+	if sourceEntityType := r.URL.Query().Get("source_entity_type"); sourceEntityType != "" {
+		if sourceField := r.URL.Query().Get("source_field"); sourceField != "" {
+			if sourceDef, err := ts.entityDef(r.Context(), sourceEntityType); err == nil {
+				if f, ok := sourceDef.FieldByName(sourceField); ok && f.Type == entity.FieldReference && f.Target == entityType {
+					constraintOpts, err := ts.crud.ResolveReferenceFilter(r.Context(), f, r.URL.Query().Get("sibling_value"))
+					if err != nil {
+						writeInternalError(w, "resolve reference filter for "+sourceEntityType+"."+sourceField, err)
+						return
+					}
+					opts.EqualsFilters = constraintOpts.EqualsFilters
+					opts.IDIn = constraintOpts.IDIn
+				}
+			}
+		}
+	}
+
 	records, err := ts.crud.ListPageFiltered(r.Context(), def, opts)
 	if err != nil {
 		writeCrudError(w, "search reference options for "+entityType, err)

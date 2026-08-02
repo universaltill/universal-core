@@ -105,6 +105,23 @@ func TestPurchaseOrder_VendorReferencesPartyDirectly(t *testing.T) {
 	}
 }
 
+// TestPurchaseOrder_VendorMustHoldVendorRole (uc-infra#78): vendor_id
+// declares a TargetFilter requiring the referenced Party to hold the
+// vendor PartyRole — a customer-only Party is no longer a valid pick.
+func TestPurchaseOrder_VendorMustHoldVendorRole(t *testing.T) {
+	f, ok := PurchaseOrder().FieldByName("vendor_id")
+	if !ok {
+		t.Fatal("expected a vendor_id field")
+	}
+	if len(f.TargetFilter) != 1 {
+		t.Fatalf("expected exactly one target_filter condition, got %+v", f.TargetFilter)
+	}
+	cond := f.TargetFilter[0]
+	if cond.Entity != "PartyRole" || cond.EntityField != "party_id" || cond.Field != "role_type" || cond.Value != "vendor" {
+		t.Fatalf("expected a PartyRole(party_id)=role_type:vendor condition, got %+v", cond)
+	}
+}
+
 // TestPurchaseOrder_StatusIsManagedByStatusType replaces the old plain
 // FieldEnum "status" field's default/enum checks — PurchaseOrder is the
 // first entity to opt into foundation.go's generic Status/StatusType

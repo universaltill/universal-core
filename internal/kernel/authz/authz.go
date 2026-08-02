@@ -908,3 +908,46 @@ func (g *GuardedEngine) ListByField(ctx context.Context, def *entity.Definition,
 func (g *GuardedEngine) ValidateStatusTransition(ctx context.Context, def *entity.Definition, id string, fields map[string]any, isCreate bool, expectedVersion *int) error {
 	return g.raw.ValidateStatusTransition(ctx, def, id, fields, isCreate, expectedVersion)
 }
+
+// ResolveReferenceFilter is NOT a bare delegate, unlike
+// ValidateStatusTransition just above — an entity-join TargetFilter
+// condition (Field.TargetFilter's Entity set, e.g. TimeEntry.employee_id's
+// PartyRole condition) resolves by reading ANOTHER entity type's data
+// (PartyRole) the caller may not hold read permission on at all. Without
+// a gate here, whether a given Party id appears in the narrowed
+// candidate set becomes an oracle for "does this Party hold the
+// employee PartyRole" — disclosing PartyRole membership to a viewer who
+// was never granted CanRead("PartyRole"), the same class of leak
+// rejectHiddenSortFilter already guards against for SortField/FilterField
+// (independent review, this commit — the original draft's doc comment
+// here claimed "nothing here grants a read this actor didn't already
+// have," which was true for MustMatchParentField's own-field comparison
+// but not for this case).
+//
+// Fixed by dropping any Entity-join condition the caller cannot read
+// before delegating — the field's OTHER conditions (a direct-field
+// TargetFilter, or MustMatchParentField) still apply; only the
+// unreadable join stops narrowing. This fails toward the picker simply
+// narrowing LESS for that viewer (crud.Engine's own write-time
+// enforcement is unaffected either way, since that runs unguarded
+// against the full Definition) rather than toward disclosing anything,
+// or toward breaking the picker outright.
+func (g *GuardedEngine) ResolveReferenceFilter(ctx context.Context, f entity.Field, siblingValue string) (data.ListPageOptions, error) {
+	if len(f.TargetFilter) > 0 {
+		readable := make([]entity.TargetFilterCondition, 0, len(f.TargetFilter))
+		for _, cond := range f.TargetFilter {
+			if cond.Entity != "" {
+				ok, err := g.res.CanRead(ctx, cond.Entity)
+				if err != nil {
+					return data.ListPageOptions{}, err
+				}
+				if !ok {
+					continue
+				}
+			}
+			readable = append(readable, cond)
+		}
+		f.TargetFilter = readable
+	}
+	return g.raw.ResolveReferenceFilter(ctx, f, siblingValue)
+}

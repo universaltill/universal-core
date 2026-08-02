@@ -108,9 +108,14 @@ func setupUBLTenant(t *testing.T) *ublFixture {
 	f.vendorID = create("Party", map[string]any{
 		"party_type": "organization", "name": "Supplier & Sons <LLC>", "tax_id": "S-999", "status": "active",
 	})
+	// uc-infra#78: PurchaseOrder.vendor_id/SalesOrder.customer_id now
+	// declare a TargetFilter requiring the referenced Party to actually
+	// hold the matching PartyRole.
+	create("PartyRole", map[string]any{"party_id": f.vendorID, "role_type": "vendor"})
 	f.customerID = create("Party", map[string]any{
 		"party_type": "organization", "name": "Customer GmbH", "tax_id": "C-111", "status": "active",
 	})
+	create("PartyRole", map[string]any{"party_id": f.customerID, "role_type": "customer"})
 	f.currencyID = create("Currency", map[string]any{
 		"code": "USD", "name": "US Dollar", "minor_unit": 2.0,
 	})

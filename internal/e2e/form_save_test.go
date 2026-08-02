@@ -237,6 +237,13 @@ func TestPurchaseOrderStages_ReversedDates_ToastInRealBrowser(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed vendor: %v", err)
 	}
+	// uc-infra#78: PurchaseOrder.vendor_id now requires the referenced
+	// Party to hold the vendor PartyRole.
+	if _, err := crud.NewEngine(tenantDB).Create(ctx, foundation.PartyRole(), map[string]any{
+		"party_id": vendorID.ID, "role_type": "vendor",
+	}, actor); err != nil {
+		t.Fatalf("seed vendor PartyRole: %v", err)
+	}
 	statusID := publishedStatusID(t, tenantDB, "purchase_order_status", "approved")
 	po, err := crud.NewEngine(tenantDB).Create(ctx, purchasing.PurchaseOrder(), map[string]any{
 		"po_number": "PO-TOAST-1", "vendor_id": vendorID.ID, "order_date": "2026-07-01",

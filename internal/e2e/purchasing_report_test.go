@@ -43,6 +43,13 @@ func TestPurchasingReport_LeadTimeAndReorderSections_RealBrowser(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed vendor: %v", err)
 	}
+	// uc-infra#78: PurchaseOrder.vendor_id now requires the referenced
+	// Party to hold the vendor PartyRole.
+	if _, err := engine.Create(ctx, foundation.PartyRole(), map[string]any{
+		"party_id": vendor.ID, "role_type": "vendor",
+	}, actor); err != nil {
+		t.Fatalf("seed vendor PartyRole: %v", err)
+	}
 	receivedID := publishedStatusID(t, tenantDB, "purchase_order_status", "received")
 	approvedID := publishedStatusID(t, tenantDB, "purchase_order_status", "approved")
 
@@ -159,6 +166,13 @@ func TestPurchasingReport_OnTimeDeliverySection_RealBrowser(t *testing.T) {
 	}, actor)
 	if err != nil {
 		t.Fatalf("seed vendor: %v", err)
+	}
+	// uc-infra#78: PurchaseOrder.vendor_id now requires the referenced
+	// Party to hold the vendor PartyRole.
+	if _, err := engine.Create(ctx, foundation.PartyRole(), map[string]any{
+		"party_id": vendor.ID, "role_type": "vendor",
+	}, actor); err != nil {
+		t.Fatalf("seed vendor PartyRole: %v", err)
 	}
 	receivedID := publishedStatusID(t, tenantDB, "purchase_order_status", "received")
 

@@ -72,6 +72,13 @@ func TestAPI_CustomerInvoice_IssueViaRealHTTPPostsToLedger(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create Party: %v", err)
 	}
+	// uc-infra#78: SalesOrder.customer_id now requires the referenced
+	// Party to hold the customer PartyRole.
+	if _, err := engine.Create(ctx, def("PartyRole"), map[string]any{
+		"party_id": customer.ID, "role_type": "customer",
+	}, actor); err != nil {
+		t.Fatalf("create customer PartyRole: %v", err)
+	}
 	statusTypes, err := engine.ListByField(ctx, def("StatusType"), "code", "sales_order_status")
 	if err != nil || len(statusTypes) == 0 {
 		t.Fatalf("list sales_order_status StatusType: %v", err)

@@ -3,21 +3,27 @@
 // purchasing/sales/finance/assets, published by cmd/provision-tenant
 // only for a tenant that has it.
 //
-// **Two things this module does NOT enforce**, stated up front because
-// the reference types below read as if it might:
-//   - A Party referenced as assignee_id/employee_id is not checked to
-//     actually hold the `employee` PartyRole. FieldReference carries
-//     only a Target, so any Party — including a pure vendor
-//     organization — is accepted, and the picker offers them. Same gap
-//     customer_id and vendor_id already have; it needs a declarative
-//     role filter on FieldReference, filed on the board rather than
-//     special-cased here.
-//   - A Task's parent_task_id is not constrained to a task in the SAME
-//     project. Nothing walks the parent chain today except the cycle
-//     guard, so the damage is latent, but a cross-project subtree would
-//     misattribute work to the wrong project in any future roll-up or
-//     tree view. Also filed — it needs the same kind of "reference must
-//     agree with a field of mine" constraint the kernel lacks.
+// **Two gaps this module used to have, now closed by declarative
+// constraints on the fields themselves (uc-infra#78)**, kept documented
+// here because they're what makes the field declarations below read
+// correctly:
+//   - TimeEntry.employee_id and Task.assignee_id each declare a
+//     TargetFilter requiring the referenced Party to actually hold the
+//     `employee` PartyRole (foundation.PartyRole) — a pure vendor
+//     organization is no longer accepted, and the reference picker no
+//     longer offers one. SalesOrder.customer_id/PurchaseOrder.vendor_id
+//     got the equivalent customer/vendor role filters in the same
+//     change.
+//   - Task.parent_task_id declares MustMatchParentField: "project_id" —
+//     a parent task must be in the SAME project as the child, checked
+//     by crud.Engine on every create/update and by the reference
+//     picker's own search, not just the pre-existing cycle guard.
+//
+// Both are generic, Definition-declared mechanisms
+// (entity.Field.TargetFilter/MustMatchParentField) evaluated by
+// crud.Engine and the reference-search endpoint — nothing here or in
+// those engines special-cases "Task" or "employee" by name; see
+// entity.TargetFilterCondition's own doc comment for the mechanism.
 //
 // **TimeEntry and Task reference Party, not hr.Employee — and that is
 // deliberate (ADR-0013 rule 4).** An Employee entity now exists (the HR
@@ -107,22 +113,32 @@ func Project() *entity.Definition {
 // here: ADR-0007 put cycle detection in crud.Engine generically, over
 // any FieldReference whose Target is its own EntityType, precisely so a
 // new hierarchy like this one inherits the guard rather than
-// re-implementing (or forgetting) it.
+// re-implementing (or forgetting) it. parent_task_id's
+// MustMatchParentField: "project_id" (v2, uc-infra#78) closes the
+// remaining gap the cycle guard alone didn't: a parent task must be in
+// the SAME project as its child, checked generically by crud.Engine and
+// the reference picker's own search, not just here in a comment.
 //
 // assignee_id targets Party, not hr.Employee — see this package's doc
 // comment and ADR-0013 rule 4: a contractor who holds no employment can
-// still be assigned a task.
+// still be assigned a task. Its TargetFilter (v2, uc-infra#78) requires
+// the referenced Party to actually hold the employee PartyRole — a
+// contractor still qualifies as long as they hold that role
+// (foundation.go's PartyRole comment: a Party can hold several roles at
+// once), but a pure vendor/customer Party no longer does.
 func Task() *entity.Definition {
 	return &entity.Definition{
 		EntityType:     "Task",
-		Version:        1,
+		Version:        2,
 		Module:         "projects",
 		StatusTypeCode: "task_status",
 		Fields: []entity.Field{
 			{Name: "project_id", Type: entity.FieldReference, Required: true, Target: "Project"},
-			{Name: "parent_task_id", Type: entity.FieldReference, Target: "Task"},
+			{Name: "parent_task_id", Type: entity.FieldReference, Target: "Task", MustMatchParentField: "project_id"},
 			{Name: "title", Type: entity.FieldI18nText, Required: true},
-			{Name: "assignee_id", Type: entity.FieldReference, Target: "Party"},
+			{Name: "assignee_id", Type: entity.FieldReference, Target: "Party", TargetFilter: []entity.TargetFilterCondition{
+				{Entity: "PartyRole", EntityField: "party_id", Field: "role_type", Value: "employee"},
+			}},
 			{Name: "estimated_hours", Type: entity.FieldNumber, Default: float64(0)},
 			{Name: "due_date", Type: entity.FieldDate},
 			{Name: "status_id", Type: entity.FieldReference, Required: true, Target: "Status"},
@@ -151,13 +167,18 @@ func Task() *entity.Definition {
 func TimeEntry() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "TimeEntry",
-		Version:    1,
+		Version:    2,
 		Module:     "projects",
 		Fields: []entity.Field{
 			{Name: "task_id", Type: entity.FieldReference, Required: true, Target: "Task"},
 			// The person who did the work: a Party holding the employee
-			// PartyRole (see the package comment).
-			{Name: "employee_id", Type: entity.FieldReference, Required: true, Target: "Party"},
+			// PartyRole (see the package comment). TargetFilter (v2,
+			// uc-infra#78) enforces that, not just documents it: a pure
+			// vendor Party can no longer be logged against, and the
+			// reference picker no longer offers one.
+			{Name: "employee_id", Type: entity.FieldReference, Required: true, Target: "Party", TargetFilter: []entity.TargetFilterCondition{
+				{Entity: "PartyRole", EntityField: "party_id", Field: "role_type", Value: "employee"},
+			}},
 			{Name: "entry_date", Type: entity.FieldDate, Required: true},
 			{Name: "hours", Type: entity.FieldNumber, Required: true},
 			// billable is the flag project billing will read; whether an

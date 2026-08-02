@@ -498,6 +498,9 @@ func TestUniversalCore_UBLExportRoute_ServedByRealBinary(t *testing.T) {
 		return rec.ID
 	}
 	vendorID := create("Party", map[string]any{"party_type": "organization", "name": "Smoke Vendor", "status": "active"})
+	// uc-infra#78: PurchaseOrder.vendor_id now requires the referenced
+	// Party to hold the vendor PartyRole.
+	create("PartyRole", map[string]any{"party_id": vendorID, "role_type": "vendor"})
 	currencyID := create("Currency", map[string]any{"code": "USD", "name": "US Dollar", "minor_unit": 2.0})
 	itemID := create("Item", map[string]any{"sku": "SMOKE-1", "name": "Smoke Widget", "item_type": "stock"})
 	statusTypes, err := engine.ListByField(ctx, def("StatusType"), "code", "purchase_order_status")

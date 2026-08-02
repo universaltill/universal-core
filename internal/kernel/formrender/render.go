@@ -262,6 +262,17 @@ type fieldView struct {
 	// permission on RefTarget (or the target has none configured) and no
 	// button renders at all. See Data.ReferenceCreateLabels.
 	CreateNewLabel string
+	// MustMatchParentField mirrors the field's own declared
+	// entity.Field.MustMatchParentField (uc-infra#78) — empty unless the
+	// Definition declares one. Rendered as the combobox's own
+	// data-must-match-field attribute so the picker's client-side script
+	// knows WHICH sibling input on this same form to read before it
+	// queries GET /api/references (the sibling's value is submitted as
+	// the search's sibling_value, so the server can apply the
+	// declared "target must share this field's value" constraint). Purely
+	// declarative — formrender never inspects what "project_id" means,
+	// it only relays what the Definition already said.
+	MustMatchParentField string
 	// I18nInputs is set only for FieldI18nText (ADR-0009): one entry per
 	// supported locale, each rendered as its own text input named
 	// "{Name}.{Locale}" so the form decoder can reassemble the per-locale
@@ -626,6 +637,7 @@ func (r *Renderer) buildFields(s form.Section, ent *entity.Definition, record ma
 			// no synthetic blank <option> needed.
 			current, _ := record[ff.Name].(string)
 			fv.RefTarget = ef.Target
+			fv.MustMatchParentField = ef.MustMatchParentField
 			fv.CreateNewLabel = referenceCreateLabels[ff.Name]
 			for _, opt := range referenceOptions[ff.Name] {
 				if opt.ID == current {
@@ -753,7 +765,7 @@ const tmplSrc = `<form class="uc-form" data-entity-type="{{.EntityType}}"{{if .R
 <div class="uc-field">
 <label for="{{.Name}}">{{.Label}}{{if .Required}}{{$.RequiredSuffix}}{{end}}</label>
 {{if eq .Type "bool"}}<input type="hidden" name="{{.Name}}" value="false"><input type="checkbox" id="{{.Name}}" name="{{.Name}}" value="true" {{if .Checked}}checked{{end}}{{if .Required}} required{{end}}>
-{{else if eq .Type "reference"}}<div class="uc-ref" data-target="{{.RefTarget}}" data-field="{{.Name}}">
+{{else if eq .Type "reference"}}<div class="uc-ref" data-target="{{.RefTarget}}" data-field="{{.Name}}"{{if .MustMatchParentField}} data-must-match-field="{{.MustMatchParentField}}"{{end}}>
 <input type="hidden" name="{{.Name}}" value="{{.Value}}">
 <input type="text" id="{{.Name}}" class="uc-ref-search" autocomplete="off" value="{{.CurrentLabel}}" placeholder="{{$.RefSearchPlaceholder}}"{{if .Required}} required{{end}}>
 <div class="uc-ref-results" hidden></div>

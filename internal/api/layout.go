@@ -213,6 +213,28 @@ var shellTmpl = template.Must(template.New("shell").Parse(fmt.Sprintf(`<!doctype
       refSeq.set(search, mySeq);
       var url = "/api/references/" + encodeURIComponent(box.dataset.target)
               + "?q=" + encodeURIComponent(search.value);
+      // Field.TargetFilter/MustMatchParentField (uc-infra#78): tell the
+      // server WHICH reference field is searching, so it can apply that
+      // field's own declared constraint — a target entity type (e.g.
+      // Party) can be the target of several different fields with
+      // different constraints (TimeEntry.employee_id vs
+      // SalesOrder.customer_id), so the target type alone isn't enough.
+      var form = box.closest(".uc-form");
+      if (form) {
+        url += "&source_entity_type=" + encodeURIComponent(form.dataset.entityType)
+             + "&source_field=" + encodeURIComponent(box.dataset.field);
+        // MustMatchParentField: read the CURRENT value of the sibling
+        // field the Definition named (data-must-match-field, set only
+        // when the field declares one) directly off this same form, so
+        // the server can filter candidates to ones sharing that value —
+        // e.g. only Tasks in the same project as the one being edited.
+        if (box.dataset.mustMatchField) {
+          var sibling = form.querySelector('[name="' + box.dataset.mustMatchField + '"]');
+          if (sibling && sibling.value) {
+            url += "&sibling_value=" + encodeURIComponent(sibling.value);
+          }
+        }
+      }
       fetch(url, { headers: { "Accept": "application/json" } })
         .then(function(r) { return r.json(); })
         .then(function(env) {

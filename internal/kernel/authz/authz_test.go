@@ -509,3 +509,57 @@ func TestGuardedEngine_ValidateStatusTransitionDelegates(t *testing.T) {
 		t.Fatalf("ValidateStatusTransition should delegate ungated: %v", err)
 	}
 }
+
+// TestGuardedEngine_ResolveReferenceFilter_DropsUnreadableEntityJoinCondition
+// (uc-infra#78, independent review finding): a caller who was not
+// granted CanRead("PartyRole") must not have PartyRole membership
+// disclosed to them via the reference-picker's own narrowing — an
+// entity-join TargetFilter condition whose Entity they cannot read is
+// dropped rather than resolved, while the field's read-permitted
+// remains unaffected.
+func TestGuardedEngine_ResolveReferenceFilter_DropsUnreadableEntityJoinCondition(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+
+	party := f.create("Party", map[string]any{
+		"party_type": "person", "name": "Some Employee", "status": "active",
+	})
+	f.create("PartyRole", map[string]any{"party_id": party.ID, "role_type": "employee"})
+
+	locked := f.role("no-party-role-read")
+	f.permit(locked.ID, "Party", true, false)
+	f.permit(locked.ID, "PartyRole", false, false) // explicitly denied
+	f.grant("user-locked", locked.ID)
+
+	field := entity.Field{
+		Name: "employee_id", Type: entity.FieldReference, Target: "Party",
+		TargetFilter: []entity.TargetFilterCondition{
+			{Entity: "PartyRole", EntityField: "party_id", Field: "role_type", Value: "employee"},
+		},
+	}
+
+	g := Guard(f.engine, humanResolver(f, "user-locked"))
+	opts, err := g.ResolveReferenceFilter(ctx, field, "")
+	if err != nil {
+		t.Fatalf("ResolveReferenceFilter: %v", err)
+	}
+	if opts.IDIn != nil {
+		t.Fatalf("expected no IDIn narrowing when the caller cannot read the join entity, got %v", opts.IDIn)
+	}
+
+	// The same field, for a caller who CAN read PartyRole, still narrows
+	// normally — confirms the drop above is permission-specific, not a
+	// blanket regression of the mechanism itself.
+	open := f.role("party-role-reader")
+	f.permit(open.ID, "Party", true, false)
+	f.permit(open.ID, "PartyRole", true, false)
+	f.grant("user-open", open.ID)
+	gOpen := Guard(f.engine, humanResolver(f, "user-open"))
+	opts2, err := gOpen.ResolveReferenceFilter(ctx, field, "")
+	if err != nil {
+		t.Fatalf("ResolveReferenceFilter (open): %v", err)
+	}
+	if opts2.IDIn == nil {
+		t.Fatal("expected IDIn narrowing when the caller CAN read the join entity")
+	}
+}

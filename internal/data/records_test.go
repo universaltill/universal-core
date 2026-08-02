@@ -350,3 +350,221 @@ func TestRecordRepo_ListPageFilteredEscapesLikeWildcards(t *testing.T) {
 		t.Fatalf("literal _ should match only under_score, got %v", us)
 	}
 }
+
+// TestRecordRepo_ListPageFilteredEqualsFilters (uc-infra#78): EqualsFilters
+// is an exact-match condition ANDed onto the query, independent of
+// FilterField's own substring search — proves both that it filters at all
+// and that it composes with FilterField rather than replacing it.
+func TestRecordRepo_ListPageFilteredEqualsFilters(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(db)
+
+	if _, err := repo.Create(ctx, "PersonRole", map[string]any{"person_id": "p1", "role_type": "employee"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := repo.Create(ctx, "PersonRole", map[string]any{"person_id": "p2", "role_type": "vendor"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := repo.Create(ctx, "PersonRole", map[string]any{"person_id": "p3", "role_type": "employee"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	recs, err := repo.ListPageFiltered(ctx, "PersonRole", ListPageOptions{
+		EqualsFilters: []FieldEquals{{Field: "role_type", Value: "employee"}},
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListPageFiltered with EqualsFilters: %v", err)
+	}
+	if len(recs) != 2 {
+		t.Fatalf("expected 2 employee rows, got %d: %+v", len(recs), recs)
+	}
+
+	n, err := repo.CountFiltered(ctx, "PersonRole", ListPageOptions{
+		EqualsFilters: []FieldEquals{{Field: "role_type", Value: "employee"}},
+	})
+	if err != nil || n != 2 {
+		t.Fatalf("CountFiltered with EqualsFilters: got %d (%v), want 2", n, err)
+	}
+
+	// Composes with a substring FilterField on a DIFFERENT field —
+	// narrowing by role_type must not disable the picker's own free-text
+	// search on person_id.
+	both, err := repo.ListPageFiltered(ctx, "PersonRole", ListPageOptions{
+		FilterField:   "person_id",
+		FilterValue:   "p1",
+		EqualsFilters: []FieldEquals{{Field: "role_type", Value: "employee"}},
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListPageFiltered with FilterField+EqualsFilters: %v", err)
+	}
+	if len(both) != 1 || both[0].Data["person_id"] != "p1" {
+		t.Fatalf("expected exactly p1, got %+v", both)
+	}
+}
+
+// TestRecordRepo_ListPageFilteredIDIn (uc-infra#78): IDIn restricts to an
+// explicit id set, independent of FilterField — the mechanism that lets a
+// resolved TargetFilter role-holding join intersect with the picker's own
+// label search.
+func TestRecordRepo_ListPageFilteredIDIn(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(db)
+
+	a, err := repo.Create(ctx, "Widget", map[string]any{"name": "alpha"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	b, err := repo.Create(ctx, "Widget", map[string]any{"name": "beta"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := repo.Create(ctx, "Widget", map[string]any{"name": "gamma"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	recs, err := repo.ListPageFiltered(ctx, "Widget", ListPageOptions{IDIn: []string{a.ID, b.ID}, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListPageFiltered with IDIn: %v", err)
+	}
+	if len(recs) != 2 {
+		t.Fatalf("expected 2 rows restricted by IDIn, got %d: %+v", len(recs), recs)
+	}
+
+	n, err := repo.CountFiltered(ctx, "Widget", ListPageOptions{IDIn: []string{a.ID}})
+	if err != nil || n != 1 {
+		t.Fatalf("CountFiltered with IDIn: got %d (%v), want 1", n, err)
+	}
+
+	// A non-nil EMPTY IDIn means "resolved to no matches" — must return
+	// no rows, not "no restriction" (same convention FilterIn documents).
+	empty, err := repo.ListPageFiltered(ctx, "Widget", ListPageOptions{IDIn: []string{}, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListPageFiltered with empty IDIn: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("expected an empty (non-nil) IDIn to match nothing, got %+v", empty)
+	}
+}
+
+func TestRecordRepo_ExistsByFieldsQ(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(db)
+
+	if _, err := repo.Create(ctx, "PersonRole", map[string]any{"person_id": "p1", "role_type": "employee"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	exists, err := repo.ExistsByFieldsQ(ctx, db, "PersonRole", map[string]string{"person_id": "p1", "role_type": "employee"})
+	if err != nil {
+		t.Fatalf("ExistsByFieldsQ: %v", err)
+	}
+	if !exists {
+		t.Fatal("expected a matching PersonRole to exist")
+	}
+
+	notEmployee, err := repo.ExistsByFieldsQ(ctx, db, "PersonRole", map[string]string{"person_id": "p1", "role_type": "vendor"})
+	if err != nil {
+		t.Fatalf("ExistsByFieldsQ: %v", err)
+	}
+	if notEmployee {
+		t.Fatal("expected no PersonRole matching person_id=p1 AND role_type=vendor")
+	}
+
+	noSuchPerson, err := repo.ExistsByFieldsQ(ctx, db, "PersonRole", map[string]string{"person_id": "nobody", "role_type": "employee"})
+	if err != nil {
+		t.Fatalf("ExistsByFieldsQ: %v", err)
+	}
+	if noSuchPerson {
+		t.Fatal("expected no PersonRole for a nonexistent person_id")
+	}
+}
+
+func TestRecordRepo_ExistsByFieldsQ_RequiresAtLeastOnePair(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(db)
+
+	if _, err := repo.ExistsByFieldsQ(ctx, db, "PersonRole", map[string]string{}); err == nil {
+		t.Fatal("expected an error for zero field/value pairs, not a query with no filter at all")
+	}
+}
+
+func TestRecordRepo_ExistsByFieldsQ_HostileFieldNameIsInert(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(db)
+
+	if _, err := repo.Create(ctx, "PersonRole", map[string]any{"person_id": "p1", "role_type": "employee"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	hostile := "role_type'); DROP TABLE records; --"
+	if _, err := repo.ExistsByFieldsQ(ctx, db, "PersonRole", map[string]string{hostile: "employee"}); err != nil {
+		t.Fatalf("hostile field name should be inert, not error: %v", err)
+	}
+	if _, err := repo.Create(ctx, "PersonRole", map[string]any{"person_id": "p2", "role_type": "employee"}); err != nil {
+		t.Fatalf("records table was harmed by a hostile field name: %v", err)
+	}
+}
+
+func TestRecordRepo_DistinctFieldValues(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(db)
+
+	for _, personID := range []string{"p1", "p2", "p1"} { // p1 holds the role twice, must dedupe
+		if _, err := repo.Create(ctx, "PersonRole", map[string]any{"person_id": personID, "role_type": "employee"}); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+	}
+	if _, err := repo.Create(ctx, "PersonRole", map[string]any{"person_id": "p3", "role_type": "vendor"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	ids, err := repo.DistinctFieldValues(ctx, "PersonRole", "role_type", "employee", "person_id")
+	if err != nil {
+		t.Fatalf("DistinctFieldValues: %v", err)
+	}
+	got := map[string]bool{}
+	for _, id := range ids {
+		got[id] = true
+	}
+	if len(got) != 2 || !got["p1"] || !got["p2"] {
+		t.Fatalf("expected exactly {p1, p2}, got %v", ids)
+	}
+
+	none, err := repo.DistinctFieldValues(ctx, "PersonRole", "role_type", "customer", "person_id")
+	if err != nil {
+		t.Fatalf("DistinctFieldValues: %v", err)
+	}
+	if len(none) != 0 {
+		t.Fatalf("expected no matches for role_type=customer, got %v", none)
+	}
+}
+
+func TestRecordRepo_DistinctFieldValues_ExcludesSoftDeletedRecords(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(db)
+
+	rec, err := repo.Create(ctx, "PersonRole", map[string]any{"person_id": "p1", "role_type": "employee"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := repo.Delete(ctx, "PersonRole", rec.ID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	ids, err := repo.DistinctFieldValues(ctx, "PersonRole", "role_type", "employee", "person_id")
+	if err != nil {
+		t.Fatalf("DistinctFieldValues: %v", err)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("expected a soft-deleted PersonRole to be excluded, got %v", ids)
+	}
+}

@@ -84,10 +84,14 @@ func Item() *entity.Definition {
 // was the second, so the shared loop now lives in
 // internal/kernel/recordmigrate and both backfill commands are written
 // against it.
+// vendor_id's TargetFilter (v7, uc-infra#78) requires the referenced
+// Party to actually hold the vendor PartyRole — before this, a customer
+// Party could be picked here just as easily as a real vendor, the same
+// gap SalesOrder.customer_id had in the other direction.
 func PurchaseOrder() *entity.Definition {
 	return &entity.Definition{
 		EntityType:     "PurchaseOrder",
-		Version:        6,
+		Version:        7,
 		Module:         "purchasing",
 		StatusTypeCode: "purchase_order_status",
 		Fields: []entity.Field{
@@ -101,7 +105,9 @@ func PurchaseOrder() *entity.Definition {
 			// as Currency.code/Item.sku, which rely on the same
 			// application-level convention, not a DB constraint).
 			{Name: "po_number", Type: entity.FieldString, Required: true},
-			{Name: "vendor_id", Type: entity.FieldReference, Required: true, Target: "Party"},
+			{Name: "vendor_id", Type: entity.FieldReference, Required: true, Target: "Party", TargetFilter: []entity.TargetFilterCondition{
+				{Entity: "PartyRole", EntityField: "party_id", Field: "role_type", Value: "vendor"},
+			}},
 			{Name: "order_date", Type: entity.FieldDate, Required: true},
 			// promised_delivery_date (#11) is the vendor's own commitment
 			// made at order time — a buyer/vendor-agreed date, entered

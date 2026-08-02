@@ -97,6 +97,10 @@ func (e *Engine) Create(ctx context.Context, def *entity.Definition, fields map[
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback is a no-op after a successful commit
 
+	if err := checkReferenceTargetConstraints(ctx, tx, e.records, def, fields); err != nil {
+		return data.Record{}, err
+	}
+
 	rec, err := e.records.CreateTx(ctx, tx, def.EntityType, fields)
 	if err != nil {
 		return data.Record{}, fmt.Errorf("create record: %w", err)
@@ -287,6 +291,10 @@ func (e *Engine) Update(ctx context.Context, def *entity.Definition, id string, 
 		if err := checkSelfReferenceCycle(ctx, tx, e.records, def.EntityType, id, f.Name, newParentID); err != nil {
 			return 0, err
 		}
+	}
+
+	if err := checkReferenceTargetConstraints(ctx, tx, e.records, def, fields); err != nil {
+		return 0, err
 	}
 
 	newVersion, err := e.records.UpdateTx(ctx, tx, def.EntityType, id, fields, expectedVersion)

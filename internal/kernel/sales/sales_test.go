@@ -62,6 +62,23 @@ func TestSalesOrder_CustomerReferencesPartyDirectly(t *testing.T) {
 	}
 }
 
+// TestSalesOrder_CustomerMustHoldCustomerRole (uc-infra#78): customer_id
+// declares a TargetFilter requiring the referenced Party to hold the
+// customer PartyRole — a vendor-only Party is no longer a valid pick.
+func TestSalesOrder_CustomerMustHoldCustomerRole(t *testing.T) {
+	f, ok := SalesOrder().FieldByName("customer_id")
+	if !ok {
+		t.Fatal("expected a customer_id field")
+	}
+	if len(f.TargetFilter) != 1 {
+		t.Fatalf("expected exactly one target_filter condition, got %+v", f.TargetFilter)
+	}
+	cond := f.TargetFilter[0]
+	if cond.Entity != "PartyRole" || cond.EntityField != "party_id" || cond.Field != "role_type" || cond.Value != "customer" {
+		t.Fatalf("expected a PartyRole(party_id)=role_type:customer condition, got %+v", cond)
+	}
+}
+
 func TestSalesOrder_StatusIsManagedByStatusType(t *testing.T) {
 	def := SalesOrder()
 	if def.StatusTypeCode != "sales_order_status" {

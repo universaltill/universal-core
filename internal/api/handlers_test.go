@@ -3568,6 +3568,13 @@ func TestAPI_PurchaseOrder_StagedLeadTimeTimestamps(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create Party: %v", err)
 	}
+	// uc-infra#78: PurchaseOrder.vendor_id now requires the referenced
+	// Party to hold the vendor PartyRole.
+	if _, err := engine.Create(ctx, def("PartyRole"), map[string]any{
+		"party_id": vendor.ID, "role_type": "vendor",
+	}, actor); err != nil {
+		t.Fatalf("create vendor PartyRole: %v", err)
+	}
 	statusTypes, err := engine.ListByField(ctx, def("StatusType"), "code", "purchase_order_status")
 	if err != nil || len(statusTypes) == 0 {
 		t.Fatalf("list purchase_order_status StatusType: %v (n=%d)", err, len(statusTypes))
