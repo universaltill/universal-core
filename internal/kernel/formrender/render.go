@@ -294,6 +294,19 @@ type fieldView struct {
 	// declarative — formrender never inspects what "project_id" means,
 	// it only relays what the Definition already said.
 	MustMatchParentField string
+	// Min/Max mirror the field's own declared entity.Field Min/Max
+	// (ADR-0018 §4), rendered as the number input's min/max HTML
+	// attributes — the same "validation is defined once, applied
+	// identically client- and server-side" principle Required's own
+	// attribute already follows. Pre-formatted strings, not *float64:
+	// text/template prints a non-nil *float64 as its pointer address, not
+	// its value (fmt's %v on a pointer to a scalar doesn't dereference),
+	// so formatting happens once here, matching FormatFieldValue's own
+	// 'f'-verb convention. Empty means unset — same idiom CurrentLabel/
+	// MustMatchParentField already use, no separate bool needed since an
+	// HTML attribute is either present or absent.
+	Min string
+	Max string
 	// I18nInputs is set only for FieldI18nText (ADR-0009): one entry per
 	// supported locale, each rendered as its own text input named
 	// "{Name}.{Locale}" so the form decoder can reassemble the per-locale
@@ -658,6 +671,12 @@ func (r *Renderer) buildFields(s form.Section, ent *entity.Definition, record ma
 			Required: ef.Required,
 			Value:    FormatFieldValue(record[ff.Name]),
 		}
+		if ef.Min != nil {
+			fv.Min = strconv.FormatFloat(*ef.Min, 'f', -1, 64)
+		}
+		if ef.Max != nil {
+			fv.Max = strconv.FormatFloat(*ef.Max, 'f', -1, 64)
+		}
 
 		switch ef.Type {
 		case entity.FieldBool:
@@ -861,7 +880,7 @@ const tmplSrc = `<form class="uc-form" data-entity-type="{{.EntityType}}"{{if .R
 {{range .Options}}<option value="{{.Value}}" {{if .Selected}}selected{{end}}>{{.Label}}</option>{{end}}
 </select>
 {{else if eq .Type "date"}}<input type="date" id="{{.Name}}" name="{{.Name}}" value="{{.Value}}"{{if .Required}} required{{end}}>
-{{else if eq .Type "number"}}<input type="number" id="{{.Name}}" name="{{.Name}}" value="{{.Value}}"{{if .Required}} required{{end}}>
+{{else if eq .Type "number"}}<input type="number" id="{{.Name}}" name="{{.Name}}" value="{{.Value}}"{{if .Min}} min="{{.Min}}"{{end}}{{if .Max}} max="{{.Max}}"{{end}}{{if .Required}} required{{end}}>
 {{else}}<input type="text" id="{{.Name}}" name="{{.Name}}" value="{{.Value}}"{{if .Required}} required{{end}}>
 {{end}}
 </div>

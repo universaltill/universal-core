@@ -191,14 +191,15 @@ func ContactMechanism() *entity.Definition {
 func Attachment() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "Attachment",
-		Version:    2,
-		Module:     "foundation",
+		// Version 3 (uc-infra#80): size_bytes gained a Min:0 bound.
+		Version: 3,
+		Module:  "foundation",
 		Fields: []entity.Field{
 			{Name: "entity_type", Type: entity.FieldString, Required: true},
 			{Name: "record_id", Type: entity.FieldString, Required: true},
 			{Name: "file_name", Type: entity.FieldString, Required: true},
 			{Name: "mime_type", Type: entity.FieldString, Required: true},
-			{Name: "size_bytes", Type: entity.FieldNumber, Required: true},
+			{Name: "size_bytes", Type: entity.FieldNumber, Required: true, Min: entity.Float64Ptr(0)},
 			// storage_path is where the actual bytes live (e.g. an object
 			// store key) — this kernel spike models the metadata record
 			// only, not a storage backend.
@@ -234,12 +235,18 @@ func UnitOfMeasure() *entity.Definition {
 func UomConversion() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "UomConversion",
-		Version:    2,
-		Module:     "foundation",
+		// Version 3 (uc-infra#80): factor gained a Min:0 bound — a
+		// negative multiplier is nonsensical for a unit conversion. Not a
+		// strict positivity check (factor == 0 would collapse every
+		// converted quantity to zero, also nonsensical) since Min is
+		// inclusive; that residual gap is the same one this issue's own
+		// tracking left for StockTransfer.qty, not solved here either.
+		Version: 3,
+		Module:  "foundation",
 		Fields: []entity.Field{
 			{Name: "from_uom_id", Type: entity.FieldReference, Required: true, Target: "UnitOfMeasure"},
 			{Name: "to_uom_id", Type: entity.FieldReference, Required: true, Target: "UnitOfMeasure"},
-			{Name: "factor", Type: entity.FieldNumber, Required: true}, // to_qty = from_qty × factor
+			{Name: "factor", Type: entity.FieldNumber, Required: true, Min: entity.Float64Ptr(0)}, // to_qty = from_qty × factor
 		},
 	}
 }
@@ -249,12 +256,19 @@ func UomConversion() *entity.Definition {
 func Currency() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "Currency",
-		Version:    2,
-		Module:     "foundation",
+		// Version 3 (uc-infra#80): minor_unit gained a [0, 6] bound,
+		// matching the range assets.MinorUnits (depreciation.go) already
+		// enforces downstream at the money-conversion boundary
+		// (MaxMinorUnitScale) — declaring it here on the Definition
+		// catches the same bad value earlier, at the same generic layer
+		// every other bound in this sweep uses, instead of only when a
+		// depreciation schedule happens to touch this currency.
+		Version: 3,
+		Module:  "foundation",
 		Fields: []entity.Field{
 			{Name: "code", Type: entity.FieldString, Required: true}, // ISO 4217, e.g. "QAR", "USD"
 			{Name: "name", Type: entity.FieldString, Required: true},
-			{Name: "minor_unit", Type: entity.FieldNumber, Default: float64(2)},
+			{Name: "minor_unit", Type: entity.FieldNumber, Default: float64(2), Min: entity.Float64Ptr(0), Max: entity.Float64Ptr(6)},
 		},
 	}
 }
@@ -272,13 +286,16 @@ func Currency() *entity.Definition {
 func ExchangeRate() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "ExchangeRate",
-		Version:    2,
-		Module:     "foundation",
+		// Version 3 (uc-infra#80): rate gained a Min:0 bound — same
+		// reasoning as UomConversion.factor above (a negative exchange
+		// rate is nonsensical; zero is a separate, undeclared gap).
+		Version: 3,
+		Module:  "foundation",
 		Fields: []entity.Field{
 			{Name: "from_currency_id", Type: entity.FieldReference, Required: true, Target: "Currency"},
 			{Name: "to_currency_id", Type: entity.FieldReference, Required: true, Target: "Currency"},
 			{Name: "effective_date", Type: entity.FieldDate, Required: true},
-			{Name: "rate", Type: entity.FieldNumber, Required: true}, // to_amount = from_amount × rate
+			{Name: "rate", Type: entity.FieldNumber, Required: true, Min: entity.Float64Ptr(0)}, // to_amount = from_amount × rate
 		},
 	}
 }

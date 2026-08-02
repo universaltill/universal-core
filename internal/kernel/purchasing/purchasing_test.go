@@ -603,8 +603,8 @@ func TestFacility_RejectsUnknownType(t *testing.T) {
 // merely that the field exists.
 func TestInventoryItem_IsKeyedByItemAndFacility(t *testing.T) {
 	def := InventoryItem()
-	if def.Version != 3 {
-		t.Errorf("InventoryItem is v%d, want v3 — the facility bump", def.Version)
+	if def.Version != 4 {
+		t.Errorf("InventoryItem is v%d, want v4 — the facility bump (v3) plus qty_on_hand's Min:0 bound (v4, uc-infra#80)", def.Version)
 	}
 	f, ok := def.FieldByName("facility_id")
 	if !ok {

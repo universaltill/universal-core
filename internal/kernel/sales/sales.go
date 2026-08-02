@@ -62,8 +62,9 @@ import "github.com/universaltill/universal-core/internal/kernel/entity"
 // had in the other direction.
 func SalesOrder() *entity.Definition {
 	return &entity.Definition{
-		EntityType:     "SalesOrder",
-		Version:        2,
+		EntityType: "SalesOrder",
+		// Version 3 (uc-infra#80): total gained a Min:0 bound.
+		Version:        3,
 		Module:         "sales",
 		StatusTypeCode: "sales_order_status",
 		Fields: []entity.Field{
@@ -79,7 +80,7 @@ func SalesOrder() *entity.Definition {
 			{Name: "order_date", Type: entity.FieldDate, Required: true},
 			{Name: "currency_id", Type: entity.FieldReference, Target: "Currency"},
 			{Name: "status_id", Type: entity.FieldReference, Required: true, Target: "Status"},
-			{Name: "total", Type: entity.FieldNumber, Default: float64(0)},
+			{Name: "total", Type: entity.FieldNumber, Default: float64(0), Min: entity.Float64Ptr(0)},
 		},
 		Relationships: []entity.Relationship{
 			// ParentField ("sales_order_id") is what
@@ -99,14 +100,16 @@ func SalesOrder() *entity.Definition {
 func SOLine() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "SOLine",
-		Version:    1,
-		Module:     "sales",
+		// Version 2 (uc-infra#80): qty, unit_price and line_total gained
+		// Min:0 bounds.
+		Version: 2,
+		Module:  "sales",
 		Fields: []entity.Field{
 			{Name: "sales_order_id", Type: entity.FieldReference, Required: true, Target: "SalesOrder"},
 			{Name: "item_id", Type: entity.FieldReference, Required: true, Target: "Item"},
-			{Name: "qty", Type: entity.FieldNumber, Required: true},
-			{Name: "unit_price", Type: entity.FieldNumber, Required: true},
-			{Name: "line_total", Type: entity.FieldNumber, Default: float64(0)},
+			{Name: "qty", Type: entity.FieldNumber, Required: true, Min: entity.Float64Ptr(0)},
+			{Name: "unit_price", Type: entity.FieldNumber, Required: true, Min: entity.Float64Ptr(0)},
+			{Name: "line_total", Type: entity.FieldNumber, Default: float64(0), Min: entity.Float64Ptr(0)},
 		},
 	}
 }
@@ -133,8 +136,9 @@ func SOLine() *entity.Definition {
 // module.
 func CustomerInvoice() *entity.Definition {
 	return &entity.Definition{
-		EntityType:     "CustomerInvoice",
-		Version:        1,
+		EntityType: "CustomerInvoice",
+		// Version 2 (uc-infra#80): total gained a Min:0 bound.
+		Version:        2,
 		Module:         "sales",
 		StatusTypeCode: "customer_invoice_status",
 		Fields: []entity.Field{
@@ -144,7 +148,7 @@ func CustomerInvoice() *entity.Definition {
 			{Name: "invoice_date", Type: entity.FieldDate, Required: true},
 			{Name: "currency_id", Type: entity.FieldReference, Target: "Currency"},
 			{Name: "status_id", Type: entity.FieldReference, Required: true, Target: "Status"},
-			{Name: "total", Type: entity.FieldNumber, Default: float64(0)},
+			{Name: "total", Type: entity.FieldNumber, Default: float64(0), Min: entity.Float64Ptr(0)},
 		},
 	}
 }

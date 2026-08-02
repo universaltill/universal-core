@@ -1,6 +1,7 @@
 package entity
 
 import (
+	"math"
 	"strings"
 	"testing"
 )
@@ -58,6 +59,97 @@ func TestValidateRecord(t *testing.T) {
 		data := map[string]any{"name": "Acme"}
 		if err := ValidateRecord(def, data); err != nil {
 			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
+
+// boundedDef declares Min-only, Max-only and Min+Max FieldNumber fields —
+// the three shapes ADR-0018 §4's Min/Max mechanism supports.
+func boundedDef() *Definition {
+	return &Definition{
+		EntityType: "LeaveRequest",
+		Version:    1,
+		Fields: []Field{
+			{Name: "days", Type: FieldNumber, Min: Float64Ptr(0)},
+			{Name: "probability", Type: FieldNumber, Min: Float64Ptr(0), Max: Float64Ptr(100)},
+			{Name: "discount", Type: FieldNumber, Max: Float64Ptr(0)},
+			{Name: "unbounded", Type: FieldNumber},
+		},
+	}
+}
+
+// TestValidateRecord_MinMax (uc-infra#80, ADR-0018 §4): entity.Field's
+// Min/Max bounds are inclusive and enforced per-field, independent of any
+// other declared bound.
+func TestValidateRecord_MinMax(t *testing.T) {
+	def := boundedDef()
+
+	t.Run("below min is rejected", func(t *testing.T) {
+		if err := ValidateRecord(def, map[string]any{"days": -99.0}); err == nil {
+			t.Fatal("expected error for days below its Min")
+		}
+	})
+	t.Run("at min is accepted (inclusive)", func(t *testing.T) {
+		if err := ValidateRecord(def, map[string]any{"days": 0.0}); err != nil {
+			t.Fatalf("unexpected error at the inclusive minimum: %v", err)
+		}
+	})
+	t.Run("above min with no max is accepted", func(t *testing.T) {
+		if err := ValidateRecord(def, map[string]any{"days": 1_000_000.0}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+	t.Run("above max is rejected", func(t *testing.T) {
+		if err := ValidateRecord(def, map[string]any{"probability": 10000.0}); err == nil {
+			t.Fatal("expected error for probability above its Max")
+		}
+	})
+	t.Run("at max is accepted (inclusive)", func(t *testing.T) {
+		if err := ValidateRecord(def, map[string]any{"probability": 100.0}); err != nil {
+			t.Fatalf("unexpected error at the inclusive maximum: %v", err)
+		}
+	})
+	t.Run("below min on a percentage field is rejected", func(t *testing.T) {
+		if err := ValidateRecord(def, map[string]any{"probability": -400.0}); err == nil {
+			t.Fatal("expected error for probability below its Min")
+		}
+	})
+	t.Run("max-only field rejects above max", func(t *testing.T) {
+		if err := ValidateRecord(def, map[string]any{"discount": 1.0}); err == nil {
+			t.Fatal("expected error: discount has Max:0 and no Min")
+		}
+	})
+	t.Run("max-only field accepts any value below max", func(t *testing.T) {
+		if err := ValidateRecord(def, map[string]any{"discount": -1_000_000.0}); err != nil {
+			t.Fatalf("unexpected error: a Max-only field has no floor: %v", err)
+		}
+	})
+	t.Run("unbounded field accepts any value", func(t *testing.T) {
+		if err := ValidateRecord(def, map[string]any{"unbounded": -1e18}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+	t.Run("int and int64 values are bound-checked like float64", func(t *testing.T) {
+		if err := ValidateRecord(def, map[string]any{"days": -1}); err == nil {
+			t.Fatal("expected error for an int value below Min")
+		}
+		if err := ValidateRecord(def, map[string]any{"days": int64(-1)}); err == nil {
+			t.Fatal("expected error for an int64 value below Min")
+		}
+	})
+	t.Run("NaN is rejected even on an unbounded field", func(t *testing.T) {
+		if err := ValidateRecord(def, map[string]any{"unbounded": math.NaN()}); err == nil {
+			t.Fatal("expected error: NaN is never a valid FieldNumber value")
+		}
+	})
+	t.Run("+Inf is rejected", func(t *testing.T) {
+		if err := ValidateRecord(def, map[string]any{"unbounded": math.Inf(1)}); err == nil {
+			t.Fatal("expected error: +Inf is never a valid FieldNumber value")
+		}
+	})
+	t.Run("-Inf is rejected", func(t *testing.T) {
+		if err := ValidateRecord(def, map[string]any{"unbounded": math.Inf(-1)}); err == nil {
+			t.Fatal("expected error: -Inf is never a valid FieldNumber value")
 		}
 	})
 }

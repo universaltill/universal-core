@@ -2,6 +2,7 @@ package entity
 
 import (
 	"fmt"
+	"math"
 	"slices"
 	"time"
 )
@@ -95,10 +96,33 @@ func validateFieldValue(f Field, v any) error {
 			return fmt.Errorf("expected string, got %T", v)
 		}
 	case FieldNumber:
-		switch v.(type) {
-		case float64, int, int64:
+		var num float64
+		switch n := v.(type) {
+		case float64:
+			num = n
+		case int:
+			num = float64(n)
+		case int64:
+			num = float64(n)
 		default:
 			return fmt.Errorf("expected number, got %T", v)
+		}
+		// A bound can't be enforced on a value ordering can't compare:
+		// NaN < min and NaN > max are both false, so without this check a
+		// NaN would silently sail past any declared Min/Max. Rejected
+		// unconditionally, not just when a bound is declared — "not a real
+		// number" is never a valid FieldNumber value, bound or no bound,
+		// and this is the one place in the kernel that decides that
+		// (depreciation.go's MinorUnits has had to guard against exactly
+		// this reaching it from an unbounded field).
+		if math.IsNaN(num) || math.IsInf(num, 0) {
+			return fmt.Errorf("value %v is not a finite number", v)
+		}
+		if f.Min != nil && num < *f.Min {
+			return fmt.Errorf("value %v is below the minimum %v", num, *f.Min)
+		}
+		if f.Max != nil && num > *f.Max {
+			return fmt.Errorf("value %v is above the maximum %v", num, *f.Max)
 		}
 	case FieldBool:
 		if _, ok := v.(bool); !ok {

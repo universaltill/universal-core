@@ -196,3 +196,84 @@ func TestCountMissingField_FalseAndZeroAreNotMissing(t *testing.T) {
 		t.Errorf("CountMissingField = %d, want 0 — false and 0 are present values", n)
 	}
 }
+
+// f64 takes the address of a float64 literal — Go has no `&0.0` for a
+// literal, same reason entity.Float64Ptr exists; kept local to this test
+// file rather than importing the entity package for one helper.
+func f64(v float64) *float64 { return &v }
+
+// CountOutOfRangeField is CountMissingField's counterpart for
+// entity.Field.Min/Max (uc-infra#80) — same "an operator must be told
+// before a record silently becomes uneditable" stakes, so the boundary
+// cases get the same delta-per-case treatment TestCountMissingField
+// uses.
+func TestCountOutOfRangeField(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	records := data.NewRecordRepo(tenantDB)
+	ctx := context.Background()
+
+	mk := func(fields map[string]any) string {
+		t.Helper()
+		rec, err := records.Create(ctx, "Widget", fields)
+		if err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		return rec.ID
+	}
+	count := func(min, max *float64) int {
+		t.Helper()
+		n, err := records.CountOutOfRangeField(ctx, "Widget", "qty", min, max)
+		if err != nil {
+			t.Fatalf("CountOutOfRangeField: %v", err)
+		}
+		return n
+	}
+
+	if n := count(f64(0), nil); n != 0 {
+		t.Fatalf("empty fixture counts %d", n)
+	}
+
+	mk(map[string]any{"qty": -1.0})
+	if n := count(f64(0), nil); n != 1 {
+		t.Errorf("a value below Min must count: got %d, want 1", n)
+	}
+	mk(map[string]any{"qty": 0.0})
+	if n := count(f64(0), nil); n != 1 {
+		t.Errorf("a value AT the inclusive Min must not count: got %d, want 1", n)
+	}
+	mk(map[string]any{"qty": 100.0})
+	if n := count(f64(0), f64(24)); n != 2 {
+		t.Errorf("a value above Max must count: got %d, want 2", n)
+	}
+	if n := count(f64(0), f64(100)); n != 1 {
+		t.Errorf("a value AT the inclusive Max must not count: got %d, want 1", n)
+	}
+	if n := count(nil, nil); n != 0 {
+		t.Errorf("no declared bound must never count anything: got %d, want 0", n)
+	}
+	mk(map[string]any{"qty": "not a number"})
+	if n := count(f64(0), nil); n != 1 {
+		t.Errorf("a non-numeric value must not count (jsonb_typeof guard, not a cast error): got %d, want 1", n)
+	}
+	mk(map[string]any{"other": "x"})
+	if n := count(f64(0), nil); n != 1 {
+		t.Errorf("an absent field must not count — CountMissingField's job, not this one's: got %d, want 1", n)
+	}
+
+	if _, err := records.Create(ctx, "Other", map[string]any{"qty": -1.0}); err != nil {
+		t.Fatalf("create Other: %v", err)
+	}
+	if n := count(f64(0), nil); n != 1 {
+		t.Errorf("another entity type must not contribute: got %d, want 1", n)
+	}
+
+	for i := 0; i < 2; i++ {
+		doomed := mk(map[string]any{"qty": -1.0})
+		if err := records.Delete(ctx, "Widget", doomed); err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+	}
+	if n := count(f64(0), nil); n != 1 {
+		t.Errorf("soft-deleted rows must not contribute: got %d, want 1", n)
+	}
+}

@@ -391,6 +391,66 @@ func TestDefinitionValidate(t *testing.T) {
 			},
 			wantErr: false,
 		},
+		{
+			name: "valid min and max on a number field",
+			def: Definition{
+				EntityType: "LeaveRequest",
+				Fields: []Field{
+					{Name: "days", Type: FieldNumber, Min: Float64Ptr(0), Max: Float64Ptr(365)},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "valid min only, no max",
+			def: Definition{
+				EntityType: "LeaveRequest",
+				Fields: []Field{
+					{Name: "days", Type: FieldNumber, Min: Float64Ptr(0)},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "min greater than max is rejected",
+			def: Definition{
+				EntityType: "Opportunity",
+				Fields: []Field{
+					{Name: "probability", Type: FieldNumber, Min: Float64Ptr(100), Max: Float64Ptr(0)},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "min equal to max is allowed (a fixed-value field)",
+			def: Definition{
+				EntityType: "Rate",
+				Fields: []Field{
+					{Name: "value", Type: FieldNumber, Min: Float64Ptr(5), Max: Float64Ptr(5)},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "min on a non-number field is rejected",
+			def: Definition{
+				EntityType: "Vendor",
+				Fields: []Field{
+					{Name: "name", Type: FieldString, Min: Float64Ptr(0)},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "max on a non-number field is rejected",
+			def: Definition{
+				EntityType: "Vendor",
+				Fields: []Field{
+					{Name: "name", Type: FieldString, Max: Float64Ptr(10)},
+				},
+			},
+			wantErr: true,
+		},
 	}
 
 	for _, tc := range cases {

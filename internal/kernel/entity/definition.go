@@ -116,6 +116,16 @@ type Field struct {
 	// Definition entirely, without a registry this package doesn't have
 	// access to).
 	MustMatchParentField string `json:"must_match_parent_field,omitempty"`
+	// Min and Max declare inclusive numeric bounds (ADR-0018 §4) — *float64
+	// so "unset" and "zero" stay distinguishable, the same pointer pattern
+	// this project already uses for optional declarative constraints (see
+	// TargetFilterCondition's own doc comment for the analogous reasoning).
+	// Only valid when Type == FieldNumber; Definition.Validate rejects them
+	// on any other field type and rejects Min > Max. Generic and
+	// declarative, same shape as NotBefore — no entity-type branching, the
+	// bound itself lives on the Definition, not in this engine.
+	Min *float64 `json:"min,omitempty"`
+	Max *float64 `json:"max,omitempty"`
 }
 
 // TargetFilterCondition is one field/value condition a candidate target
@@ -223,6 +233,12 @@ type Definition struct {
 	// generic engine should default to "everywhere" on inference.
 	QuickCreatable bool `json:"quick_creatable,omitempty"`
 }
+
+// Float64Ptr returns a pointer to v — a small helper so every Definition
+// declaring a Field.Min/Max literal doesn't need its own local variable to
+// take the address of a constant (Go has no `&0.0` for a literal). Exported
+// because every module package declaring bounds needs it, not just this one.
+func Float64Ptr(v float64) *float64 { return &v }
 
 // FieldByName returns the field with the given name, if present.
 func (d *Definition) FieldByName(name string) (Field, bool) {
@@ -349,6 +365,12 @@ func (d *Definition) Validate() error {
 			if _, ok := d.FieldByName(f.MustMatchParentField); !ok {
 				return fmt.Errorf("field %q must_match_parent_field %q is not a field of %s", f.Name, f.MustMatchParentField, d.EntityType)
 			}
+		}
+		if (f.Min != nil || f.Max != nil) && f.Type != FieldNumber {
+			return fmt.Errorf("field %q has min/max but is type %q, not number", f.Name, f.Type)
+		}
+		if f.Min != nil && f.Max != nil && *f.Min > *f.Max {
+			return fmt.Errorf("field %q has min %v greater than max %v", f.Name, *f.Min, *f.Max)
 		}
 	}
 	// NotBefore checked in a second pass: it may reference a field

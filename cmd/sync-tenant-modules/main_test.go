@@ -358,7 +358,7 @@ func TestSync_BringsAStaleTenantUpToDate(t *testing.T) {
 
 	// The per-tenant progress line names exactly what moved, and the
 	// module set it inferred (ADR-0017 §1).
-	want := fmt.Sprintf("Sync Smoke Test (%s): Facility v1 (new), InventoryItem v2->v3 [foundation, purchasing]", id)
+	want := fmt.Sprintf("Sync Smoke Test (%s): Facility v1 (new), InventoryItem v2->v4 [foundation, purchasing]", id)
 	if !strings.Contains(stderr, want) {
 		t.Fatalf("expected progress line %q, got stderr: %q", want, stderr)
 	}
@@ -367,8 +367,8 @@ func TestSync_BringsAStaleTenantUpToDate(t *testing.T) {
 	if v, ok := versions["Facility"]; !ok || v != 1 {
 		t.Fatalf("expected Facility v1 published after sync, got v%d (present=%v)", v, ok)
 	}
-	if v := versions["InventoryItem"]; v != 3 {
-		t.Fatalf("expected InventoryItem v3 after sync, got v%d", v)
+	if v := versions["InventoryItem"]; v != 4 {
+		t.Fatalf("expected InventoryItem v4 after sync, got v%d", v)
 	}
 	// No records exist, so nothing was invalidated — the data-migration
 	// section must stay silent rather than cry wolf.
@@ -459,7 +459,7 @@ func TestSync_DryRunReportsWithoutWriting(t *testing.T) {
 	// Exactly the changes the real run makes in
 	// TestSync_BringsAStaleTenantUpToDate — a dry run whose report
 	// differs from the run it predicts is worthless as a drift report.
-	want := fmt.Sprintf("DRY RUN: Sync Smoke Test (%s): Facility v1 (new), InventoryItem v2->v3 [foundation, purchasing]", id)
+	want := fmt.Sprintf("DRY RUN: Sync Smoke Test (%s): Facility v1 (new), InventoryItem v2->v4 [foundation, purchasing]", id)
 	if !strings.Contains(stderr, want) {
 		t.Fatalf("expected planned-change line %q, got stderr: %q", want, stderr)
 	}
@@ -498,6 +498,81 @@ func TestSync_WarnsAboutRecordsMadeInvalid(t *testing.T) {
 		t.Fatalf("sync must not migrate records itself, %d row(s) still lack facility_id", missing)
 	}
 }
+
+// TestSync_WarnsAboutOutOfRangeNumericFields is
+// TestSync_WarnsAboutRecordsMadeInvalid's counterpart for a newly-added
+// entity.Field.Min/Max (uc-infra#80, ADR-0018 §4/§Consequences): a
+// tenant holding an InventoryItem with a negative qty_on_hand — legal
+// under the v2 shape staleTenant fixes it at — must be warned when the
+// sync bumps it to v4 (which is also where qty_on_hand gained Min:0), not
+// silently told "0 data migrations needed" only for the record to 400 on
+// its next edit. The same fixture record also lacks facility_id, so this
+// exercises requiredFieldWarnings and numericBoundWarnings firing
+// together on one row without either shadowing the other.
+func TestSync_WarnsAboutOutOfRangeNumericFields(t *testing.T) {
+	dsn, control, router := controlPlane(t)
+	_, tenantDB := staleTenant(t, control, router, "Sync Smoke Test")
+	insertLegacyInventoryItem(t, tenantDB, "00000000-0000-0000-0000-000000000001", -5)
+	want := `Sync Smoke Test: InventoryItem — 1 record(s) are outside the new bound on "qty_on_hand" and will fail validation on next edit`
+
+	// Dry run FIRST, same order TestSync_DryRunPredictsTheMigrationsItWouldCreate
+	// uses and for the same reason: running the real sync first would fix
+	// the tenant, leaving nothing for a dry run afterward to predict.
+	dryStdout, _, code := run(t, []string{"DATABASE_URL=" + dsn}, "-actor-id=smoke-test", "-dry-run")
+	if code != 0 {
+		t.Fatalf("dry run: exit %d", code)
+	}
+	if !strings.Contains(dryStdout, want) {
+		t.Fatalf("dry run must predict the numeric-bound warning, got stdout: %q", dryStdout)
+	}
+	assertStale(t, tenantDB, "after dry run")
+
+	stdout, stderr, code := run(t, []string{"DATABASE_URL=" + dsn}, "-actor-id=smoke-test")
+	if code != 0 {
+		t.Fatalf("sync: exit %d, stderr: %s", code, stderr)
+	}
+	if !strings.Contains(stdout, "2 data migration(s) now needed:") {
+		t.Fatalf("expected two data-migration warnings (facility_id AND qty_on_hand), got stdout: %q", stdout)
+	}
+	if !strings.Contains(stdout, want) {
+		t.Fatalf("expected warning %q, got stdout: %q", want, stdout)
+	}
+}
+
+// TestSync_LoosenedBoundIsNotAWarning confirms numericBoundChanged's
+// asymmetry actually reaches the warning path: a bound that only ever
+// admits MORE values than the one it replaces must never warn, even
+// though the field's Min/Max literal did change — matching how a Min
+// moving down or a Max moving up can never strand a record that already
+// satisfied the tighter, older bound.
+func TestSync_LoosenedBoundIsNotAWarning(t *testing.T) {
+	old := &entity.Definition{EntityType: "Widget", Version: 1, Fields: []entity.Field{
+		{Name: "qty", Type: entity.FieldNumber, Min: f64ptr(10), Max: f64ptr(90)},
+	}}
+	loosenedMin := entity.Field{Name: "qty", Type: entity.FieldNumber, Min: f64ptr(0), Max: f64ptr(90)}
+	loosenedMax := entity.Field{Name: "qty", Type: entity.FieldNumber, Min: f64ptr(10), Max: f64ptr(100)}
+	tightenedMin := entity.Field{Name: "qty", Type: entity.FieldNumber, Min: f64ptr(20), Max: f64ptr(90)}
+	tightenedMax := entity.Field{Name: "qty", Type: entity.FieldNumber, Min: f64ptr(10), Max: f64ptr(80)}
+	newlyBounded := entity.Field{Name: "other", Type: entity.FieldNumber, Min: f64ptr(0)}
+
+	if numericBoundChanged(old, loosenedMin) {
+		t.Error("a Min that moved down must not be reported as changed")
+	}
+	if numericBoundChanged(old, loosenedMax) {
+		t.Error("a Max that moved up must not be reported as changed")
+	}
+	if !numericBoundChanged(old, tightenedMin) {
+		t.Error("a Min that moved up must be reported as changed")
+	}
+	if !numericBoundChanged(old, tightenedMax) {
+		t.Error("a Max that moved down must be reported as changed")
+	}
+	if !numericBoundChanged(old, newlyBounded) {
+		t.Error("a field with no prior bound must be reported as changed")
+	}
+}
+
+func f64ptr(v float64) *float64 { return &v }
 
 // TestSync_WarnsAboutTargetConstraintViolations is
 // TestSync_WarnsAboutRecordsMadeInvalid's counterpart for a newly-added
@@ -578,8 +653,8 @@ func TestSync_TenantIDTargetsOneTenant(t *testing.T) {
 	if v, ok := versions["Facility"]; !ok || v != 1 {
 		t.Fatalf("targeted tenant: expected Facility v1, got v%d (present=%v)", v, ok)
 	}
-	if v := versions["InventoryItem"]; v != 3 {
-		t.Fatalf("targeted tenant: expected InventoryItem v3, got v%d", v)
+	if v := versions["InventoryItem"]; v != 4 {
+		t.Fatalf("targeted tenant: expected InventoryItem v4, got v%d", v)
 	}
 	assertStale(t, bystander, "untargeted tenant")
 }
@@ -688,8 +763,14 @@ func TestSync_RolledBackTargetVersionIsReportedNotPredicted(t *testing.T) {
 	_, tenantDB := staleTenant(t, control, router, "Sync Smoke Test")
 	insertLegacyInventoryItem(t, tenantDB, "00000000-0000-0000-0000-000000000001", 5)
 
-	// Publish InventoryItem v3, then roll it back: the exact state that
-	// makes the sync unable to advance this type.
+	// Publish the code's actual latest InventoryItem version, then roll it
+	// back: the exact state that makes the sync unable to advance this
+	// type. Read dynamically from purchasing.InventoryItem().Version
+	// rather than a hardcoded literal — this test's whole premise is that
+	// NOTHING newer and non-rolled-back exists, which only holds if this
+	// really is the latest, not whatever it happened to be when this test
+	// was written.
+	latest := purchasing.InventoryItem().Version
 	ctx := context.Background()
 	repo := data.NewEntityDefinitionRepo(tenantDB)
 	actor := audit.Actor{Type: audit.ActorHuman, ID: "smoke-test-setup"}
@@ -697,17 +778,17 @@ func TestSync_RolledBackTargetVersionIsReportedNotPredicted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal InventoryItem: %v", err)
 	}
-	if _, err := repo.CreateDraft(ctx, "InventoryItem", 3, raw, actor); err != nil {
-		t.Fatalf("draft v3: %v", err)
+	if _, err := repo.CreateDraft(ctx, "InventoryItem", latest, raw, actor); err != nil {
+		t.Fatalf("draft v%d: %v", latest, err)
 	}
-	if err := repo.Approve(ctx, "InventoryItem", 3, actor); err != nil {
-		t.Fatalf("approve v3: %v", err)
+	if err := repo.Approve(ctx, "InventoryItem", latest, actor); err != nil {
+		t.Fatalf("approve v%d: %v", latest, err)
 	}
-	if err := repo.Publish(ctx, "InventoryItem", 3, actor); err != nil {
-		t.Fatalf("publish v3: %v", err)
+	if err := repo.Publish(ctx, "InventoryItem", latest, actor); err != nil {
+		t.Fatalf("publish v%d: %v", latest, err)
 	}
-	if err := repo.Rollback(ctx, "InventoryItem", 3, actor); err != nil {
-		t.Fatalf("rollback v3: %v", err)
+	if err := repo.Rollback(ctx, "InventoryItem", latest, actor); err != nil {
+		t.Fatalf("rollback v%d: %v", latest, err)
 	}
 
 	dryOut, dryErr, code := run(t, []string{"DATABASE_URL=" + dsn}, "-actor-id=smoke-test", "-dry-run")
@@ -729,7 +810,7 @@ func TestSync_RolledBackTargetVersionIsReportedNotPredicted(t *testing.T) {
 		t.Errorf("a real run must name the type it cannot advance — otherwise a stuck tenant looks healthy:\n%s", realErr)
 	}
 	if v := publishedEntityVersions(t, tenantDB)["InventoryItem"]; v != 2 {
-		t.Errorf("InventoryItem is at v%d; the rolled-back v3 must not have been published", v)
+		t.Errorf("InventoryItem is at v%d; the rolled-back v%d must not have been published", v, latest)
 	}
 }
 

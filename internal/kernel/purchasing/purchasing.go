@@ -90,8 +90,9 @@ func Item() *entity.Definition {
 // gap SalesOrder.customer_id had in the other direction.
 func PurchaseOrder() *entity.Definition {
 	return &entity.Definition{
-		EntityType:     "PurchaseOrder",
-		Version:        7,
+		EntityType: "PurchaseOrder",
+		// Version 8 (uc-infra#80): total gained a Min:0 bound.
+		Version:        8,
 		Module:         "purchasing",
 		StatusTypeCode: "purchase_order_status",
 		Fields: []entity.Field{
@@ -126,7 +127,7 @@ func PurchaseOrder() *entity.Definition {
 			{Name: "promised_delivery_date", Type: entity.FieldDate, NotBefore: "order_date"},
 			{Name: "currency_id", Type: entity.FieldReference, Target: "Currency"},
 			{Name: "status_id", Type: entity.FieldReference, Required: true, Target: "Status"},
-			{Name: "total", Type: entity.FieldNumber, Default: float64(0)},
+			{Name: "total", Type: entity.FieldNumber, Default: float64(0), Min: entity.Float64Ptr(0)},
 			// Staged lead-time timestamps (#29) — reference-data-model.md
 			// §2's six stages, in order; the raw material for R10's
 			// P50/P90 lead-time forecast (#30). All optional (an
@@ -167,14 +168,16 @@ func PurchaseOrder() *entity.Definition {
 func POLine() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "POLine",
-		Version:    2,
-		Module:     "purchasing",
+		// Version 3 (uc-infra#80): qty, unit_price and line_total gained
+		// Min:0 bounds.
+		Version: 3,
+		Module:  "purchasing",
 		Fields: []entity.Field{
 			{Name: "purchase_order_id", Type: entity.FieldReference, Required: true, Target: "PurchaseOrder"},
 			{Name: "item_id", Type: entity.FieldReference, Required: true, Target: "Item"},
-			{Name: "qty", Type: entity.FieldNumber, Required: true},
-			{Name: "unit_price", Type: entity.FieldNumber, Required: true},
-			{Name: "line_total", Type: entity.FieldNumber, Default: float64(0)},
+			{Name: "qty", Type: entity.FieldNumber, Required: true, Min: entity.Float64Ptr(0)},
+			{Name: "unit_price", Type: entity.FieldNumber, Required: true, Min: entity.Float64Ptr(0)},
+			{Name: "line_total", Type: entity.FieldNumber, Default: float64(0), Min: entity.Float64Ptr(0)},
 		},
 	}
 }
@@ -243,12 +246,18 @@ func Facility() *entity.Definition {
 func InventoryItem() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "InventoryItem",
-		Version:    3,
-		Module:     "purchasing",
+		// Version 4 (uc-infra#80): qty_on_hand gained a Min:0 bound.
+		// qty_available_to_promise is left unbounded: unlike physical
+		// on-hand stock, ATP legitimately goes negative under real
+		// oversell/backorder conditions (demand outstrips on-hand plus
+		// incoming supply) — bounding it here would reject a real,
+		// meaningful inventory state, not a data-entry mistake.
+		Version: 4,
+		Module:  "purchasing",
 		Fields: []entity.Field{
 			{Name: "item_id", Type: entity.FieldReference, Required: true, Target: "Item"},
 			{Name: "facility_id", Type: entity.FieldReference, Required: true, Target: "Facility"},
-			{Name: "qty_on_hand", Type: entity.FieldNumber, Required: true, Default: float64(0)},
+			{Name: "qty_on_hand", Type: entity.FieldNumber, Required: true, Default: float64(0), Min: entity.Float64Ptr(0)},
 			{Name: "qty_available_to_promise", Type: entity.FieldNumber, Required: true, Default: float64(0)},
 		},
 	}
@@ -287,20 +296,31 @@ func InventoryItem() *entity.Definition {
 // task (the card's own wording) — a transfer moves stock between two
 // Facility rows, nothing finer.
 //
-// ValidateStockTransfer (ledger.go) rejects from_facility_id ==
-// to_facility_id and qty <= 0 on create AND on update — entity.Field has
-// no Min/Max or cross-field-inequality concept yet (#80), so this is a
-// crud.Hook business rule, the same mechanism PostGoodsReceiptLineToLedger
-// and MatchVendorInvoiceOnUpdate already use for entity-specific rules
-// the generic entity/crud engine must not special-case. Both actions,
-// not just create: this entity is editable through the generic
-// PUT /api/records/StockTransfer/{id} route like every other one, so a
-// create-only check would leave the invariant one ordinary edit away
-// from being false in stored data (see the hook's own doc comment).
+// qty declares Min:0 (uc-infra#80) — negative is caught here, at the
+// same generic layer as every other bounded quantity, and mirrored into
+// the form as the input's min="0" attribute and into csvimport/
+// recordmigrate's preview paths, neither of which runs crud.Hooks. That
+// is strictly WEAKER than what this entity actually needs (qty must be
+// greater than zero, not merely non-negative), because Min is inclusive
+// and cannot express "> 0" — the two do not disagree (Min:0 rejects a
+// strict subset of what qty<=0 rejects; composition is monotone), they
+// layer. ValidateStockTransfer (ledger.go) below is what closes the
+// remaining gap: qty == 0 specifically, and from_facility_id ==
+// to_facility_id, neither expressible as a single field's own Min/Max
+// (the latter is a cross-field comparison, which entity.Field has no
+// concept of at all) — a crud.Hook business rule, the same mechanism
+// PostGoodsReceiptLineToLedger and MatchVendorInvoiceOnUpdate already
+// use for entity-specific rules the generic entity/crud engine must not
+// special-case. Both actions, not just create: this entity is editable
+// through the generic PUT /api/records/StockTransfer/{id} route like
+// every other one, so a create-only check would leave the invariant one
+// ordinary edit away from being false in stored data (see the hook's
+// own doc comment).
 func StockTransfer() *entity.Definition {
 	return &entity.Definition{
-		EntityType:     "StockTransfer",
-		Version:        1,
+		EntityType: "StockTransfer",
+		// Version 2 (uc-infra#80): qty gained a Min:0 bound.
+		Version:        2,
 		Module:         "purchasing",
 		StatusTypeCode: "stock_transfer_status",
 		// No name/title field and no transfer number, so ADR-0013's
@@ -315,7 +335,7 @@ func StockTransfer() *entity.Definition {
 			{Name: "item_id", Type: entity.FieldReference, Required: true, Target: "Item"},
 			{Name: "from_facility_id", Type: entity.FieldReference, Required: true, Target: "Facility"},
 			{Name: "to_facility_id", Type: entity.FieldReference, Required: true, Target: "Facility"},
-			{Name: "qty", Type: entity.FieldNumber, Required: true},
+			{Name: "qty", Type: entity.FieldNumber, Required: true, Min: entity.Float64Ptr(0)},
 			{Name: "transfer_date", Type: entity.FieldDate, Required: true},
 			{Name: "status_id", Type: entity.FieldReference, Required: true, Target: "Status"},
 			{Name: "notes", Type: entity.FieldString},
@@ -382,13 +402,14 @@ func GoodsReceipt() *entity.Definition {
 func GoodsReceiptLine() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "GoodsReceiptLine",
-		Version:    1,
-		Module:     "purchasing",
+		// Version 2 (uc-infra#80): qty_received gained a Min:0 bound.
+		Version: 2,
+		Module:  "purchasing",
 		Fields: []entity.Field{
 			{Name: "goods_receipt_id", Type: entity.FieldReference, Required: true, Target: "GoodsReceipt"},
 			{Name: "po_line_id", Type: entity.FieldReference, Required: true, Target: "POLine"},
 			{Name: "item_id", Type: entity.FieldReference, Required: true, Target: "Item"},
-			{Name: "qty_received", Type: entity.FieldNumber, Required: true},
+			{Name: "qty_received", Type: entity.FieldNumber, Required: true, Min: entity.Float64Ptr(0)},
 		},
 	}
 }
@@ -424,8 +445,9 @@ func GoodsReceiptLine() *entity.Definition {
 // CustomerInvoice's own graph).
 func VendorInvoice() *entity.Definition {
 	return &entity.Definition{
-		EntityType:     "VendorInvoice",
-		Version:        2,
+		EntityType: "VendorInvoice",
+		// Version 3 (uc-infra#80): total gained a Min:0 bound.
+		Version:        3,
 		Module:         "purchasing",
 		StatusTypeCode: "vendor_invoice_status",
 		Fields: []entity.Field{
@@ -435,7 +457,7 @@ func VendorInvoice() *entity.Definition {
 			{Name: "invoice_date", Type: entity.FieldDate, Required: true},
 			{Name: "currency_id", Type: entity.FieldReference, Target: "Currency"},
 			{Name: "status_id", Type: entity.FieldReference, Required: true, Target: "Status"},
-			{Name: "total", Type: entity.FieldNumber, Default: float64(0)},
+			{Name: "total", Type: entity.FieldNumber, Default: float64(0), Min: entity.Float64Ptr(0)},
 			// match_exception_reason: set by MatchVendorInvoiceOnUpdate
 			// (ledger.go) with the human-readable reason the last match
 			// attempt failed, the moment status_id lands on
@@ -472,15 +494,17 @@ func VendorInvoice() *entity.Definition {
 func ReorderRule() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "ReorderRule",
-		Version:    1,
-		Module:     "purchasing",
+		// Version 2 (uc-infra#80): reorder_point and safety_stock gained
+		// Min:0 bounds.
+		Version: 2,
+		Module:  "purchasing",
 		Fields: []entity.Field{
 			{Name: "item_id", Type: entity.FieldReference, Required: true, Target: "Item"},
-			{Name: "reorder_point", Type: entity.FieldNumber, Required: true},
+			{Name: "reorder_point", Type: entity.FieldNumber, Required: true, Min: entity.Float64Ptr(0)},
 			// safety_stock defaults to 0 rather than being required —
 			// "no buffer" is a legitimate policy and the signal math
 			// treats a missing value as 0 anyway (issue #30's design).
-			{Name: "safety_stock", Type: entity.FieldNumber, Default: float64(0)},
+			{Name: "safety_stock", Type: entity.FieldNumber, Default: float64(0), Min: entity.Float64Ptr(0)},
 			// p90 default: the conservative choice — a buyer who never
 			// touches this field gets "order early enough that 90% of
 			// history would have arrived in time", not the coin-flip P50.
@@ -552,12 +576,13 @@ func RequestForQuotation() *entity.Definition {
 func RequestForQuotationLine() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "RequestForQuotationLine",
-		Version:    1,
-		Module:     "purchasing",
+		// Version 2 (uc-infra#80): qty gained a Min:0 bound.
+		Version: 2,
+		Module:  "purchasing",
 		Fields: []entity.Field{
 			{Name: "request_for_quotation_id", Type: entity.FieldReference, Required: true, Target: "RequestForQuotation"},
 			{Name: "item_id", Type: entity.FieldReference, Required: true, Target: "Item"},
-			{Name: "qty", Type: entity.FieldNumber, Required: true},
+			{Name: "qty", Type: entity.FieldNumber, Required: true, Min: entity.Float64Ptr(0)},
 		},
 	}
 }
@@ -611,12 +636,13 @@ func RequestForQuotationVendor() *entity.Definition {
 func RequestForQuotationQuoteLine() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "RequestForQuotationQuoteLine",
-		Version:    1,
-		Module:     "purchasing",
+		// Version 2 (uc-infra#80): unit_price gained a Min:0 bound.
+		Version: 2,
+		Module:  "purchasing",
 		Fields: []entity.Field{
 			{Name: "rfq_line_id", Type: entity.FieldReference, Required: true, Target: "RequestForQuotationLine"},
 			{Name: "vendor_id", Type: entity.FieldReference, Required: true, Target: "Party"},
-			{Name: "unit_price", Type: entity.FieldNumber, Required: true},
+			{Name: "unit_price", Type: entity.FieldNumber, Required: true, Min: entity.Float64Ptr(0)},
 			{Name: "quoted_at", Type: entity.FieldDate},
 		},
 	}

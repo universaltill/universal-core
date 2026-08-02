@@ -391,8 +391,8 @@ func TestFixedAsset_UpgradeFromV1(t *testing.T) {
 	}
 
 	def := publishedDef(t, tenantDB, "FixedAsset")
-	if def.Version != 2 {
-		t.Errorf("entity: GetPublished returned v%d, want v2", def.Version)
+	if want := FixedAsset().Version; def.Version != want {
+		t.Errorf("entity: GetPublished returned v%d, want v%d", def.Version, want)
 	}
 	var hasRelated bool
 	for _, r := range def.Relationships {

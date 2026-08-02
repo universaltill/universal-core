@@ -112,8 +112,15 @@ func Period() *entity.Definition {
 func TaxCode() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "TaxCode",
-		Version:    1,
-		Module:     "finance",
+		// Version 2 (uc-infra#80): rate gained a Min:0 bound — a negative
+		// tax rate has no meaning. Deliberately no Max: unlike
+		// crm.Opportunity.probability, a rate's upper bound is jurisdiction
+		// policy (compound/luxury rates can legitimately exceed 100 in
+		// some tax regimes), not a kernel-invariant ceiling — plugin
+		// territory per this repo's own plugin-first rule, not something
+		// to cap here.
+		Version: 2,
+		Module:  "finance",
 		Fields: []entity.Field{
 			{Name: "code", Type: entity.FieldString, Required: true},
 			{Name: "name", Type: entity.FieldString, Required: true},
@@ -122,7 +129,7 @@ func TaxCode() *entity.Definition {
 			// eventually computes an actual tax amount divides by 100
 			// itself rather than this field storing a pre-divided fraction
 			// that would look wrong rendered directly in a form.
-			{Name: "rate", Type: entity.FieldNumber, Required: true},
+			{Name: "rate", Type: entity.FieldNumber, Required: true, Min: entity.Float64Ptr(0)},
 			{Name: "tax_type", Type: entity.FieldEnum, Required: true,
 				EnumValues: []string{"vat", "withholding", "sales"}},
 			{Name: "jurisdiction", Type: entity.FieldString},

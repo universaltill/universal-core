@@ -117,10 +117,18 @@ func PostGoodsReceiptLineToLedger(ctx context.Context, tx *sql.Tx, _ *entity.Def
 
 // ValidateStockTransfer is a crud.Hook (internal/kernel/crud.Hook) —
 // register it for the "StockTransfer" entity type (Engine.SetHook) to
-// reject two business-rule violations entity.Field has no way to express
-// yet (#80: no Min/Max, no cross-field-inequality concept): a transfer
-// whose from_facility_id and to_facility_id are the same (not a transfer
-// at all), and a transfer with qty <= 0.
+// reject two business-rule violations entity.Field still has no way to
+// express even with Min/Max (uc-infra#80): a transfer whose
+// from_facility_id and to_facility_id are the same (a cross-field
+// comparison — Min/Max is single-field only), and a transfer with
+// qty <= 0 specifically (Min is inclusive, so qty's own declared Min:0
+// already rejects every negative value; this hook's qty check narrows
+// the remaining gap, qty == 0, that an inclusive bound structurally
+// cannot). The two mechanisms layer rather than duplicate: qty's Min:0
+// is what a form's min="0" attribute, csvimport's preview, and
+// recordmigrate's dry run all see (none of those run crud.Hooks), and
+// this hook is the strictly-greater-than-zero backstop for the one path
+// that does.
 //
 // Validation-only, unlike PostGoodsReceiptLineToLedger: no ledger
 // posting, no audit write of its own — a rejection returns
