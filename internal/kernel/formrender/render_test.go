@@ -768,11 +768,105 @@ func TestRender_MasterDetailRollUp(t *testing.T) {
 		t.Fatalf("render: %v", err)
 	}
 	out := buf.String()
-	if !strings.Contains(out, "total: 350.5") {
-		t.Fatalf("expected roll-up total 350.5, got:\n%s", out)
+	// The label is "Total" (resolved through field.PurchaseOrder.total,
+	// #99), not the raw "total" field name; data-field stays raw so a
+	// selector keyed on it still works across locales.
+	if !strings.Contains(out, `<p class="uc-rollup" data-field="total">Total: 350.5</p>`) {
+		t.Fatalf("expected roll-up total 350.5 with a resolved label, got:\n%s", out)
 	}
 	if !strings.Contains(out, `id="total" name="total" value="350.5"`) {
 		t.Fatalf("expected the roll-up target field on the Header section to carry the freshly computed total, got:\n%s", out)
+	}
+}
+
+// TestRender_MasterDetailColumnsAndRollUpLabelResolveThroughCatalog (#99):
+// master-detail column headers and the roll-up label previously rendered
+// the raw snake_case field name verbatim in every locale — the one
+// rendering path in this form that never got the field.{EntityType}.
+// {FieldName} treatment #53/#85's sibling field labels already have. Uses
+// the real POLine/PurchaseOrder catalog entries (not a synthetic test
+// key) so this is a proof the production wiring resolves, the same shape
+// TestRender_SectionTitleResolvesThroughCatalog uses for #53. Turkish is
+// asserted, not English, because an English-locale assertion here could
+// pass by coincidence (Total/total, Quantity/quantity) without proving
+// translation actually happened (same reasoning that test documents).
+func TestRender_MasterDetailColumnsAndRollUpLabelResolveThroughCatalog(t *testing.T) {
+	r := testRenderer(t)
+	childDef := &entity.Definition{
+		EntityType: "POLine", Version: 1,
+		Fields: []entity.Field{{Name: "qty", Type: entity.FieldNumber}},
+	}
+	data := Data{
+		RecordID: "po-1",
+		Record:   map[string]any{"payment_method": "Wire"},
+		Children: map[string][]map[string]any{
+			"POLine": {{"qty": 5.0, "line_total": 5.0}},
+		},
+		ChildDefs: map[string]*entity.Definition{"POLine": childDef},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "tr"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, `<th data-field="qty">Miktar</th>`) {
+		t.Errorf("expected the qty column header resolved to Turkish via field.POLine.qty, got:\n%s", out)
+	}
+	if !strings.Contains(out, `data-field="total">Toplam: 5</p>`) {
+		t.Errorf("expected the roll-up label resolved to Turkish via field.PurchaseOrder.total, got:\n%s", out)
+	}
+}
+
+// TestRender_MasterDetailColumnsFallBackToRawFieldNameWhenUntranslated
+// (#99): a column/roll-up label with no catalog entry — or no child
+// Definition at all — must still show the raw field name, not go blank.
+// This is the branch that protects every module from #99's own
+// regression (GoodsReceiptLine's four fields shipping with no catalog
+// keys, caught by independent review): TOrDefault degrading silently to
+// its fallback is correct behavior at render time, but only if the
+// fallback is actually wired through, which is exactly what this test
+// pins down.
+func TestRender_MasterDetailColumnsFallBackToRawFieldNameWhenUntranslated(t *testing.T) {
+	r := testRenderer(t)
+
+	// No catalog entry exists for field.Untranslated.* in any locale.
+	childDef := &entity.Definition{
+		EntityType: "Untranslated", Version: 1,
+		Fields: []entity.Field{{Name: "widget_count", Type: entity.FieldNumber}},
+	}
+	data := Data{
+		RecordID: "po-1",
+		Record:   map[string]any{"payment_method": "Wire"},
+		Children: map[string][]map[string]any{
+			"POLine": {{"widget_count": 3.0}},
+		},
+		ChildDefs: map[string]*entity.Definition{"POLine": childDef},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, `<th data-field="widget_count">widget_count</th>`) {
+		t.Errorf("expected an untranslated column header to fall back to the raw field name, got:\n%s", out)
+	}
+
+	// No ChildDefs entry at all (childDef == nil): buildChildRows falls
+	// back to the union of the rows' own keys, and childColumns must
+	// still label each with its own raw name, not an empty string.
+	dataNoChildDef := Data{
+		RecordID: "po-1",
+		Record:   map[string]any{"payment_method": "Wire"},
+		Children: map[string][]map[string]any{
+			"POLine": {{"widget_count": 3.0}},
+		},
+	}
+	var buf2 strings.Builder
+	if err := r.Render(&buf2, purchaseOrderForm(), purchaseOrderEntity(), dataNoChildDef, "en"); err != nil {
+		t.Fatalf("render (no ChildDefs): %v", err)
+	}
+	if !strings.Contains(buf2.String(), `<th data-field="widget_count">widget_count</th>`) {
+		t.Errorf("expected a column header with no child Definition at all to still show the raw field name, got:\n%s", buf2.String())
 	}
 }
 

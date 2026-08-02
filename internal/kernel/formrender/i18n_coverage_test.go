@@ -28,6 +28,7 @@ import (
 	"github.com/universaltill/universal-core/internal/i18n"
 	"github.com/universaltill/universal-core/internal/kernel/assets"
 	"github.com/universaltill/universal-core/internal/kernel/crm"
+	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/finance"
 	"github.com/universaltill/universal-core/internal/kernel/form"
 	"github.com/universaltill/universal-core/internal/kernel/formrender"
@@ -66,6 +67,34 @@ func allModuleForms() []*form.Definition {
 	var out []*form.Definition
 	for _, forms := range moduleFormSets() {
 		out = append(out, forms...)
+	}
+	return out
+}
+
+// entityByType indexes every module's All() (the same entity.Definition
+// lists Publish seeds into a tenant) by EntityType, for #99's coverage
+// gate below to resolve a master_detail/related_list section's Target
+// (or a RollUp's parent entity) to the Definition whose Fields it needs
+// to walk. Mirrors moduleFormSets' module list exactly — kept as a
+// separate literal rather than derived from it because entity.All() and
+// form.AllForms() are two different per-module functions with no shared
+// registry to draw both from.
+func entityByType() map[string]*entity.Definition {
+	sets := [][]*entity.Definition{
+		foundation.All(),
+		sales.All(),
+		projects.All(),
+		crm.All(),
+		hr.All(),
+		assets.All(),
+		finance.All(),
+		purchasing.All(),
+	}
+	out := make(map[string]*entity.Definition)
+	for _, defs := range sets {
+		for _, d := range defs {
+			out[d.EntityType] = d
+		}
 	}
 	return out
 }
@@ -167,5 +196,76 @@ func TestSectionAndSaveActionCatalogCoverage(t *testing.T) {
 	}
 	if checked == 0 {
 		t.Fatal("no sections found across any module's AllForms() — moduleFormSets is stale or every module returned nothing, either way this test isn't checking anything")
+	}
+}
+
+// TestMasterDetailAndRollUpCatalogCoverage is #99's own coverage gate,
+// the same reason TestSectionAndSaveActionCatalogCoverage exists for
+// #53: without it, a module could add a master_detail/related_list
+// section (or a RollUp) whose child fields or roll-up target have no
+// field.{EntityType}.{FieldName} translation, and buildChildRows/the
+// roll-up label would silently degrade to the raw field name in every
+// locale with nothing to notice — exactly how GoodsReceiptLine's four
+// fields shipped untranslated in the first version of this fix (caught
+// by independent review, not by any test, which is why this exists now).
+func TestMasterDetailAndRollUpCatalogCoverage(t *testing.T) {
+	catalog, err := i18n.Load("en")
+	if err != nil {
+		t.Fatalf("load i18n catalog: %v", err)
+	}
+	locales := []string{"en", "ar", "fa", "tr"}
+	entities := entityByType()
+
+	checkedFields, checkedRollUps := 0, 0
+	seenKeys := map[string]bool{}
+	for _, def := range allModuleForms() {
+		for _, s := range def.Sections {
+			if s.Component != form.ComponentMasterDetail && s.Component != form.ComponentRelatedList {
+				continue
+			}
+			childDef, ok := entities[s.Target]
+			if !ok {
+				t.Errorf("section %q of entity %q targets %q, which has no Definition in entityByType — "+
+					"either a stale Target or entityByType's module list needs updating", s.Title, def.EntityType, s.Target)
+				continue
+			}
+			for _, f := range childDef.Fields {
+				key := "field." + childDef.EntityType + "." + f.Name
+				if seenKeys[key] {
+					continue
+				}
+				seenKeys[key] = true
+				for _, locale := range locales {
+					if !hasRealTranslation(catalog, locale, key) {
+						t.Errorf("no %s translation for child column %q of entity %q (missing catalog key %q, "+
+							"rendered by a master_detail/related_list section on %q)",
+							locale, f.Name, childDef.EntityType, key, def.EntityType)
+					}
+				}
+				checkedFields++
+			}
+
+			if s.RollUp == "" {
+				continue
+			}
+			key := "field." + def.EntityType + "." + s.RollUpTarget
+			if seenKeys[key] {
+				continue
+			}
+			seenKeys[key] = true
+			for _, locale := range locales {
+				if !hasRealTranslation(catalog, locale, key) {
+					t.Errorf("no %s translation for roll-up target %q of entity %q (missing catalog key %q)",
+						locale, s.RollUpTarget, def.EntityType, key)
+				}
+			}
+			checkedRollUps++
+		}
+	}
+	if checkedFields == 0 {
+		t.Fatal("no master_detail/related_list child columns found across any module's AllForms() — this test isn't checking anything")
+	}
+	if checkedRollUps == 0 {
+		t.Fatal("no RollUp sections found across any module's AllForms() — the roll-up label check below never ran")
 	}
 }
