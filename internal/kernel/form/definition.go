@@ -64,7 +64,16 @@ type Action struct {
 	Op       ActionOp `json:"op"`
 	Workflow string   `json:"workflow,omitempty"` // required when Op == OpWorkflowStart
 	Report   string   `json:"report,omitempty"`   // required when Op == OpReportRender
-	Route    string   `json:"route,omitempty"`    // required when Op == OpNavigate
+	// Route is required when Op == OpNavigate. It may contain a literal
+	// "{id}" placeholder, substituted by formrender with the current
+	// record's id (url.PathEscape'd) — a route with the placeholder is
+	// omitted from the rendered form entirely on a new/unsaved record
+	// (no id to substitute yet), the same degrade-rather-than-dead-link
+	// behavior a Save action's hidden "_version" field already has for
+	// that case. A route with no placeholder (e.g. a plain "Back" link)
+	// renders unconditionally, exactly as before this field's meaning
+	// was extended.
+	Route string `json:"route,omitempty"`
 }
 
 // Definition is one version of a form's layout for an entity type.

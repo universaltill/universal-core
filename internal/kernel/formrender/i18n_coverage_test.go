@@ -129,6 +129,10 @@ func hasRealTranslation(c *i18n.Catalog, locale, key string) bool {
 	return c.HasOwn(locale, key) && strings.TrimSpace(c.T(locale, key)) != ""
 }
 
+// Also covers every non-Save Action's Label (formrender.ActionCatalogKey),
+// added for uc-infra#66's "Download UBL file" navigate action — the
+// first production Definition to use a non-Save action, so this is the
+// first run where that half of the gate has anything real to check.
 func TestSectionAndSaveActionCatalogCoverage(t *testing.T) {
 	catalog, err := i18n.Load("en")
 	if err != nil {
@@ -147,6 +151,12 @@ func TestSectionAndSaveActionCatalogCoverage(t *testing.T) {
 	// locale. No such pair exists today (verified across all 81 sections
 	// of all 8 modules); this keeps it that way.
 	titleForKey := map[string]string{}
+	// labelForKey is ActionCatalogKey's own version of titleForKey's
+	// collision guard, for the same reason: two DIFFERENT Labels on the
+	// SAME EntityType could slug to one key and silently share a
+	// translation. Checked alongside sections in one pass rather than a
+	// second loop over allModuleForms() — same data, same reasoning.
+	labelForKey := map[string]string{}
 	sawSaveAction := false
 	for _, def := range allModuleForms() {
 		for _, s := range def.Sections {
@@ -175,10 +185,34 @@ func TestSectionAndSaveActionCatalogCoverage(t *testing.T) {
 			checked++
 		}
 		for _, a := range def.Actions {
-			if a.Op != form.OpSave {
+			if a.Op == form.OpSave {
+				sawSaveAction = true
 				continue
 			}
-			sawSaveAction = true
+			// Every non-Save action (uc-infra#66's "Download UBL file"
+			// is the first production one) resolves through
+			// ActionCatalogKey, formrender.ActionCatalogKey's own doc
+			// comment — the per-entity-and-action key
+			// SaveActionCatalogKey's doc comment flagged as the thing
+			// to add "when a real form actually needs one". Without
+			// this half of the gate, a future action could ship with a
+			// Label and no translation and nothing would ever notice,
+			// exactly the hole this whole test exists to close for
+			// sections.
+			key := formrender.ActionCatalogKey(def.EntityType, a.Label)
+			if prev, ok := labelForKey[key]; ok && prev != a.Label {
+				t.Errorf("action labels %q and %q of entity %q both slug to catalog key %q — "+
+					"they would share one translation; rename one or give the slug rule more to work with",
+					prev, a.Label, def.EntityType, key)
+			}
+			labelForKey[key] = a.Label
+			for _, locale := range locales {
+				if !hasRealTranslation(catalog, locale, key) {
+					t.Errorf("no %s translation for action %q (op %s) of entity %q (missing catalog key %q)",
+						locale, a.Label, a.Op, def.EntityType, key)
+				}
+			}
+			checked++
 		}
 	}
 	// One global key, so check it once rather than once per form per

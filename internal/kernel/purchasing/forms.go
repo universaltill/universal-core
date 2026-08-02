@@ -34,16 +34,21 @@ func ItemForm() *form.Definition {
 // PurchaseOrderForm's Lines section is a real master-detail (Target:
 // "POLine", rolling POLine.line_total up into PurchaseOrder.total) — the
 // same pattern formrender/render_test.go's fixture already exercises,
-// now backing an actual entity instead of just a test fixture. No
+// now backing an actual entity instead of just a test fixture. Still no
 // workflow/report actions: unlike that fixture's "Submit for Approval"/
 // "Print", this kernel doesn't have a po_approval workflow or po_print
 // report defined yet (QUEUE.md) — adding an action wired to a
-// nonexistent workflow/report would 404 the moment someone clicked it,
-// so Save is the only real action for now.
+// nonexistent workflow/report would 404 the moment someone clicked it.
+// The "Download UBL file" navigate action (v6, uc-infra#66) is real,
+// though: GET /export/PurchaseOrder/{id}/ubl has existed since #27, it
+// was just unreachable from any rendered page until this — the {id}
+// placeholder is formrender's per-record navigate substitution
+// (form.Action.Route's own doc comment), so it's simply absent on the
+// "new" form (nothing to export yet) rather than a dead link.
 func PurchaseOrderForm() *form.Definition {
 	return &form.Definition{
 		EntityType: "PurchaseOrder",
-		Version:    5,
+		Version:    6,
 		Sections: []form.Section{
 			{
 				Title:     "Header",
@@ -84,6 +89,7 @@ func PurchaseOrderForm() *form.Definition {
 		},
 		Actions: []form.Action{
 			{Label: "Save", Op: form.OpSave},
+			{Label: "Download UBL file", Op: form.OpNavigate, Route: "/export/PurchaseOrder/{id}/ubl"},
 		},
 	}
 }

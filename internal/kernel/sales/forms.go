@@ -4,13 +4,16 @@ import "github.com/universaltill/universal-core/internal/kernel/form"
 
 // SalesOrderForm's Lines section is a real master-detail (Target:
 // "SOLine", rolling SOLine.line_total up into SalesOrder.total) — the
-// same pattern PurchaseOrderForm uses for POLine. No workflow/report
-// actions, same reasoning as PurchaseOrderForm's own doc comment: this
-// kernel has no so_approval workflow or sales report defined yet.
+// same pattern PurchaseOrderForm uses for POLine. Still no workflow/
+// report actions, same reasoning as PurchaseOrderForm's own doc comment:
+// this kernel has no so_approval workflow or sales report defined yet.
+// The "Download UBL file" navigate action (v2, uc-infra#66) mirrors
+// PurchaseOrderForm's own — see that Definition's doc comment for why
+// it's safe to add without a workflow/report behind it.
 func SalesOrderForm() *form.Definition {
 	return &form.Definition{
 		EntityType: "SalesOrder",
-		Version:    1,
+		Version:    2,
 		Sections: []form.Section{
 			{
 				Title:     "Header",
@@ -34,6 +37,7 @@ func SalesOrderForm() *form.Definition {
 		},
 		Actions: []form.Action{
 			{Label: "Save", Op: form.OpSave},
+			{Label: "Download UBL file", Op: form.OpNavigate, Route: "/export/SalesOrder/{id}/ubl"},
 		},
 	}
 }
@@ -64,11 +68,12 @@ func SOLineForm() *form.Definition {
 // CustomerInvoiceForm has no master-detail section, unlike
 // SalesOrderForm/GoodsReceiptForm — CustomerInvoice has no line-item
 // child entity in this first slice (this package's own doc comment on
-// CustomerInvoice).
+// CustomerInvoice). The "Download UBL file" navigate action (v2,
+// uc-infra#66) mirrors PurchaseOrderForm's own.
 func CustomerInvoiceForm() *form.Definition {
 	return &form.Definition{
 		EntityType: "CustomerInvoice",
-		Version:    1,
+		Version:    2,
 		Sections: []form.Section{
 			{
 				Title:     "Details",
@@ -86,6 +91,7 @@ func CustomerInvoiceForm() *form.Definition {
 		},
 		Actions: []form.Action{
 			{Label: "Save", Op: form.OpSave},
+			{Label: "Download UBL file", Op: form.OpNavigate, Route: "/export/CustomerInvoice/{id}/ubl"},
 		},
 	}
 }

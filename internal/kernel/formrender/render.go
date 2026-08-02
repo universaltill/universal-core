@@ -84,6 +84,22 @@ func SectionCatalogKey(entityType, title string) string {
 	return "form." + entityType + ".section." + slugifyTitle(title)
 }
 
+// ActionCatalogKey is SectionCatalogKey's counterpart for a non-Save
+// Action's Label: a per-entity-type key ("form."+entityType+".action."+
+// slug(label)") so two entities can independently translate an action
+// with the same English label, same reasoning as field labels and
+// section titles. This is the "add a per-entity-and-action key the same
+// way SectionCatalogKey works... when a real form actually needs one"
+// this file's own SaveActionCatalogKey doc comment already flagged as
+// the next step — the UBL export download button (uc-infra#66,
+// following up #27's independent review finding that the export was
+// unreachable from the UI) is the first real form to need it. Exported
+// so i18n_coverage_test.go's external test package can compute the same
+// key this package's own render path looks up.
+func ActionCatalogKey(entityType, label string) string {
+	return "form." + entityType + ".action." + slugifyTitle(label)
+}
+
 // Data is everything the renderer needs beyond the two Definitions: the
 // record's current field values (nil/empty for a new, unsaved record) and,
 // for master_detail/related_list sections, each section's child records
@@ -465,9 +481,41 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 	vm.HiddenFields = buildHiddenFields(ent, effective, rendered, data.RedactedFields)
 
 	for _, a := range def.Actions {
-		av := actionView{Label: a.Label, Op: a.Op, Route: a.Route}
+		// A navigate Route may carry a "{id}" placeholder for the
+		// current record's own id (e.g. "/export/PurchaseOrder/{id}/
+		// ubl") — the same per-record link shape ReportHref/WorkflowHref
+		// already build from data.RecordID, just declared in the
+		// Definition instead of hardcoded here, so it stays generic
+		// (works for any entity/route, not a PurchaseOrder-specific
+		// branch — CLAUDE.md's kernel/deterministic-core boundary
+		// rule). A record that doesn't exist yet (data.RecordID == "",
+		// the "new" form) has nothing to navigate to, so the action is
+		// omitted entirely rather than rendering a dead link — the same
+		// reasoning Data.Version's own doc comment gives for not
+		// rendering "_version" on a new record.
+		if a.Op == form.OpNavigate && strings.Contains(a.Route, "{id}") && data.RecordID == "" {
+			continue
+		}
+		av := actionView{Op: a.Op, Route: a.Route}
+		if a.Op == form.OpNavigate {
+			av.Route = strings.ReplaceAll(a.Route, "{id}", url.PathEscape(data.RecordID))
+		}
 		if a.Op == form.OpSave {
+			// One global key: every OpSave action in every Definition
+			// this kernel ships uses the identical literal Label, so
+			// there is nothing to key per entity on (SaveActionCatalogKey's
+			// own doc comment).
 			av.Label = r.i18n.TOrDefault(locale, SaveActionCatalogKey, a.Label)
+		} else {
+			// Every other op carries a genuinely per-instance Label, so
+			// it resolves through the per-entity-and-action key
+			// SaveActionCatalogKey's doc comment already anticipated
+			// (ActionCatalogKey, above) rather than the one shared
+			// Save key. TOrDefault's usual additive-fallback guarantee
+			// applies: a Definition whose action has no catalog entry
+			// yet (none did before this change) renders exactly as it
+			// always has, in every locale.
+			av.Label = r.i18n.TOrDefault(locale, ActionCatalogKey(def.EntityType, a.Label), a.Label)
 		}
 		switch a.Op {
 		case form.OpWorkflowStart:
