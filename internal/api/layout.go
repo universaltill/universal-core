@@ -184,6 +184,107 @@ var shellTmpl = template.Must(template.New("shell").Parse(fmt.Sprintf(`<!doctype
     showToast({{.ToastNetworkError}});
   });
 
+  // Global console/error capture for the in-app issue logger
+  // (internal/api/issuereport.go, universaltill/uc-infra#46): every page
+  // already goes through this one shell, so wiring this here — same
+  // reasoning as the htmx error-toast listener above — means the issue
+  // report page can pick up what happened on whichever page the problem
+  // actually occurred on, not just its own. Persisted to sessionStorage
+  // (tab lifetime only, not localStorage) rather than sent anywhere; the
+  // issue-report page is the only reader, and only once a human has
+  // reviewed — and can still edit/redact — it in a visible textarea
+  // before Submit (not readonly, unlike the voice transcript: that field
+  // is the user's own dictated speech, this one is machine-harvested
+  // content they never authored and may need to strike something from).
+  // Capped so an unbounded run of console spam can't grow this without
+  // bound; oldest entries drop first. Every listener body is wrapped in
+  // try/catch: a bug in this capture code must never be able to break
+  // the app it's supposed to be helping debug.
+  //
+  // Keyed per-tenant (ucTenantKey below), not one bare origin-wide key:
+  // sessionStorage survives an in-tab tenant switch
+  // (guardTenantHeader/X-UC-Tenant above is exactly why that's possible)
+  // and a same-tab logout/login, and this kernel's multi-tenancy rule
+  // (universal-core/CLAUDE.md) treats cross-tenant content mixing as the
+  // single most consequential thing to avoid — Tenant A's console output
+  // must never end up pre-filled into a report filed against Tenant B.
+  // issueReportSubmit's own script clears this tenant's key once a
+  // submission is underway, so a filed report's content isn't silently
+  // resubmitted/inflated by a second report in the same session.
+  //
+  // Single-quoted string literals below ('error', not "error") are
+  // deliberate, not stylistic: this script is rendered into every page's
+  // body, and TestAPI_RBAC_DeniedPageIsLocalized (and friends) assert a
+  // rendered page never contains the double-quoted substring error, as a
+  // check against accidentally serving the raw JSON envelope instead of
+  // a page. A double-quoted "error" here would trip that check on every
+  // page, not just the denial page.
+  function ucTenantKey() {
+    var nav = document.querySelector("[data-uc-tenant]");
+    return "ucConsoleLog:" + (nav ? nav.getAttribute("data-uc-tenant") : "anonymous");
+  }
+  var ucLogMaxEntries = 200;
+  var ucLogMaxChars = 20000;
+  function ucAppendLog(entry) {
+    try {
+      var key = ucTenantKey();
+      var buf;
+      try {
+        buf = JSON.parse(window.sessionStorage.getItem(key) || "[]");
+        if (!Array.isArray(buf)) { buf = []; }
+      } catch (e) {
+        buf = [];
+      }
+      buf.push(entry);
+      while (buf.length > ucLogMaxEntries) {
+        buf.shift();
+      }
+      while (buf.join("\n").length > ucLogMaxChars && buf.length > 1) {
+        buf.shift();
+      }
+      window.sessionStorage.setItem(key, JSON.stringify(buf));
+    } catch (e) {
+      // sessionStorage unavailable (private mode, quota, etc.) — capture
+      // is best-effort, never worth surfacing to the user.
+    }
+  }
+  try {
+    ['error', 'warn'].forEach(function(level) {
+      var original = console[level];
+      console[level] = function() {
+        try {
+          var parts = Array.prototype.slice.call(arguments).map(String);
+          ucAppendLog("[" + level + "] " + parts.join(" "));
+        } catch (e) {
+          // never let capture break the original console call below.
+        }
+        if (original) { original.apply(console, arguments); }
+      };
+    });
+    window.addEventListener('error', function(evt) {
+      try {
+        var msg = evt && evt.message ? evt.message : "window error";
+        var loc = evt && evt.filename ? (" (" + evt.filename + ":" + evt.lineno + ")") : "";
+        ucAppendLog("[error] " + msg + loc);
+      } catch (e) {
+        // see ucAppendLog's own try/catch note above.
+      }
+    });
+    window.addEventListener("unhandledrejection", function(evt) {
+      try {
+        var reason = evt && evt.reason ? String(evt.reason) : "unhandled rejection";
+        ucAppendLog("[unhandledrejection] " + reason);
+      } catch (e) {
+        // see ucAppendLog's own try/catch note above.
+      }
+    });
+  } catch (e) {
+    // Installing the capture itself must never be able to take down
+    // everything registered after it in this same IIFE (the reference-
+    // field combobox below) — e.g. some environment where console is
+    // missing or non-configurable. Capture is simply absent in that case.
+  }
+
   // Searchable reference-field combobox (#24). A reference field renders
   // as .uc-ref { hidden input (the id), text input (the search), results
   // div }. Typing queries /api/references/{target}; clicking an option

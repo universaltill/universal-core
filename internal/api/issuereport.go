@@ -67,6 +67,7 @@ func (h *Handler) issueReportNewPage(w http.ResponseWriter, r *http.Request) {
 		StopLabel:         h.catalog.T(locale, "issue_report.stop_button"),
 		TranscribingLabel: h.catalog.T(locale, "issue_report.transcribing"),
 		TranscriptLabel:   h.catalog.T(locale, "issue_report.transcript_label"),
+		ConsoleLogLabel:   h.catalog.T(locale, "issue_report.console_log_label"),
 		SubmitLabel:       h.catalog.T(locale, "issue_report.submit_button"),
 		NoMicLabel:        h.catalog.T(locale, "issue_report.no_mic"),
 	})
@@ -183,6 +184,7 @@ func (h *Handler) issueReportSubmit(w http.ResponseWriter, r *http.Request) {
 		"title":       r.PostForm.Get("title"),
 		"description": r.PostForm.Get("description"),
 		"transcript":  r.PostForm.Get("transcript"),
+		"console_log": r.PostForm.Get("console_log"),
 		"page_url":    r.PostForm.Get("page_url"),
 		"user_agent":  r.Header.Get("User-Agent"),
 	} {
@@ -222,6 +224,7 @@ type issueReportPageView struct {
 	StopLabel         string
 	TranscribingLabel string
 	TranscriptLabel   string
+	ConsoleLogLabel   string
 	SubmitLabel       string
 	NoMicLabel        string
 }
@@ -259,6 +262,9 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
 <label for="uc-issue-transcript">{{.TranscriptLabel}}</label>
 <textarea id="uc-issue-transcript" name="transcript" rows="4" readonly></textarea>
 
+<label for="uc-issue-console-log">{{.ConsoleLogLabel}}</label>
+<textarea id="uc-issue-console-log" name="console_log" rows="4"></textarea>
+
 <input type="hidden" name="page_url" id="uc-issue-page-url">
 <button type="submit">{{.SubmitLabel}}</button>
 </form>
@@ -267,6 +273,52 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
 <script>
 (function() {
   document.getElementById("uc-issue-page-url").value = window.location.href;
+
+  // Same per-tenant key derivation as internal/api/layout.go's shellTmpl
+  // (ucTenantKey there) — duplicated rather than shared, since this page
+  // has no JS module system to share it through; both must agree on the
+  // key shape or the prefill silently finds nothing.
+  function ucTenantKey() {
+    var nav = document.querySelector("[data-uc-tenant]");
+    return "ucConsoleLog:" + (nav ? nav.getAttribute("data-uc-tenant") : "anonymous");
+  }
+
+  // Pre-fill the console-log textarea from whatever internal/api/layout.
+  // go's shellTmpl has been buffering into sessionStorage, scoped to this
+  // tenant, since this tab's session started — best-effort, same as the
+  // capture itself: a browser that never ran that script (or cleared
+  // storage) just leaves this textarea blank, exactly like "no mic"
+  // leaves the transcript blank. Left editable (not readonly) so a human
+  // who spots something they'd rather not send — a token, another
+  // tenant's data leaking through some bug — can strike it before Submit.
+  try {
+    var rawLog = window.sessionStorage.getItem(ucTenantKey());
+    if (rawLog) {
+      var entries = JSON.parse(rawLog);
+      if (Array.isArray(entries) && entries.length > 0) {
+        document.getElementById("uc-issue-console-log").value = entries.join("\n");
+      }
+    }
+  } catch (e) {
+    // malformed/unavailable sessionStorage — leave the textarea blank.
+  }
+
+  // Clear this tenant's buffered log once a submission is underway, so a
+  // second report filed later in the same tab session doesn't keep
+  // re-surfacing (and re-storing) console output that already made it
+  // into a filed report. This is a plain (non-htmx) form post — the
+  // browser navigates away regardless of whether the submission actually
+  // succeeds, so "before Submit's native navigation proceeds" is the only
+  // hook available; a failed submission (e.g. a validation 400) also
+  // clears it, an accepted trade-off for not needing a fetch-based
+  // submit flow just for this.
+  document.getElementById("uc-issue-report-form").addEventListener("submit", function() {
+    try {
+      window.sessionStorage.removeItem(ucTenantKey());
+    } catch (e) {
+      // best-effort, same as capture itself.
+    }
+  });
 
   var recordBtn = document.getElementById("uc-issue-record-btn");
   var statusEl = document.getElementById("uc-issue-record-status");

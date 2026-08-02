@@ -55,7 +55,12 @@ func PartyForm() *form.Definition {
 func IssueReportForm() *form.Definition {
 	return &form.Definition{
 		EntityType: "IssueReport",
-		Version:    1,
+		// Version bumped 1->2 alongside IssueReport entity's own v1->v2
+		// (foundation.go) to carry the new console_log field into the
+		// triage view — a field a human can never actually see and act on
+		// otherwise, since this is the only surface that renders a
+		// submitted report.
+		Version: 2,
 		Sections: []form.Section{
 			{
 				Title:     "Details",
@@ -64,6 +69,7 @@ func IssueReportForm() *form.Definition {
 					{Name: "title", Label: "Title"},
 					{Name: "description", Label: "Description"},
 					{Name: "transcript", Label: "Voice Transcript"},
+					{Name: "console_log", Label: "Console Log"},
 					{Name: "page_url", Label: "Page"},
 					{Name: "user_agent", Label: "Browser"},
 					{Name: "status", Label: "Status"},

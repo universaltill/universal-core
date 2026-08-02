@@ -96,6 +96,7 @@
   "issue_report.stop_button": "Stop recording",
   "issue_report.transcribing": "Transcribing…",
   "issue_report.transcript_label": "Voice transcript",
+  "issue_report.console_log_label": "Console log",
   "issue_report.submit_button": "Submit",
   "issue_report.no_mic": "Voice recording isn't available in this browser — please type your description instead.",
   "issue_report.result_heading": "Thanks — your report was submitted",

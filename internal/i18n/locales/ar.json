@@ -96,6 +96,7 @@
   "issue_report.stop_button": "إيقاف التسجيل",
   "issue_report.transcribing": "جارٍ تحويل الصوت إلى نص…",
   "issue_report.transcript_label": "النص الصوتي",
+  "issue_report.console_log_label": "سجل وحدة التحكم",
   "issue_report.submit_button": "إرسال",
   "issue_report.no_mic": "تسجيل الصوت غير متاح في هذا المتصفح — يرجى كتابة الوصف بدلاً من ذلك.",
   "issue_report.result_heading": "شكرًا — تم إرسال بلاغك",

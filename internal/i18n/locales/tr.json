@@ -96,6 +96,7 @@
   "issue_report.stop_button": "Kaydı durdur",
   "issue_report.transcribing": "Metne dönüştürülüyor…",
   "issue_report.transcript_label": "Ses dökümü",
+  "issue_report.console_log_label": "Konsol günlüğü",
   "issue_report.submit_button": "Gönder",
   "issue_report.no_mic": "Bu tarayıcıda ses kaydı kullanılamıyor — lütfen açıklamanızı yazın.",
   "issue_report.result_heading": "Teşekkürler — bildiriminiz gönderildi",

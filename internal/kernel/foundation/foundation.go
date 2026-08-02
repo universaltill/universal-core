@@ -411,10 +411,22 @@ func StatusTransition() *entity.Definition {
 // entity is the interim (and permanent, regardless — an audit trail of
 // every report ever submitted, filed or not) store; filing to GitHub is
 // a later step that would read from here, not replace it.
+// console_log (v2, optional) is the browser's own console.error/warn
+// output plus any uncaught error/unhandledrejection since the page that
+// captured it loaded — see internal/api/layout.go's shellTmpl and
+// internal/api/issuereport.go. Optional, same as transcript: a browser
+// with nothing captured (or an old row from before this field existed)
+// just omits the key, no recordmigrate backfill needed since this isn't
+// Required. Version bumped 1->2 regardless (same reasoning as UserRole's
+// v1->v2 department_id addition, b90ff56): an unbumped Version is a
+// no-op for every tenant whose registry already has v1 published
+// (moduleseed.publishOne returns early once a version's status is
+// already Published), so the field would silently never reach an
+// already-provisioned tenant without this.
 func IssueReport() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "IssueReport",
-		Version:    1,
+		Version:    2,
 		Module:     "foundation",
 		Fields: []entity.Field{
 			{Name: "title", Type: entity.FieldString, Required: true},
@@ -425,6 +437,7 @@ func IssueReport() *entity.Definition {
 			// human's own edits to description never lose the original.
 			{Name: "description", Type: entity.FieldString, Required: true},
 			{Name: "transcript", Type: entity.FieldString},
+			{Name: "console_log", Type: entity.FieldString},
 			{Name: "page_url", Type: entity.FieldString},
 			{Name: "user_agent", Type: entity.FieldString},
 			{Name: "status", Type: entity.FieldEnum, Required: true,

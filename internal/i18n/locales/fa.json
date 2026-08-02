@@ -96,6 +96,7 @@
   "issue_report.stop_button": "توقف ضبط",
   "issue_report.transcribing": "در حال تبدیل صدا به متن…",
   "issue_report.transcript_label": "متن پیاده‌شده صدا",
+  "issue_report.console_log_label": "گزارش کنسول",
   "issue_report.submit_button": "ارسال",
   "issue_report.no_mic": "ضبط صدا در این مرورگر در دسترس نیست — لطفاً توضیحات را تایپ کنید.",
   "issue_report.result_heading": "با تشکر — گزارش شما ارسال شد",
