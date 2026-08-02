@@ -1,6 +1,7 @@
 /bin/
 *.log
 .DS_Store
+/coverage.out
 
 # This repo is public. docs/ (ADRs, code-review records) and infra/
 # (Terraform) live in the private universaltill/uc-infra repo instead —

@@ -125,7 +125,7 @@ jobs:
         # -coverpkg=./...-minus-cmd measurement (see
         # uc-infra/docs/code-reviews/2026-08-02-tdd-coverage-gate.md).
         run: |
-          COVERAGE_FLOOR=PLACEHOLDER
+          COVERAGE_FLOOR=84.0
           TOTAL=$(go tool cover -func=coverage.out | tail -1 | awk '{print $NF}' | tr -d '%')
           echo "Whole-program coverage: ${TOTAL}% (floor: ${COVERAGE_FLOOR}%)"
           awk -v t="$TOTAL" -v f="$COVERAGE_FLOOR" 'BEGIN { exit (t+0 >= f+0) ? 0 : 1 }' || {
