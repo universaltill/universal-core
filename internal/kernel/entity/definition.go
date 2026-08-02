@@ -327,6 +327,20 @@ func (d *Definition) Validate() error {
 			if cond.Entity != "" && cond.EntityField == "" {
 				return fmt.Errorf("field %q has a target_filter condition on entity %q with no entity_field", f.Name, cond.Entity)
 			}
+			// An entity-join condition's EntityField and Field must be
+			// DIFFERENT keys in the equals map crud.ExistsByFieldsQ builds
+			// from them ({EntityField: targetID, Field: cond.Value}) —
+			// independent review: when they're equal, the second entry
+			// silently overwrites the first, collapsing the query to just
+			// "does entity=value exist" with no join to the candidate
+			// target at all, so the constraint would silently pass for
+			// EVERY candidate with no error anywhere. Rejected at
+			// definition-validation time (this is data a human reviews
+			// before publish, ADR-0017 §14) rather than working around the
+			// collapse in the map-based query itself.
+			if cond.Entity != "" && cond.EntityField == cond.Field {
+				return fmt.Errorf("field %q has a target_filter condition on entity %q whose entity_field and field are both %q — they must name different columns", f.Name, cond.Entity, cond.Field)
+			}
 		}
 		if f.MustMatchParentField != "" {
 			if f.Type != FieldReference {

@@ -215,6 +215,39 @@ func nodeFormDef() *form.Definition {
 	}
 }
 
+// groupedItemEntityDef/groupedItemFormDef are a throwaway self-referencing
+// entity carrying MustMatchParentField (uc-infra#78) — the HTTP-level
+// counterpart of internal/kernel/crud/target_constraints_test.go's own
+// groupedItemDef, used here to prove crud.ErrTargetConstraintViolation's
+// mapping to a translated 400 (independent review, finding #6/#7: this
+// had zero coverage at the HTTP layer, and the message shipped
+// untranslated before that fix).
+func groupedItemEntityDef() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "GroupedItem",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "name", Type: entity.FieldString, Required: true},
+			{Name: "group_id", Type: entity.FieldString, Required: true},
+			{Name: "parent_item_id", Type: entity.FieldReference, Target: "GroupedItem", MustMatchParentField: "group_id"},
+		},
+	}
+}
+
+func groupedItemFormDef() *form.Definition {
+	return &form.Definition{
+		EntityType: "GroupedItem",
+		Version:    1,
+		Sections: []form.Section{
+			{Title: "Details", Component: form.ComponentFields, Fields: []form.FormField{
+				{Name: "name", Label: "Name"},
+				{Name: "group_id", Label: "Group"},
+				{Name: "parent_item_id", Label: "Parent Item"},
+			}},
+		},
+	}
+}
+
 // publishEntityAndForm drives both Definitions through
 // CreateDraft -> Approve -> Publish, so handler tests can exercise a
 // real registry lookup instead of constructing a Definition in Go and
@@ -713,6 +746,73 @@ func TestAPI_CreateRecord_HookRejectionIs400(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("expected the rejected create to roll back entirely, found %d Vendor records", count)
+	}
+}
+
+// TestAPI_UpdateRecord_TargetConstraintViolationIs400Localized is the
+// HTTP-level proof that crud.ErrTargetConstraintViolation (a
+// *crud.TargetConstraintError, uc-infra#78) reaches the client as a 400
+// with a TRANSLATED per-field message — independent review findings #6
+// (the message shipped untranslated, contradicting CLAUDE.md's "no
+// hardcoded user-facing strings") and #7 (zero coverage at this layer)
+// together. Uses groupedItemEntityDef's MustMatchParentField shape
+// rather than TargetFilter's entity-join shape — either exercises the
+// same writeCrudErrorLocalized mapping, and this one needs no second
+// entity type/PartyRole fixture to set up.
+func TestAPI_UpdateRecord_TargetConstraintViolationIs400Localized(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, groupedItemEntityDef(), groupedItemFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	createParent := newRequest("POST", "/api/records/GroupedItem", tenantID, "farshid",
+		[]byte(`{"name":"A-root","group_id":"group-a"}`))
+	parentRec := httptest.NewRecorder()
+	mux.ServeHTTP(parentRec, createParent)
+	var parent struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(parentRec.Body.Bytes(), &parent); err != nil {
+		t.Fatalf("unmarshal parent create response: %v", err)
+	}
+
+	createChild := newRequest("POST", "/api/records/GroupedItem", tenantID, "farshid",
+		[]byte(`{"name":"B-child","group_id":"group-b"}`))
+	childRec := httptest.NewRecorder()
+	mux.ServeHTTP(childRec, createChild)
+	var child struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(childRec.Body.Bytes(), &child); err != nil {
+		t.Fatalf("unmarshal child create response: %v", err)
+	}
+
+	// Assigning the group-a parent to the group-b child violates
+	// MustMatchParentField.
+	updateReq := newRequest("POST", "/api/records/GroupedItem/"+child.Data.ID, tenantID, "farshid",
+		[]byte(`{"name":"B-child","group_id":"group-b","parent_item_id":"`+parent.Data.ID+`","version":1}`))
+	updateRec := httptest.NewRecorder()
+	mux.ServeHTTP(updateRec, updateReq)
+	if updateRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a target constraint violation, got %d: %s", updateRec.Code, updateRec.Body.String())
+	}
+	// The translated envelope message (crud.error.target_constraint_violation,
+	// {field} resolved via the field-label catalog, falling back to the raw
+	// field name — no field.GroupedItem.parent_item_id key exists), NOT the
+	// untranslated Detail text (entity/field/value-naming, e.g. "expected").
+	want := `The selected value for parent_item_id does not meet this field's required constraint.`
+	if !strings.Contains(updateRec.Body.String(), want) {
+		t.Fatalf("expected the translated envelope message %q, got: %s", want, updateRec.Body.String())
+	}
+	if strings.Contains(updateRec.Body.String(), "expected \"group-b\"") {
+		t.Fatalf("expected the raw untranslated Detail text NOT to reach the client, got: %s", updateRec.Body.String())
 	}
 }
 
@@ -1562,6 +1662,23 @@ func orderFormDefWithVendorReference() *form.Definition {
 	}
 }
 
+// orderEntityDefWithJoinFilteredVendorReference is
+// orderEntityDefWithVendorReference plus an entity-join TargetFilter on
+// vendor_id (the TimeEntry.employee_id/PurchaseOrder.vendor_id shape) —
+// used by TestAPI_RenderForm_ReferenceCreateButtonHiddenForJoinTargetFilter
+// (finding #10) below.
+func orderEntityDefWithJoinFilteredVendorReference() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "Order",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "vendor_id", Type: entity.FieldReference, Target: "Vendor", TargetFilter: []entity.TargetFilterCondition{
+				{Entity: "VendorRole", EntityField: "vendor_id", Field: "role_type", Value: "vendor"},
+			}},
+		},
+	}
+}
+
 // TestAPI_RenderForm_ReferenceFieldRendersComboboxNotFullList is the
 // end-to-end regression test for #24's actual scaling fix (formrender's
 // own tests cover the template logic in isolation): a reference field
@@ -1806,6 +1923,41 @@ func TestAPI_RenderForm_ReferenceCreateButtonHiddenWithoutQuickCreatable(t *test
 	body := rec.Body.String()
 	if strings.Contains(body, `<button type="button" class="uc-ref-create"`) {
 		t.Fatalf("expected no quick-create button for a non-QuickCreatable target despite full CanWrite, got:\n%s", body)
+	}
+}
+
+// TestAPI_RenderForm_ReferenceCreateButtonHiddenForJoinTargetFilter is
+// the regression test for independent review finding #10: quick-create
+// from a picker can only POST a bare new record of the target type — it
+// has no way to also create the separate joined-entity row (e.g. a
+// PartyRole/VendorRole) an entity-join TargetFilter condition requires,
+// which would guarantee the very next save 400s with no way to fix it
+// from that dialog. Vendor here IS QuickCreatable and this actor DOES
+// hold CanWrite on it (both other gates pass), isolating that the
+// suppression is specifically about the join TargetFilter shape.
+func TestAPI_RenderForm_ReferenceCreateButtonHiddenForJoinTargetFilter(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, quickCreatableVendorEntityDef(), vendorFormDef())
+	publishEntityAndForm(t, db, orderEntityDefWithJoinFilteredVendorReference(), orderFormDefWithVendorReference())
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	req := newRequest("GET", "/forms/Order/new", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, `<button type="button" class="uc-ref-create"`) {
+		t.Fatalf("expected no quick-create button for a field with a join TargetFilter, got:\n%s", body)
+	}
+	// The search/select half of the picker must still work.
+	if !strings.Contains(body, `class="uc-ref" data-target="Vendor" data-field="vendor_id"`) {
+		t.Fatalf("expected the vendor_id combobox to still render, got:\n%s", body)
 	}
 }
 

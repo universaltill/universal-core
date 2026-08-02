@@ -133,6 +133,7 @@ func (h *Handler) searchReferenceOptions(w http.ResponseWriter, r *http.Request)
 					}
 					opts.EqualsFilters = constraintOpts.EqualsFilters
 					opts.IDIn = constraintOpts.IDIn
+					opts.JoinFilters = constraintOpts.JoinFilters
 				}
 			}
 		}

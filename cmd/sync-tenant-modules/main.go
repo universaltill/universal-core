@@ -58,12 +58,14 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"reflect"
 	"strings"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
+	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/modules"
 	"github.com/universaltill/universal-core/internal/tenantdb"
@@ -253,8 +255,10 @@ func syncTenant(
 		report(name, id, optional, external, changes, true)
 		reportBlocked(name, id, blocked)
 		want := codeDefinitions(optional)
-		return requiredFieldWarnings(ctx, tenantDB, name, changes,
-			func(t string) (*entity.Definition, bool) { d, ok := want[t]; return d, ok }), outcomeSynced
+		defFor := func(t string) (*entity.Definition, bool) { d, ok := want[t]; return d, ok }
+		warnings := requiredFieldWarnings(ctx, tenantDB, name, changes, defFor)
+		warnings = append(warnings, targetConstraintWarnings(ctx, tenantDB, entityDefs, name, changes, defFor)...)
+		return warnings, outcomeSynced
 	}
 
 	// A failure part-way through leaves this tenant PARTIALLY published,
@@ -306,18 +310,20 @@ func syncTenant(
 			name, id, failure)
 	}
 
-	return requiredFieldWarnings(ctx, tenantDB, name, changes,
-		func(t string) (*entity.Definition, bool) {
-			v, err := entityDefs.GetPublished(ctx, t)
-			if err != nil {
-				return nil, false
-			}
-			var def entity.Definition
-			if err := json.Unmarshal(v.Definition, &def); err != nil {
-				return nil, false
-			}
-			return &def, true
-		}), result
+	defFor := func(t string) (*entity.Definition, bool) {
+		v, err := entityDefs.GetPublished(ctx, t)
+		if err != nil {
+			return nil, false
+		}
+		var def entity.Definition
+		if err := json.Unmarshal(v.Definition, &def); err != nil {
+			return nil, false
+		}
+		return &def, true
+	}
+	warnings := requiredFieldWarnings(ctx, tenantDB, name, changes, defFor)
+	warnings = append(warnings, targetConstraintWarnings(ctx, tenantDB, entityDefs, name, changes, defFor)...)
+	return warnings, result
 }
 
 // outcome is how one tenant fared. Partial is deliberately distinct
@@ -584,4 +590,87 @@ func requiredFieldWarnings(
 		}
 	}
 	return out
+}
+
+// targetConstraintWarnings is requiredFieldWarnings' counterpart for a
+// FieldReference's declared TargetFilter/MustMatchParentField
+// (uc-infra#78 follow-up, same class of gap as uc-infra#73): a version
+// bump that adds or tightens one of these constraints can invalidate
+// existing records the exact same way a newly-Required field does, and
+// this command's whole reason for reporting anything (see the package
+// doc comment) is so an operator sees that BEFORE the next edit-and-save
+// of one of those records 400s with no warning it was coming.
+//
+// "Added or tightened" is judged by comparing the field's declaration on
+// the OLD published Definition (c.from, looked up via entityDefs) against
+// defFor's result, field by field (targetConstraintChanged). A field
+// whose TargetFilter/MustMatchParentField is byte-for-byte unchanged from
+// the previous version needs no new check — whatever warning surfaced
+// when it was FIRST added already covered it, and re-warning on every
+// later unrelated version bump would train an operator to ignore this
+// list. A brand-new-to-the-registry type (c.from == 0, oldDef left nil)
+// is deliberately NOT skipped, the same reasoning requiredFieldWarnings'
+// own doc comment gives: "new to the published registry" does not mean
+// "no records" (a rolled-back version's records are still there) — every
+// constrained field is treated as newly-added and checked; the check
+// itself is cheap (a handful of indexed page reads) when there really
+// are zero records.
+func targetConstraintWarnings(
+	ctx context.Context,
+	tenantDB *sql.DB,
+	entityDefs *data.EntityDefinitionRepo,
+	tenantName string,
+	changes []change,
+	defFor func(entityType string) (*entity.Definition, bool),
+) []string {
+	records := data.NewRecordRepo(tenantDB)
+	var out []string
+	for _, c := range changes {
+		newDef, ok := defFor(c.entityType)
+		if !ok {
+			continue
+		}
+		var oldDef *entity.Definition
+		if c.from > 0 {
+			v, err := entityDefs.GetVersion(ctx, c.entityType, c.from)
+			if err == nil {
+				var d entity.Definition
+				if json.Unmarshal(v.Definition, &d) == nil {
+					oldDef = &d
+				}
+			}
+		}
+		for _, f := range newDef.Fields {
+			if f.Type != entity.FieldReference || (len(f.TargetFilter) == 0 && f.MustMatchParentField == "") {
+				continue
+			}
+			if oldDef != nil && !targetConstraintChanged(oldDef, f) {
+				continue
+			}
+			n, err := crud.CountTargetConstraintViolations(ctx, tenantDB, records, newDef, f.Name)
+			if err != nil || n == 0 {
+				continue
+			}
+			out = append(out, fmt.Sprintf(
+				"%s: %s — %d record(s) already violate the new reference constraint on %q and will fail validation on next edit",
+				tenantName, c.entityType, n, f.Name))
+		}
+	}
+	return out
+}
+
+// targetConstraintChanged reports whether newField's declared
+// TargetFilter/MustMatchParentField is new, or differs from, the
+// same-named field on oldDef — deliberately comparing just those two
+// constraint mechanisms, not the whole Field (a relabel or an unrelated
+// Required flip is not this warning's concern).
+func targetConstraintChanged(oldDef *entity.Definition, newField entity.Field) bool {
+	oldField, ok := oldDef.FieldByName(newField.Name)
+	if !ok {
+		return true // the field itself is new
+	}
+	if oldField.MustMatchParentField != newField.MustMatchParentField {
+		return true
+	}
+	return !reflect.DeepEqual(oldField.TargetFilter, newField.TargetFilter)
 }

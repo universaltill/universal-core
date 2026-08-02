@@ -327,6 +327,26 @@ func TestDefinitionValidate(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			// Independent review finding #8: crud.ExistsByFieldsQ's call
+			// site builds map[string]string{EntityField: targetID, Field:
+			// cond.Value} — when EntityField == Field, the second entry
+			// silently overwrites the first in that map, collapsing the
+			// query to "does entity=value exist" with no join to the
+			// candidate target at all, disabling the constraint with no
+			// error anywhere. Rejected here instead, at
+			// definition-validation time.
+			name: "target_filter entity_field and field must differ",
+			def: Definition{
+				EntityType: "TimeEntry",
+				Fields: []Field{
+					{Name: "employee_id", Type: FieldReference, Target: "Party", TargetFilter: []TargetFilterCondition{
+						{Entity: "PartyRole", EntityField: "role_type", Field: "role_type", Value: "employee"},
+					}},
+				},
+			},
+			wantErr: true,
+		},
+		{
 			name: "valid direct-field target_filter (no entity)",
 			def: Definition{
 				EntityType: "Vendor",

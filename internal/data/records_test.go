@@ -450,6 +450,127 @@ func TestRecordRepo_ListPageFilteredIDIn(t *testing.T) {
 	}
 }
 
+// TestRecordRepo_ListPageFilteredJoinFilters (independent review,
+// uc-infra#78 follow-up): JoinFilters is the correlated-EXISTS
+// replacement for the original resolve-then-IDIn shape a TargetFilter
+// entity-join condition used to go through (RecordRepo.DistinctFieldValues
+// + ListPageOptions.IDIn) — this proves the SQL-pushed-down narrowing
+// actually filters correctly end to end against real Postgres: only
+// candidates with a matching row in the joined entity type come back,
+// multiple JoinFilters entries AND together, and a soft-deleted joined
+// row doesn't count as a match (same "deleted is absent" posture every
+// other read in this file already takes).
+func TestRecordRepo_ListPageFilteredJoinFilters(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(db)
+
+	employee, err := repo.Create(ctx, "Person", map[string]any{"name": "Jamie"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := repo.Create(ctx, "PersonRole", map[string]any{"person_id": employee.ID, "role_type": "employee"}); err != nil {
+		t.Fatalf("create role: %v", err)
+	}
+	vendor, err := repo.Create(ctx, "Person", map[string]any{"name": "Acme"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := repo.Create(ctx, "PersonRole", map[string]any{"person_id": vendor.ID, "role_type": "vendor"}); err != nil {
+		t.Fatalf("create role: %v", err)
+	}
+	noRole, err := repo.Create(ctx, "Person", map[string]any{"name": "Nobody"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	jf := JoinFilter{Entity: "PersonRole", EntityField: "person_id", Field: "role_type", Value: "employee"}
+
+	recs, err := repo.ListPageFiltered(ctx, "Person", ListPageOptions{JoinFilters: []JoinFilter{jf}, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListPageFiltered with JoinFilters: %v", err)
+	}
+	if len(recs) != 1 || recs[0].ID != employee.ID {
+		t.Fatalf("expected exactly the employee record, got %+v", recs)
+	}
+	for _, rec := range recs {
+		if rec.ID == vendor.ID || rec.ID == noRole.ID {
+			t.Fatalf("JoinFilters leaked a non-matching candidate: %+v", recs)
+		}
+	}
+
+	n, err := repo.CountFiltered(ctx, "Person", ListPageOptions{JoinFilters: []JoinFilter{jf}})
+	if err != nil || n != 1 {
+		t.Fatalf("CountFiltered with JoinFilters: got %d (%v), want 1", n, err)
+	}
+
+	// A soft-deleted PersonRole must not count as a match.
+	deletedRoleHolder, err := repo.Create(ctx, "Person", map[string]any{"name": "Departed"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	deletedRole, err := repo.Create(ctx, "PersonRole", map[string]any{"person_id": deletedRoleHolder.ID, "role_type": "employee"})
+	if err != nil {
+		t.Fatalf("create role: %v", err)
+	}
+	if err := repo.Delete(ctx, "PersonRole", deletedRole.ID); err != nil {
+		t.Fatalf("delete role: %v", err)
+	}
+	afterSoftDelete, err := repo.ListPageFiltered(ctx, "Person", ListPageOptions{JoinFilters: []JoinFilter{jf}, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListPageFiltered with JoinFilters after soft-delete: %v", err)
+	}
+	for _, rec := range afterSoftDelete {
+		if rec.ID == deletedRoleHolder.ID {
+			t.Fatalf("a soft-deleted PersonRole should not satisfy the join filter, got %+v", afterSoftDelete)
+		}
+	}
+}
+
+// TestRecordRepo_ListPageFilteredJoinFilters_MultipleConditionsAND proves
+// two JoinFilters entries on the same call compose with AND semantics —
+// a candidate must satisfy EVERY entry, not any one of them (mirroring
+// EqualsFilters' own AND composition, and replacing what intersectIDSets
+// used to do in Go for the entity-join TargetFilter shape).
+func TestRecordRepo_ListPageFilteredJoinFilters_MultipleConditionsAND(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(db)
+
+	both, err := repo.Create(ctx, "Person", map[string]any{"name": "Both"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := repo.Create(ctx, "PersonRole", map[string]any{"person_id": both.ID, "role_type": "employee"}); err != nil {
+		t.Fatalf("create role: %v", err)
+	}
+	if _, err := repo.Create(ctx, "PersonCert", map[string]any{"person_id": both.ID, "cert_type": "safety"}); err != nil {
+		t.Fatalf("create cert: %v", err)
+	}
+
+	onlyEmployee, err := repo.Create(ctx, "Person", map[string]any{"name": "OnlyEmployee"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := repo.Create(ctx, "PersonRole", map[string]any{"person_id": onlyEmployee.ID, "role_type": "employee"}); err != nil {
+		t.Fatalf("create role: %v", err)
+	}
+
+	recs, err := repo.ListPageFiltered(ctx, "Person", ListPageOptions{
+		JoinFilters: []JoinFilter{
+			{Entity: "PersonRole", EntityField: "person_id", Field: "role_type", Value: "employee"},
+			{Entity: "PersonCert", EntityField: "person_id", Field: "cert_type", Value: "safety"},
+		},
+		Limit: 10,
+	})
+	if err != nil {
+		t.Fatalf("ListPageFiltered with two JoinFilters: %v", err)
+	}
+	if len(recs) != 1 || recs[0].ID != both.ID {
+		t.Fatalf("expected exactly the record satisfying BOTH join filters, got %+v", recs)
+	}
+}
+
 func TestRecordRepo_ExistsByFieldsQ(t *testing.T) {
 	db := freshTenantDB(t)
 	ctx := context.Background()

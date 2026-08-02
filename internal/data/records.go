@@ -310,19 +310,58 @@ type ListPageOptions struct {
 	EqualsFilters []FieldEquals
 	// IDIn optionally restricts results to only these ids — independent
 	// of FilterField/FilterValue/FilterIn (which test a DECLARED
-	// field's own value against the query), used to intersect a
-	// reference picker's free-text label search with a
-	// separately-resolved candidate-id set — e.g. TargetFilter's
-	// role-holding join condition, resolved via
-	// RecordRepo.DistinctFieldValues to the set of Party ids that hold
-	// the required PartyRole (uc-infra#78). Nil means no restriction. A
+	// field's own value against the query). Nil means no restriction. A
 	// non-nil EMPTY slice means "resolved to no matches" and returns no
 	// rows — the same convention FilterIn already documents, for the
 	// same reason: collapsing "no matches" into "no restriction" is the
 	// more dangerous default.
-	IDIn   []string
-	Limit  int
-	Offset int
+	//
+	// NOT used for TargetFilter's entity-join condition (uc-infra#78)
+	// any more — see JoinFilters below for why that moved off this
+	// mechanism. IDIn stays available as a generic "restrict to this
+	// already-known id set" primitive for any future caller that
+	// legitimately has one in hand.
+	IDIn []string
+	// JoinFilters are additional narrowing conditions requiring a
+	// candidate record to have at least one matching row in ANOTHER
+	// entity type, checked via a correlated EXISTS subquery — the
+	// mechanism a FieldReference's declared TargetFilter entity-join
+	// condition (Field.TargetFilter with Entity set) uses to narrow a
+	// reference picker's candidates (uc-infra#78): e.g. "does a
+	// PartyRole exist with party_id = this candidate's id AND
+	// role_type = 'employee'?". Every entry ANDs together (every
+	// condition on a field must hold), the same AND semantics
+	// EqualsFilters already gives its own entries.
+	//
+	// Deliberately pushed down as a correlated EXISTS rather than
+	// resolved application-side into a value list and re-bound as an
+	// array parameter (RecordRepo.DistinctFieldValues, the ORIGINAL
+	// shape this replaced) — independent review: that shape read the
+	// ENTIRE matching set of the OTHER entity type into memory on every
+	// debounced picker keystroke, unbounded, exactly the "will not work
+	// at 1000s of rows" scale problem this endpoint exists to fix in
+	// the first place. A correlated EXISTS lets Postgres decide per
+	// candidate row whether a match exists, without ever materializing
+	// the full joined set.
+	JoinFilters []JoinFilter
+	Limit       int
+	Offset      int
+}
+
+// JoinFilter is one entity-join narrowing condition — see
+// ListPageOptions.JoinFilters. Every field name and value is bound as a
+// parameter, the same discipline every other generic field-name-driven
+// query in this file follows.
+type JoinFilter struct {
+	// Entity is the OTHER entity type to check.
+	Entity string
+	// EntityField is the field on Entity that should hold the
+	// candidate record's own id.
+	EntityField string
+	// Field/Value is the condition Entity's matching row must also
+	// satisfy (e.g. role_type = "employee").
+	Field string
+	Value string
 }
 
 // FieldEquals is one exact-match field/value condition — see
@@ -337,7 +376,7 @@ type FieldEquals struct {
 // returned. Without it, filtering to 3 rows would still show "Page 1 of
 // 40".
 func (r *RecordRepo) CountFiltered(ctx context.Context, entityType string, opts ListPageOptions) (int, error) {
-	if opts.FilterField == "" && len(opts.EqualsFilters) == 0 && opts.IDIn == nil {
+	if opts.FilterField == "" && len(opts.EqualsFilters) == 0 && opts.IDIn == nil && len(opts.JoinFilters) == 0 {
 		return r.CountByEntityType(ctx, entityType)
 	}
 	where, args := filterWhereClause(entityType, opts)
@@ -379,8 +418,30 @@ func filterWhereClause(entityType string, opts ListPageOptions) (string, []any) 
 		where += fmt.Sprintf(` AND data->>$%d = $%d`, len(args)-1, len(args))
 	}
 	if opts.IDIn != nil {
+		// id = ANY($n::uuid[]), not id::text = ANY($n): casting the
+		// PARAMETER to uuid[] (Postgres infers the array element type
+		// from the explicit cast) instead of casting the PK column to
+		// text lets this use records' own primary-key btree index —
+		// independent review: the previous id::text cast defeated it,
+		// forcing a sequential scan of records for every call.
 		args = append(args, opts.IDIn)
-		where += fmt.Sprintf(` AND id::text = ANY($%d)`, len(args))
+		where += fmt.Sprintf(` AND id = ANY($%d::uuid[])`, len(args))
+	}
+	for i, jf := range opts.JoinFilters {
+		// A correlated EXISTS, not a resolve-then-array-bind — see
+		// JoinFilters' own doc comment on why. records is referenced by
+		// its bare table name from inside the subquery (the outer query
+		// never aliases it either), which Postgres resolves as the
+		// outer row per SQL's normal correlated-subquery scoping rules.
+		// The subquery's own alias (j0, j1, ...) is unique per condition
+		// so multiple JoinFilters entries don't collide with each other.
+		args = append(args, jf.Entity, jf.EntityField, jf.Field, jf.Value)
+		n := len(args)
+		alias := fmt.Sprintf("j%d", i)
+		where += fmt.Sprintf(
+			` AND EXISTS (SELECT 1 FROM records %s WHERE %s.entity_type = $%d AND %s.deleted_at IS NULL AND %s.data->>$%d = records.id::text AND %s.data->>$%d = $%d)`,
+			alias, alias, n-3, alias, alias, n-2, alias, n-1, n,
+		)
 	}
 	return where, args
 }

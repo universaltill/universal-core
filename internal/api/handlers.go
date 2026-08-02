@@ -492,6 +492,26 @@ func (h *Handler) writeCrudErrorLocalized(w http.ResponseWriter, r *http.Request
 		httpx.WriteError(w, http.StatusBadRequest, h.catalog.T(locale, "sor.mode_reserved"))
 		return
 	}
+	// crud.TargetConstraintError (uc-infra#78) is a routine data-entry
+	// mistake a real end user hits, not a rare admin-only action, so it
+	// gets the same translated-envelope treatment as the two SoR cases
+	// above rather than writeCrudError's untranslated ErrReferenceCycle/
+	// ErrHookRejected precedent (independent review: that precedent was
+	// the wrong one to follow here — CLAUDE.md's "no hardcoded
+	// user-facing strings"). Detail (entity/field/value-naming, possibly
+	// already generalized by GuardedEngine.sanitizeTargetConstraintError)
+	// is logged in full server-side; only the field name is surfaced to
+	// the caller, resolved through the same field-label catalog key
+	// (field.{EntityType}.{FieldName}) listview.go's column headers use.
+	var tce *crud.TargetConstraintError
+	if errors.As(err, &tce) {
+		log.Printf("api: %s: %v", logContext, err)
+		locale := localeFromRequest(w, r)
+		fieldLabel := h.catalog.TOrDefault(locale, "field."+tce.EntityType+"."+tce.FieldName, tce.FieldName)
+		msg := strings.ReplaceAll(h.catalog.T(locale, "crud.error.target_constraint_violation"), "{field}", fieldLabel)
+		httpx.WriteError(w, http.StatusBadRequest, msg)
+		return
+	}
 	writeCrudError(w, logContext, err)
 }
 
@@ -1210,9 +1230,40 @@ func (h *Handler) loadReferenceCreateLabels(ctx context.Context, ts tenantScope,
 		if !state.quickCreatable || !state.canWrite {
 			continue
 		}
+		if hasJoinTargetFilter(f) {
+			// The quick-create dialog (layout.go's .uc-ref-create handler)
+			// can only POST a bare new record of f.Target — it has no way
+			// to ALSO create the separate joined-entity row (e.g. a
+			// PartyRole) an entity-join TargetFilter condition requires
+			// (TimeEntry.employee_id's "must hold the employee PartyRole"),
+			// so offering the button here would guarantee the very next
+			// save 400s with no way to fix it from that dialog
+			// (independent review, uc-infra#78 follow-up, finding #10).
+			// Suppressed rather than offered-then-broken.
+			continue
+		}
 		out[f.Name] = h.catalog.T(locale, "form.reference.create_new") + " " + h.entityDisplayName(locale, f.Target)
 	}
 	return out, nil
+}
+
+// hasJoinTargetFilter reports whether f declares an entity-join
+// TargetFilter condition (Field.TargetFilter with Entity set) — see
+// loadReferenceCreateLabels' own use above for why this specific shape
+// is what a quick-create dialog cannot satisfy. Direct-field TargetFilter
+// (Entity == "") and MustMatchParentField are deliberately NOT gated
+// here: MustMatchParentField's own record-target-side value being unset
+// on a freshly quick-created target is already tolerated as "not
+// comparable, skip" (checkReferenceTargetConstraints' own posture, see
+// its doc comment), so a quick-created Task with no project_id yet does
+// not 400 the way a quick-created Party with no PartyRole row would.
+func hasJoinTargetFilter(f entity.Field) bool {
+	for _, cond := range f.TargetFilter {
+		if cond.Entity != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // loadCurrentReferenceLabels resolves ONLY the label of each reference

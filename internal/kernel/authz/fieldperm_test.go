@@ -440,3 +440,42 @@ func TestGuardedEngine_RejectsHiddenSortFilter(t *testing.T) {
 		t.Fatalf("sorting by a visible field should work: %v", err)
 	}
 }
+
+// TestGuardedEngine_RejectsHiddenEqualsFilter: EqualsFilters is the
+// mechanism a FieldReference's TargetFilter/MustMatchParentField
+// narrowing reaches ListPageFiltered/CountFiltered through
+// (internal/kernel/crud.Engine.ResolveReferenceFilter), and
+// MustMatchParentField's entry carries the caller-supplied sibling_value
+// query param as its equality VALUE against a field name that can be
+// RBAC-hidden — independent review (uc-infra#78 follow-up): without this
+// guard, a role that can read Party but not its hidden tax_id could use
+// tax_id as an EqualsFilters key to bisect its values via the reference
+// search endpoint, exactly the oracle rejectHiddenSortFilter already
+// existed to close for SortField/FilterField.
+func TestGuardedEngine_RejectsHiddenEqualsFilter(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	clerk := f.role("clerk")
+	f.grant("user-clerk", clerk.ID)
+	f.hide(clerk.ID, "Party", "tax_id")
+
+	g := guardedFor(f, "user-clerk")
+	def := f.def("Party")
+
+	if _, err := g.ListPageFiltered(ctx, def, data.ListPageOptions{
+		EqualsFilters: []data.FieldEquals{{Field: "tax_id", Value: "some-uuid"}}, Limit: 10,
+	}); !errors.Is(err, ErrDenied) {
+		t.Fatalf("EqualsFilters on a hidden field should be denied, got %v", err)
+	}
+	if _, err := g.CountFiltered(ctx, def, data.ListPageOptions{
+		EqualsFilters: []data.FieldEquals{{Field: "tax_id", Value: "some-uuid"}},
+	}); !errors.Is(err, ErrDenied) {
+		t.Fatalf("counting with EqualsFilters on a hidden field should be denied, got %v", err)
+	}
+	// A VISIBLE field is fine.
+	if _, err := g.ListPageFiltered(ctx, def, data.ListPageOptions{
+		EqualsFilters: []data.FieldEquals{{Field: "name", Value: "Open"}}, Limit: 10,
+	}); err != nil {
+		t.Fatalf("EqualsFilters on a visible field should work: %v", err)
+	}
+}

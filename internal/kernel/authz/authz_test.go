@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -543,8 +544,8 @@ func TestGuardedEngine_ResolveReferenceFilter_DropsUnreadableEntityJoinCondition
 	if err != nil {
 		t.Fatalf("ResolveReferenceFilter: %v", err)
 	}
-	if opts.IDIn != nil {
-		t.Fatalf("expected no IDIn narrowing when the caller cannot read the join entity, got %v", opts.IDIn)
+	if len(opts.JoinFilters) != 0 {
+		t.Fatalf("expected no JoinFilters narrowing when the caller cannot read the join entity, got %+v", opts.JoinFilters)
 	}
 
 	// The same field, for a caller who CAN read PartyRole, still narrows
@@ -559,7 +560,71 @@ func TestGuardedEngine_ResolveReferenceFilter_DropsUnreadableEntityJoinCondition
 	if err != nil {
 		t.Fatalf("ResolveReferenceFilter (open): %v", err)
 	}
-	if opts2.IDIn == nil {
-		t.Fatal("expected IDIn narrowing when the caller CAN read the join entity")
+	if len(opts2.JoinFilters) != 1 {
+		t.Fatalf("expected JoinFilters narrowing when the caller CAN read the join entity, got %+v", opts2.JoinFilters)
+	}
+}
+
+// TestGuardedEngine_Create_TargetConstraintError_StripsJoinDetailWhenCallerCannotReadJoinEntity
+// is the regression test for independent review finding #5:
+// crud.Engine's write-time rejection ran unguarded against the full
+// Definition, and its error message named the joined entity/field/value
+// verbatim regardless of whether the caller could read that joined
+// entity at all — a caller denied CanRead("PartyRole") could still probe
+// its membership via repeated create-and-rollback attempts reading the
+// message text. GuardedEngine.Create now generalizes the message via
+// sanitizeTargetConstraintError when CanRead(JoinEntity) is false, while
+// a caller who CAN read the joined entity still gets the full,
+// specific detail — same "least surprise" split ResolveReferenceFilter's
+// own narrowing already makes for the READ path.
+func TestGuardedEngine_Create_TargetConstraintError_StripsJoinDetailWhenCallerCannotReadJoinEntity(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+
+	vendor := f.create("Party", map[string]any{
+		"party_type": "organization", "name": "Vendor Co", "status": "active",
+	})
+	f.create("PartyRole", map[string]any{"party_id": vendor.ID, "role_type": "vendor"})
+
+	assignmentDef := &entity.Definition{
+		EntityType: "Assignment",
+		Fields: []entity.Field{
+			{Name: "title", Type: entity.FieldString, Required: true},
+			{Name: "assignee_id", Type: entity.FieldReference, Target: "Party", TargetFilter: []entity.TargetFilterCondition{
+				{Entity: "PartyRole", EntityField: "party_id", Field: "role_type", Value: "employee"},
+			}},
+		},
+	}
+
+	locked := f.role("no-party-role-read-2")
+	f.permit(locked.ID, "Assignment", true, true)
+	f.permit(locked.ID, "PartyRole", false, false) // explicitly denied
+	f.grant("user-locked-2", locked.ID)
+
+	g := Guard(f.engine, humanResolver(f, "user-locked-2"))
+	_, err := g.Create(ctx, assignmentDef, map[string]any{"title": "x", "assignee_id": vendor.ID},
+		audit.Actor{Type: audit.ActorHuman, ID: "user-locked-2"})
+	if !errors.Is(err, crud.ErrTargetConstraintViolation) {
+		t.Fatalf("expected ErrTargetConstraintViolation, got %v", err)
+	}
+	if strings.Contains(err.Error(), "PartyRole") || strings.Contains(err.Error(), "role_type") || strings.Contains(err.Error(), "employee") {
+		t.Fatalf("expected the joined entity/field/value detail to be stripped for a caller who cannot read PartyRole, got: %v", err)
+	}
+
+	// The same field, for a caller who CAN read PartyRole, still gets the
+	// full, specific detail — confirms the stripping above is
+	// permission-specific, not a blanket regression of the message.
+	open := f.role("party-role-reader-2")
+	f.permit(open.ID, "Assignment", true, true)
+	f.permit(open.ID, "PartyRole", true, false)
+	f.grant("user-open-2", open.ID)
+	gOpen := Guard(f.engine, humanResolver(f, "user-open-2"))
+	_, err2 := gOpen.Create(ctx, assignmentDef, map[string]any{"title": "x", "assignee_id": vendor.ID},
+		audit.Actor{Type: audit.ActorHuman, ID: "user-open-2"})
+	if !errors.Is(err2, crud.ErrTargetConstraintViolation) {
+		t.Fatalf("expected ErrTargetConstraintViolation, got %v", err2)
+	}
+	if !strings.Contains(err2.Error(), "PartyRole") {
+		t.Fatalf("expected full join detail for a caller who CAN read PartyRole, got: %v", err2)
 	}
 }

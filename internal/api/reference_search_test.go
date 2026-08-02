@@ -227,6 +227,160 @@ func TestReferenceSearch_HiddenLabelFieldDegradesNot403(t *testing.T) {
 	}
 }
 
+// createGroupedItem is createVendor's counterpart for groupedItemEntityDef
+// (handlers_test.go) — a small throwaway self-referencing entity carrying
+// MustMatchParentField (uc-infra#78), used by the source_entity_type/
+// source_field/sibling_value tests below.
+func createGroupedItem(t *testing.T, mux *http.ServeMux, tenantID, name, groupID string) string {
+	t.Helper()
+	body := fmt.Sprintf(`{"name":%q,"group_id":%q}`, name, groupID)
+	req := newRequest("POST", "/api/records/GroupedItem", tenantID, "farshid", []byte(body))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create GroupedItem %q: expected 201, got %d: %s", name, rec.Code, rec.Body.String())
+	}
+	var created struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal create response: %v", err)
+	}
+	return created.Data.ID
+}
+
+// TestReferenceSearch_SourceField_MustMatchParentFieldNarrowsBySiblingValue
+// is the HTTP-level proof of MustMatchParentField's own narrowing
+// (internal/kernel/crud/target_constraints_test.go's
+// TestEngine_ResolveReferenceFilter_MustMatchParentField proves the
+// mechanism itself) — independent review finding #7 flagged this had
+// zero coverage at the handler layer. sibling_value is the field being
+// tested for injection safety too: it flows straight from the query
+// string into an EqualsFilters value (crud.Engine.ResolveReferenceFilter),
+// so this also exercises that it narrows correctly rather than, say,
+// matching everything.
+func TestReferenceSearch_SourceField_MustMatchParentFieldNarrowsBySiblingValue(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, groupedItemEntityDef(), groupedItemFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	inGroupA := createGroupedItem(t, mux, tenantID, "A-item", "group-a")
+	createGroupedItem(t, mux, tenantID, "B-item", "group-b")
+
+	req := newRequest("GET",
+		"/api/references/GroupedItem?source_entity_type=GroupedItem&source_field=parent_item_id&sibling_value=group-a",
+		tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	opts := decodeRefOptions(t, rec.Body.Bytes())
+	if len(opts) != 1 || opts[0].ID != inGroupA {
+		t.Fatalf("expected exactly the group-a item, got %+v", opts)
+	}
+}
+
+// TestReferenceSearch_SourceField_UnresolvableSourceEntityTypeIgnored:
+// a source_entity_type that doesn't resolve to a real Definition (a stale
+// form, a typo) must degrade to an unnarrowed listing, not fail the whole
+// search — the same graceful-degradation posture the label/sort logic
+// already takes (independent review finding #7).
+func TestReferenceSearch_SourceField_UnresolvableSourceEntityTypeIgnored(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	id := createVendor(t, mux, tenantID, "Acme Textiles")
+
+	req := newRequest("GET",
+		"/api/references/Vendor?source_entity_type=NoSuchEntity&source_field=whatever&sibling_value=x",
+		tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 despite an unresolvable source_entity_type, got %d: %s", rec.Code, rec.Body.String())
+	}
+	opts := decodeRefOptions(t, rec.Body.Bytes())
+	if len(opts) != 1 || opts[0].ID != id {
+		t.Fatalf("expected the unnarrowed vendor list, got %+v", opts)
+	}
+}
+
+// TestReferenceSearch_SourceField_NonReferenceSourceFieldIgnored: a
+// source_field that resolves but isn't a FieldReference (a stale form
+// pointing at a plain string field) must also degrade to an unnarrowed
+// listing rather than erroring or silently matching nothing.
+func TestReferenceSearch_SourceField_NonReferenceSourceFieldIgnored(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, groupedItemEntityDef(), groupedItemFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	id := createGroupedItem(t, mux, tenantID, "A-item", "group-a")
+
+	// "name" is a plain string field on GroupedItem, not a FieldReference.
+	req := newRequest("GET",
+		"/api/references/GroupedItem?source_entity_type=GroupedItem&source_field=name&sibling_value=group-a",
+		tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 despite a non-reference source_field, got %d: %s", rec.Code, rec.Body.String())
+	}
+	opts := decodeRefOptions(t, rec.Body.Bytes())
+	if len(opts) != 1 || opts[0].ID != id {
+		t.Fatalf("expected the unnarrowed list, got %+v", opts)
+	}
+}
+
+// TestReferenceSearch_SourceField_MismatchedTargetIgnored: source_field
+// IS a real FieldReference, but its declared Target is a DIFFERENT
+// entity type than the one being searched (entityType) — a stale form
+// pointing the picker at the wrong field entirely. Must degrade to an
+// unnarrowed listing, not apply a constraint that belongs to a different
+// target type.
+func TestReferenceSearch_SourceField_MismatchedTargetIgnored(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
+	publishEntityAndForm(t, db, groupedItemEntityDef(), groupedItemFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	id := createVendor(t, mux, tenantID, "Acme Textiles")
+
+	// parent_item_id targets GroupedItem, not Vendor — searching Vendor
+	// with it named as the source field must not apply its narrowing.
+	req := newRequest("GET",
+		"/api/references/Vendor?source_entity_type=GroupedItem&source_field=parent_item_id&sibling_value=group-a",
+		tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 despite a mismatched-target source_field, got %d: %s", rec.Code, rec.Body.String())
+	}
+	opts := decodeRefOptions(t, rec.Body.Bytes())
+	if len(opts) != 1 || opts[0].ID != id {
+		t.Fatalf("expected the unnarrowed vendor list, got %+v", opts)
+	}
+}
+
 // TestReferenceSearch_RequiresAuth confirms the endpoint is behind the
 // same auth gate as every other /api route — an unauthenticated request
 // never reaches the data layer.

@@ -35,46 +35,6 @@ func TestValueMatches(t *testing.T) {
 	}
 }
 
-func TestIntersectIDSets(t *testing.T) {
-	cases := []struct {
-		name string
-		sets [][]string
-		want []string
-	}{
-		{"no sets", nil, nil},
-		{"one set passes through deduped", [][]string{{"a", "b", "a"}}, []string{"a", "b"}},
-		{"two sets intersect", [][]string{{"a", "b", "c"}, {"b", "c", "d"}}, []string{"b", "c"}},
-		{"disjoint sets produce empty, not nil", [][]string{{"a"}, {"b"}}, []string{}},
-		{"empty set collapses whole intersection", [][]string{{"a", "b"}, {}}, []string{}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := intersectIDSets(tc.sets)
-			if tc.want == nil {
-				if got != nil {
-					t.Fatalf("expected nil, got %v", got)
-				}
-				return
-			}
-			if got == nil {
-				t.Fatalf("expected non-nil %v, got nil", tc.want)
-			}
-			gotSet := map[string]bool{}
-			for _, id := range got {
-				gotSet[id] = true
-			}
-			if len(gotSet) != len(tc.want) {
-				t.Fatalf("intersectIDSets(%v) = %v, want %v", tc.sets, got, tc.want)
-			}
-			for _, id := range tc.want {
-				if !gotSet[id] {
-					t.Fatalf("intersectIDSets(%v) = %v, missing %q", tc.sets, got, id)
-				}
-			}
-		})
-	}
-}
-
 // --- integration tests against a real Postgres (TargetFilter's
 // entity-join shape — the PartyRole "does a Party hold this role"
 // pattern, modeled here with throwaway Person/PersonRole entities so
@@ -148,6 +108,25 @@ func groupedItemDef() *entity.Definition {
 			{Name: "parent_item_id", Type: entity.FieldReference, Target: "GroupedItem", MustMatchParentField: "group_id"},
 		},
 	}
+}
+
+// groupedItemOptionalGroupDef is groupedItemDef with group_id NOT
+// Required — used only by the "target has nothing to compare"
+// consistency test below (finding #9), which needs a target record that
+// legitimately has no stored value for its own MustMatchParentField
+// field at all.
+func groupedItemOptionalGroupDef() *entity.Definition {
+	def := groupedItemDef()
+	fields := make([]entity.Field, len(def.Fields))
+	copy(fields, def.Fields)
+	for i, f := range fields {
+		if f.Name == "group_id" {
+			f.Required = false
+			fields[i] = f
+		}
+	}
+	def.Fields = fields
+	return def
 }
 
 func TestEngine_Create_TargetFilterEntityJoin_RejectsWhenTargetLacksRole(t *testing.T) {
@@ -270,6 +249,59 @@ func TestEngine_Create_TargetFilterEntityJoin_DanglingTargetAllowed(t *testing.T
 	}
 }
 
+// TestEngine_Create_TargetFilterEntityJoin_NonUUIDReferenceValueAllowed
+// is the regression test for independent review finding #3: a
+// non-UUID-shaped reference value (a validation-layer concern
+// entity.validateFieldValue only checks is a string, not that it's
+// UUID-shaped) used to reach records.GetTx's `WHERE id = $1` against a
+// uuid column, producing a raw Postgres "invalid input syntax for type
+// uuid" error that fell through to an internal 500 — a regression from
+// the pre-existing "tolerated dangling reference" behaviour, which the
+// existing dangling-reference tests above don't catch because
+// "00000000-0000-0000-0000-000000000000" IS valid UUID syntax. A
+// non-UUID string must be tolerated exactly the same way.
+func TestEngine_Create_TargetFilterEntityJoin_NonUUIDReferenceValueAllowed(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	_, err := engine.Create(ctx, assignmentDef(), map[string]any{
+		"title": "Ghost task", "assignee_id": "junk",
+	}, actor)
+	if err != nil {
+		t.Fatalf("expected a non-UUID assignee reference to be tolerated as dangling, got %v", err)
+	}
+}
+
+// TestEngine_Create_MustMatchParentField_NonUUIDReferenceValueAllowed is
+// the MustMatchParentField twin of the test above — the direct-field
+// (Entity == "") TargetFilter shape and the MustMatchParentField
+// mechanism share the same loadTarget closure, so both need the same
+// non-UUID tolerance proven independently. Uses Create, deliberately,
+// not Update: groupedItemDef's parent_item_id is a SELF-reference, and
+// Update additionally runs checkSelfReferenceCycle first (crud.go),
+// which has this exact same class of bug in its own GetTxIncludingDeleted
+// call (independent review found this while writing this test) — a
+// real, separate, PRE-EXISTING gap this PR did not introduce and did
+// not touch, out of scope for this fix pass, flagged in the code review
+// doc instead. Create never runs that check at all (a new record's id
+// cannot yet appear in any chain — crud.go's own doc comment), so it
+// isolates target_constraints.go's own fix cleanly.
+func TestEngine_Create_MustMatchParentField_NonUUIDReferenceValueAllowed(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	def := groupedItemDef()
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	if _, err := engine.Create(ctx, def, map[string]any{
+		"name": "orphan", "group_id": "group-a", "parent_item_id": "not-a-uuid",
+	}, actor); err != nil {
+		t.Fatalf("expected a non-UUID parent_item_id to be tolerated as dangling, got %v", err)
+	}
+}
+
 func TestEngine_Create_TargetFilterDirectField_RejectsMismatch(t *testing.T) {
 	db := freshTenantDB(t)
 	ctx := context.Background()
@@ -365,6 +397,36 @@ func TestEngine_Create_MustMatchParentField_DanglingParentAllowed(t *testing.T) 
 	}
 }
 
+// TestEngine_Create_MustMatchParentField_TargetMissingOwnValueAllowed is
+// the regression test for independent review finding #9: a target
+// record that EXISTS but has nothing stored for its own
+// MustMatchParentField value (never set — group_id is optional on this
+// throwaway Definition) used to always fail valueMatches(nil, ownValue)
+// and reject, making the field permanently unusable against any such
+// target — inconsistent with the field-omitted-on-THIS-record case just
+// above, which already skips rather than rejects. Both "nothing to
+// compare" cases must now behave the same way: skip, not reject.
+func TestEngine_Create_MustMatchParentField_TargetMissingOwnValueAllowed(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	def := groupedItemOptionalGroupDef()
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	// A parent created with no group_id at all — nothing for the child's
+	// own group_id to compare against.
+	parent, err := engine.Create(ctx, def, map[string]any{"name": "ungrouped-root"}, actor)
+	if err != nil {
+		t.Fatalf("create parent with no group_id: %v", err)
+	}
+
+	if _, err := engine.Create(ctx, def, map[string]any{
+		"name": "child", "group_id": "group-a", "parent_item_id": parent.ID,
+	}, actor); err != nil {
+		t.Fatalf("expected a parent with no stored group_id to be treated as not-comparable (allowed), got %v", err)
+	}
+}
+
 func TestEngine_Update_MustMatchParentField_ClearingReferenceAllowed(t *testing.T) {
 	db := freshTenantDB(t)
 	ctx := context.Background()
@@ -422,30 +484,31 @@ func TestEngine_ResolveReferenceFilter_EntityJoinCondition(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResolveReferenceFilter: %v", err)
 	}
-	if opts.IDIn == nil {
-		t.Fatal("expected IDIn to be resolved (non-nil) for an entity-join TargetFilter")
+	if len(opts.JoinFilters) != 1 {
+		t.Fatalf("expected exactly one JoinFilters entry for an entity-join TargetFilter, got %+v", opts.JoinFilters)
 	}
-	found := false
-	for _, id := range opts.IDIn {
-		if id == vendor.ID {
-			t.Fatalf("expected vendor %s to be excluded from the employee-only candidate set, got IDIn=%v", vendor.ID, opts.IDIn)
-		}
-		if id == employee.ID {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("expected employee %s to be included in the candidate set, got IDIn=%v", employee.ID, opts.IDIn)
+	jf := opts.JoinFilters[0]
+	if jf.Entity != "PersonRole" || jf.EntityField != "person_id" || jf.Field != "role_type" || jf.Value != "employee" {
+		t.Fatalf("unexpected JoinFilters entry: %+v", jf)
 	}
 
 	// Applying opts against the real query must actually filter the
-	// list down, not just describe the intent.
-	recs, err := engine.ListPageFiltered(ctx, personDef(), data.ListPageOptions{Limit: 10, IDIn: opts.IDIn})
+	// list down, not just describe the intent — this is the correlated
+	// EXISTS narrowing, evaluated by Postgres itself, not an id list
+	// resolved and intersected in Go (independent review, uc-infra#78
+	// follow-up: the original DistinctFieldValues-based shape did the
+	// latter, unboundedly).
+	recs, err := engine.ListPageFiltered(ctx, personDef(), data.ListPageOptions{Limit: 10, JoinFilters: opts.JoinFilters})
 	if err != nil {
-		t.Fatalf("ListPageFiltered with resolved IDIn: %v", err)
+		t.Fatalf("ListPageFiltered with resolved JoinFilters: %v", err)
 	}
 	if len(recs) != 1 || recs[0].ID != employee.ID {
 		t.Fatalf("expected exactly the employee record, got %+v", recs)
+	}
+	for _, rec := range recs {
+		if rec.ID == vendor.ID {
+			t.Fatalf("expected vendor %s to be excluded from the employee-only candidate set, got %+v", vendor.ID, recs)
+		}
 	}
 }
 

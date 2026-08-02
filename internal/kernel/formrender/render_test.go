@@ -202,6 +202,77 @@ func TestRender_ReferenceFieldNoCreateButtonWithoutLabel(t *testing.T) {
 	}
 }
 
+// TestRender_ReferenceFieldMustMatchParentFieldRendersDataAttribute is
+// the formrender-layer test for uc-infra#78's MustMatchParentField
+// wiring — the review flagged this had zero coverage (finding #7). A
+// field declaring MustMatchParentField must render the
+// data-must-match-field attribute the client-side picker script reads
+// to know which sibling input's current value to submit as
+// sibling_value on its next /api/references search.
+func TestRender_ReferenceFieldMustMatchParentFieldRendersDataAttribute(t *testing.T) {
+	r := testRenderer(t)
+	ent := &entity.Definition{
+		EntityType: "Task",
+		Fields: []entity.Field{
+			{Name: "project_id", Type: entity.FieldReference, Target: "Project"},
+			{Name: "parent_task_id", Type: entity.FieldReference, Target: "Task", MustMatchParentField: "project_id"},
+		},
+	}
+	def := &form.Definition{
+		EntityType: "Task",
+		Sections: []form.Section{{
+			Title: "Header", Component: form.ComponentFields,
+			Fields: []form.FormField{
+				{Name: "project_id", Label: "Project"},
+				{Name: "parent_task_id", Label: "Parent Task"},
+			},
+		}},
+	}
+	data := Data{Record: map[string]any{}}
+	var buf strings.Builder
+	if err := r.Render(&buf, def, ent, data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	body := buf.String()
+	if !strings.Contains(body, `class="uc-ref" data-target="Task" data-field="parent_task_id" data-must-match-field="project_id"`) {
+		t.Fatalf("expected parent_task_id's combobox to carry data-must-match-field=\"project_id\", got:\n%s", body)
+	}
+	// project_id itself declares no MustMatchParentField and must NOT
+	// pick up the attribute from its neighbour.
+	if !strings.Contains(body, `class="uc-ref" data-target="Project" data-field="project_id">`) {
+		t.Fatalf("expected project_id's combobox to carry no data-must-match-field attribute, got:\n%s", body)
+	}
+}
+
+// TestRender_ReferenceFieldWithoutMustMatchParentFieldOmitsDataAttribute
+// is the inverse: a plain FieldReference with no MustMatchParentField
+// declared must render no data-must-match-field attribute at all — its
+// mere absence in the DOM is what the client script's "skip the sibling
+// read" branch relies on, so it needs to be asserted as deliberately as
+// its presence above.
+func TestRender_ReferenceFieldWithoutMustMatchParentFieldOmitsDataAttribute(t *testing.T) {
+	r := testRenderer(t)
+	ent := &entity.Definition{
+		EntityType: "PurchaseOrder",
+		Fields:     []entity.Field{{Name: "vendor_id", Type: entity.FieldReference, Target: "Party"}},
+	}
+	def := &form.Definition{
+		EntityType: "PurchaseOrder",
+		Sections: []form.Section{{
+			Title: "Header", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "vendor_id", Label: "Vendor"}},
+		}},
+	}
+	data := Data{Record: map[string]any{}}
+	var buf strings.Builder
+	if err := r.Render(&buf, def, ent, data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if strings.Contains(buf.String(), "data-must-match-field") {
+		t.Fatalf("expected no data-must-match-field attribute for a field with no MustMatchParentField, got:\n%s", buf.String())
+	}
+}
+
 // TestRender_SavedRecordCarriesDataRecordIDAndLabel proves the two data
 // attributes the quick-create modal's JS relies on to read back a just-
 // created record (layout.go's htmx:afterSettle handler) actually appear

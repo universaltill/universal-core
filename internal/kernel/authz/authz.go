@@ -707,7 +707,7 @@ func (g *GuardedEngine) Create(ctx context.Context, def *entity.Definition, fiel
 	}
 	rec, err := g.raw.Create(ctx, def, effective, actor)
 	if err != nil {
-		return data.Record{}, err
+		return data.Record{}, g.sanitizeTargetConstraintError(ctx, err)
 	}
 	// The created record is echoed straight back to the caller (API JSON,
 	// re-rendered form), so it goes through the same redaction a read of
@@ -738,7 +738,60 @@ func (g *GuardedEngine) Update(ctx context.Context, def *entity.Definition, id s
 	if err != nil {
 		return 0, err
 	}
-	return g.raw.Update(ctx, def, id, effective, expectedVersion, actor)
+	version, err := g.raw.Update(ctx, def, id, effective, expectedVersion, actor)
+	if err != nil {
+		return 0, g.sanitizeTargetConstraintError(ctx, err)
+	}
+	return version, nil
+}
+
+// sanitizeTargetConstraintError generalizes a crud.TargetConstraintError's
+// message when the caller cannot read the joined entity type its detail
+// names (JoinEntity, set only for an entity-join TargetFilter condition —
+// see TargetConstraintError's own doc comment) — closing the
+// create-and-rollback membership-probe ResolveReferenceFilter's doc
+// comment above describes: without this, a caller denied
+// CanRead(cond.Entity) could still learn whether some candidate target
+// holds a PartyRole (or any other joined-entity fact) by reading the
+// verbatim entity/field/value text a rejected Create/Update carried.
+//
+// Every other TargetConstraintError shape (direct-field TargetFilter,
+// MustMatchParentField) is left as-is: JoinEntity is empty for both, and
+// neither reads an entity type the caller doesn't already hold via its
+// own submitted record's fields, so there is nothing to strip.
+//
+// RESIDUAL RISK, stated plainly (independent review, uc-infra#78
+// follow-up, not fully closed by this fix): this generalizes the
+// MESSAGE, not the create-and-rollback probe itself. A caller denied
+// CanRead(JoinEntity) who repeatedly attempts a create with different
+// candidate target ids still learns join membership from the
+// 400-vs-201 OUTCOME alone, message text aside — same information,
+// slower to extract. Closing that fully would mean either never
+// distinguishing this failure from any other write failure (worse UX
+// for the overwhelmingly common case: a legitimate caller's own typo)
+// or pre-checking CanRead(JoinEntity) up front and refusing the write
+// outright when it's false (a bigger behavior change than this fix
+// pass's scope — it would also 403 a write that might otherwise
+// legitimately fail for an unrelated reason). Flagged here and in the
+// code review doc rather than silently left implied fixed.
+func (g *GuardedEngine) sanitizeTargetConstraintError(ctx context.Context, err error) error {
+	var tce *crud.TargetConstraintError
+	if !errors.As(err, &tce) || tce.JoinEntity == "" {
+		return err
+	}
+	ok, checkErr := g.res.CanRead(ctx, tce.JoinEntity)
+	if checkErr != nil {
+		return checkErr
+	}
+	if ok {
+		return err
+	}
+	return &crud.TargetConstraintError{
+		EntityType: tce.EntityType,
+		FieldName:  tce.FieldName,
+		JoinEntity: tce.JoinEntity,
+		Detail:     "target does not satisfy a reference constraint",
+	}
 }
 
 func (g *GuardedEngine) Delete(ctx context.Context, def *entity.Definition, id string, actor audit.Actor) error {
@@ -863,8 +916,36 @@ func (g *GuardedEngine) CountFiltered(ctx context.Context, def *entity.Definitio
 
 // rejectHiddenSortFilter denies sorting or filtering by a field this
 // actor may not read — see ListPageFiltered's doc comment on the oracle.
+//
+// This must also cover opts.EqualsFilters, not just SortField/FilterField
+// (independent review, uc-infra#78 follow-up): EqualsFilters is how a
+// FieldReference's declared TargetFilter/MustMatchParentField narrowing
+// reaches this query (internal/kernel/crud.Engine.ResolveReferenceFilter),
+// and MustMatchParentField's entry carries the CALLER-supplied
+// sibling_value query param
+// (internal/api/reference_search.go) as its equality value against a
+// field name that can be RBAC-hidden on this entity type (e.g.
+// Task.project_id hidden from a role that can still read Task). Without
+// this check, GET /api/references/Task?...&sibling_value=<project-uuid>
+// turns a hidden field into a membership oracle: the response set
+// reveals exactly which Tasks have that hidden project_id, letting a
+// caller reconstruct the whole hidden mapping by iterating candidate
+// values — the same class of leak SortField/FilterField were already
+// guarded against, just reached through a newer field of
+// ListPageOptions instead of an older one.
+//
+// The direct-field TargetFilter shape (Field.TargetFilter with
+// Entity == "") ALSO lands in EqualsFilters, but with a Definition-constant
+// Value the caller never supplies (e.g. "status"="active") — it can't
+// itself be turned into an oracle for anything the caller doesn't already
+// know from the Definition. It is still checked here rather than
+// special-cased around: gating every EqualsFilters entry uniformly is
+// simpler to reason about than one that depends on which of the two
+// TargetFilter shapes produced it, and it costs nothing (a Definition
+// legitimately narrowing by a hidden field would be unusual and worth
+// surfacing, not silently allowing).
 func (g *GuardedEngine) rejectHiddenSortFilter(ctx context.Context, def *entity.Definition, opts data.ListPageOptions) error {
-	if opts.SortField == "" && opts.FilterField == "" {
+	if opts.SortField == "" && opts.FilterField == "" && len(opts.EqualsFilters) == 0 {
 		return nil
 	}
 	hidden, err := g.res.HiddenFields(ctx, def.EntityType)
@@ -874,6 +955,11 @@ func (g *GuardedEngine) rejectHiddenSortFilter(ctx context.Context, def *entity.
 	for _, f := range []string{opts.SortField, opts.FilterField} {
 		if f != "" && hidden[f] {
 			return fmt.Errorf("%w: cannot sort or filter %s by hidden field %s", ErrDenied, def.EntityType, f)
+		}
+	}
+	for _, eq := range opts.EqualsFilters {
+		if hidden[eq.Field] {
+			return fmt.Errorf("%w: cannot filter %s by hidden field %s", ErrDenied, def.EntityType, eq.Field)
 		}
 	}
 	return nil
@@ -928,10 +1014,28 @@ func (g *GuardedEngine) ValidateStatusTransition(ctx context.Context, def *entit
 // before delegating — the field's OTHER conditions (a direct-field
 // TargetFilter, or MustMatchParentField) still apply; only the
 // unreadable join stops narrowing. This fails toward the picker simply
-// narrowing LESS for that viewer (crud.Engine's own write-time
-// enforcement is unaffected either way, since that runs unguarded
-// against the full Definition) rather than toward disclosing anything,
-// or toward breaking the picker outright.
+// narrowing LESS for that viewer for the READ (picker) path specifically.
+//
+// CORRECTION (independent review, uc-infra#78 follow-up): the paragraph
+// above used to go on to claim this "fails toward the picker simply
+// narrowing LESS... rather than toward disclosing anything ... or toward
+// breaking the picker outright" full stop — that overstated what this
+// function alone achieves. crud.Engine's own write-time enforcement
+// (checkReferenceTargetConstraints, called from unguarded Create/Update)
+// is deliberately unaffected by this gate — it must still evaluate the
+// FULL Definition, including a join the picker just hid, or the
+// constraint itself would stop being enforced for that viewer. Create/
+// Update's error DID, before this fix, name the joined entity/field/
+// value verbatim regardless of whether the caller could read that
+// entity at all, which is a second, narrower oracle of the same kind:
+// a caller denied CanRead(cond.Entity) could still learn PartyRole
+// membership one candidate at a time via repeated create-and-reject
+// probes, reading the message text (or even just the 400-vs-201 outcome)
+// rather than the picker's candidate list. GuardedEngine.Create/Update
+// now call sanitizeTargetConstraintError below to generalize that
+// message when CanRead(JoinEntity) is false — see its own doc comment,
+// including the residual risk that fix does NOT close (the outcome-only
+// signal, message text aside).
 func (g *GuardedEngine) ResolveReferenceFilter(ctx context.Context, f entity.Field, siblingValue string) (data.ListPageOptions, error) {
 	if len(f.TargetFilter) > 0 {
 		readable := make([]entity.TargetFilterCondition, 0, len(f.TargetFilter))

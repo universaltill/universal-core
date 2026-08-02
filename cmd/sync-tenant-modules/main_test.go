@@ -117,6 +117,58 @@ func staleTenant(t *testing.T, control *sql.DB, router *tenantdb.Router, name st
 	return id, tenantDB
 }
 
+// staleTenantOldPurchaseOrder is staleTenant's sibling for the
+// TargetFilter data-migration warning test below: everything else is
+// CURRENT (unlike staleTenant, which also pins InventoryItem/omits
+// Facility — irrelevant noise for this test), but PurchaseOrder is
+// pinned at v6, the version before uc-infra#78's vendor_id TargetFilter
+// (v7) existed at all.
+func staleTenantOldPurchaseOrder(t *testing.T, control *sql.DB, router *tenantdb.Router, name string) (id string, tenantDB *sql.DB) {
+	t.Helper()
+	id, tenantDB = newTenant(t, control, router, name)
+	ctx := context.Background()
+	if err := modules.PublishFoundation(ctx, tenantDB, setupActor); err != nil {
+		t.Fatalf("PublishFoundation: %v", err)
+	}
+	var items []moduleseed.Item
+	for _, def := range purchasing.All() {
+		if def.EntityType == "PurchaseOrder" {
+			def = purchaseOrderV6()
+		}
+		raw, err := json.Marshal(def)
+		if err != nil {
+			t.Fatalf("marshal %s definition: %v", def.EntityType, err)
+		}
+		items = append(items, moduleseed.Item{Key: def.EntityType, Version: def.Version, Raw: raw})
+	}
+	if err := moduleseed.PublishAll(ctx, data.NewEntityDefinitionRepo(tenantDB), items, setupActor); err != nil {
+		t.Fatalf("publish purchasing with old PurchaseOrder: %v", err)
+	}
+	return id, tenantDB
+}
+
+// purchaseOrderV6 is PurchaseOrder as it stood before uc-infra#78 added
+// vendor_id's TargetFilter (v7) — derived from the CURRENT Definition
+// rather than hand-duplicated field by field (unlike inventoryItemV2
+// below, which predates a bigger shape change): the only difference v6
+// had was the absence of this one field's TargetFilter, so copying and
+// stripping it is the more faithful reconstruction and can't drift from
+// the real v6 shape as unrelated fields get added around it.
+func purchaseOrderV6() *entity.Definition {
+	def := *purchasing.PurchaseOrder()
+	def.Version = 6
+	fields := make([]entity.Field, len(def.Fields))
+	copy(fields, def.Fields)
+	for i, f := range fields {
+		if f.Name == "vendor_id" {
+			f.TargetFilter = nil
+			fields[i] = f
+		}
+	}
+	def.Fields = fields
+	return &def
+}
+
 // publishStalePurchasing publishes every purchasing Definition EXCEPT
 // Facility, with InventoryItem pinned at v2 — the same hand-built
 // moduleseed.Item list technique cmd/backfill-inventory-facility's
@@ -224,6 +276,47 @@ func insertLegacyInventoryItem(t *testing.T, tenantDB *sql.DB, itemID string, qt
 		`INSERT INTO records (entity_type, data) VALUES ('InventoryItem', $1)`, raw,
 	); err != nil {
 		t.Fatalf("insert legacy InventoryItem: %v", err)
+	}
+}
+
+// insertBareParty writes a Party record with no PartyRole rows at all —
+// not a vendor, not a customer, not an employee — straight into records,
+// the fixture TestSync_WarnsAboutTargetConstraintViolations needs to
+// violate PurchaseOrder.vendor_id's TargetFilter.
+func insertBareParty(t *testing.T, tenantDB *sql.DB, name string) string {
+	t.Helper()
+	raw, err := json.Marshal(map[string]any{"party_type": "organization", "name": name})
+	if err != nil {
+		t.Fatalf("marshal Party: %v", err)
+	}
+	var id string
+	if err := tenantDB.QueryRowContext(context.Background(),
+		`INSERT INTO records (entity_type, data) VALUES ('Party', $1) RETURNING id`, raw,
+	).Scan(&id); err != nil {
+		t.Fatalf("insert bare Party: %v", err)
+	}
+	return id
+}
+
+// insertLegacyPurchaseOrder writes a v6-shaped PurchaseOrder (vendor_id
+// with no TargetFilter to satisfy) straight into records, bypassing
+// crud.Engine — the same reasoning insertLegacyInventoryItem gives: v7
+// would reject the very row whose existence the sync has to warn about.
+func insertLegacyPurchaseOrder(t *testing.T, tenantDB *sql.DB, vendorID string) {
+	t.Helper()
+	raw, err := json.Marshal(map[string]any{
+		"po_number":  "PO-LEGACY-1",
+		"vendor_id":  vendorID,
+		"order_date": "2026-01-01",
+		"status_id":  "00000000-0000-0000-0000-000000000000",
+	})
+	if err != nil {
+		t.Fatalf("marshal legacy PurchaseOrder: %v", err)
+	}
+	if _, err := tenantDB.ExecContext(context.Background(),
+		`INSERT INTO records (entity_type, data) VALUES ('PurchaseOrder', $1)`, raw,
+	); err != nil {
+		t.Fatalf("insert legacy PurchaseOrder: %v", err)
 	}
 }
 
@@ -403,6 +496,41 @@ func TestSync_WarnsAboutRecordsMadeInvalid(t *testing.T) {
 	}
 	if missing != 1 {
 		t.Fatalf("sync must not migrate records itself, %d row(s) still lack facility_id", missing)
+	}
+}
+
+// TestSync_WarnsAboutTargetConstraintViolations is
+// TestSync_WarnsAboutRecordsMadeInvalid's counterpart for a newly-added
+// FieldReference TargetFilter (independent review, uc-infra#78
+// follow-up, same class of gap as uc-infra#73): a tenant whose
+// PurchaseOrder.vendor_id points at a Party holding no vendor PartyRole
+// at all synced 0->6->7 must be warned, not silently told "0 data
+// migrations needed" only for the very next hand-edit of that record to
+// 400.
+func TestSync_WarnsAboutTargetConstraintViolations(t *testing.T) {
+	dsn, control, router := controlPlane(t)
+	_, tenantDB := staleTenantOldPurchaseOrder(t, control, router, "Sync Smoke Test TargetFilter")
+
+	partyID := insertBareParty(t, tenantDB, "Not Actually A Vendor")
+	insertLegacyPurchaseOrder(t, tenantDB, partyID)
+
+	stdout, stderr, code := run(t, []string{"DATABASE_URL=" + dsn}, "-actor-id=smoke-test")
+	if code != 0 {
+		t.Fatalf("sync: exit %d, stderr: %s", code, stderr)
+	}
+	want := `Sync Smoke Test TargetFilter: PurchaseOrder — 1 record(s) already violate the new reference constraint on "vendor_id" and will fail validation on next edit`
+	if !strings.Contains(stdout, want) {
+		t.Fatalf("expected warning %q, got stdout: %q", want, stdout)
+	}
+	// The sync reports; it must not have repaired or rejected anything.
+	var n int
+	if err := tenantDB.QueryRowContext(context.Background(),
+		`SELECT count(*) FROM records WHERE entity_type = 'PurchaseOrder' AND deleted_at IS NULL`,
+	).Scan(&n); err != nil {
+		t.Fatalf("count PurchaseOrder records: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("sync must not touch the offending record, got %d PurchaseOrder record(s)", n)
 	}
 }
 
