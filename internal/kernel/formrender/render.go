@@ -223,7 +223,12 @@ type sectionView struct {
 	Children  []childRowView
 	// Columns is the child table's column order, from the child
 	// Definition — see buildChildRows on why it can't come per row.
-	Columns     []string
+	Columns []columnView
+	// RollUpField is the raw target field name (stable for data-field,
+	// same reasoning as cellView.Field/columnView.Field below).
+	// RollUpLabel is that field's resolved display text — see
+	// buildViewModel's ComponentMasterDetail case.
+	RollUpField string
 	RollUpLabel string
 	RollUpTotal string // empty when the section has no roll-up
 	// AddHref is pre-built via net/url so a Target
@@ -330,6 +335,16 @@ type cellView struct {
 	Value any
 }
 
+// columnView is one child-table column header. Field is the raw,
+// untranslated field name — kept in data-field so a stable selector
+// survives across locales (the same reason cellView.Field stays raw).
+// Label is Field resolved through the field.{EntityType}.{FieldName}
+// catalog for display, falling back to Field itself when untranslated.
+type columnView struct {
+	Field string
+	Label string
+}
+
 type actionView struct {
 	Label        string
 	Op           form.ActionOp
@@ -421,7 +436,15 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 			sv.Children, sv.Columns = buildChildRows(data.Children[s.Target], data.ChildDefs[s.Target], r.i18n, locale)
 			sv.AddHref = "/api/records/" + url.PathEscape(s.Target) + "/new"
 			if s.RollUp != "" {
-				sv.RollUpLabel = s.RollUpTarget
+				// RollUpTarget names a field on the PARENT entity (ent,
+				// not the child section's Target) — see form.Section.
+				// RollUp's doc comment: it sums into "a header field".
+				// Keyed off ent.EntityType, not def.EntityType, to match
+				// every other field.{EntityType}.{FieldName} lookup in
+				// this file (buildFields, childColumns): field names
+				// belong to the entity Definition, not the form one.
+				sv.RollUpField = s.RollUpTarget
+				sv.RollUpLabel = r.i18n.TOrDefault(locale, "field."+ent.EntityType+"."+s.RollUpTarget, s.RollUpTarget)
 				sv.RollUpTotal = strconv.FormatFloat(rollUpTotals[s.RollUpTarget], 'f', -1, 64)
 			}
 
@@ -690,12 +713,24 @@ func (r *Renderer) buildFields(s form.Section, ent *entity.Definition, record ma
 // childDef may be nil (a Definition mismatch the caller already
 // tolerates); the per-row key fallback keeps such a section rendering
 // something rather than nothing.
-func buildChildRows(children []map[string]any, childDef *entity.Definition, catalog *i18n.Catalog, locale string) ([]childRowView, []string) {
-	columns := childColumns(children, childDef)
+func buildChildRows(children []map[string]any, childDef *entity.Definition, catalog *i18n.Catalog, locale string) ([]childRowView, []columnView) {
+	names := childColumns(children, childDef)
+	columns := make([]columnView, 0, len(names))
+	for _, name := range names {
+		label := name
+		// Same "field.{EntityType}.{FieldName}" convention buildFields
+		// already resolves field labels through — falls back to the raw
+		// name (childDef == nil, or no translation yet) so an unkeyed
+		// column still renders exactly as before.
+		if childDef != nil && catalog != nil {
+			label = catalog.TOrDefault(locale, "field."+childDef.EntityType+"."+name, name)
+		}
+		columns = append(columns, columnView{Field: name, Label: label})
+	}
 	rows := make([]childRowView, 0, len(children))
 	for _, child := range children {
-		row := childRowView{Cells: make([]cellView, 0, len(columns))}
-		for _, name := range columns {
+		row := childRowView{Cells: make([]cellView, 0, len(names))}
+		for _, name := range names {
 			row.Cells = append(row.Cells, cellView{
 				Field: name,
 				Value: childCellValue(child, name, childDef, catalog, locale),
@@ -785,13 +820,13 @@ const tmplSrc = `<form class="uc-form" data-entity-type="{{.EntityType}}"{{if .R
 {{end}}
 {{else if eq .Component "master_detail"}}
 <table class="uc-master-detail" data-target="{{.Target}}">
-<thead><tr>{{range .Columns}}<th data-field="{{.}}">{{.}}</th>{{end}}</tr></thead>
+<thead><tr>{{range .Columns}}<th data-field="{{.Field}}">{{.Label}}</th>{{end}}</tr></thead>
 <tbody>
 {{range .Children}}<tr>{{range .Cells}}<td data-field="{{.Field}}">{{.Value}}</td>{{end}}</tr>{{end}}
 </tbody>
 </table>
 {{if not .Children}}<p class="uc-empty">{{$.MasterDetailEmpty}}</p>{{end}}
-{{if .RollUpTotal}}<p class="uc-rollup" data-field="{{.RollUpLabel}}">{{.RollUpLabel}}: {{.RollUpTotal}}</p>{{end}}
+{{if .RollUpTotal}}<p class="uc-rollup" data-field="{{.RollUpField}}">{{.RollUpLabel}}: {{.RollUpTotal}}</p>{{end}}
 <button type="button" hx-get="{{.AddHref}}" hx-target="closest table" hx-swap="beforeend">{{$.MasterDetailAdd}}</button>
 {{else if eq .Component "related_list"}}
 <div class="uc-related-list">

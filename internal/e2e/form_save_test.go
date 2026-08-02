@@ -204,6 +204,83 @@ func TestFormSectionTitlesAndSaveButtonAreLocalized_RealBrowser(t *testing.T) {
 	}
 }
 
+// TestMasterDetailColumnHeadersAndRollUpLabelAreLocalized_RealBrowser
+// (#99): the Lines master-detail table's column headers and its roll-up
+// label are real, rendered, translated text in a real browser — a
+// rendered-HTML-string test proves the markup shape but, per #53's own
+// tests in this file, can't prove a browser actually shows the resolved
+// text rather than raw Go template output some intermediate layer
+// mangled.
+//
+// Driven through the EDIT form of a PO created directly via crud.Engine
+// (same reasoning as TestPurchaseOrderStages_ReversedDates_ToastInReal
+// Browser above — the create form's reference pickers are orthogonal
+// machinery this test doesn't need to fight): buildFormRenderData only
+// resolves Data.ChildDefs when there's an existing record id
+// (internal/api/handlers.go), so /forms/PurchaseOrder/new never has a
+// child Definition to resolve column labels against at all — a
+// pre-existing, separate gap from #99, not something to paper over here.
+//
+// Driven in TURKISH (?lang=tr), same reasoning as the two tests above:
+// PurchaseOrderForm's POLine field names ("purchase_order_id", "total")
+// aren't English words a coincidental match could produce, but asserting
+// the real Turkish catalog text is still the only way to prove
+// buildChildRows/the roll-up label are actually resolved through
+// field.{EntityType}.{FieldName} rather than left as the raw field name.
+func TestMasterDetailColumnHeadersAndRollUpLabelAreLocalized_RealBrowser(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, tenantDB := testServer(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	// testServer publishes entities/forms but not the status graph —
+	// PurchaseOrder.status_id needs it (idempotent, same call
+	// cmd/provision-tenant makes).
+	if err := purchasing.PublishStatuses(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("PublishStatuses: %v", err)
+	}
+	vendorID, err := crud.NewEngine(tenantDB).Create(ctx, foundation.Party(), map[string]any{
+		"name": "Header Vendor", "party_type": "organization", "status": "active",
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed vendor: %v", err)
+	}
+	statusID := publishedStatusID(t, tenantDB, "purchase_order_status", "approved")
+	po, err := crud.NewEngine(tenantDB).Create(ctx, purchasing.PurchaseOrder(), map[string]any{
+		"po_number": "PO-HEADER-1", "vendor_id": vendorID.ID, "order_date": "2026-07-01", "status_id": statusID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed PO: %v", err)
+	}
+
+	bctx := browserCtx(t, tenantID)
+	if err := chromedp.Run(bctx,
+		chromedp.Navigate(srv.URL+"/forms/PurchaseOrder/"+po.ID+"?lang=tr"),
+		chromedp.WaitVisible(`table.uc-master-detail`, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("open /forms/PurchaseOrder/%s?lang=tr: %v", po.ID, err)
+	}
+
+	// First declared POLine field is purchase_order_id -> "Satın Alma
+	// Siparişi"; the raw field name stays in data-field so a stable
+	// selector still works regardless of locale.
+	var firstHeader string
+	if err := chromedp.Run(bctx, chromedp.Text(`table.uc-master-detail thead th[data-field="purchase_order_id"]`, &firstHeader, chromedp.ByQuery)); err != nil {
+		t.Fatalf("read first column header: %v", err)
+	}
+	if got := strings.TrimSpace(firstHeader); got != "Satın Alma Siparişi" {
+		t.Fatalf("expected the Turkish translation of the purchase_order_id column header, got %q", got)
+	}
+
+	var rollUpText string
+	if err := chromedp.Run(bctx, chromedp.Text(`p.uc-rollup[data-field="total"]`, &rollUpText, chromedp.ByQuery)); err != nil {
+		t.Fatalf("read roll-up label: %v", err)
+	}
+	if got := strings.TrimSpace(rollUpText); !strings.HasPrefix(got, "Toplam:") {
+		t.Fatalf("expected the roll-up label to start with the Turkish translation of \"total\", got %q", got)
+	}
+}
+
 // submitForm clicks the form's Save button and waits for htmx's own
 // afterSettle event — see clickAndSettle's doc comment in
 // csv_import_test.go for why WaitVisible on the swapped content isn't

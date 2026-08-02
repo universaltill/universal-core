@@ -2093,7 +2093,10 @@ func TestAPI_RenderRecordForm_ShowsMasterDetailChildren(t *testing.T) {
 	if strings.Contains(body, "No lines yet") {
 		t.Fatalf("expected the existing POLine to render as a child row, got:\n%s", body)
 	}
-	if !strings.Contains(body, "total: 150.5") {
+	// "Total", not "total": the label resolves through
+	// field.PurchaseOrder.total (#99), not the raw RollUpTarget field
+	// name — see formrender's own TestRender_MasterDetailRollUp.
+	if !strings.Contains(body, "Total: 150.5") {
 		t.Fatalf("expected the roll-up to sum the child's line_total into the header total, got:\n%s", body)
 	}
 }
