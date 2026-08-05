@@ -83,17 +83,22 @@ jobs:
       - name: Install xmllint for SAF-T XSD validation
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxml2-utils
 
-      # internal/e2e's 49 real-browser tests need Chrome/Chromium on
-      # PATH (internal/e2e/csv_import_test.go's findBrowser) — ubuntu-
-      # latest ships google-chrome-stable today, but this asserts it
-      # explicitly (same reasoning as xmllint above) instead of trusting
-      # that ambient fact silently forever. Belt-and-suspenders with
-      # findBrowser's own CI-env hard-failure: if this step ever starts
-      # failing, that's the loud signal; if the runner image changes in
-      # some way this miss, findBrowser fails the build too, rather than
-      # 49 tests quietly skipping (found 2026-08-02, independent review
-      # of uc-infra#56 — a coverage baseline measured on a machine
-      # without a browser had silently skipped all of them).
+      # internal/e2e's 49 real-browser tests need a Chrome/Chromium
+      # binary (internal/e2e/browser_discovery_test.go's findBrowser) —
+      # ubuntu-latest ships google-chrome-stable on PATH today, but this
+      # asserts it explicitly (same reasoning as xmllint above) instead
+      # of trusting that ambient fact silently forever. This check is
+      # PATH-only on purpose: findBrowser also falls back to
+      # $PLAYWRIGHT_BROWSERS_PATH for Playwright-provisioned sandboxes
+      # (uc-infra#122), but this workflow never sets that variable, so
+      # PATH is the only route GitHub Actions itself actually takes.
+      # Belt-and-suspenders with findBrowser's own CI-env hard-failure:
+      # if this step ever starts failing, that's the loud signal; if the
+      # runner image changes in some way this misses, findBrowser fails
+      # the build too, rather than 49 tests quietly skipping (found
+      # 2026-08-02, independent review of uc-infra#56 — a coverage
+      # baseline measured on a machine without a browser had silently
+      # skipped all of them).
       - name: Confirm a real browser is available for internal/e2e
         run: |
           command -v google-chrome-stable || command -v google-chrome || command -v chromium || command -v chromium-browser || {
