@@ -348,17 +348,23 @@ func TestSync_MissingActorID_FailsFast(t *testing.T) {
 // falsified actor_type onto every Definition an unattended pipeline
 // sync run re-published (uc-infra#123, same test shape as
 // cmd/provision-tenant's TestProvisionTenant_ActorTypeValidation).
-// Validation runs before any database work, so no control-plane
-// connection is needed for any of these to fail correctly.
+//
+// Validation runs before any database work, and this pins that claim
+// rather than merely asserting it in prose (independent review, finding
+// 2): DATABASE_URL points at an unreachable-but-parseable address, so a
+// rejection reaching the actor-validation error (not a "ping
+// control-plane database" connection error) proves the ordering, the
+// same way cmd/provision-tenant's assertNoTenantCreated does by a
+// different, tenant-counting route.
 func TestSync_ActorTypeValidation(t *testing.T) {
-	dsn, _, _ := controlPlane(t)
+	const unreachableDSN = "postgres://postgres:postgres@127.0.0.1:1/nonexistent?sslmode=disable"
 
-	_, stderr, code := run(t, []string{"DATABASE_URL=" + dsn}, "-actor-id=pipeline", "-actor-type=ai_agent")
+	_, stderr, code := run(t, []string{"DATABASE_URL=" + unreachableDSN}, "-actor-id=pipeline", "-actor-type=ai_agent")
 	if code == 0 || !strings.Contains(stderr, "model_version") {
 		t.Errorf("expected ai_agent to require -model-version, got code %d: %s", code, stderr)
 	}
 
-	_, stderr, code = run(t, []string{"DATABASE_URL=" + dsn}, "-actor-id=pipeline", "-actor-type=wizard")
+	_, stderr, code = run(t, []string{"DATABASE_URL=" + unreachableDSN}, "-actor-id=pipeline", "-actor-type=wizard")
 	if code == 0 || !strings.Contains(stderr, "invalid actor") {
 		t.Errorf("expected an unknown actor type to be rejected, got code %d: %s", code, stderr)
 	}
@@ -367,7 +373,7 @@ func TestSync_ActorTypeValidation(t *testing.T) {
 	// a human row carrying a model version (uc-infra#72 independent
 	// review, finding 4): Validate() alone only rejects an EMPTY
 	// ModelVersion on an agent, never a populated one on a human.
-	_, stderr, code = run(t, []string{"DATABASE_URL=" + dsn}, "-actor-id=pipeline", "-model-version=claude-x")
+	_, stderr, code = run(t, []string{"DATABASE_URL=" + unreachableDSN}, "-actor-id=pipeline", "-model-version=claude-x")
 	if code == 0 || !strings.Contains(stderr, "-model-version is only meaningful") {
 		t.Errorf("expected a human actor with -model-version set to be rejected, got code %d: %s", code, stderr)
 	}

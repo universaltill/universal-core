@@ -301,14 +301,21 @@ func TestBackfill_ActorTypeValidation(t *testing.T) {
 // TestBackfill_ActorTypeAI_WritesRealAuditRow is the positive half
 // TestBackfill_ActorTypeValidation deliberately doesn't cover: every
 // rejection test above only proves the guardrail exists, never that a
-// SUCCESSFUL ai_agent run actually reaches the migrated record's own
-// audit_log row with the right values (same class of wiring mistake
+// SUCCESSFUL ai_agent run actually reaches every audit_log row it
+// writes with the right values (same class of wiring mistake
 // uc-infra#72's independent review found — a validated actor built but
 // a different one passed downstream). Runs the real compiled binary
-// against a real legacy row and reads that record's audit trail
-// directly by record_id — narrower than a whole-table count, and immune
-// to tenantDatabase's own human-actor setup noise since it's scoped to
-// this one InventoryItem.
+// against a real legacy row and reads audit trails directly by
+// record_id — narrower than a whole-table count, and immune to
+// tenantDatabase's own human-actor setup noise.
+//
+// This binary has TWO audit-writing mutation call sites, not one:
+// getOrCreateFacility's engine.Create (independent review, finding 1 —
+// a mutant that falsified only the Facility-create actor left this
+// package green when the assertion checked solely the InventoryItem
+// row) and recordmigrate.Run's engine.Update on the InventoryItem
+// itself. Both are asserted here so a wiring mistake on either path
+// fails this test.
 func TestBackfill_ActorTypeAI_WritesRealAuditRow(t *testing.T) {
 	dsn, tenantDB := tenantDatabase(t, true)
 	id := insertLegacyInventoryItem(t, tenantDB, "INV-AI-1",
@@ -322,19 +329,30 @@ func TestBackfill_ActorTypeAI_WritesRealAuditRow(t *testing.T) {
 		t.Fatalf("expected the migration to actually run, got stdout: %q", stdout)
 	}
 
-	var actorType, actorID string
-	var modelVersion sql.NullString
-	if err := tenantDB.QueryRowContext(context.Background(),
-		`SELECT actor_type, actor_id, model_version FROM audit_log WHERE record_id = $1 ORDER BY id DESC LIMIT 1`, id,
-	).Scan(&actorType, &actorID, &modelVersion); err != nil {
-		t.Fatalf("read audit_log row for %s: %v", id, err)
+	assertAuditRow := func(t *testing.T, label, recordID string) {
+		t.Helper()
+		var actorType, actorID string
+		var modelVersion sql.NullString
+		if err := tenantDB.QueryRowContext(context.Background(),
+			`SELECT actor_type, actor_id, model_version FROM audit_log WHERE record_id = $1 ORDER BY id DESC LIMIT 1`, recordID,
+		).Scan(&actorType, &actorID, &modelVersion); err != nil {
+			t.Fatalf("read audit_log row for %s (%s): %v", label, recordID, err)
+		}
+		if actorType != "ai_agent" || actorID != "pipeline" {
+			t.Errorf("%s: expected actor_type=ai_agent, actor_id=pipeline, got actor_type=%q, actor_id=%q", label, actorType, actorID)
+		}
+		if !modelVersion.Valid || modelVersion.String != "claude-test-1" {
+			t.Errorf("%s: expected model_version=claude-test-1, got %+v", label, modelVersion)
+		}
 	}
-	if actorType != "ai_agent" || actorID != "pipeline" {
-		t.Errorf("expected actor_type=ai_agent, actor_id=pipeline, got actor_type=%q, actor_id=%q", actorType, actorID)
+
+	assertAuditRow(t, "InventoryItem", id)
+
+	created := facilities(t, tenantDB)
+	if len(created) != 1 {
+		t.Fatalf("expected exactly one Facility created, got %d: %+v", len(created), created)
 	}
-	if !modelVersion.Valid || modelVersion.String != "claude-test-1" {
-		t.Errorf("expected model_version=claude-test-1, got %+v", modelVersion)
-	}
+	assertAuditRow(t, "Facility", created[0].id)
 }
 
 func TestBackfill_NoFacilityDefinitionPublished_FailsCleanly(t *testing.T) {
