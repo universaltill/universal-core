@@ -974,6 +974,116 @@ func TestRender_RelatedListRowsAndEmptyState(t *testing.T) {
 	}
 }
 
+// TestRender_RelatedListColumnHeadersResolveThroughCatalog (uc-infra#103):
+// buildChildRows computes a fully catalog-resolved Columns for related_list
+// sections exactly like master_detail (see TestRender_MasterDetail
+// ColumnsAndRollUpLabelResolveThroughCatalog, the sibling test this
+// mirrors), but the template used to discard it — no header of any kind
+// rendered, so every related_list section in the app showed unlabeled
+// cells. Uses the real PurchaseOrder catalog entry (not a synthetic test
+// key), same reasoning as the master_detail test: an English assertion
+// here could pass by coincidence, Turkish proves translation actually
+// happened.
+func TestRender_RelatedListColumnHeadersResolveThroughCatalog(t *testing.T) {
+	r := testRenderer(t)
+	childDef := &entity.Definition{
+		EntityType: "PurchaseOrder", Version: 1,
+		Fields: []entity.Field{{Name: "vendor_id", Type: entity.FieldReference, Target: "Party"}},
+	}
+	data := Data{
+		Record: map[string]any{"payment_method": "Wire"},
+		Children: map[string][]map[string]any{
+			"PurchaseOrder": {{"vendor_id": "vendor-1"}},
+		},
+		ChildDefs: map[string]*entity.Definition{"PurchaseOrder": childDef},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "tr"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, `<span class="uc-related-header-cell" data-field="vendor_id">Tedarikçi</span>`) {
+		t.Errorf("expected the vendor_id column header resolved to Turkish via field.PurchaseOrder.vendor_id, got:\n%s", out)
+	}
+}
+
+// TestRender_RelatedListColumnHeadersFallBackToRawFieldNameWhenUntranslated
+// (uc-infra#103): mirrors TestRender_MasterDetailColumnsFallBackToRaw
+// FieldNameWhenUntranslated — an untranslated field, or no child
+// Definition at all, must still show the raw field name as the header
+// rather than going blank or omitting the header entirely.
+func TestRender_RelatedListColumnHeadersFallBackToRawFieldNameWhenUntranslated(t *testing.T) {
+	r := testRenderer(t)
+
+	// No catalog entry exists for field.Untranslated.* in any locale.
+	childDef := &entity.Definition{
+		EntityType: "Untranslated", Version: 1,
+		Fields: []entity.Field{{Name: "widget_count", Type: entity.FieldNumber}},
+	}
+	data := Data{
+		Record: map[string]any{"payment_method": "Wire"},
+		Children: map[string][]map[string]any{
+			"PurchaseOrder": {{"widget_count": 3.0}},
+		},
+		ChildDefs: map[string]*entity.Definition{"PurchaseOrder": childDef},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, `<span class="uc-related-header-cell" data-field="widget_count">widget_count</span>`) {
+		t.Errorf("expected an untranslated column header to fall back to the raw field name, got:\n%s", out)
+	}
+
+	// No ChildDefs entry at all (childDef == nil): buildChildRows falls
+	// back to the union of the rows' own keys, and childColumns must still
+	// label each with its own raw name, not an empty string.
+	dataNoChildDef := Data{
+		Record: map[string]any{"payment_method": "Wire"},
+		Children: map[string][]map[string]any{
+			"PurchaseOrder": {{"widget_count": 3.0}},
+		},
+	}
+	var buf2 strings.Builder
+	if err := r.Render(&buf2, purchaseOrderForm(), purchaseOrderEntity(), dataNoChildDef, "en"); err != nil {
+		t.Fatalf("render (no ChildDefs): %v", err)
+	}
+	if !strings.Contains(buf2.String(), `<span class="uc-related-header-cell" data-field="widget_count">widget_count</span>`) {
+		t.Errorf("expected a column header with no child Definition at all to still show the raw field name, got:\n%s", buf2.String())
+	}
+}
+
+// TestRender_RelatedListHeaderRendersEvenWhenEmpty (uc-infra#103): the
+// header describes the child Definition's declared field order (see
+// buildChildRows), independent of whether any rows exist — same as
+// master_detail's <thead>, which always renders regardless of .Children.
+// A related list with zero rows today should still show what its columns
+// WOULD be, not just the empty-state message.
+func TestRender_RelatedListHeaderRendersEvenWhenEmpty(t *testing.T) {
+	r := testRenderer(t)
+	childDef := &entity.Definition{
+		EntityType: "PurchaseOrder", Version: 1,
+		Fields: []entity.Field{{Name: "vendor_id", Type: entity.FieldReference, Target: "Party"}},
+	}
+	data := Data{
+		Record:    map[string]any{"payment_method": "Wire"},
+		Children:  map[string][]map[string]any{"PurchaseOrder": {}},
+		ChildDefs: map[string]*entity.Definition{"PurchaseOrder": childDef},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, `<span class="uc-related-header-cell" data-field="vendor_id">Vendor</span>`) {
+		t.Errorf("expected the column header to render even with zero rows, got:\n%s", out)
+	}
+	if !strings.Contains(out, "No related records.") {
+		t.Errorf("expected the empty-state message to still render alongside the header, got:\n%s", out)
+	}
+}
+
 func TestRender_AllActionKindsRendered(t *testing.T) {
 	r := testRenderer(t)
 	data := Data{RecordID: "po-1", Record: map[string]any{"payment_method": "Wire"}, Children: map[string][]map[string]any{}}

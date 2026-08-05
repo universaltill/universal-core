@@ -878,6 +878,7 @@ const tmplSrc = `<form class="uc-form" data-entity-type="{{.EntityType}}"{{if .R
 <button type="button" hx-get="{{.AddHref}}" hx-target="closest table" hx-swap="beforeend">{{$.MasterDetailAdd}}</button>
 {{else if eq .Component "related_list"}}
 <div class="uc-related-list">
+{{if .Columns}}<div class="uc-related-header" role="row">{{range .Columns}}<span class="uc-related-header-cell" data-field="{{.Field}}">{{.Label}}</span>{{end}}</div>{{end}}
 {{if not .Children}}<p class="uc-empty">{{$.RelatedListEmpty}}</p>{{end}}
 {{range .Children}}<div class="uc-related-row">{{range .Cells}}<span data-field="{{.Field}}">{{.Value}}</span>{{end}}</div>{{end}}
 </div>
