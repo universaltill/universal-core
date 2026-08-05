@@ -253,6 +253,45 @@ func TestValidateRecord_I18nText(t *testing.T) {
 	if err := ValidateRecord(reqDef, map[string]any{}); err == nil {
 		t.Fatal("expected an absent required i18n_text field to fail validation")
 	}
+
+	// uc-infra#104: a required i18n_text can be PRESENT yet structurally
+	// valid while carrying no content — a direct JSON API caller sending
+	// {} or every locale blank, or a CSV/XLSX cell whose text is
+	// literally "{}" (a genuinely blank form field or CSV cell is
+	// already caught upstream as absent — see validate.go's comment on
+	// this same check). None of those trip the `!present || v == nil`
+	// guard, so {} (or every locale blank) must still fail Required, the
+	// same as an absent field would.
+	if err := ValidateRecord(reqDef, map[string]any{"label": map[string]any{}}); err == nil {
+		t.Fatal("expected a required i18n_text with an empty {} object to fail validation")
+	}
+	if err := ValidateRecord(reqDef, map[string]any{"label": map[string]any{"en": ""}}); err == nil {
+		t.Fatal("expected a required i18n_text with every locale blank to fail validation")
+	}
+	if err := ValidateRecord(reqDef, map[string]any{"label": map[string]any{"en": "", "tr": ""}}); err == nil {
+		t.Fatal("expected a required i18n_text with every locale blank (multiple locales) to fail validation")
+	}
+	// At least one non-blank locale satisfies Required, even if others
+	// are blank — "no Turkish translation yet" is not the same gap as
+	// "no translation in any language at all".
+	if err := ValidateRecord(reqDef, map[string]any{"label": map[string]any{"en": "", "tr": "Proje"}}); err != nil {
+		t.Fatalf("expected a required i18n_text with one non-blank locale to pass, got: %v", err)
+	}
+	// The error carries the same Kind/shape as every other Required
+	// rejection — uc-infra#96's translation layer keys purely on Kind,
+	// so this needs no new catalog entry.
+	err := ValidateRecord(reqDef, map[string]any{"label": map[string]any{}})
+	var verr *ValidationError
+	if err == nil || !errors.As(err, &verr) || verr.Kind != KindRequired || verr.FieldName != "label" {
+		t.Fatalf("expected a KindRequired ValidationError naming %q, got: %v", "label", err)
+	}
+
+	// Optional i18n_text is untouched by this: an empty {} (or all-blank
+	// locales) stays valid when the field isn't Required — this is
+	// exactly the shape-only behavior documented above, unchanged.
+	if err := ValidateRecord(def, map[string]any{"label": map[string]any{"en": ""}}); err != nil {
+		t.Fatalf("optional i18n_text with a blank locale value should still be valid: %v", err)
+	}
 }
 
 // TestValidateRecord_NotBefore_TransitiveChain (#29 review finding 1):

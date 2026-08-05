@@ -119,7 +119,47 @@ func ValidateRecord(def *Definition, data map[string]any) error {
 		if verr := validateFieldValue(def.EntityType, f, v); verr != nil {
 			return verr
 		}
+		// A required i18n_text can be PRESENT yet structurally valid
+		// (per ADR-0009, {} is a legal "no translation yet" shape) while
+		// still carrying no actual content — e.g. a direct JSON API
+		// caller sending {"name":{}} or {"name":{"en":""}}, or a CSV/XLSX
+		// cell whose text is literally "{}" (a genuinely blank CSV cell
+		// is already caught upstream as absent — csvimport.buildRowData
+		// skips it before Coerce ever runs, and the generated HTML form
+		// does the same for an all-blank field — handlers.go's
+		// parseRecordFields). None of those trip the presence check
+		// above, so Required must also mean "at least one locale has
+		// content" for this field type specifically — checked here,
+		// after the generic shape check, rather than in
+		// validateFieldValue, which stays structural-only per ADR-0009
+		// and must not know about Required (uc-infra#104). Reuses
+		// KindRequired/the identical Detail shape the presence check
+		// above uses, so uc-infra#96's translation layer (keyed on Kind)
+		// needs no new catalog entry for this.
+		if f.Required && f.Type == FieldI18nText && !i18nTextHasContent(v) {
+			return &ValidationError{
+				Kind:       KindRequired,
+				EntityType: def.EntityType,
+				FieldName:  f.Name,
+				Detail:     fmt.Sprintf("field %q is required", f.Name),
+			}
+		}
 	}
+	// Note (independent review, uc-infra#104): this is intentionally
+	// LOOSER than formrender's client-side rule for the same field —
+	// formrender marks only the fallback/primary locale's input as the
+	// browser's `required` attribute (render.go: "a required multilingual
+	// field must be named in the primary language at least"), while this
+	// accepts ANY single non-blank locale. That's not a violation of
+	// ADR-0017 §5's "validation is defined once" — the browser's
+	// `required` never lets an all-blank submission through in the first
+	// place, so anything the form actually submits already satisfies this
+	// looser server rule too. The gap this function closes is for callers
+	// that bypass the form entirely (direct JSON API, CSV/XLSX import),
+	// where "primary locale filled in" isn't a precondition to begin
+	// with — narrowing the server to match the form's primary-locale-only
+	// rule would need a real design pass (which primary locale, for a
+	// tenant with none configured?), not a guess folded into this fix.
 	var fieldByName map[string]Field
 	for _, f := range def.Fields {
 		if f.NotBefore == "" {
@@ -243,4 +283,30 @@ func validateFieldValue(entityType string, f Field, v any) *ValidationError {
 		return newErr(KindInvalid, fmt.Sprintf("unknown field type %q", f.Type))
 	}
 	return nil
+}
+
+// i18nTextHasContent reports whether an i18n_text value — already
+// shape-validated by validateFieldValue at this point, so safely a
+// map[string]any of locale->string — has at least one locale with a
+// non-empty string. Only called for Required fields (see ValidateRecord);
+// an optional i18n_text stays governed by validateFieldValue's
+// structural-only ADR-0009 check regardless of what this returns.
+//
+// A whitespace-only string ("   ") counts as content here, matching this
+// field's pre-existing baseline for what "non-empty" means. Whether
+// whitespace-only should also fail Required is uc-infra#105's gap
+// (JSON API vs. CSV import disagreeing on blank for other field types)
+// — deliberately not folded in here; that's a distinct, separately
+// scoped fix.
+func i18nTextHasContent(v any) bool {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return false
+	}
+	for _, val := range m {
+		if s, ok := val.(string); ok && s != "" {
+			return true
+		}
+	}
+	return false
 }
