@@ -21,6 +21,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -31,7 +32,9 @@ import (
 	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/db"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
+	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
+	"github.com/universaltill/universal-core/internal/kernel/hr"
 	"github.com/universaltill/universal-core/internal/kernel/moduleseed"
 	"github.com/universaltill/universal-core/internal/kernel/purchasing"
 	"github.com/universaltill/universal-core/internal/modules"
@@ -531,6 +534,202 @@ func TestSync_WarnsAboutTargetConstraintViolations(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("sync must not touch the offending record, got %d PurchaseOrder record(s)", n)
+	}
+}
+
+// staleTenantOldAttendanceRecord is staleTenantOldPurchaseOrder's sibling
+// for the Unique data-migration warning test below: HR published with
+// AttendanceRecord pinned at v1, the version before uc-infra#81's
+// (employee_id, entry_date) Unique constraint (v2) existed at all.
+func staleTenantOldAttendanceRecord(t *testing.T, control *sql.DB, router *tenantdb.Router, name string) (id string, tenantDB *sql.DB) {
+	t.Helper()
+	id, tenantDB = newTenant(t, control, router, name)
+	ctx := context.Background()
+	if err := modules.PublishFoundation(ctx, tenantDB, setupActor); err != nil {
+		t.Fatalf("PublishFoundation: %v", err)
+	}
+	var items []moduleseed.Item
+	for _, def := range hr.All() {
+		if def.EntityType == "AttendanceRecord" {
+			def = attendanceRecordV1()
+		}
+		raw, err := json.Marshal(def)
+		if err != nil {
+			t.Fatalf("marshal %s definition: %v", def.EntityType, err)
+		}
+		items = append(items, moduleseed.Item{Key: def.EntityType, Version: def.Version, Raw: raw})
+	}
+	if err := moduleseed.PublishAll(ctx, data.NewEntityDefinitionRepo(tenantDB), items, setupActor); err != nil {
+		t.Fatalf("publish hr with old AttendanceRecord: %v", err)
+	}
+	return id, tenantDB
+}
+
+// attendanceRecordV1 is AttendanceRecord as it stood before uc-infra#81
+// added the (employee_id, entry_date) Unique constraint (v2) — derived
+// from the CURRENT Definition (same reasoning purchaseOrderV6's own doc
+// comment gives): the only difference v1 had was the absence of Unique,
+// so copying and clearing it can't drift from the real v1 shape as
+// unrelated fields change around it.
+func attendanceRecordV1() *entity.Definition {
+	def := *hr.AttendanceRecord()
+	def.Version = 1
+	def.Unique = nil
+	return &def
+}
+
+// insertLegacyDuplicateAttendanceRecords writes two AttendanceRecord rows
+// for the SAME (employee_id, entry_date) straight into records, bypassing
+// crud.Engine — v2 would reject the second one via the new enforcement
+// stage, the same reasoning insertLegacyInventoryItem/
+// insertLegacyPurchaseOrder give for their own already-invalid fixtures.
+func insertLegacyDuplicateAttendanceRecords(t *testing.T, tenantDB *sql.DB, employeeID, entryDate string) {
+	t.Helper()
+	for i := 0; i < 2; i++ {
+		raw, err := json.Marshal(map[string]any{
+			"employee_id":  employeeID,
+			"entry_date":   entryDate,
+			"hours_worked": float64(8),
+			"source":       "manual",
+		})
+		if err != nil {
+			t.Fatalf("marshal legacy AttendanceRecord %d: %v", i, err)
+		}
+		if _, err := tenantDB.ExecContext(context.Background(),
+			`INSERT INTO records (entity_type, data) VALUES ('AttendanceRecord', $1)`, raw,
+		); err != nil {
+			t.Fatalf("insert legacy AttendanceRecord %d: %v", i, err)
+		}
+	}
+}
+
+// TestSync_WarnsAboutUniqueConstraintViolations is
+// TestSync_WarnsAboutTargetConstraintViolations' counterpart for
+// Definition.Unique (uc-infra#81): a tenant with two pre-existing
+// AttendanceRecord rows for the same (employee_id, entry_date), synced
+// past the version that first declares that Unique set, must be warned —
+// not silently told "0 data migrations needed" only for the very next
+// hand-edit of either row to 400.
+func TestSync_WarnsAboutUniqueConstraintViolations(t *testing.T) {
+	dsn, control, router := controlPlane(t)
+	_, tenantDB := staleTenantOldAttendanceRecord(t, control, router, "Sync Smoke Test Unique")
+
+	insertLegacyDuplicateAttendanceRecords(t, tenantDB, "00000000-0000-0000-0000-0000000000e1", "2026-08-01")
+
+	stdout, stderr, code := run(t, []string{"DATABASE_URL=" + dsn}, "-actor-id=smoke-test")
+	if code != 0 {
+		t.Fatalf("sync: exit %d, stderr: %s", code, stderr)
+	}
+	want := `Sync Smoke Test Unique: AttendanceRecord — 2 record(s) already collide on the new unique constraint "employee_id+entry_date" and will fail validation on next edit`
+	if !strings.Contains(stdout, want) {
+		t.Fatalf("expected warning %q, got stdout: %q", want, stdout)
+	}
+	// The sync reports; it must not have repaired or rejected anything.
+	var n int
+	if err := tenantDB.QueryRowContext(context.Background(),
+		`SELECT count(*) FROM records WHERE entity_type = 'AttendanceRecord' AND deleted_at IS NULL`,
+	).Scan(&n); err != nil {
+		t.Fatalf("count AttendanceRecord records: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("sync must not touch the offending records, got %d AttendanceRecord record(s)", n)
+	}
+}
+
+// TestSync_BackfillsUniqueConstraintKeysForExistingRecords is the
+// regression test for the gap independent review found: without a
+// backfill, a Unique constraint added to an entity type that already has
+// data protects NONE of it — a fresh, real duplicate against an
+// un-keyed pre-existing record is silently accepted. This proves the
+// fix end to end through the real compiled binary: sync backfills the
+// pre-existing record's key, and a subsequent real duplicate submitted
+// through crud.Engine (standing in for a real user's next save) is
+// rejected.
+func TestSync_BackfillsUniqueConstraintKeysForExistingRecords(t *testing.T) {
+	dsn, control, router := controlPlane(t)
+	_, tenantDB := staleTenantOldAttendanceRecord(t, control, router, "Sync Smoke Test Backfill")
+
+	// One pre-existing, NON-colliding AttendanceRecord — the case
+	// TestSync_WarnsAboutUniqueConstraintViolations doesn't cover (that
+	// one is about records already colliding with EACH OTHER; this one
+	// is about a single old record with no key row at all yet).
+	insertLegacyDuplicateAttendanceRecords(t, tenantDB, "00000000-0000-0000-0000-0000000000e2", "2026-08-05")
+	// insertLegacyDuplicateAttendanceRecords writes 2 rows; delete one so
+	// this fixture is a single pre-existing record, not a collision.
+	if _, err := tenantDB.ExecContext(context.Background(),
+		`DELETE FROM records WHERE entity_type = 'AttendanceRecord' AND id = (
+			SELECT id FROM records WHERE entity_type = 'AttendanceRecord' ORDER BY created_at, id LIMIT 1
+		)`); err != nil {
+		t.Fatalf("trim fixture to a single record: %v", err)
+	}
+	var remaining int
+	if err := tenantDB.QueryRowContext(context.Background(),
+		`SELECT count(*) FROM records WHERE entity_type = 'AttendanceRecord'`).Scan(&remaining); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if remaining != 1 {
+		t.Fatalf("fixture setup: expected exactly 1 pre-existing AttendanceRecord, got %d", remaining)
+	}
+
+	stdout, stderr, code := run(t, []string{"DATABASE_URL=" + dsn}, "-actor-id=smoke-test")
+	if code != 0 {
+		t.Fatalf("sync: exit %d, stderr: %s", code, stderr)
+	}
+	want := `Sync Smoke Test Backfill: AttendanceRecord — backfilled unique constraint "employee_id+entry_date" for 1 existing record(s)`
+	if !strings.Contains(stderr, want) {
+		t.Fatalf("expected backfill line %q, got stderr: %q (stdout: %q)", want, stderr, stdout)
+	}
+
+	var keyCount int
+	if err := tenantDB.QueryRowContext(context.Background(),
+		`SELECT count(*) FROM record_unique_keys WHERE entity_type = 'AttendanceRecord'`).Scan(&keyCount); err != nil {
+		t.Fatalf("count record_unique_keys: %v", err)
+	}
+	if keyCount != 1 {
+		t.Fatalf("expected the pre-existing record to be backfilled a key row, got %d", keyCount)
+	}
+
+	// The real proof: a FRESH duplicate against the now-backfilled
+	// pre-existing record is rejected through the real engine, exactly
+	// the exposure this closes.
+	engine := crud.NewEngine(tenantDB)
+	_, err := engine.Create(context.Background(), hr.AttendanceRecord(), map[string]any{
+		"employee_id": "00000000-0000-0000-0000-0000000000e2", "entry_date": "2026-08-05",
+		"hours_worked": float64(1), "source": "manual",
+	}, setupActor)
+	if !errors.Is(err, crud.ErrUniqueConstraintViolation) {
+		t.Fatalf("expected a fresh duplicate against the backfilled pre-existing record to be rejected, got %v (stderr: %s)", err, stderr)
+	}
+}
+
+// TestSync_DryRun_DoesNotBackfillUniqueConstraintKeys confirms -dry-run
+// writes nothing to record_unique_keys either — the same "nothing is
+// published" contract dry-run already holds for entity/form definitions
+// (this file's own doc comment), now extended to the one write real syncs
+// make.
+func TestSync_DryRun_DoesNotBackfillUniqueConstraintKeys(t *testing.T) {
+	dsn, control, router := controlPlane(t)
+	_, tenantDB := staleTenantOldAttendanceRecord(t, control, router, "Sync Smoke Test Backfill DryRun")
+	insertLegacyDuplicateAttendanceRecords(t, tenantDB, "00000000-0000-0000-0000-0000000000e3", "2026-08-05")
+	if _, err := tenantDB.ExecContext(context.Background(),
+		`DELETE FROM records WHERE entity_type = 'AttendanceRecord' AND id = (
+			SELECT id FROM records WHERE entity_type = 'AttendanceRecord' ORDER BY created_at, id LIMIT 1
+		)`); err != nil {
+		t.Fatalf("trim fixture to a single record: %v", err)
+	}
+
+	_, _, code := run(t, []string{"DATABASE_URL=" + dsn}, "-actor-id=smoke-test", "-dry-run")
+	if code != 0 {
+		t.Fatalf("dry-run sync failed: exit %d", code)
+	}
+
+	var keyCount int
+	if err := tenantDB.QueryRowContext(context.Background(),
+		`SELECT count(*) FROM record_unique_keys`).Scan(&keyCount); err != nil {
+		t.Fatalf("count record_unique_keys: %v", err)
+	}
+	if keyCount != 0 {
+		t.Fatalf("expected -dry-run to write no record_unique_keys rows, got %d", keyCount)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 
 	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
+	"github.com/universaltill/universal-core/internal/kernel/hr"
 	"github.com/universaltill/universal-core/internal/kernel/purchasing"
 )
 
@@ -419,6 +420,92 @@ func TestPurchaseOrderStages_ReversedDates_ToastInRealBrowser(t *testing.T) {
 	}
 	if !strings.Contains(toastText, "must not be before") {
 		t.Fatalf("toast %q should carry the chronology error", toastText)
+	}
+}
+
+// TestAttendanceRecordUniqueConstraint_ToastInRealBrowser is
+// TestPurchaseOrderStages_ReversedDates_ToastInRealBrowser's counterpart
+// for uc-infra#81's (employee_id, entry_date) Unique constraint: a real
+// browser edit that would collide with another record's key must render
+// the translated toast, not just a JSON 400 (proven separately, without
+// a browser, by internal/api's TestAPI_CreateRecord_
+// UniqueConstraintViolationIs400Localized). Both AttendanceRecord rows
+// are seeded server-side with the SAME employee_id but DIFFERENT
+// entry_date, so the browser interaction only has to touch entry_date —
+// a plain <input type="date">, no reference-picker interaction needed
+// (same reasoning the PurchaseOrder toast test above avoids touching
+// vendor_id's picker: it edits shipped_at, seeding vendor_id server-side
+// instead).
+func TestAttendanceRecordUniqueConstraint_ToastInRealBrowser(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, tenantDB := testServer(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	if err := hr.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("hr.Publish: %v", err)
+	}
+	if err := hr.PublishForms(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("hr.PublishForms: %v", err)
+	}
+	if err := hr.PublishStatuses(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("hr.PublishStatuses: %v", err)
+	}
+
+	engine := crud.NewEngine(tenantDB)
+	// A REAL Employee, not a dangling reference: the reference-picker's
+	// visible search input is HTML5 `required`, and only pre-fills from a
+	// resolved label (internal/api's loadCurrentReferenceLabels) — a
+	// dangling id leaves it empty, so native browser validation silently
+	// blocks the submit this test's whole assertion depends on, well
+	// before the click ever reaches the server. Unrelated to
+	// entry_date/Unique; just what a real edit form needs to be usable.
+	partyID, err := engine.Create(ctx, foundation.Party(), map[string]any{
+		"name": "Attendance Toast Employee", "party_type": "person", "status": "active",
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed Party: %v", err)
+	}
+	employeeStatusID := publishedStatusID(t, tenantDB, "employee_status", "active")
+	employee, err := engine.Create(ctx, hr.Employee(), map[string]any{
+		"employee_number": "E-TOAST-1", "party_id": partyID.ID, "hire_date": "2026-01-01", "status_id": employeeStatusID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed Employee: %v", err)
+	}
+	employeeID := employee.ID
+
+	if _, err := engine.Create(ctx, hr.AttendanceRecord(), map[string]any{
+		"employee_id": employeeID, "entry_date": "2026-08-01", "hours_worked": float64(8), "source": "manual",
+	}, actor); err != nil {
+		t.Fatalf("seed first AttendanceRecord: %v", err)
+	}
+	second, err := engine.Create(ctx, hr.AttendanceRecord(), map[string]any{
+		"employee_id": employeeID, "entry_date": "2026-08-02", "hours_worked": float64(8), "source": "manual",
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed second AttendanceRecord: %v", err)
+	}
+
+	bctx := browserCtx(t, tenantID)
+	if err := chromedp.Run(bctx,
+		chromedp.Navigate(srv.URL+"/forms/AttendanceRecord/"+second.ID),
+		chromedp.WaitVisible(`form.uc-form`, chromedp.ByQuery),
+		chromedp.SetValue(`input[name="entry_date"]`, "2026-08-01", chromedp.ByQuery),
+		// A plain click, not submitForm(): clickAndSettle's settle helper
+		// rejects on a non-2xx response, and a 400 is exactly what this
+		// test wants — the toast's own visibility is the wait condition.
+		chromedp.Click(`form.uc-form button[type="submit"]`, chromedp.ByQuery),
+		chromedp.WaitVisible(`#uc-toast.uc-toast-visible`, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("colliding entry_date save + toast: %v", err)
+	}
+	var toastText string
+	if err := chromedp.Run(bctx, chromedp.Text(`#uc-toast`, &toastText, chromedp.ByQuery)); err != nil {
+		t.Fatalf("read toast: %v", err)
+	}
+	if !strings.Contains(toastText, "already used by another record") {
+		t.Fatalf("toast %q should carry the unique-constraint error", toastText)
 	}
 }
 

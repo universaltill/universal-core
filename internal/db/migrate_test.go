@@ -404,3 +404,61 @@ func TestApply_ConcurrentCallersDoNotFail(t *testing.T) {
 		t.Fatalf("expected exactly %d recorded migrations after %d concurrent Apply calls, got %d", want, callers, count)
 	}
 }
+
+// TestApplyTenant_RecordUniqueKeysTableAndIndexExist confirms
+// 0006_record_unique_keys.sql actually lands (universaltill/uc-infra#81):
+// the composite UNIQUE constraint here is the real correctness guarantee
+// entity.Definition.Unique's enforcement depends on (ADR-0018 section 3) —
+// a table that merely EXISTS without the constraint would let
+// crud.Engine's writeUniqueConstraintKeys silently stop enforcing
+// anything, so this pins the constraint's exact column set, not just the
+// table's presence.
+func TestApplyTenant_RecordUniqueKeysTableAndIndexExist(t *testing.T) {
+	db := freshTestDB(t, "uc_test_tenant")
+	ctx := context.Background()
+
+	if err := ApplyTenant(ctx, db); err != nil {
+		t.Fatalf("ApplyTenant: %v", err)
+	}
+
+	var cols []string
+	rows, err := db.QueryContext(ctx, `
+		SELECT a.attname
+		FROM pg_constraint c
+		JOIN unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) ON true
+		JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
+		WHERE c.conname = 'record_unique_keys_key_uq'
+		ORDER BY k.ord`)
+	if err != nil {
+		t.Fatalf("query record_unique_keys_key_uq columns: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var col string
+		if err := rows.Scan(&col); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		cols = append(cols, col)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+
+	want := []string{"entity_type", "constraint_name", "key_value"}
+	if len(cols) != len(want) {
+		t.Fatalf("expected record_unique_keys_key_uq to cover %v, got %v", want, cols)
+	}
+	for i, c := range cols {
+		if c != want[i] {
+			t.Fatalf("expected record_unique_keys_key_uq column %d to be %q, got %q (full: %v)", i, want[i], c, cols)
+		}
+	}
+
+	var indexdef string
+	if err := db.QueryRowContext(ctx,
+		`SELECT indexdef FROM pg_indexes WHERE tablename = 'record_unique_keys' AND indexname = $1`,
+		"record_unique_keys_record_id_idx",
+	).Scan(&indexdef); err != nil {
+		t.Fatalf("expected record_unique_keys_record_id_idx to exist after ApplyTenant: %v", err)
+	}
+}

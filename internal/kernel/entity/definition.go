@@ -118,6 +118,22 @@ type Field struct {
 	MustMatchParentField string `json:"must_match_parent_field,omitempty"`
 }
 
+// UniqueConstraintName canonicalizes a declared field set into the stable
+// name crud's enforcement stage and record_unique_keys both key on: the
+// field names sorted, joined by "+". Sorting means {"a","b"} and {"b","a"}
+// name the same constraint — Validate below rejects declaring both as
+// distinct entries — and gives Dev/Reviewer a name that doesn't depend on
+// declaration order. Exported because crud (a different package, by the
+// kernel/deterministic-core boundary rule: entity stays generic, crud does
+// the database-aware enforcement) needs the exact same name to look up and
+// write record_unique_keys rows — computing it twice, differently, would
+// silently desync the two.
+func UniqueConstraintName(fields []string) string {
+	sorted := append([]string(nil), fields...)
+	slices.Sort(sorted)
+	return strings.Join(sorted, "+")
+}
+
 // TargetFilterCondition is one field/value condition a candidate target
 // record must satisfy — see Field.TargetFilter.
 //
@@ -222,6 +238,23 @@ type Definition struct {
 	// discipline LabelField above already follows, not something a
 	// generic engine should default to "everywhere" on inference.
 	QuickCreatable bool `json:"quick_creatable,omitempty"`
+	// Unique declares one or more sets of field names that must be unique
+	// together across every live (non-soft-deleted) record of this entity
+	// type — e.g. [][]string{{"employee_id","entry_date"}} on
+	// AttendanceRecord rejects a second row for the same employee on the
+	// same day (uc-infra#81). A single-element set covers a "natural key"
+	// field on its own (employee_number, po_number, Item.sku, ...); this
+	// task declares it only on AttendanceRecord's composite case — see
+	// ADR-0018 §3 for why this is a Definition-level declaration enforced
+	// by crud.Engine (a database-aware stage, not entity.ValidateRecord:
+	// deciding uniqueness needs OTHER records, which would break
+	// ValidateRecord's deliberate purity, see its own doc comment) rather
+	// than a partial unique index generated from metadata (ADR-0018 §3(a),
+	// rejected: would mean the metadata layer executing DDL at publish
+	// time). A record with any named field absent/nil is exempt from that
+	// constraint, mirroring ordinary SQL NULL-in-a-unique-index semantics
+	// — Required already covers "must always be present" separately.
+	Unique [][]string `json:"unique,omitempty"`
 }
 
 // FieldByName returns the field with the given name, if present.
@@ -396,6 +429,30 @@ func (d *Definition) Validate() error {
 			}
 			visited[name] = true
 		}
+	}
+	// Unique checked in its own pass, same reasoning as NotBefore's: static,
+	// shape-only checks that don't need any other record (crud.Engine does
+	// the database-aware enforcement — see Unique's own doc comment).
+	seenConstraints := make(map[string]bool, len(d.Unique))
+	for _, set := range d.Unique {
+		if len(set) == 0 {
+			return fmt.Errorf("unique constraint in %s has an empty field set", d.EntityType)
+		}
+		seenInSet := make(map[string]bool, len(set))
+		for _, name := range set {
+			if _, ok := d.FieldByName(name); !ok {
+				return fmt.Errorf("unique constraint in %s references unknown field %q", d.EntityType, name)
+			}
+			if seenInSet[name] {
+				return fmt.Errorf("unique constraint in %s repeats field %q within one constraint", d.EntityType, name)
+			}
+			seenInSet[name] = true
+		}
+		name := UniqueConstraintName(set)
+		if seenConstraints[name] {
+			return fmt.Errorf("unique constraint on fields %v is declared more than once in %s", set, d.EntityType)
+		}
+		seenConstraints[name] = true
 	}
 	for _, r := range d.Relationships {
 		if r.Target == "" {

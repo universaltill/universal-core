@@ -793,5 +793,6 @@
   "sor.read_only_blocked_no_source": "Bu kayıt salt okunur bir harici ana kayıt sistemine aittir — düzenlemeler bir sonraki içe aktarmada üzerine yazılır.",
   "sor.mode_reserved": "\"bidirectional\" modu, yaklaşan eşitleme motoru için ayrılmıştır ve henüz kaydedilemez.",
   "crud.error.target_constraint_violation": "{field} için seçilen değer, bu alanın gerekli kısıtlamasını karşılamıyor.",
+  "crud.error.unique_constraint_violation": "Bu {fields} kombinasyonu zaten başka bir kayıt tarafından kullanılıyor.",
   "form.SystemOfRecord.section.details": "Detaylar"
 }

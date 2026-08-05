@@ -10,6 +10,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -29,6 +30,7 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/finance"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
+	"github.com/universaltill/universal-core/internal/kernel/hr"
 	"github.com/universaltill/universal-core/internal/kernel/purchasing"
 	"github.com/universaltill/universal-core/internal/tenantdb"
 	"github.com/universaltill/universal-core/internal/testexec"
@@ -721,5 +723,122 @@ func TestUniversalCore_StockTransferRoutes_ServedByRealBinary(t *testing.T) {
 	validResp, validRespBody := post("/api/records/StockTransfer", validBody)
 	if validResp.StatusCode != http.StatusCreated {
 		t.Fatalf("expected 201 for a valid StockTransfer, got %d: %s", validResp.StatusCode, validRespBody)
+	}
+}
+
+// TestUniversalCore_AttendanceRecordUniqueConstraint_EnforcedByRealBinary
+// is the smoke layer for uc-infra#81: the real compiled binary, talking
+// to a real Postgres tenant database, actually rejects a second
+// AttendanceRecord for the same (employee_id, entry_date) — not just the
+// in-process httptest coverage internal/api and internal/kernel/crud
+// already have. This is the "double-submit" case CLAUDE.md's testing
+// rule asks for: a real end user double-clicking Save, or a retried
+// request, landing on a real running server.
+func TestUniversalCore_AttendanceRecordUniqueConstraint_EnforcedByRealBinary(t *testing.T) {
+	controlDSN := testexec.FreshDatabase(t, "uc_test_server_control")
+
+	control := testexec.Open(t, controlDSN)
+	ctx := context.Background()
+	if err := db.ApplyControl(ctx, control); err != nil {
+		t.Fatalf("ApplyControl: %v", err)
+	}
+	router, err := tenantdb.NewRouter(control, controlDSN)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+	defer router.Close()
+	tenantID, err := router.Create(ctx, "AttendanceRecord Smoke Test", "eu-west")
+	if err != nil {
+		t.Fatalf("router.Create: %v", err)
+	}
+	testexec.DropTenantDatabase(t, testexec.Open(t, controlDSN), tenantID)
+	tenantDB, err := router.Get(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("router.Get: %v", err)
+	}
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "smoke-test-setup"}
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := hr.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("hr.Publish: %v", err)
+	}
+	router.Close()
+	control.Close()
+
+	baseURL := startServer(t, controlDSN, "INSECURE_DEV_AUTH=true")
+
+	post := func(path, body string) (*http.Response, string) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, baseURL+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("build request %s: %v", path, err)
+		}
+		req.Header.Set("X-Tenant-ID", tenantID)
+		req.Header.Set("X-Actor-ID", "smoke-test")
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		respBody, _ := io.ReadAll(resp.Body)
+		return resp, string(respBody)
+	}
+
+	// employee_id is a dangling reference (no real Employee record) —
+	// tolerated (ADR-0007, same as every other FieldReference with no
+	// TargetFilter/MustMatchParentField), and irrelevant to what this
+	// test is actually proving.
+	body := `{"employee_id":"00000000-0000-0000-0000-0000000000e1","entry_date":"2026-08-01","hours_worked":8,"source":"manual"}`
+
+	firstResp, firstBody := post("/api/records/AttendanceRecord", body)
+	if firstResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 for the first AttendanceRecord, got %d: %s", firstResp.StatusCode, firstBody)
+	}
+
+	secondResp, secondBody := post("/api/records/AttendanceRecord", body)
+	if secondResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a duplicate (employee_id, entry_date) double-submit, got %d: %s", secondResp.StatusCode, secondBody)
+	}
+	if !strings.Contains(secondBody, "already used by another record") {
+		t.Fatalf("expected the translated unique-constraint message, got: %s", secondBody)
+	}
+
+	// Asserted through the real running server's own API, not a direct DB
+	// query — router/control are already closed above (same reasoning
+	// TestUniversalCore_StockTransferRoutes_ServedByRealBinary's post/get
+	// helpers give: from this point on, the server process is the only
+	// thing this test talks to).
+	get := func(path string) (*http.Response, string) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, baseURL+path, nil)
+		if err != nil {
+			t.Fatalf("build request %s: %v", path, err)
+		}
+		req.Header.Set("X-Tenant-ID", tenantID)
+		req.Header.Set("X-Actor-ID", "smoke-test")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		respBody, _ := io.ReadAll(resp.Body)
+		return resp, string(respBody)
+	}
+	listResp, listBody := get("/api/records/AttendanceRecord")
+	if listResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from GET /api/records/AttendanceRecord, got %d: %s", listResp.StatusCode, listBody)
+	}
+	var list struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(listBody), &list); err != nil {
+		t.Fatalf("unmarshal list response: %v", err)
+	}
+	if len(list.Data) != 1 {
+		t.Fatalf("expected exactly 1 AttendanceRecord after the rejected double-submit, got %d: %s", len(list.Data), listBody)
 	}
 }

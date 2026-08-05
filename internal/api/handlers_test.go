@@ -816,6 +816,86 @@ func TestAPI_UpdateRecord_TargetConstraintViolationIs400Localized(t *testing.T) 
 	}
 }
 
+// checkInEntityDef/checkInFormDef are a throwaway (employee_id,
+// entry_date) shape for the Unique-constraint HTTP test below — same
+// reasoning groupedItemEntityDef's own doc comment gives for not
+// importing hr.AttendanceRecord directly: this exercises the GENERIC
+// mechanism via the real registry, not one module's Definition.
+func checkInEntityDef() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "CheckIn",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "employee_id", Type: entity.FieldString, Required: true},
+			{Name: "entry_date", Type: entity.FieldDate, Required: true},
+		},
+		Unique: [][]string{{"employee_id", "entry_date"}},
+	}
+}
+
+func checkInFormDef() *form.Definition {
+	return &form.Definition{
+		EntityType: "CheckIn",
+		Version:    1,
+		Sections: []form.Section{
+			{Title: "Details", Component: form.ComponentFields, Fields: []form.FormField{
+				{Name: "employee_id", Label: "Employee"},
+				{Name: "entry_date", Label: "Date"},
+			}},
+		},
+	}
+}
+
+// TestAPI_CreateRecord_UniqueConstraintViolationIs400Localized is
+// TestAPI_UpdateRecord_TargetConstraintViolationIs400Localized's
+// counterpart for crud.UniqueConstraintError (uc-infra#81): the
+// HTTP-level proof that a duplicate (employee_id, entry_date) reaches the
+// client as a 400 with a TRANSLATED message naming both colliding
+// fields, not a raw, untranslated driver/constraint-name error.
+func TestAPI_CreateRecord_UniqueConstraintViolationIs400Localized(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, checkInEntityDef(), checkInFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	first := newRequest("POST", "/api/records/CheckIn", tenantID, "farshid",
+		[]byte(`{"employee_id":"emp-1","entry_date":"2026-08-01"}`))
+	firstRec := httptest.NewRecorder()
+	mux.ServeHTTP(firstRec, first)
+	if firstRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 for the first CheckIn, got %d: %s", firstRec.Code, firstRec.Body.String())
+	}
+
+	second := newRequest("POST", "/api/records/CheckIn", tenantID, "farshid",
+		[]byte(`{"employee_id":"emp-1","entry_date":"2026-08-01"}`))
+	secondRec := httptest.NewRecorder()
+	mux.ServeHTTP(secondRec, second)
+	if secondRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a duplicate (employee_id, entry_date), got %d: %s", secondRec.Code, secondRec.Body.String())
+	}
+	// The translated envelope message (crud.error.unique_constraint_violation,
+	// {fields} resolved via the field-label catalog per field, falling back
+	// to the raw field name — no field.CheckIn.* keys exist).
+	want := `This combination of employee_id, entry_date is already used by another record.`
+	if !strings.Contains(secondRec.Body.String(), want) {
+		t.Fatalf("expected the translated envelope message %q, got: %s", want, secondRec.Body.String())
+	}
+	if strings.Contains(secondRec.Body.String(), "record_unique_keys") {
+		t.Fatalf("expected no raw constraint/table name to reach the client, got: %s", secondRec.Body.String())
+	}
+
+	var count int
+	if err := db.QueryRowContext(context.Background(), `SELECT count(*) FROM records WHERE entity_type = 'CheckIn'`).Scan(&count); err != nil {
+		t.Fatalf("count CheckIn records: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected the rejected duplicate create to roll back entirely, found %d CheckIn records", count)
+	}
+}
+
 // TestAPI_RenderForm_IncludesVersionHiddenField confirms an existing
 // record's edit form actually carries the "_version" hidden field a real
 // browser needs to round-trip for optimistic-locking protection — a new/

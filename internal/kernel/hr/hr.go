@@ -53,10 +53,6 @@
 //   - employee_id pointing at an Employee that exists at all — a
 //     dangling reference is accepted (#78).
 //
-//   - one attendance row per employment per day: two rows for the same
-//     (employee, date) are accepted, and silently double-count hours
-//     for anything that sums them;
-//
 //   - attendance falling inside its employment's hire/end window, or
 //     against an employment that has not been terminated: a 1999 row
 //     against a 2024 hire saves;
@@ -201,10 +197,19 @@ func LeaveRequest() *entity.Definition {
 // hours_worked has no upper or lower bound: entity.Field cannot
 // express one yet (#80), so a negative or 30-hour day saves cleanly.
 // Listed in this package's "Not enforced" comment with the rest.
+//
+// Unique: [{employee_id, entry_date}] closes uc-infra#81 — one attendance
+// row per employee per day, enforced by crud.Engine (ADR-0018 §3(c), a
+// record_unique_keys side table with a real Postgres UNIQUE index, not a
+// best-effort Go-side check alone). Version bumped 1→2 for it: an
+// existing tenant needs cmd/sync-tenant-modules to warn about any
+// already-colliding rows before this starts rejecting their next edit
+// (ADR-0018's Consequences), same as any other constraint-tightening
+// version bump.
 func AttendanceRecord() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "AttendanceRecord",
-		Version:    1,
+		Version:    2,
 		Module:     "hr",
 		// Like Employee, this has no name — ADR-0013's closing rule says
 		// such an entity must declare its own label rather than fall
@@ -221,6 +226,7 @@ func AttendanceRecord() *entity.Definition {
 				Default:    "timesheet"},
 			{Name: "notes", Type: entity.FieldString},
 		},
+		Unique: [][]string{{"employee_id", "entry_date"}},
 	}
 }
 
