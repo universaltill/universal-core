@@ -2,11 +2,14 @@ package projects
 
 import "github.com/universaltill/universal-core/internal/kernel/form"
 
-// ProjectForm edits its task list in place (master-detail), with no
-// roll-up target: estimated hours sum to a number worth seeing, but
-// storing that sum on Project would create a second source of truth
-// that silently disagrees with the tasks the moment one is edited
-// outside the form. Budget is what the project actually commits to.
+// ProjectForm edits its task list AND its budget breakdown in place
+// (master-detail), both with no roll-up target: for Tasks, estimated
+// hours sum to a number worth seeing, but storing that sum on Project
+// would create a second source of truth that silently disagrees with
+// the tasks the moment one is edited outside the form; for Budget
+// Lines, the identical reasoning applies to Project.budget (uc-infra#79
+// — see the package doc comment for why a computed actual isn't here
+// either). Budget is what the project actually commits to.
 func ProjectForm() *form.Definition {
 	return &form.Definition{
 		EntityType: "Project",
@@ -36,6 +39,11 @@ func ProjectForm() *form.Definition {
 				Title:     "Tasks",
 				Component: form.ComponentMasterDetail,
 				Target:    "Task",
+			},
+			{
+				Title:     "Budget Lines",
+				Component: form.ComponentMasterDetail,
+				Target:    "ProjectBudgetLine",
 			},
 		},
 		Actions: []form.Action{
@@ -101,11 +109,36 @@ func TimeEntryForm() *form.Definition {
 	}
 }
 
+// ProjectBudgetLineForm, like POLineForm, is kept independently
+// CRUD-able rather than only reachable through Project's master-detail
+// section — same reasoning as purchasing/forms.go's own note on POLine.
+func ProjectBudgetLineForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "ProjectBudgetLine",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Budget Line",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "project_id", Label: "Project"},
+					{Name: "category", Label: "Category"},
+					{Name: "planned_amount", Label: "Planned Amount"},
+				},
+			},
+		},
+		Actions: []form.Action{
+			{Label: "Save", Op: form.OpSave},
+		},
+	}
+}
+
 // AllForms returns every Form Definition this module adds.
 func AllForms() []*form.Definition {
 	return []*form.Definition{
 		ProjectForm(),
 		TaskForm(),
 		TimeEntryForm(),
+		ProjectBudgetLineForm(),
 	}
 }

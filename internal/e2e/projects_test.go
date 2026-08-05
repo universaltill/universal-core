@@ -154,3 +154,117 @@ func TestProjects_TaskTableRendersLocalizedAndAligned(t *testing.T) {
 		t.Errorf("Turkish viewer did not get the Turkish task title:\n%s", turkish)
 	}
 }
+
+// TestProjects_BudgetLinesTableRendersLocalizedWithNoRollUp (uc-infra#79):
+// the second master-detail section on ProjectForm, driven end-to-end in
+// a real browser rather than the string-level formrender unit tests
+// alone (CLAUDE.md: a rendered-HTML-string test proves markup structure,
+// never proves the real page actually shows it). Two things this test
+// exists to catch that a template-only check can't:
+//   - the table is selected by data-target="ProjectBudgetLine" (not
+//     position), so it can't accidentally read the Tasks table instead
+//     now that the form has two master-detail sections;
+//   - the section renders with NO roll-up element at all — the
+//     package doc comment's deliberate decision (budget lines are
+//     advisory, not derived into/from Project.budget) is what a real
+//     page shows, not just what the Definition claims.
+func TestProjects_BudgetLinesTableRendersLocalizedWithNoRollUp(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, tenantDB := testServer(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	for _, step := range []struct {
+		name string
+		fn   func() error
+	}{
+		{"foundation", func() error { return foundation.Publish(ctx, tenantDB, actor) }},
+		{"foundation forms", func() error { return foundation.PublishForms(ctx, tenantDB, actor) }},
+		{"projects", func() error { return projects.Publish(ctx, tenantDB, actor) }},
+		{"projects forms", func() error { return projects.PublishForms(ctx, tenantDB, actor) }},
+		{"projects statuses", func() error { return projects.PublishStatuses(ctx, tenantDB, actor) }},
+	} {
+		if err := step.fn(); err != nil {
+			t.Fatalf("publish %s: %v", step.name, err)
+		}
+	}
+
+	engine := crud.NewEngine(tenantDB)
+	defs := func(entityType string) *entity.Definition {
+		t.Helper()
+		v, err := data.NewEntityDefinitionRepo(tenantDB).GetPublished(ctx, entityType)
+		if err != nil {
+			t.Fatalf("GetPublished(%s): %v", entityType, err)
+		}
+		d, err := entity.Unmarshal(v.Definition)
+		if err != nil {
+			t.Fatalf("unmarshal %s: %v", entityType, err)
+		}
+		return d
+	}
+	status := func(typeCode, code string) string {
+		t.Helper()
+		types, _ := engine.ListByField(ctx, defs("StatusType"), "code", typeCode)
+		if len(types) == 0 {
+			t.Fatalf("no StatusType %s", typeCode)
+		}
+		rows, _ := engine.ListByField(ctx, defs("Status"), "status_type_id", types[0].ID)
+		for _, r := range rows {
+			if c, _ := r.Data["code"].(string); c == code {
+				return r.ID
+			}
+		}
+		t.Fatalf("no %s/%s", typeCode, code)
+		return ""
+	}
+
+	project, err := engine.Create(ctx, defs("Project"), map[string]any{
+		"project_code": "PRJ-BUDGET-E2E", "name": map[string]any{"en": "Budget Rollout"},
+		"start_date": "2026-02-01", "status_id": status("project_status", "active"),
+	}, actor)
+	if err != nil {
+		t.Fatalf("create Project: %v", err)
+	}
+	if _, err := engine.Create(ctx, defs("ProjectBudgetLine"), map[string]any{
+		"project_id": project.ID, "category": "labour", "planned_amount": 45000.0,
+	}, actor); err != nil {
+		t.Fatalf("create ProjectBudgetLine: %v", err)
+	}
+
+	browser := browserCtx(t, tenantID)
+	var headerText, categoryCell, amountCell string
+	if err := chromedp.Run(browser,
+		chromedp.Navigate(srv.URL+"/forms/Project/"+project.ID+"?lang=tr"),
+		chromedp.WaitVisible(`table.uc-master-detail[data-target="ProjectBudgetLine"]`, chromedp.ByQuery),
+		chromedp.Text(`table.uc-master-detail[data-target="ProjectBudgetLine"] thead th[data-field="category"]`, &headerText, chromedp.ByQuery),
+		chromedp.Text(`table.uc-master-detail[data-target="ProjectBudgetLine"] tbody td[data-field="category"]`, &categoryCell, chromedp.ByQuery),
+		chromedp.Text(`table.uc-master-detail[data-target="ProjectBudgetLine"] tbody td[data-field="planned_amount"]`, &amountCell, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("render project form: %v", err)
+	}
+
+	if got := strings.TrimSpace(headerText); got != "Kategori" {
+		t.Errorf("expected the Turkish translation of the category column header, got %q", got)
+	}
+	// The CELL value, not just the header, must also be translated —
+	// the childCellValue fix this card adds (formrender's own unit
+	// tests pin the mechanism; this proves the real page shows it).
+	if got := strings.TrimSpace(categoryCell); got != "İşçilik" {
+		t.Errorf("expected the Turkish translation of category=labour in the cell, got %q", got)
+	}
+	if got := strings.TrimSpace(amountCell); got != "45000" {
+		t.Errorf("expected the planned_amount cell to show 45000, got %q", got)
+	}
+
+	// No roll-up element for this section at all — the deliberate
+	// "Project.budget stays advisory, not derived" decision.
+	var rollUpCount int
+	if err := chromedp.Run(browser, chromedp.Evaluate(`
+		document.querySelectorAll('table.uc-master-detail[data-target="ProjectBudgetLine"] ~ p.uc-rollup').length
+	`, &rollUpCount)); err != nil {
+		t.Fatalf("count roll-up elements: %v", err)
+	}
+	if rollUpCount != 0 {
+		t.Errorf("expected no roll-up element for the Budget Lines section, found %d", rollUpCount)
+	}
+}

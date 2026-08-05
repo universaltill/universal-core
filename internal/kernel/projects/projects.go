@@ -1,7 +1,7 @@
 // Package projects is the Projects module (reference-data-model.md §8,
-// BACKLOG.md R8) — Project, Task and TimeEntry. A licensed module like
-// purchasing/sales/finance/assets, published by cmd/provision-tenant
-// only for a tenant that has it.
+// BACKLOG.md R8) — Project, Task, TimeEntry and ProjectBudgetLine. A
+// licensed module like purchasing/sales/finance/assets, published by
+// cmd/provision-tenant only for a tenant that has it.
 //
 // **Two gaps this module used to have, now closed by declarative
 // constraints on the fields themselves (uc-infra#78)**, kept documented
@@ -50,12 +50,39 @@
 // employment, and these two fields stay on Party. No migration was
 // needed.
 //
+// **ProjectBudgetLine** (§8's fourth row, uc-infra#79) ships in this
+// slice as planning-only: category + planned_amount, composed under
+// Project exactly as POLine composes under PurchaseOrder. It
+// deliberately has NO computed "actual" column and NO currency_id of
+// its own:
+//   - An "actual" would need to price TimeEntry's hours (no employee
+//     cost-rate concept exists anywhere in this kernel — grep confirms
+//     it) and/or a non-labour expense record (also does not exist —
+//     VendorInvoice/GoodsReceiptLine carry no project dimension). #79's
+//     own body warned against exactly this: "a budget line that
+//     silently compares planned cost against labour-only actuals would
+//     read as complete while being wrong in the direction that
+//     matters." Shipping a partial actual would be worse than shipping
+//     none — filed as uc-infra#134 rather than guessed at here.
+//   - No currency_id: every OTHER composition child line-item in this
+//     kernel (POLine, SOLine, GoodsReceiptLine) has none either — the
+//     parent document (here, Project.currency_id, already a field)
+//     carries it once, not once per line. Adding one here would be a
+//     new, one-off convention with no precedent.
+//   - Nothing rejects a negative planned_amount: entity.Field has no
+//     Min/Max concept yet (tracked as uc-infra#80, same pre-existing gap
+//     POLine.qty/unit_price already have — not a regression this entity
+//     introduces), and a negative budget line is a more obviously wrong
+//     record than a negative quantity, so worth naming explicitly here
+//     rather than only in #80's own tracking.
+//   - Project.budget is unchanged and NOT derived from the lines
+//     (matches ProjectForm's own doc comment on the Tasks section:
+//     summing children onto the parent creates a second source of
+//     truth the moment one is edited outside the form). Budget lines
+//     are an advisory breakdown of the single number Project already
+//     commits to, not a replacement for it.
+//
 // Deliberately NOT in this slice:
-//   - **ProjectBudgetLine** (§8's fourth row): planned cost by category,
-//     rolling up against TimeEntry and expense actuals. It needs an
-//     expense concept this kernel doesn't have yet, so a budget line
-//     could only roll up against half its inputs — filed rather than
-//     half-built.
 //   - **Overrun prediction (R10)**: the card says so explicitly. This
 //     module is the history such a model would learn from, which is why
 //     estimated_hours and logged hours are both first-class.
@@ -104,6 +131,12 @@ func Project() *entity.Definition {
 			// friends have none of those — but the master-detail editing
 			// experience is what a project's task list wants.
 			{Name: "tasks", Kind: entity.RelationComposition, Target: "Task", ParentField: "project_id"},
+			// Composition, same reasoning as tasks above: a budget line
+			// is planning detail for exactly one project and has no
+			// meaning detached from it, and ProjectForm edits the
+			// breakdown in place — the same call POLine/SOLine make
+			// under their own parents.
+			{Name: "budget_lines", Kind: entity.RelationComposition, Target: "ProjectBudgetLine", ParentField: "project_id"},
 		},
 	}
 }
@@ -190,6 +223,33 @@ func TimeEntry() *entity.Definition {
 	}
 }
 
+// ProjectBudgetLine is planned cost by category (reference-data-model.md
+// §8, uc-infra#79) — the fourth Projects entity, composed under Project.
+// See this package's doc comment for why it ships planning-only: no
+// computed actual, no currency_id of its own.
+func ProjectBudgetLine() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "ProjectBudgetLine",
+		Version:    1,
+		Module:     "projects",
+		Fields: []entity.Field{
+			{Name: "project_id", Type: entity.FieldReference, Required: true, Target: "Project"},
+			// A closed list rather than free text: a category is only
+			// useful as a roll-up/reporting dimension if a report can
+			// group by it without normalizing free-text spelling first.
+			// "labour" is the one category TimeEntry can eventually
+			// price against once a cost-rate concept exists (see the
+			// package doc comment); the rest are placeholders for the
+			// non-labour costs this kernel has no expense entity for
+			// yet.
+			{Name: "category", Type: entity.FieldEnum, Required: true,
+				EnumValues: []string{"labour", "materials", "travel", "equipment", "other"},
+				Default:    "labour"},
+			{Name: "planned_amount", Type: entity.FieldNumber, Required: true, Default: float64(0)},
+		},
+	}
+}
+
 // All returns every Definition this module adds — the set a tenant gets
 // once Projects is one of their licensed modules (seed.go's Publish).
 func All() []*entity.Definition {
@@ -197,5 +257,6 @@ func All() []*entity.Definition {
 		Project(),
 		Task(),
 		TimeEntry(),
+		ProjectBudgetLine(),
 	}
 }

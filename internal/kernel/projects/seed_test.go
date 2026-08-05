@@ -127,7 +127,7 @@ func TestPublish_PublishesEveryDefinition(t *testing.T) {
 	if err := PublishForms(ctx, tenantDB, humanActor()); err != nil {
 		t.Fatalf("PublishForms: %v", err)
 	}
-	for _, et := range []string{"Project", "Task", "TimeEntry"} {
+	for _, et := range []string{"Project", "Task", "TimeEntry", "ProjectBudgetLine"} {
 		if got := publishedDef(t, tenantDB, et); got.Module != "projects" {
 			t.Errorf("%s published with module %q", et, got.Module)
 		}
@@ -347,6 +347,115 @@ func TestTask_SelfReferenceCycleRejected(t *testing.T) {
 		"parent_task_id": child.ID, "status_id": status("task_status", "todo"),
 	}, &v2, actor); err == nil {
 		t.Fatal("a task must not be its own parent")
+	}
+}
+
+// TestProjectBudgetLine_ComposesUnderProjectAndRejectsBadCategory
+// (uc-infra#79): a budget line round-trips through the real engine
+// scoped to its project (mirroring TestTimeEntry_UsableEndToEnd's shape
+// below, and POLine/PurchaseOrder's own composition test elsewhere),
+// two projects' lines stay isolated from each other via project_id,
+// and an out-of-enum category is rejected by ValidateRecord — not just
+// asserted structurally in the unit test, but actually enforced by the
+// engine a create goes through.
+func TestProjectBudgetLine_ComposesUnderProjectAndRejectsBadCategory(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+	for _, step := range []struct {
+		name string
+		fn   func(context.Context, *sql.DB, audit.Actor) error
+	}{
+		{"foundation", foundation.Publish},
+		{"projects", Publish},
+		{"projects statuses", PublishStatuses},
+	} {
+		if err := step.fn(ctx, tenantDB, actor); err != nil {
+			t.Fatalf("publish %s: %v", step.name, err)
+		}
+	}
+	engine := crud.NewEngine(tenantDB)
+	projDef := publishedDef(t, tenantDB, "Project")
+	statusFor := func(code string) string {
+		t.Helper()
+		types, _ := engine.ListByField(ctx, publishedDef(t, tenantDB, "StatusType"), "code", "project_status")
+		rows, _ := engine.ListByField(ctx, publishedDef(t, tenantDB, "Status"), "status_type_id", types[0].ID)
+		for _, r := range rows {
+			if c, _ := r.Data["code"].(string); c == code {
+				return r.ID
+			}
+		}
+		t.Fatalf("no project_status/%s", code)
+		return ""
+	}
+
+	projA, err := engine.Create(ctx, projDef, map[string]any{
+		"project_code": "PRJ-BUDGET-A", "name": map[string]any{"en": "Project A"},
+		"start_date": "2026-01-01", "status_id": statusFor("planned"),
+	}, actor)
+	if err != nil {
+		t.Fatalf("create Project A: %v", err)
+	}
+	projB, err := engine.Create(ctx, projDef, map[string]any{
+		"project_code": "PRJ-BUDGET-B", "name": map[string]any{"en": "Project B"},
+		"start_date": "2026-01-01", "status_id": statusFor("planned"),
+	}, actor)
+	if err != nil {
+		t.Fatalf("create Project B: %v", err)
+	}
+
+	lineDef := publishedDef(t, tenantDB, "ProjectBudgetLine")
+	for _, l := range []struct {
+		category string
+		amount   float64
+	}{
+		{"labour", 45000},
+		{"materials", 15000},
+	} {
+		if _, err := engine.Create(ctx, lineDef, map[string]any{
+			"project_id": projA.ID, "category": l.category, "planned_amount": l.amount,
+		}, actor); err != nil {
+			t.Fatalf("create ProjectBudgetLine(%s): %v", l.category, err)
+		}
+	}
+	if _, err := engine.Create(ctx, lineDef, map[string]any{
+		"project_id": projB.ID, "category": "travel", "planned_amount": 2000.0,
+	}, actor); err != nil {
+		t.Fatalf("create ProjectBudgetLine for Project B: %v", err)
+	}
+
+	// project_id isolation: Project A's lines must not leak Project B's.
+	linesA, err := engine.ListByField(ctx, lineDef, "project_id", projA.ID)
+	if err != nil || len(linesA) != 2 {
+		t.Fatalf("Project A budget lines: err=%v n=%d", err, len(linesA))
+	}
+	var total float64
+	for _, r := range linesA {
+		amt, _ := r.Data["planned_amount"].(float64)
+		total += amt
+	}
+	if total != 60000 {
+		t.Errorf("Project A planned total = %v, want 60000", total)
+	}
+	linesB, err := engine.ListByField(ctx, lineDef, "project_id", projB.ID)
+	if err != nil || len(linesB) != 1 {
+		t.Fatalf("Project B budget lines: err=%v n=%d", err, len(linesB))
+	}
+
+	// An out-of-enum category must be rejected by the engine, not just
+	// documented as invalid in the unit test.
+	if _, err := engine.Create(ctx, lineDef, map[string]any{
+		"project_id": projA.ID, "category": "not_a_real_category", "planned_amount": 100.0,
+	}, actor); err == nil {
+		t.Fatal("expected an out-of-enum category to be rejected")
+	}
+
+	// A missing project_id must also be rejected — a budget line has no
+	// meaning detached from a project (Required: true on the field).
+	if _, err := engine.Create(ctx, lineDef, map[string]any{
+		"category": "labour", "planned_amount": 100.0,
+	}, actor); err == nil {
+		t.Fatal("expected a budget line with no project_id to be rejected")
 	}
 }
 
