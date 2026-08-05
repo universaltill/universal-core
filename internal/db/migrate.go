@@ -9,9 +9,12 @@ import (
 	"context"
 	"database/sql"
 	"embed"
+	"errors"
 	"fmt"
 	"io/fs"
 	"sort"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 //go:embed migrations/*.sql
@@ -172,6 +175,18 @@ func applyOne(ctx context.Context, sqlDB *sql.DB, fsys embed.FS, dir, name strin
 	defer tx.Rollback() //nolint:errcheck // rollback is a no-op after a successful commit
 
 	if _, err := tx.ExecContext(ctx, string(stmt)); err != nil {
+		if isAlreadyExistsError(err) {
+			return fmt.Errorf(
+				"apply migration %s (from %s): a database object it creates already exists — "+
+					"this database most likely already has a different migration set applied to it: "+
+					"check DATABASE_URL, and which migration set ran against it before — "+
+					"cmd/migrate's -target=legacy vs. the control-plane set that cmd/provision-tenant, "+
+					"cmd/install-module and cmd/universal-core apply internally (via db.ApplyControl) "+
+					"are not interchangeable; each target/internal caller applies a genuinely different "+
+					"schema, not a duplicate of another (universaltill/uc-infra#84): %w",
+				name, dir, err,
+			)
+		}
 		return fmt.Errorf("apply migration %s: %w", name, err)
 	}
 	if _, err := tx.ExecContext(ctx,
@@ -180,4 +195,42 @@ func applyOne(ctx context.Context, sqlDB *sql.DB, fsys embed.FS, dir, name strin
 		return fmt.Errorf("record migration %s: %w", name, err)
 	}
 	return tx.Commit()
+}
+
+// alreadyExistsSQLStates are the Postgres "duplicate_*" error codes
+// (class 42, syntax error or access rule violation) a migration
+// statement can fail with when the object it's trying to create is
+// already present — the symptom of applying two incompatible migration
+// sets to the same database (universaltill/uc-infra#84), not a
+// transient/retryable failure. See
+// https://www.postgresql.org/docs/current/errcodes-appendix.html.
+//
+// duplicate_database (42P04) is deliberately not in this set: every
+// migration statement here runs inside a transaction (applyOne's tx,
+// above), and Postgres cannot run CREATE DATABASE inside a transaction
+// block at all — that fails with 25001 (active_sql_transaction), never
+// 42P04. Nothing under internal/db/migrations{,/control,/tenant} issues
+// CREATE DATABASE, so 42P04 can't occur from this call site; including
+// it would just be a dead, untestable-for-real allowlist entry
+// (independent review of uc-infra#84's fix, 2026-08-05).
+var alreadyExistsSQLStates = map[string]bool{
+	"42P07": true, // duplicate_table
+	"42701": true, // duplicate_column
+	"42710": true, // duplicate_object (e.g. a constraint or index)
+	"42P06": true, // duplicate_schema
+	"42723": true, // duplicate_function — none of today's migrations define
+	// one, but a future CREATE FUNCTION/TRIGGER migration hitting this
+	// class of collision should get the same clear diagnosis, not a
+	// silent fallback to the raw error (independent review).
+}
+
+// isAlreadyExistsError reports whether err is a Postgres error whose
+// SQLSTATE indicates the migration failed because it tried to create
+// something that already exists.
+func isAlreadyExistsError(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	return alreadyExistsSQLStates[pgErr.Code]
 }

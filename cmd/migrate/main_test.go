@@ -76,6 +76,32 @@ func TestMigrate_Legacy_AppliesSchemaAndIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestMigrate_TargetMismatch_FailsWithGuidance is the smoke-test layer
+// for universaltill/uc-infra#84: running the real compiled binary with
+// the default -target (legacy) against a database, then running it
+// again with -target=control against that same database, must fail
+// with a clear diagnosis in stderr rather than a bare Postgres
+// "already exists" error — internal/db's TestApplyControl_AfterApply_
+// FailsWithGuidance already covers this at the unit layer; this
+// confirms the same behavior actually reaches an operator's terminal
+// through the real binary, flags, and log output.
+func TestMigrate_TargetMismatch_FailsWithGuidance(t *testing.T) {
+	dsn := testexec.FreshDatabase(t, "uc_test_migrate_target_mismatch")
+
+	_, stderr, code := run(t, []string{"DATABASE_URL=" + dsn})
+	if code != 0 {
+		t.Fatalf("first run (legacy): exit %d, stderr: %s", code, stderr)
+	}
+
+	_, stderr, code = run(t, []string{"DATABASE_URL=" + dsn}, "-target=control")
+	if code == 0 {
+		t.Fatal("expected the second run (control, against an already-legacy-migrated database) to fail")
+	}
+	if !strings.Contains(stderr, "already has a different migration set applied") {
+		t.Fatalf("expected a clear diagnosis in stderr, got: %q", stderr)
+	}
+}
+
 func TestMigrate_Control_AppliesOnlyControlPlaneSchema(t *testing.T) {
 	dsn := testexec.FreshDatabase(t, "uc_test_migrate_control")
 

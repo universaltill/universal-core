@@ -17,6 +17,17 @@
 // bringing an existing tenant database's schema up to date after a new
 // tenant migration file lands (internal/tenantdb.Router.Create already
 // runs this automatically when provisioning a brand-new tenant).
+//
+// This command is NOT a prerequisite for cmd/provision-tenant:
+// provision-tenant applies its own control-plane migrations
+// (-target=control's set) internally and needs nothing run before it.
+// Running this command's default (-target=legacy) against what's
+// actually meant to be a control-plane database, then running
+// provision-tenant against that same database, applies two different,
+// incompatible migration sets to one database and fails (see
+// universaltill/uc-infra#84) — each -target is a genuinely different
+// schema for a genuinely different kind of database, not a step in one
+// shared setup sequence.
 package main
 
 import (
@@ -37,7 +48,7 @@ func main() {
 	if dbURL == "" {
 		log.Fatal("DATABASE_URL is required")
 	}
-	target := flag.String("target", "legacy", "which migration set to apply: legacy, control, or tenant")
+	target := flag.String("target", "legacy", "which migration set to apply: legacy (original shared-database set — NOT a prerequisite for cmd/provision-tenant, which applies its own control-plane migrations internally), control (control-plane tenants registry), or tenant (a single tenant's own database)")
 	flag.Parse()
 
 	apply, err := applyFuncFor(*target)

@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -230,6 +231,96 @@ func TestApplyControl_IsIdempotent(t *testing.T) {
 	}
 	if err := ApplyControl(ctx, db); err != nil {
 		t.Fatalf("second ApplyControl should be a no-op, got: %v", err)
+	}
+}
+
+// TestApplyControl_AfterApply_FailsWithGuidance is the regression test
+// for universaltill/uc-infra#84: running cmd/migrate's default
+// (-target=legacy, i.e. Apply) against a fresh database and then
+// cmd/provision-tenant (which always calls ApplyControl internally)
+// against that same database used to fail with a bare "relation
+// \"tenants\" already exists (SQLSTATE 42P07)" — Apply's 001_init.sql
+// and ApplyControl's 0001_init.sql are two different migration files
+// with two different shapes of a same-named tenants table, so
+// schema_migrations' filename-keyed dedup can't recognize this as
+// "already done." The fix doesn't make this a no-op (the two schemas
+// are genuinely different, not duplicates) — it turns the raw Postgres
+// error into a clear diagnosis instead of something that reads like
+// corruption.
+func TestApplyControl_AfterApply_FailsWithGuidance(t *testing.T) {
+	db := freshTestDB(t, "uc_test_legacy_then_control")
+	ctx := context.Background()
+
+	if err := Apply(ctx, db); err != nil {
+		t.Fatalf("Apply (legacy): %v", err)
+	}
+
+	err := ApplyControl(ctx, db)
+	if err == nil {
+		t.Fatal("expected ApplyControl to fail against a database already migrated with a different target, got nil")
+	}
+	if !strings.Contains(err.Error(), "already has a different migration set applied") {
+		t.Fatalf("expected a clear diagnosis naming the likely cause, got: %v", err)
+	}
+	// The original Postgres detail must still be reachable (wrapped, not
+	// swallowed) — this is a clearer error, not a replacement one.
+	if !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("expected the underlying Postgres error to still be present (wrapped): %v", err)
+	}
+}
+
+// TestApply_AfterApplyControl_FailsWithGuidance is the symmetric case:
+// ApplyControl first, then Apply (legacy) against the same database.
+func TestApply_AfterApplyControl_FailsWithGuidance(t *testing.T) {
+	db := freshTestDB(t, "uc_test_control_then_legacy")
+	ctx := context.Background()
+
+	if err := ApplyControl(ctx, db); err != nil {
+		t.Fatalf("ApplyControl: %v", err)
+	}
+
+	err := Apply(ctx, db)
+	if err == nil {
+		t.Fatal("expected Apply to fail against a database already migrated with a different target, got nil")
+	}
+	if !strings.Contains(err.Error(), "already has a different migration set applied") {
+		t.Fatalf("expected a clear diagnosis naming the likely cause, got: %v", err)
+	}
+}
+
+// TestIsAlreadyExistsError is a unit-level test of the classification
+// logic on its own, independent of a real database round-trip —
+// TestApplyControl_AfterApply_FailsWithGuidance above only exercises the
+// "true, duplicate_table" case that actually occurs in practice; this
+// covers the negative paths (a plain non-Postgres error, and a
+// PgError whose code isn't in the "already exists" set) directly.
+func TestIsAlreadyExistsError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil error", nil, false},
+		{"plain non-Postgres error", errors.New("boom"), false},
+		{"PgError with an unrelated code", &pgconn.PgError{Code: "23505"}, false}, // unique_violation
+		{"PgError: duplicate_table", &pgconn.PgError{Code: "42P07"}, true},
+		{"PgError: duplicate_column", &pgconn.PgError{Code: "42701"}, true},
+		{"PgError: duplicate_object", &pgconn.PgError{Code: "42710"}, true},
+		{"PgError: duplicate_schema", &pgconn.PgError{Code: "42P06"}, true},
+		{"PgError: duplicate_function", &pgconn.PgError{Code: "42723"}, true},
+		// duplicate_database (42P04) is deliberately NOT in the allowlist —
+		// see alreadyExistsSQLStates' doc comment: migration statements
+		// always run inside a transaction, and CREATE DATABASE can't run
+		// in one at all, so this code can never actually reach here.
+		{"PgError: duplicate_database is NOT classified as already-exists here", &pgconn.PgError{Code: "42P04"}, false},
+		{"wrapped PgError", fmt.Errorf("apply migration x: %w", &pgconn.PgError{Code: "42P07"}), true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isAlreadyExistsError(c.err); got != c.want {
+				t.Errorf("isAlreadyExistsError(%v) = %v, want %v", c.err, got, c.want)
+			}
+		})
 	}
 }
 
