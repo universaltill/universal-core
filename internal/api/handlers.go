@@ -515,6 +515,41 @@ func (h *Handler) writeCrudErrorLocalized(w http.ResponseWriter, r *http.Request
 	writeCrudError(w, logContext, err)
 }
 
+// writeValidationErrorLocalized translates an entity.ValidateRecord
+// failure into the viewer's locale before it reaches a form-save toast
+// or the JSON API's error envelope (uc-infra#96) — CLAUDE.md's "no
+// hardcoded user-facing strings" applies to *entity.ValidationError
+// exactly like it does to crud.TargetConstraintError
+// (writeCrudErrorLocalized above): the field name is resolved through
+// the same field.{EntityType}.{FieldName} label catalog form rendering
+// and the target-constraint mapping already use, substituted into a
+// per-Kind entity.validation.* template.
+func (h *Handler) writeValidationErrorLocalized(w http.ResponseWriter, r *http.Request, err error) {
+	httpx.WriteError(w, http.StatusBadRequest, h.validationErrorMessage(localeFromRequest(w, r), err))
+}
+
+// validationErrorMessage is writeValidationErrorLocalized's pure
+// message-building half, split out so a caller that already has the
+// viewer's locale, or that renders into a page fragment rather than a
+// fresh error envelope (extSQLSourceSave's inline form error), can reuse
+// the same translation. Falls back to err.Error() (the untranslated,
+// English Detail) for any error that isn't an *entity.ValidationError,
+// so it's safe to call unconditionally on anything ValidateRecord might
+// return.
+func (h *Handler) validationErrorMessage(locale string, err error) string {
+	var verr *entity.ValidationError
+	if !errors.As(err, &verr) {
+		return err.Error()
+	}
+	fieldLabel := h.catalog.TOrDefault(locale, "field."+verr.EntityType+"."+verr.FieldName, verr.FieldName)
+	msg := strings.ReplaceAll(h.catalog.T(locale, "entity.validation."+string(verr.Kind)), "{field}", fieldLabel)
+	if verr.Kind == entity.KindNotBefore {
+		otherLabel := h.catalog.TOrDefault(locale, "field."+verr.EntityType+"."+verr.OtherField, verr.OtherField)
+		msg = strings.ReplaceAll(msg, "{other_field}", otherLabel)
+	}
+	return msg
+}
+
 // sorReadOnlyMessage builds the translated system-of-record refusal for
 // the viewer's locale, naming the owning source when the engine resolved
 // its name — shared by the single-record mapping above and the import
@@ -665,7 +700,7 @@ func (h *Handler) createRecord(w http.ResponseWriter, r *http.Request) {
 	// itself still fails on past this point is a genuine internal/DB
 	// error (500, generic message, logged).
 	if err := entity.ValidateRecord(entDef, fields); err != nil {
-		httpx.WriteError(w, http.StatusBadRequest, err.Error())
+		h.writeValidationErrorLocalized(w, r, err)
 		return
 	}
 	// isCreate=true, id/version both ignored: Create generates the
@@ -746,7 +781,7 @@ func (h *Handler) updateRecord(w http.ResponseWriter, r *http.Request) {
 	// bad update is unambiguously a 400, not indistinguishable from a
 	// genuine 500.
 	if err := entity.ValidateRecord(entDef, fields); err != nil {
-		httpx.WriteError(w, http.StatusBadRequest, err.Error())
+		h.writeValidationErrorLocalized(w, r, err)
 		return
 	}
 	// Extracted before ValidateStatusTransition, not after: a real status

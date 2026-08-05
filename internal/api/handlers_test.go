@@ -816,6 +816,43 @@ func TestAPI_UpdateRecord_TargetConstraintViolationIs400Localized(t *testing.T) 
 	}
 }
 
+// TestAPI_CreateRecord_ValidationErrorIsLocalized is
+// TestAPI_UpdateRecord_TargetConstraintViolationIs400Localized's
+// counterpart for entity.ValidateRecord's own errors (uc-infra#96): a
+// missing-required-field 400 must carry the translated
+// entity.validation.required envelope message, not ValidateRecord's raw
+// Detail text (English, snake_case field name) — the exact gap the issue
+// reported: `field "shipped_at" must not be before "production_ready_at"`
+// style text reaching the toast verbatim.
+func TestAPI_CreateRecord_ValidationErrorIsLocalized(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	// "name" is Required and omitted entirely.
+	req := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{}`))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a missing required field, got %d: %s", rec.Code, rec.Body.String())
+	}
+	// vendorEntityDef's Vendor has no field.Vendor.name catalog override,
+	// so TOrDefault falls back to the raw field name "name" for {field} —
+	// still the translated entity.validation.required template, not
+	// ValidateRecord's own Detail text.
+	want := `name is required.`
+	if !strings.Contains(rec.Body.String(), want) {
+		t.Fatalf("expected the translated envelope message %q, got: %s", want, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), `field "name" is required`) {
+		t.Fatalf("expected ValidateRecord's raw untranslated Detail text NOT to reach the client, got: %s", rec.Body.String())
+	}
+}
+
 // TestAPI_RenderForm_IncludesVersionHiddenField confirms an existing
 // record's edit form actually carries the "_version" hidden field a real
 // browser needs to round-trip for optimistic-locking protection — a new/
@@ -3859,8 +3896,9 @@ func TestAPI_PurchaseOrder_StagedLeadTimeTimestamps(t *testing.T) {
 	}
 
 	// Out-of-order: shipped_at before production_ready_at -> 400, and
-	// the error body names both fields so the caller knows which pair to
-	// fix (entity.validateNotBefore's message, surfaced verbatim).
+	// the error body names both fields (through their translated
+	// field.PurchaseOrder.* catalog labels, not the raw snake_case field
+	// names — uc-infra#96) so the caller knows which pair to fix.
 	bad := map[string]any{
 		"po_number": "PO-STAGED-2", "vendor_id": vendor.ID,
 		"order_date": "2026-07-01", "status_id": draftID,
@@ -3877,7 +3915,7 @@ func TestAPI_PurchaseOrder_StagedLeadTimeTimestamps(t *testing.T) {
 	if badRec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for shipped_at before production_ready_at, got %d: %s", badRec.Code, badRec.Body.String())
 	}
-	if b := badRec.Body.String(); !strings.Contains(b, "shipped_at") || !strings.Contains(b, "production_ready_at") {
-		t.Fatalf("expected the error body to name both fields of the violated chain, got: %s", b)
+	if b := badRec.Body.String(); !strings.Contains(b, "Shipped") || !strings.Contains(b, "Production Ready") {
+		t.Fatalf("expected the error body to name both fields of the violated chain by their translated labels, got: %s", b)
 	}
 }

@@ -793,5 +793,11 @@
   "sor.read_only_blocked_no_source": "Bu kayıt salt okunur bir harici ana kayıt sistemine aittir — düzenlemeler bir sonraki içe aktarmada üzerine yazılır.",
   "sor.mode_reserved": "\"bidirectional\" modu, yaklaşan eşitleme motoru için ayrılmıştır ve henüz kaydedilemez.",
   "crud.error.target_constraint_violation": "{field} için seçilen değer, bu alanın gerekli kısıtlamasını karşılamıyor.",
-  "form.SystemOfRecord.section.details": "Detaylar"
+  "form.SystemOfRecord.section.details": "Detaylar",
+  "entity.validation.required": "{field} zorunludur.",
+  "entity.validation.type_mismatch": "{field} geçersiz bir değere sahip.",
+  "entity.validation.enum_invalid": "{field} geçerli bir seçenek değil.",
+  "entity.validation.i18n_text_invalid": "{field} geçersiz bir değere sahip.",
+  "entity.validation.not_before": "{field}, {other_field} tarihinden önce olamaz.",
+  "entity.validation.invalid": "{field} geçersiz."
 }

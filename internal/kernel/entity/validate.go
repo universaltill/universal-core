@@ -1,10 +1,80 @@
 package entity
 
 import (
+	"errors"
 	"fmt"
 	"slices"
 	"time"
 )
+
+// ValidationErrorKind classifies a ValidateRecord failure so a caller
+// that renders it to an end user (internal/api) can translate it —
+// CLAUDE.md's "no hardcoded user-facing strings" applies to
+// ValidateRecord's errors exactly like it does to
+// crud.TargetConstraintError (see that type's own doc comment, which
+// this mirrors): this package stays generic and English-only
+// internally (no i18n import here — that would pull a UI concern into
+// the kernel), and internal/api maps Kind + FieldName (and, for
+// KindNotBefore, OtherField) to a translated message via the i18n
+// catalog, the same field.{EntityType}.{FieldName} label lookup form
+// rendering and target-constraint errors already use.
+type ValidationErrorKind string
+
+const (
+	// KindRequired: a Required field was omitted or submitted as nil.
+	KindRequired ValidationErrorKind = "required"
+	// KindTypeMismatch: the submitted value's Go type doesn't match
+	// what the field's declared Type expects (string/number/bool, or
+	// FieldEnum's underlying string carrier).
+	KindTypeMismatch ValidationErrorKind = "type_mismatch"
+	// KindEnumInvalid: a FieldEnum value that IS a string, but isn't
+	// one of Field.EnumValues.
+	KindEnumInvalid ValidationErrorKind = "enum_invalid"
+	// KindI18nTextInvalid: a FieldI18nText value that isn't a
+	// locale->string object, or has a non-string value for some locale.
+	KindI18nTextInvalid ValidationErrorKind = "i18n_text_invalid"
+	// KindNotBefore: a FieldDate value is chronologically before the
+	// nearest present predecessor named by Field.NotBefore.
+	KindNotBefore ValidationErrorKind = "not_before"
+	// KindInvalid is the defensive catch-all for a field whose Type
+	// isn't one ValidateRecord knows how to check at all. Definition.
+	// Validate rejects an unknown FieldType at publish time, so this
+	// only fires for a Definition built without going through Validate
+	// first (e.g. an ad-hoc one in a test) — a real end user submitting
+	// a form against a published Definition can never trigger it, but
+	// it still gets a translated message rather than an English
+	// fmt.Errorf leaking through in the one place a corrupt Definition
+	// could reach this far.
+	KindInvalid ValidationErrorKind = "invalid"
+)
+
+// ErrValidation is the sentinel every *ValidationError unwraps to, for a
+// caller that only needs errors.Is(err, ErrValidation) (tests, logs) —
+// mirrors crud.ErrTargetConstraintViolation/TargetConstraintError's own
+// sentinel-plus-struct split.
+var ErrValidation = errors.New("validation failed")
+
+// ValidationError is what ValidateRecord actually returns (still typed
+// as the plain `error` interface, so every existing errors.Is/err != nil
+// caller is unaffected). Detail is the untranslated, English,
+// developer/log-facing message — kept identical in shape to
+// ValidateRecord's pre-existing fmt.Errorf text so log lines and any
+// caller inspecting Error() directly don't change behavior. Kind,
+// EntityType, FieldName and (for KindNotBefore) OtherField are what a
+// caller renders instead, for an end user, via internal/api's
+// writeValidationErrorLocalized.
+type ValidationError struct {
+	Kind       ValidationErrorKind
+	EntityType string
+	FieldName  string
+	OtherField string // set only for KindNotBefore: the earlier field being compared against
+	Detail     string
+}
+
+func (e *ValidationError) Error() string { return e.Detail }
+
+// Unwrap makes errors.Is(err, ErrValidation) match regardless of Kind.
+func (e *ValidationError) Unwrap() error { return ErrValidation }
 
 // ValidateRecord checks a record's data against its Definition — the
 // server-side half of "validation is defined once, applied identically
@@ -15,12 +85,17 @@ func ValidateRecord(def *Definition, data map[string]any) error {
 		v, present := data[f.Name]
 		if !present || v == nil {
 			if f.Required {
-				return fmt.Errorf("field %q is required", f.Name)
+				return &ValidationError{
+					Kind:       KindRequired,
+					EntityType: def.EntityType,
+					FieldName:  f.Name,
+					Detail:     fmt.Sprintf("field %q is required", f.Name),
+				}
 			}
 			continue
 		}
-		if err := validateFieldValue(f, v); err != nil {
-			return fmt.Errorf("field %q: %w", f.Name, err)
+		if verr := validateFieldValue(def.EntityType, f, v); verr != nil {
+			return verr
 		}
 	}
 	var fieldByName map[string]Field
@@ -34,8 +109,8 @@ func ValidateRecord(def *Definition, data map[string]any) error {
 				fieldByName[ff.Name] = ff
 			}
 		}
-		if err := validateNotBefore(fieldByName, f, data); err != nil {
-			return err
+		if verr := validateNotBefore(def.EntityType, fieldByName, f, data); verr != nil {
+			return verr
 		}
 	}
 	return nil
@@ -57,7 +132,7 @@ func ValidateRecord(def *Definition, data map[string]any) error {
 // The visited set is belt-and-braces: Definition.Validate rejects
 // NotBefore cycles at publish time, but an infinite loop is the wrong
 // failure mode to leave reachable from record validation regardless.
-func validateNotBefore(fieldByName map[string]Field, f Field, data map[string]any) error {
+func validateNotBefore(entityType string, fieldByName map[string]Field, f Field, data map[string]any) *ValidationError {
 	this, okThis := data[f.Name].(string)
 	if !okThis || this == "" {
 		return nil
@@ -75,7 +150,13 @@ func validateNotBefore(fieldByName map[string]Field, f Field, data map[string]an
 				return nil
 			}
 			if thisT.Before(otherT) {
-				return fmt.Errorf("field %q must not be before %q", f.Name, name)
+				return &ValidationError{
+					Kind:       KindNotBefore,
+					EntityType: entityType,
+					FieldName:  f.Name,
+					OtherField: name,
+					Detail:     fmt.Sprintf("field %q must not be before %q", f.Name, name),
+				}
 			}
 			return nil
 		}
@@ -88,29 +169,37 @@ func validateNotBefore(fieldByName map[string]Field, f Field, data map[string]an
 	return nil
 }
 
-func validateFieldValue(f Field, v any) error {
+func validateFieldValue(entityType string, f Field, v any) *ValidationError {
+	newErr := func(kind ValidationErrorKind, detail string) *ValidationError {
+		return &ValidationError{
+			Kind:       kind,
+			EntityType: entityType,
+			FieldName:  f.Name,
+			Detail:     fmt.Sprintf("field %q: %s", f.Name, detail),
+		}
+	}
 	switch f.Type {
 	case FieldString, FieldDate, FieldReference:
 		if _, ok := v.(string); !ok {
-			return fmt.Errorf("expected string, got %T", v)
+			return newErr(KindTypeMismatch, fmt.Sprintf("expected string, got %T", v))
 		}
 	case FieldNumber:
 		switch v.(type) {
 		case float64, int, int64:
 		default:
-			return fmt.Errorf("expected number, got %T", v)
+			return newErr(KindTypeMismatch, fmt.Sprintf("expected number, got %T", v))
 		}
 	case FieldBool:
 		if _, ok := v.(bool); !ok {
-			return fmt.Errorf("expected bool, got %T", v)
+			return newErr(KindTypeMismatch, fmt.Sprintf("expected bool, got %T", v))
 		}
 	case FieldEnum:
 		s, ok := v.(string)
 		if !ok {
-			return fmt.Errorf("expected string for enum, got %T", v)
+			return newErr(KindTypeMismatch, fmt.Sprintf("expected string for enum, got %T", v))
 		}
 		if !slices.Contains(f.EnumValues, s) {
-			return fmt.Errorf("value %q not in enum %v", s, f.EnumValues)
+			return newErr(KindEnumInvalid, fmt.Sprintf("value %q not in enum %v", s, f.EnumValues))
 		}
 	case FieldI18nText:
 		// Structural only (ADR-0009): a JSON object of locale -> string.
@@ -121,15 +210,15 @@ func validateFieldValue(f Field, v any) error {
 		// field), so this is purely a shape check.
 		m, ok := v.(map[string]any)
 		if !ok {
-			return fmt.Errorf("expected an object of locale->string for i18n_text, got %T", v)
+			return newErr(KindI18nTextInvalid, fmt.Sprintf("expected an object of locale->string for i18n_text, got %T", v))
 		}
 		for loc, val := range m {
 			if _, ok := val.(string); !ok {
-				return fmt.Errorf("i18n_text value for locale %q must be a string, got %T", loc, val)
+				return newErr(KindI18nTextInvalid, fmt.Sprintf("i18n_text value for locale %q must be a string, got %T", loc, val))
 			}
 		}
 	default:
-		return fmt.Errorf("unknown field type %q", f.Type)
+		return newErr(KindInvalid, fmt.Sprintf("unknown field type %q", f.Type))
 	}
 	return nil
 }
