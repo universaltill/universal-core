@@ -1005,19 +1005,15 @@ func (h *Handler) renderRecordForm(w http.ResponseWriter, r *http.Request) {
 
 // renderForm is shared by the "new" and "existing record" routes; id =="" means new.
 //
-// master_detail sections are populated below via loadMasterDetailChildren
-// (RecordRepo.ListByField, added once a real caller — PurchaseOrder's
-// Lines section — needed it; formrender itself already supported
-// Data.Children, this handler just didn't fetch anything to put there
-// before). related_list sections still render empty: unlike
-// master_detail, the template already lazy-loads a related_list's rows
-// itself via a separate hx-trigger="load" request to
-// /api/records/{Target}?ref=..., but nothing serves that ref-filtered
-// query yet (no form.Section field says which field on Target points
-// back to this record for an arbitrary related-list, the way
-// entity.Relationship.ParentField does for a composition/master-detail
-// child) — still a real gap, just not one any Definition in this kernel
-// exercises yet (QUEUE.md).
+// master_detail AND related_list sections are both populated below via
+// loadMasterDetailChildren (RecordRepo.ListByField, added once a real
+// caller — PurchaseOrder's Lines section — needed it; formrender itself
+// already supported Data.Children, this handler just didn't fetch
+// anything to put there before). related_list used to render server-side
+// via a separate hx-trigger="load" lazy-load to an endpoint that ignored
+// the ref filter and returned every record of the target type — removed
+// (board #20) in favor of rendering from Children exactly like
+// master_detail, since the rows are already fetched here.
 func (h *Handler) renderForm(w http.ResponseWriter, r *http.Request, id string) {
 	rc, ok := requestContext(w, r)
 	if !ok {
@@ -1150,12 +1146,13 @@ func (h *Handler) buildFormRenderData(ctx context.Context, ts tenantScope, entDe
 		renderData.Record = rec.Data
 		renderData.RecordLabel = h.recordLabel(entDef, rec, locale)
 
-		children, childDefs, err := h.loadMasterDetailChildren(ctx, ts, entDef, formDef, id)
+		children, childDefs, childReferenceLabels, err := h.loadMasterDetailChildren(ctx, ts, entDef, formDef, id, locale)
 		if err != nil {
 			return formrender.Data{}, fmt.Errorf("load master-detail children: %w", err)
 		}
 		renderData.Children = children
 		renderData.ChildDefs = childDefs
+		renderData.ChildReferenceLabels = childReferenceLabels
 	}
 	// Resolved AFTER the record is loaded, because it depends on the
 	// record's current values: the combobox (#24) only needs each
@@ -1398,14 +1395,29 @@ func (h *Handler) referenceLabelFor(ctx context.Context, ts tenantScope, targetT
 }
 
 // pageReferenceLabels resolves the labels of just the reference ids that
-// actually appear in `records` (one list page) — field -> id -> label. Like
-// the form combobox (#24), this deliberately does NOT list every target
-// record: a page of 20 purchase orders resolves at most 20 distinct vendor
-// ids, not the whole vendor table, so the list view scales with page size
-// rather than with the referenced entity's total row count. A label that
-// can't be resolved (dangling id, or this viewer lacking read access to
-// the target) is simply omitted; the cell renderer falls back to the raw
-// id — visible-but-broken beats silently hiding a dangling reference.
+// actually appear in `records` — field -> id -> label. Like the form
+// combobox (#24), this deliberately does NOT list every target record:
+// records normally means one list page (at most 20-ish distinct vendor
+// ids, not the whole vendor table), so the list view scales with page
+// size rather than with the referenced entity's total row count. A
+// label that can't be resolved (dangling id, or this viewer lacking
+// read access to the target) is simply omitted; the cell renderer
+// falls back to the raw id — visible-but-broken beats silently hiding a
+// dangling reference.
+//
+// `records` is NOT always page-sized, though: loadMasterDetailChildren
+// reuses this same helper for a master-detail/related-list section's
+// child rows, and RecordRepo.ListByField has no LIMIT — a large parent
+// (thousands of converted Leads on one Campaign, say) could otherwise
+// turn one form render into one uncached DB round-trip PER distinct
+// referenced id (independent review, uc-infra#85 follow-up).
+// pageReferenceLabelResolveLimit caps distinct ids resolved PER FIELD at
+// the same bound the reference-picker search already uses
+// (referenceFilterMatchLimit) — past it, remaining ids for that field
+// simply take the existing "unresolved, cell falls back to raw id" path
+// rather than issuing more queries. A real list page never approaches
+// this bound, so the cap is a no-op there; it only bites the unbounded
+// child-row case this doc comment above describes.
 func (h *Handler) pageReferenceLabels(ctx context.Context, ts tenantScope, def *entity.Definition, records []data.Record, locale string) map[string]map[string]string {
 	out := map[string]map[string]string{}
 	cache := map[string]string{} // "target\x00id" -> label
@@ -1415,6 +1427,9 @@ func (h *Handler) pageReferenceLabels(ctx context.Context, ts tenantScope, def *
 		}
 		byID := map[string]string{}
 		for _, rec := range records {
+			if len(byID) >= referenceFilterMatchLimit {
+				break
+			}
 			id, _ := rec.Data[f.Name].(string)
 			if id == "" {
 				continue
@@ -1451,12 +1466,25 @@ func (h *Handler) pageReferenceLabels(ctx context.Context, ts tenantScope, def *
 // children", the same as an explicitly empty slice) rather than erroring
 // — a Definition mismatch here is a data-modeling bug to fix in the
 // Definition, not something that should 500 every form render for it.
-func (h *Handler) loadMasterDetailChildren(ctx context.Context, ts tenantScope, entDef *entity.Definition, formDef *form.Definition, recordID string) (map[string][]map[string]any, map[string]*entity.Definition, error) {
+//
+// It also resolves each section's own reference-typed columns to labels
+// (formrender.Data.ChildReferenceLabels), reusing pageReferenceLabels —
+// the same field->id->label lookup the top-level list view already does
+// per page — rather than a second lookup convention. A child section is
+// NOT actually page-sized the way a list view's `records` is (this
+// function's own child fetch above has no LIMIT), so pageReferenceLabels
+// now caps distinct ids resolved per field at referenceFilterMatchLimit
+// for exactly this reuse — see that function's own doc comment. Before
+// this, a related-list/master-detail FieldReference column (e.g.
+// Lead.campaign_id, Lead.status_id) rendered the raw stored id, because
+// nothing populated a label map for it at all (uc-infra#85).
+func (h *Handler) loadMasterDetailChildren(ctx context.Context, ts tenantScope, entDef *entity.Definition, formDef *form.Definition, recordID, locale string) (map[string][]map[string]any, map[string]*entity.Definition, map[string]map[string]map[string]string, error) {
 	children := make(map[string][]map[string]any)
 	// The child Definitions travel with the rows: the renderer needs
 	// them for column order and to resolve i18n_text cells to the
 	// viewer's locale (formrender.buildChildRows).
 	childDefs := make(map[string]*entity.Definition)
+	referenceLabels := make(map[string]map[string]map[string]string)
 	for _, section := range formDef.Sections {
 		// Both component kinds resolve their rows the same way — parent
 		// id matched against the child's ParentField. They differ in what
@@ -1483,11 +1511,11 @@ func (h *Handler) loadMasterDetailChildren(ctx context.Context, ts tenantScope, 
 		}
 		childDef, err := ts.entityDef(ctx, section.Target)
 		if err != nil {
-			return nil, nil, fmt.Errorf("look up %s definition for master-detail section: %w", section.Target, err)
+			return nil, nil, nil, fmt.Errorf("look up %s definition for master-detail section: %w", section.Target, err)
 		}
 		records, err := ts.crud.ListByField(ctx, childDef, rel.ParentField, recordID)
 		if err != nil {
-			return nil, nil, fmt.Errorf("list %s children: %w", section.Target, err)
+			return nil, nil, nil, fmt.Errorf("list %s children: %w", section.Target, err)
 		}
 		rows := make([]map[string]any, len(records))
 		for i, rec := range records {
@@ -1495,8 +1523,9 @@ func (h *Handler) loadMasterDetailChildren(ctx context.Context, ts tenantScope, 
 		}
 		children[section.Target] = rows
 		childDefs[section.Target] = childDef
+		referenceLabels[section.Target] = h.pageReferenceLabels(ctx, ts, childDef, records, locale)
 	}
-	return children, childDefs, nil
+	return children, childDefs, referenceLabels, nil
 }
 
 func writeDefinitionLookupError(w http.ResponseWriter, entityType string, err error) {

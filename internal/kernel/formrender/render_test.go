@@ -1054,6 +1054,142 @@ func TestRender_RelatedListColumnHeadersFallBackToRawFieldNameWhenUntranslated(t
 	}
 }
 
+// TestRender_RelatedListReferenceCellResolvesToLabel (uc-infra#85): a
+// related-list/master-detail FieldReference cell must resolve through
+// ChildReferenceLabels the same way a top-level list column resolves
+// through internal/api's pageReferenceLabels — before this fix,
+// childCellValue only special-cased FieldI18nText, so this cell printed
+// the raw stored id no matter what the caller passed. Regression test:
+// written failing against the unfixed childCellValue (returned the raw
+// "vendor-1" id), now passes against the fix.
+func TestRender_RelatedListReferenceCellResolvesToLabel(t *testing.T) {
+	r := testRenderer(t)
+	childDef := &entity.Definition{
+		EntityType: "PurchaseOrder", Version: 1,
+		Fields: []entity.Field{{Name: "vendor_id", Type: entity.FieldReference, Target: "Party"}},
+	}
+	data := Data{
+		Record: map[string]any{"payment_method": "Wire"},
+		Children: map[string][]map[string]any{
+			"PurchaseOrder": {{"vendor_id": "vendor-1"}},
+		},
+		ChildDefs:            map[string]*entity.Definition{"PurchaseOrder": childDef},
+		ChildReferenceLabels: map[string]map[string]map[string]string{"PurchaseOrder": {"vendor_id": {"vendor-1": "Acme Supply Co"}}},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "Acme Supply Co") {
+		t.Errorf("expected the vendor_id cell resolved to its label, got:\n%s", out)
+	}
+	if strings.Contains(out, "vendor-1") {
+		t.Errorf("expected the raw vendor id NOT to leak into the cell once a label was available, got:\n%s", out)
+	}
+}
+
+// TestRender_RelatedListReferenceCellFallsBackToRawIDWhenUnresolved
+// (uc-infra#85): a reference whose label wasn't resolved by the caller
+// (dangling id, or this viewer lacking read access to the target — same
+// cases cellText's own referenceLabels already tolerates) must still
+// show something rather than silently vanish or error the whole render —
+// same "visible-but-broken beats hidden" reasoning as the top-level list
+// view. Covers both a nil ChildReferenceLabels entirely and a present
+// section/field map that simply doesn't have this particular id.
+func TestRender_RelatedListReferenceCellFallsBackToRawIDWhenUnresolved(t *testing.T) {
+	r := testRenderer(t)
+	childDef := &entity.Definition{
+		EntityType: "PurchaseOrder", Version: 1,
+		Fields: []entity.Field{{Name: "vendor_id", Type: entity.FieldReference, Target: "Party"}},
+	}
+	baseData := Data{
+		Record: map[string]any{"payment_method": "Wire"},
+		Children: map[string][]map[string]any{
+			"PurchaseOrder": {{"vendor_id": "vendor-dangling"}},
+		},
+		ChildDefs: map[string]*entity.Definition{"PurchaseOrder": childDef},
+	}
+
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), baseData, "en"); err != nil {
+		t.Fatalf("render (no ChildReferenceLabels at all): %v", err)
+	}
+	if !strings.Contains(buf.String(), "vendor-dangling") {
+		t.Errorf("expected the raw id as a fallback when no reference labels were supplied at all, got:\n%s", buf.String())
+	}
+
+	withEmptyEntry := baseData
+	withEmptyEntry.ChildReferenceLabels = map[string]map[string]map[string]string{"PurchaseOrder": {"vendor_id": {"some-other-id": "Someone Else"}}}
+	var buf2 strings.Builder
+	if err := r.Render(&buf2, purchaseOrderForm(), purchaseOrderEntity(), withEmptyEntry, "en"); err != nil {
+		t.Fatalf("render (id not in ChildReferenceLabels): %v", err)
+	}
+	if !strings.Contains(buf2.String(), "vendor-dangling") {
+		t.Errorf("expected the raw id as a fallback when this specific id has no resolved label, got:\n%s", buf2.String())
+	}
+}
+
+// TestRender_MasterDetailEnumCellResolvesThroughCatalog (uc-infra#85): a
+// child FieldEnum cell resolves through the same
+// "field.{EntityType}.{FieldName}.{Value}" catalog convention buildFields
+// already uses for a top-level enum <select>'s option labels. Turkish is
+// asserted, not English, for the same reason the sibling column-header
+// test in this file uses Turkish: an English assertion could pass by
+// coincidence (raw value happening to equal its own translation).
+func TestRender_MasterDetailEnumCellResolvesThroughCatalog(t *testing.T) {
+	r := testRenderer(t)
+	childDef := &entity.Definition{
+		EntityType: "Lead", Version: 1,
+		Fields: []entity.Field{{Name: "source", Type: entity.FieldEnum, EnumValues: []string{"event"}}},
+	}
+	data := Data{
+		Record: map[string]any{"payment_method": "Wire"},
+		Children: map[string][]map[string]any{
+			"POLine": {{"source": "event"}},
+		},
+		ChildDefs: map[string]*entity.Definition{"POLine": childDef},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "tr"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "Etkinlik") {
+		t.Errorf("expected the source cell resolved to Turkish via field.Lead.source.event, got:\n%s", out)
+	}
+	if strings.Contains(out, `data-field="source">event<`) {
+		t.Errorf("expected the raw enum value NOT to leak into the cell once a translation was available, got:\n%s", out)
+	}
+}
+
+// TestRender_MasterDetailEnumCellFallsBackToRawValueWhenUntranslated
+// (uc-infra#85): mirrors the column-header and reference-cell fallback
+// tests — an enum value with no catalog entry for this child entity type
+// must still render its raw stored value, not go blank.
+func TestRender_MasterDetailEnumCellFallsBackToRawValueWhenUntranslated(t *testing.T) {
+	r := testRenderer(t)
+	// No catalog entry exists for field.Untranslated.* in any locale.
+	childDef := &entity.Definition{
+		EntityType: "Untranslated", Version: 1,
+		Fields: []entity.Field{{Name: "status", Type: entity.FieldEnum, EnumValues: []string{"open"}}},
+	}
+	data := Data{
+		Record: map[string]any{"payment_method": "Wire"},
+		Children: map[string][]map[string]any{
+			"POLine": {{"status": "open"}},
+		},
+		ChildDefs: map[string]*entity.Definition{"POLine": childDef},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if !strings.Contains(buf.String(), `data-field="status">open<`) {
+		t.Errorf("expected an untranslated enum cell to fall back to its raw value, got:\n%s", buf.String())
+	}
+}
+
 // TestRender_RelatedListNoHeaderWhenNoColumns (uc-infra#103): the
 // {{if .Columns}} guard itself is untested by every other case above —
 // they all supply either a ChildDef or at least one row to derive

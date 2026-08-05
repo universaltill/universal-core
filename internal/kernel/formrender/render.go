@@ -125,6 +125,22 @@ type Data struct {
 	// to the viewer's locale rather than printing a raw map — see
 	// buildChildRows. A missing entry degrades to per-row keys.
 	ChildDefs map[string]*entity.Definition
+	// ChildReferenceLabels resolves each child row's FieldReference cells
+	// to their target's label, keyed the same way as Children (by section
+	// Target), then by the child entity's field name, then by the stored
+	// id — the same field->id->label shape internal/api's own
+	// pageReferenceLabels already returns for the top-level list view, so
+	// the caller can reuse that helper per section rather than inventing a
+	// second lookup convention. This is what makes a related-list/
+	// master-detail column showing a reference (e.g. Lead.campaign_id)
+	// print a name instead of a raw id — see childCellValue. A missing
+	// section entry, field entry, or id entry all degrade the same way
+	// cellText's referenceLabels does: the cell falls back to the raw
+	// stored value rather than failing the render, since an unresolvable
+	// reference (dangling id, or this viewer lacking read access to the
+	// target) is a real, visible-but-broken state worth showing rather
+	// than hiding.
+	ChildReferenceLabels map[string]map[string]map[string]string
 	// ReferenceOptions carries only the label of each FieldReference
 	// field's CURRENT value, keyed by field name — enough to show a name
 	// instead of a raw id on an existing record's combobox (#24). It is no
@@ -449,7 +465,7 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 			}
 
 		case form.ComponentMasterDetail:
-			sv.Children, sv.Columns = buildChildRows(data.Children[s.Target], data.ChildDefs[s.Target], r.i18n, locale)
+			sv.Children, sv.Columns = buildChildRows(data.Children[s.Target], data.ChildDefs[s.Target], data.ChildReferenceLabels[s.Target], r.i18n, locale)
 			sv.AddHref = "/api/records/" + url.PathEscape(s.Target) + "/new"
 			if s.RollUp != "" {
 				// RollUpTarget names a field on the PARENT entity (ent,
@@ -473,7 +489,7 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 			// the endpoint: the rows are already here, and a lazy-load
 			// that fires on every form render is a request this page
 			// does not need (independent review, board #20).
-			sv.Children, sv.Columns = buildChildRows(data.Children[s.Target], data.ChildDefs[s.Target], r.i18n, locale)
+			sv.Children, sv.Columns = buildChildRows(data.Children[s.Target], data.ChildDefs[s.Target], data.ChildReferenceLabels[s.Target], r.i18n, locale)
 		}
 
 		vm.Sections = append(vm.Sections, sv)
@@ -758,10 +774,21 @@ func (r *Renderer) buildFields(s form.Section, ent *entity.Definition, record ma
 // an i18n field until Task.title, which is why nothing caught it
 // before.
 //
+// FieldReference and FieldEnum cells are resolved the same way
+// internal/api's own list view (cellText) resolves its top-level
+// columns — a reference through referenceLabels (falling back to the
+// raw stored id when unresolved), an enum through the
+// "field.{EntityType}.{FieldName}.{Value}" catalog convention. Before
+// this, childCellValue only special-cased FieldI18nText, so every
+// related-list/master-detail reference or enum column printed the raw
+// stored UUID/code — invisible on a FORM's own fields, which already
+// went through buildFields' resolution, and easy to miss because of
+// that asymmetry (uc-infra#85).
+//
 // childDef may be nil (a Definition mismatch the caller already
 // tolerates); the per-row key fallback keeps such a section rendering
 // something rather than nothing.
-func buildChildRows(children []map[string]any, childDef *entity.Definition, catalog *i18n.Catalog, locale string) ([]childRowView, []columnView) {
+func buildChildRows(children []map[string]any, childDef *entity.Definition, referenceLabels map[string]map[string]string, catalog *i18n.Catalog, locale string) ([]childRowView, []columnView) {
 	names := childColumns(children, childDef)
 	columns := make([]columnView, 0, len(names))
 	for _, name := range names {
@@ -781,7 +808,7 @@ func buildChildRows(children []map[string]any, childDef *entity.Definition, cata
 		for _, name := range names {
 			row.Cells = append(row.Cells, cellView{
 				Field: name,
-				Value: childCellValue(child, name, childDef, catalog, locale),
+				Value: childCellValue(child, name, childDef, referenceLabels, catalog, locale),
 			})
 		}
 		rows = append(rows, row)
@@ -815,15 +842,44 @@ func childColumns(children []map[string]any, childDef *entity.Definition) []stri
 	return cols
 }
 
-func childCellValue(child map[string]any, name string, childDef *entity.Definition, catalog *i18n.Catalog, locale string) any {
+// childCellValue resolves one child row's cell for column name. Every
+// return path except a resolved FieldI18nText/FieldReference/FieldEnum
+// value goes through FormatFieldValue, not the raw stored value — the
+// same formatter cellText's own default case (internal/api/listview.go)
+// falls back to, and for the same reason: a bare `any` printed by
+// html/template's default verb switches a large/precise float64 to
+// scientific notation ("1e+06" instead of "1000000"), which
+// FormatFieldValue exists specifically to avoid (see its own doc
+// comment; sv.RollUpTotal already routes through the equivalent
+// strconv.FormatFloat call for exactly this reason). Before this, only
+// the FieldI18nText path in this function got that treatment, so a
+// PurchaseOrder Lines table's line_total column could show "1e+06" one
+// row above a roll-up total reading "1000000" (independent review,
+// uc-infra#85 follow-up).
+//
+// This does NOT give a child cell the regional locale formatting
+// (loc.FormatDate's Jalali calendar, loc.FormatNumber's digit
+// grouping) cellText's own FieldDate/FieldNumber cases apply — that
+// needs a uclocale.Locale, which is internal/api's concern, not
+// something this generic kernel package has access to (or should:
+// regional formatting is presentation policy, not the record data this
+// package renders). Filed as a separate gap rather than folded in here
+// (uc-infra#133) — different fix, different blast radius, not this
+// task's scope.
+func childCellValue(child map[string]any, name string, childDef *entity.Definition, referenceLabels map[string]map[string]string, catalog *i18n.Catalog, locale string) any {
 	v, present := child[name]
 	if !present {
 		return nil
 	}
 	if childDef == nil || catalog == nil {
-		return v
+		return FormatFieldValue(v)
 	}
-	if f, ok := childDef.FieldByName(name); ok && f.Type == entity.FieldI18nText {
+	f, ok := childDef.FieldByName(name)
+	if !ok {
+		return FormatFieldValue(v)
+	}
+	switch f.Type {
+	case entity.FieldI18nText:
 		if s, ok := catalog.ResolveLocalized(v, locale); ok {
 			return s
 		}
@@ -831,8 +887,25 @@ func childCellValue(child map[string]any, name string, childDef *entity.Definiti
 		// map — a missing translation is not something to show as Go
 		// syntax.
 		return nil
+	case entity.FieldReference:
+		if id, ok := v.(string); ok && id != "" {
+			if label, ok := referenceLabels[name][id]; ok {
+				return label
+			}
+		}
+		// Unresolved (dangling id, or the caller never populated a
+		// label for it — same "not this viewer's fault" cases
+		// referenceLabels' own doc comment lists) falls back to the raw
+		// stored id, exactly like cellText's top-level list columns:
+		// visible-but-broken beats silently hiding a reference.
+		return FormatFieldValue(v)
+	case entity.FieldEnum:
+		if s, ok := v.(string); ok && s != "" {
+			return catalog.TOrDefault(locale, "field."+childDef.EntityType+"."+name+"."+s, s)
+		}
+		return FormatFieldValue(v)
 	}
-	return v
+	return FormatFieldValue(v)
 }
 
 const tmplSrc = `<form class="uc-form" data-entity-type="{{.EntityType}}"{{if .RecordID}} data-record-id="{{.RecordID}}" data-record-label="{{.RecordLabel}}"{{end}} hx-post="{{.PostHref}}" hx-target="this" hx-swap="outerHTML">
