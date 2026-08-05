@@ -90,6 +90,125 @@ func TestProvisionTenant_MissingNameAndTenantID_FailsFast(t *testing.T) {
 	}
 }
 
+// An ai_agent provisioning run must carry a model version — ADR-0001
+// §14 makes AI-actor identity first-class, and audit.Actor.Validate
+// enforces it. Hard-coding ActorHuman (the pre-fix shape) would have
+// written a falsified actor_type for every unattended pipeline
+// provisioning run (uc-infra#72, same test shape as cmd/install-module's
+// TestActorTypeValidation).
+//
+// Every rejection here also asserts zero rows in `tenants` — not just a
+// non-zero exit — because the validation runs before ANY database work
+// (main.go's own comment on this ordering) and `TestMissingActorID`-
+// style substring assertions alone don't pin that: `strings.Contains(
+// stderr, "model_version")` alone would still pass if the early check
+// were deleted, since audit.New's own downstream ErrMissingModelVersion
+// contains the same substring — by which point router.Create has
+// already provisioned a real tenant database (uc-infra#72 independent
+// review, finding 2). Counting `tenants` catches that regression even
+// though this test has no tenant of its own to explicitly drop.
+func TestProvisionTenant_ActorTypeValidation(t *testing.T) {
+	dsn := freshControlDB(t)
+	assertNoTenantCreated := func(t *testing.T) {
+		t.Helper()
+		// A rejected run never reaches db.ApplyControl (validation is
+		// before any database work), so `tenants` may not even exist
+		// yet — apply control migrations on our own verification
+		// connection first, the same way openRouter does for the
+		// success-path tests, rather than assume the schema is there.
+		control := testexec.Open(t, dsn)
+		if err := db.ApplyControl(context.Background(), control); err != nil {
+			t.Fatalf("ApplyControl (verification connection): %v", err)
+		}
+		var count int
+		if err := control.QueryRowContext(context.Background(), `SELECT count(*) FROM tenants`).Scan(&count); err != nil {
+			t.Fatalf("count tenants: %v", err)
+		}
+		if count != 0 {
+			t.Errorf("expected no tenant to have been created before actor validation failed, got %d", count)
+		}
+	}
+
+	_, stderr, code := run(t, []string{"DATABASE_URL=" + dsn}, "-name=x", "-actor-id=pipeline", "-actor-type=ai_agent")
+	if code == 0 || !strings.Contains(stderr, "model_version") {
+		t.Errorf("expected ai_agent to require -model-version, got code %d: %s", code, stderr)
+	}
+	assertNoTenantCreated(t)
+
+	_, stderr, code = run(t, []string{"DATABASE_URL=" + dsn}, "-name=x", "-actor-id=pipeline", "-actor-type=wizard")
+	if code == 0 || !strings.Contains(stderr, "invalid actor") {
+		t.Errorf("expected an unknown actor type to be rejected, got code %d: %s", code, stderr)
+	}
+	assertNoTenantCreated(t)
+
+	// The other half of the same falsification, the other direction —
+	// a human row carrying a model version (uc-infra#72 independent
+	// review, finding 4): Validate() alone only rejects an EMPTY
+	// ModelVersion on an agent, never a populated one on a human.
+	_, stderr, code = run(t, []string{"DATABASE_URL=" + dsn}, "-name=x", "-actor-id=pipeline", "-model-version=claude-x")
+	if code == 0 || !strings.Contains(stderr, "-model-version is only meaningful") {
+		t.Errorf("expected a human actor with -model-version set to be rejected, got code %d: %s", code, stderr)
+	}
+	assertNoTenantCreated(t)
+}
+
+// TestProvisionTenant_ActorTypeAI_WritesRealAuditRows is the positive
+// half TestProvisionTenant_ActorTypeValidation deliberately doesn't
+// cover: every rejection test above only proves the guardrail exists,
+// never that a SUCCESSFUL ai_agent run actually reaches the audit log
+// with the right values (uc-infra#72 independent review, finding 1) — a
+// wiring mistake that constructs a validated actor but passes a
+// different one downstream (exactly the shape of the pre-fix bug in
+// cmd/seed-demo-data, which built its Actor separately from
+// cmd/install-module's validated one) would leave every rejection test
+// green. This runs the real compiled binary end to end and reads the
+// provisioned tenant's own audit_log directly.
+func TestProvisionTenant_ActorTypeAI_WritesRealAuditRows(t *testing.T) {
+	dsn := freshControlDB(t)
+
+	stdout, stderr, code := run(t, []string{"DATABASE_URL=" + dsn},
+		"-name=AI Actor Smoke Test", "-actor-id=pipeline", "-actor-type=ai_agent", "-model-version=claude-test-1")
+	if code != 0 {
+		t.Fatalf("run: exit %d, stderr: %s", code, stderr)
+	}
+	id := strings.TrimSpace(stdout)
+	if id == "" {
+		t.Fatal("expected the new tenant id printed to stdout")
+	}
+	testexec.DropTenantDatabase(t, testexec.Open(t, dsn), id)
+
+	router := openRouter(t, dsn)
+	tenantDB, err := router.Get(context.Background(), id)
+	if err != nil {
+		t.Fatalf("resolve provisioned tenant database: %v", err)
+	}
+
+	var total, wrongActorType, wrongModelVersion int
+	if err := tenantDB.QueryRowContext(context.Background(),
+		`SELECT count(*) FROM audit_log`).Scan(&total); err != nil {
+		t.Fatalf("count audit_log: %v", err)
+	}
+	if total == 0 {
+		t.Fatal("expected foundation provisioning to write at least one audit_log row")
+	}
+	if err := tenantDB.QueryRowContext(context.Background(),
+		`SELECT count(*) FROM audit_log WHERE actor_type != 'ai_agent' OR actor_id != 'pipeline'`,
+	).Scan(&wrongActorType); err != nil {
+		t.Fatalf("count wrong-actor audit_log rows: %v", err)
+	}
+	if wrongActorType != 0 {
+		t.Errorf("expected every audit_log row to carry actor_type='ai_agent', actor_id='pipeline', got %d that don't", wrongActorType)
+	}
+	if err := tenantDB.QueryRowContext(context.Background(),
+		`SELECT count(*) FROM audit_log WHERE model_version IS DISTINCT FROM 'claude-test-1'`,
+	).Scan(&wrongModelVersion); err != nil {
+		t.Fatalf("count wrong-model-version audit_log rows: %v", err)
+	}
+	if wrongModelVersion != 0 {
+		t.Errorf("expected every audit_log row to carry model_version='claude-test-1', got %d that don't", wrongModelVersion)
+	}
+}
+
 func TestProvisionTenant_UnknownModule_FailsFast(t *testing.T) {
 	dsn := freshControlDB(t)
 	_, stderr, code := run(t, []string{"DATABASE_URL=" + dsn}, "-name=x", "-actor-id=a", "-modules=nonsense")

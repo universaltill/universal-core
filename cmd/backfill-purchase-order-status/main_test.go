@@ -167,6 +167,76 @@ func TestBackfill_MissingActorID_FailsFast(t *testing.T) {
 	}
 }
 
+// An ai_agent backfill run must carry a model version — ADR-0001 §14
+// makes AI-actor identity first-class, and audit.Actor.Validate
+// enforces it. Hard-coding ActorHuman (the pre-fix shape) would have
+// written a falsified actor_type for every record an unattended
+// pipeline backfill run migrated (uc-infra#72, same test shape as
+// cmd/install-module's TestActorTypeValidation). Validation runs before
+// any database work, so the tenant doesn't need purchase_order_status
+// published for this to fail correctly.
+func TestBackfill_ActorTypeValidation(t *testing.T) {
+	dsn, _ := tenantDatabase(t, false)
+
+	_, stderr, code := run(t, []string{"DATABASE_URL=" + dsn}, "-actor-id=pipeline", "-actor-type=ai_agent")
+	if code == 0 || !strings.Contains(stderr, "model_version") {
+		t.Errorf("expected ai_agent to require -model-version, got code %d: %s", code, stderr)
+	}
+
+	_, stderr, code = run(t, []string{"DATABASE_URL=" + dsn}, "-actor-id=pipeline", "-actor-type=wizard")
+	if code == 0 || !strings.Contains(stderr, "invalid actor") {
+		t.Errorf("expected an unknown actor type to be rejected, got code %d: %s", code, stderr)
+	}
+
+	// The other half of the same falsification, the other direction —
+	// a human row carrying a model version (uc-infra#72 independent
+	// review, finding 4): Validate() alone only rejects an EMPTY
+	// ModelVersion on an agent, never a populated one on a human.
+	_, stderr, code = run(t, []string{"DATABASE_URL=" + dsn}, "-actor-id=pipeline", "-model-version=claude-x")
+	if code == 0 || !strings.Contains(stderr, "-model-version is only meaningful") {
+		t.Errorf("expected a human actor with -model-version set to be rejected, got code %d: %s", code, stderr)
+	}
+}
+
+// TestBackfill_ActorTypeAI_WritesRealAuditRow is the positive half
+// TestBackfill_ActorTypeValidation deliberately doesn't cover: every
+// rejection test above only proves the guardrail exists, never that a
+// SUCCESSFUL ai_agent run actually reaches the migrated record's own
+// audit_log row with the right values (uc-infra#72 independent review,
+// finding 1). Runs the real compiled binary against a real legacy row
+// and reads that record's audit trail directly by record_id — narrower
+// than a watermark, and immune to tenantDatabase's own human-actor setup
+// noise since it's scoped to this one PurchaseOrder.
+func TestBackfill_ActorTypeAI_WritesRealAuditRow(t *testing.T) {
+	dsn, tenantDB := tenantDatabase(t, true)
+	id := insertLegacyPurchaseOrder(t, tenantDB, "PO-AI-1", map[string]any{
+		"po_number": "PO-AI-1", "vendor_id": "00000000-0000-0000-0000-000000000001",
+		"order_date": "2026-01-01", "status": "draft",
+	})
+
+	stdout, stderr, code := run(t, []string{"DATABASE_URL=" + dsn}, "-actor-id=pipeline", "-actor-type=ai_agent", "-model-version=claude-test-1")
+	if code != 0 {
+		t.Fatalf("run: exit %d, stderr: %s", code, stderr)
+	}
+	if !strings.Contains(stdout, "Migrated 1 PurchaseOrder") {
+		t.Fatalf("expected the migration to actually run, got stdout: %q", stdout)
+	}
+
+	var actorType, actorID string
+	var modelVersion sql.NullString
+	if err := tenantDB.QueryRowContext(context.Background(),
+		`SELECT actor_type, actor_id, model_version FROM audit_log WHERE record_id = $1 ORDER BY id DESC LIMIT 1`, id,
+	).Scan(&actorType, &actorID, &modelVersion); err != nil {
+		t.Fatalf("read audit_log row for %s: %v", id, err)
+	}
+	if actorType != "ai_agent" || actorID != "pipeline" {
+		t.Errorf("expected actor_type=ai_agent, actor_id=pipeline, got actor_type=%q, actor_id=%q", actorType, actorID)
+	}
+	if !modelVersion.Valid || modelVersion.String != "claude-test-1" {
+		t.Errorf("expected model_version=claude-test-1, got %+v", modelVersion)
+	}
+}
+
 func TestBackfill_NoStatusesPublished_FailsCleanly(t *testing.T) {
 	dsn, _ := tenantDatabase(t, false) // purchasing.PublishStatuses never run
 	_, stderr, code := run(t, []string{"DATABASE_URL=" + dsn}, "-actor-id=smoke-test")
