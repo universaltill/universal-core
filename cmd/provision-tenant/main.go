@@ -58,6 +58,13 @@ func main() {
 	region := flag.String("region", "eu-west", "tenant region, only used when creating a new tenant")
 	tenantID := flag.String("tenant-id", "", "reuse an existing tenant id instead of creating a new one")
 	actorID := flag.String("actor-id", "", "audit actor id for every Definition this provisions (required)")
+	// An unattended pipeline provisioning run is an ai_agent actor, and
+	// ADR-0001 §14 makes that distinction first-class — hard-coding
+	// ActorHuman would write a falsified actor_type onto every
+	// draft/approve/publish row of every tenant this pipeline
+	// provisions (uc-infra#72, same shape as cmd/install-module's fix).
+	actorType := flag.String("actor-type", string(audit.ActorHuman), "audit actor type: human | ai_agent")
+	modelVersion := flag.String("model-version", "", "model version, required when -actor-type is ai_agent")
 	modulesFlag := flag.String("modules", "", "comma-separated modules to publish besides foundation (available: "+available+")")
 	flag.Parse()
 
@@ -66,6 +73,27 @@ func main() {
 	}
 	if *tenantID == "" && *name == "" {
 		log.Fatal("-name is required when not reusing an existing tenant via -tenant-id")
+	}
+	// Resolved and checked before any database work: an operator who
+	// mistyped the actor should learn that immediately, not after the
+	// control-plane connection and migrations already ran (same
+	// discipline as cmd/install-module).
+	actor := audit.Actor{Type: audit.ActorType(*actorType), ID: *actorID, ModelVersion: *modelVersion}
+	switch actor.Type {
+	case audit.ActorHuman, audit.ActorAgent:
+	default:
+		log.Fatalf("invalid actor: -actor-type must be %q or %q, got %q", audit.ActorHuman, audit.ActorAgent, *actorType)
+	}
+	// A human actor carrying a model version is the same class of
+	// falsified audit metadata this fix exists to prevent the other
+	// way around (uc-infra#72 independent review) — Validate() alone
+	// only rejects an EMPTY ModelVersion on an agent, never a populated
+	// one on a human, so that half of the mistake needs its own check.
+	if actor.Type == audit.ActorHuman && *modelVersion != "" {
+		log.Fatalf("invalid actor: -model-version is only meaningful when -actor-type is %q", audit.ActorAgent)
+	}
+	if err := actor.Validate(); err != nil {
+		log.Fatalf("invalid actor: %v", err)
 	}
 
 	// De-duplicated via a set: PublishAll is idempotent regardless (a
@@ -104,7 +132,6 @@ func main() {
 	}
 
 	ctx := context.Background()
-	actor := audit.Actor{Type: audit.ActorHuman, ID: *actorID}
 
 	id := *tenantID
 	var tenantDB *sql.DB

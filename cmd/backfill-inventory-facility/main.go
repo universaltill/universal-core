@@ -71,6 +71,12 @@ func main() {
 	}
 
 	ctx := context.Background()
+	// TODO(uc-infra#72 follow-up): this hardcodes ActorHuman, the exact
+	// falsified-audit-trail bug #72 fixed in cmd/provision-tenant,
+	// cmd/seed-demo-data and cmd/backfill-purchase-order-status — known,
+	// deliberately not fixed here (outside that card's named scope), not
+	// forgotten. Copy the same -actor-type/-model-version pattern when
+	// this file is next touched, or as its own follow-up card.
 	actor := audit.Actor{Type: audit.ActorHuman, ID: *actorID}
 	entityDefs := data.NewEntityDefinitionRepo(sqlDB)
 	engine := crud.NewEngine(sqlDB)
