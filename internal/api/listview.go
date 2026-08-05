@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/universaltill/universal-core/internal/data"
+	"github.com/universaltill/universal-core/internal/kernel/authz"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/formrender"
 	uclocale "github.com/universaltill/universal-core/internal/kernel/locale"
@@ -365,6 +366,16 @@ func (h *Handler) referenceIDsMatching(ctx context.Context, ts tenantScope, targ
 		// for no practical gain.
 		Limit: referenceFilterMatchLimit,
 	})
+	if errors.Is(err, authz.ErrDenied) {
+		// The viewer can read the entity being listed but not the
+		// reference field's TARGET type (entity-level RBAC, ADR-0006) —
+		// a real, supported configuration, not a licensing gap like the
+		// data.ErrNotFound case above, but the same truthful-degrade
+		// answer applies: filtering by a target you can't read matches
+		// nothing, it does not 403 the whole list page you otherwise
+		// have full permission to view (uc-infra#89).
+		return []string{}, nil
+	}
 	if err != nil {
 		return nil, fmt.Errorf("search %s by %s: %w", targetType, labelField, err)
 	}

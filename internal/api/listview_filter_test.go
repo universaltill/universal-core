@@ -226,3 +226,76 @@ func TestListPage_DefaultFilterOnReferenceColumn_UnlicensedTarget(t *testing.T) 
 		t.Fatalf("q=Widgets should match nothing when the target type isn't licensed (no target to resolve a label against):\n%s", resp.Body.String())
 	}
 }
+
+// TestListPage_DefaultFilterOnReferenceColumn_UnreadableTarget is a
+// regression test for uc-infra#89: referenceIDsMatching's data.ErrNotFound
+// degrade branch (exercised above) has a sibling gap — a reference
+// target that IS licensed/published but that THIS VIEWER may not read
+// (entity-level RBAC, ADR-0006) used to propagate authz.ErrDenied out of
+// ts.crud.ListPageFiltered, through writeCrudPageError, into a 403 for
+// the whole Gadget list page — even though the viewer can read Gadget
+// itself and is simply typing into the filter box. Every neighbouring
+// resolution path already degrades for this actor (the cell just shows
+// the raw id); the filter path must degrade the same way: zero matches,
+// not a page-wide access-denied.
+func TestListPage_DefaultFilterOnReferenceColumn_UnreadableTarget(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := foundation.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	publishEntityAndForm(t, db, categoryEntityDef(), &form.Definition{
+		EntityType: "Category", Version: 1,
+		Sections: []form.Section{{Title: "D", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "name"}}}},
+	})
+	publishEntityAndForm(t, db, referenceFirstEntityDef(), &form.Definition{
+		EntityType: "Gadget", Version: 1,
+		Sections: []form.Section{{Title: "D", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "category"}, {Name: "name"}}}},
+	})
+
+	eng := crud.NewEngine(db)
+	widgets, err := eng.Create(ctx, categoryEntityDef(), map[string]any{"name": "Widgets"}, humanActor())
+	if err != nil {
+		t.Fatalf("create Widgets category: %v", err)
+	}
+	if _, err := eng.Create(ctx, referenceFirstEntityDef(), map[string]any{"category": widgets.ID, "name": "Sprocket"}, humanActor()); err != nil {
+		t.Fatalf("seed Sprocket: %v", err)
+	}
+
+	// clerk can read Gadget but has no grant on Category at all — and a
+	// Permission row naming Category (even for a different role) opts
+	// Category into deny-unless-granted, same as any other entity-level
+	// RBAC rule (authz.go's "opt-in per entity type" semantics).
+	seedRBAC(t, db,
+		map[string][]string{"clerk": {"user-clerk"}},
+		[]map[string]any{
+			{"role": "clerk", "entity_type": "Gadget", "can_read": true, "can_write": false},
+			{"role": "clerk", "entity_type": "Category", "can_read": false, "can_write": false},
+		},
+	)
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	// Sanity check: clerk can see the Gadget list at all (Gadget itself
+	// is granted). The reference cell degrades to the raw id, same as
+	// every other resolution path when the target isn't readable.
+	plain := getAs(t, mux, "/records/Gadget", tenantID, "user-clerk")
+	if plain.Code != http.StatusOK {
+		t.Fatalf("clerk should be able to view the Gadget list at all: %d:\n%s", plain.Code, plain.Body.String())
+	}
+
+	// Typing into the (default, reference) filter box must degrade to
+	// "no matches" — not turn a page clerk can otherwise view into a 403.
+	resp := getAs(t, mux, "/records/Gadget?q=Widgets", tenantID, "user-clerk")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("filtering by a reference target the viewer can't read should degrade to a normal page, not %d:\n%s", resp.Code, resp.Body.String())
+	}
+	if strings.Contains(resp.Body.String(), "Sprocket") {
+		t.Fatalf("q=Widgets should match nothing when the viewer can't read the target type:\n%s", resp.Body.String())
+	}
+}
