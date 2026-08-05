@@ -1054,6 +1054,30 @@ func TestRender_RelatedListColumnHeadersFallBackToRawFieldNameWhenUntranslated(t
 	}
 }
 
+// TestRender_RelatedListNoHeaderWhenNoColumns (uc-infra#103): the
+// {{if .Columns}} guard itself is untested by every other case above —
+// they all supply either a ChildDef or at least one row to derive
+// columns from. With neither (a related_list with zero rows and no
+// child Definition at all — e.g. a section whose Target has no matching
+// Relationship, which loadMasterDetailChildren silently skips), Columns
+// is empty and no .uc-related-header element should render at all.
+// Removing the guard entirely still passes every other test in this
+// file; only this one pins it down.
+func TestRender_RelatedListNoHeaderWhenNoColumns(t *testing.T) {
+	r := testRenderer(t)
+	data := Data{
+		Record:   map[string]any{"payment_method": "Wire"},
+		Children: map[string][]map[string]any{"PurchaseOrder": {}},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if strings.Contains(buf.String(), "uc-related-header") {
+		t.Errorf("expected no header element when there are no columns to describe, got:\n%s", buf.String())
+	}
+}
+
 // TestRender_RelatedListHeaderRendersEvenWhenEmpty (uc-infra#103): the
 // header describes the child Definition's declared field order (see
 // buildChildRows), independent of whether any rows exist — same as

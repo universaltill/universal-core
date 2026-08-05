@@ -406,6 +406,50 @@ table.uc-table tbody tr:last-child td {
   border-radius: 6px;
 }
 
+/* related_list (uc-infra#103): unlike master_detail, which gets column
+   alignment for free from the browser's native <table> layout, this is
+   div/span markup (deliberately not a table — see the section's own
+   comment in formrender/render.go) with no ancestor to lay its cells out
+   for it. Without this, .uc-related-header-cell/.uc-related-cell stay
+   `display: inline` and run together into one unbroken string that
+   doesn't align with the row below it. flex (not grid) needs no column
+   count threaded through from Go: every header cell and every row's
+   cells share the same flex-basis, so column N of the header and column
+   N of every row land at the same x position regardless of how many
+   columns a given child Definition declares. */
+.uc-related-header,
+.uc-related-row {
+  display: flex;
+  gap: 0.5rem 1rem;
+  padding: 0.35rem 0;
+  border-bottom: 1px solid var(--uc-border);
+}
+
+.uc-related-row:last-child {
+  border-bottom: none;
+}
+
+.uc-related-header-cell,
+.uc-related-cell {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* No text-transform here, unlike table.uc-table th: this section's
+   sibling component, master_detail's <th>, gets no custom CSS at all
+   (native browser table styling only, no case change), and matching
+   that -- not the unrelated list-page table -- keeps a translated
+   label's real casing on screen instead of forcing e.g. Turkish
+   "İ"/"i" through an uppercase transform. */
+.uc-related-header-cell {
+  color: var(--uc-muted);
+  font-weight: 600;
+  font-size: 0.8rem;
+}
+
 /* The RFQ vendor-comparison report's cheapest-price marking (#9) — a
    real computed style (background + bold weight), not just a CSS class
    name in the markup, so a browser test can assert against something

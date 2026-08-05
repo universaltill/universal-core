@@ -215,12 +215,26 @@ func TestRelatedList_ColumnHeadersAreLocalized_RealBrowser(t *testing.T) {
 		t.Fatalf("create LeaveRequest: %v", err)
 	}
 
+	// .uc-related-list itself renders unconditionally (it's the empty-state
+	// wrapper too) -- waiting on that rather than .uc-related-header
+	// means a regression that drops the header fails fast on the
+	// assertions below instead of hanging the full WaitVisible timeout.
 	browser := browserCtx(t, tenantID)
 	if err := chromedp.Run(browser,
 		chromedp.Navigate(srv.URL+"/forms/Employee/"+employee.ID+"?lang=tr"),
-		chromedp.WaitVisible(`.uc-related-header`, chromedp.ByQuery),
+		chromedp.WaitVisible(`.uc-related-list`, chromedp.ByQuery),
 	); err != nil {
 		t.Fatalf("open /forms/Employee/%s?lang=tr: %v", employee.ID, err)
+	}
+
+	var headerCellCount int
+	if err := chromedp.Run(browser, chromedp.Evaluate(
+		`document.querySelectorAll('.uc-related-header-cell').length`, &headerCellCount,
+	)); err != nil {
+		t.Fatalf("count header cells: %v", err)
+	}
+	if headerCellCount == 0 {
+		t.Fatalf("expected the Leave History related_list to render column header cells, got none")
 	}
 
 	// First declared LeaveRequest field is request_number -> "Talep No";
@@ -233,6 +247,25 @@ func TestRelatedList_ColumnHeadersAreLocalized_RealBrowser(t *testing.T) {
 	}
 	if got := strings.TrimSpace(firstHeader); got != "Talep No" {
 		t.Fatalf("expected the Turkish translation of the request_number column header, got %q", got)
+	}
+
+	// A rendered-text assertion alone cannot tell a real, aligned column
+	// from a decorative label strip sitting above misaligned data (this
+	// section is div/span markup, not a <table>, so nothing lays its
+	// cells out for it without CSS -- CLAUDE.md's own warning about
+	// rendered-HTML-string tests proving markup but not real layout).
+	// Assert actual computed geometry: the leave_type header cell and
+	// the seeded row's leave_type value cell must start at the same x
+	// position in the real browser.
+	var headerLeft, cellLeft float64
+	if err := chromedp.Run(browser,
+		chromedp.Evaluate(`document.querySelector('.uc-related-header-cell[data-field="leave_type"]').getBoundingClientRect().left`, &headerLeft),
+		chromedp.Evaluate(`document.querySelector('.uc-related-cell[data-field="leave_type"]').getBoundingClientRect().left`, &cellLeft),
+	); err != nil {
+		t.Fatalf("read column geometry: %v", err)
+	}
+	if diff := headerLeft - cellLeft; diff > 1 || diff < -1 {
+		t.Errorf("leave_type header cell (x=%.1f) is not aligned with its row's value cell (x=%.1f) -- header and data are not real columns", headerLeft, cellLeft)
 	}
 
 	var rowText string
