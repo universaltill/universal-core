@@ -106,6 +106,50 @@ func TestAPI_I18nText_FormAssemblesObjectAndRoundTrips(t *testing.T) {
 	}
 }
 
+// TestAPI_I18nText_RequiredFieldRejectsBlankOverJSONAPI is the JSON-API
+// half of uc-infra#104 (split from #86, whose title "Required does not
+// reject an empty string over the JSON API" reads as fully closed for the
+// kernel but wasn't for this one field type): a required i18n_text field
+// submitted as {} or with every locale blank must 400, the same as an
+// absent field already does — not silently create a record with no
+// translation in any language.
+func TestAPI_I18nText_RequiredFieldRejectsBlankOverJSONAPI(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, unitI18nEntityDef(), unitI18nFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"empty object", `{"name":{}}`},
+		{"single blank locale", `{"name":{"en":""}}`},
+		{"every locale blank", `{"name":{"en":"","tr":""}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := newRequest("POST", "/api/records/MultiUnit", tenantID, "farshid", []byte(tc.body))
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 for a required i18n_text field with no content in any locale, got %d: %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+
+	// A non-blank locale still creates fine — this isn't rejecting the
+	// field outright, only "no content anywhere".
+	rec := httptest.NewRecorder()
+	req := newRequest("POST", "/api/records/MultiUnit", tenantID, "farshid", []byte(`{"name":{"en":"","tr":"Adet"}}`))
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 when at least one locale has content, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
 // TestAPI_I18nText_ReferenceLabelResolvesViewerLocale is the end-to-end
 // point of #23: a reference picker, its search endpoint, and the list cell
 // all show the target's label in the VIEWER's locale.

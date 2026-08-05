@@ -112,6 +112,86 @@ func TestPreview_MissingRequiredFieldFailsThatRow(t *testing.T) {
 	}
 }
 
+// TestPreview_RequiredI18nTextFieldWithNoContentFailsThatRow is the
+// csvimport-layer half of uc-infra#104. A genuinely BLANK cell is already
+// caught upstream of this bug: buildRowData treats an empty cell as an
+// absent field (skips Coerce entirely), which the pre-existing presence
+// check in ValidateRecord already rejects for a Required field. The gap
+// is a cell whose text IS a validly-shaped but content-less JSON object —
+// "{}", or every locale blank — which Coerce parses into a PRESENT {}
+// (or all-blank) value that the old code let straight through.
+func TestPreview_RequiredI18nTextFieldWithNoContentFailsThatRow(t *testing.T) {
+	def := &entity.Definition{
+		EntityType: "Unit",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "label", Type: entity.FieldI18nText, Required: true},
+			{Name: "code", Type: entity.FieldString},
+		},
+	}
+	mapping := ColumnMapping{"Label": "label", "Code": "code"}
+
+	// A genuinely blank cell was already caught before this fix — kept
+	// here as a regression guard against that pre-existing behavior
+	// changing, not as this bug's own reproduction.
+	csvData := "Label,Code\n,ea\n"
+	results, err := Preview(strings.NewReader(csvData), def, mapping)
+	if err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+	if results[0].Err == nil || !strings.Contains(results[0].Err.Error(), "required") {
+		t.Fatalf("expected a 'required' error for a blank cell on a required i18n_text field, got %v", results[0].Err)
+	}
+
+	// The actual gap: a cell containing "{}" — valid JSON, coerces to a
+	// PRESENT empty object, not an absent field.
+	csvData = "Label,Code\n" + `"{}",ea` + "\n"
+	results, err = Preview(strings.NewReader(csvData), def, mapping)
+	if err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+	if results[0].Err == nil || !strings.Contains(results[0].Err.Error(), "required") {
+		t.Fatalf(`expected a 'required' error for a required i18n_text cell of "{}" (present but content-less), got %v`, results[0].Err)
+	}
+
+	// Same gap, one locale present but blank. Note the CSV-quoting: to
+	// embed the JSON text {"en":""} inside a quoted CSV field, every "
+	// doubles ({""en"":""""}) — a single-doubled `""` around an empty
+	// value would decode to the JSON text {"en":"} (an unterminated
+	// string), which fails as malformed JSON rather than exercising the
+	// present-but-blank check this test means to cover (independent
+	// review, uc-infra#104: an earlier draft of this test got this
+	// wrong and passed for the wrong reason).
+	csvData = "Label,Code\n" + `"{""en"":""""}",ea` + "\n"
+	results, err = Preview(strings.NewReader(csvData), def, mapping)
+	if err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+	if results[0].Err == nil || !strings.Contains(results[0].Err.Error(), "required") {
+		t.Fatalf(`expected a 'required' error for a required i18n_text cell with its one locale blank, got %v`, results[0].Err)
+	}
+
+	// Same gap, every locale present but blank (multi-locale).
+	csvData = "Label,Code\n" + `"{""en"":"""",""tr"":""""}",ea` + "\n"
+	results, err = Preview(strings.NewReader(csvData), def, mapping)
+	if err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+	if results[0].Err == nil || !strings.Contains(results[0].Err.Error(), "required") {
+		t.Fatalf(`expected a 'required' error for a required i18n_text cell with every locale blank, got %v`, results[0].Err)
+	}
+
+	// A cell with real content in at least one locale still imports fine.
+	csvData = "Label,Code\n" + `"{""en"":""Each""}",ea` + "\n"
+	results, err = Preview(strings.NewReader(csvData), def, mapping)
+	if err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+	if results[0].Err != nil {
+		t.Fatalf("expected a non-blank i18n_text cell to pass, got %v", results[0].Err)
+	}
+}
+
 func TestPreview_UnknownEnumValueFails(t *testing.T) {
 	csvData := "Vendor Name,Rating\nAcme,platinum\n"
 	results, err := Preview(strings.NewReader(csvData), vendorDef(), ColumnMapping{"Vendor Name": "name", "Rating": "rating"})
