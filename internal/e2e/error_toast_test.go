@@ -33,7 +33,11 @@ func TestErrorToast_RealBrowser(t *testing.T) {
 	// UX this HTML5 attribute exists for, but not what this test is
 	// after (the *server's* error path, once a request actually
 	// happens): stripping `required` first forces the click through to
-	// a real request/response round trip.
+	// a real request/response round trip. The translated
+	// "{field} is required." message (entity.validation.required,
+	// uc-infra#96) substitutes field.Item.sku's catalog label, "SKU" —
+	// not the raw "sku" field name the server used to send verbatim
+	// before that fix.
 	var dropped bool
 	if err := chromedp.Run(ctx,
 		chromedp.Navigate(srv.URL+"/forms/Item/new"),
@@ -52,8 +56,8 @@ func TestErrorToast_RealBrowser(t *testing.T) {
 	if err := chromedp.Run(ctx, chromedp.Text(`#uc-toast`, &toastText, chromedp.ByQuery)); err != nil {
 		t.Fatalf("read toast text: %v", err)
 	}
-	if !strings.Contains(toastText, `"sku" is required`) {
-		t.Fatalf(`expected the toast to show the real server validation message ("sku" is required), got %q`, toastText)
+	if !strings.Contains(toastText, `SKU is required.`) {
+		t.Fatalf(`expected the toast to show the real, translated server validation message (SKU is required.), got %q`, toastText)
 	}
 
 	// The form itself must still be there, untouched — a failed

@@ -512,7 +512,70 @@ func (h *Handler) writeCrudErrorLocalized(w http.ResponseWriter, r *http.Request
 		httpx.WriteError(w, http.StatusBadRequest, msg)
 		return
 	}
+	// entity.ValidationError (uc-infra#96): every current create/update
+	// call site pre-validates via entity.ValidateRecord before ever
+	// reaching crud.Engine, so this is defense in depth for a future or
+	// less-guarded caller of Create/Update — without it, a validation
+	// failure surfacing only here (crud.go's own internal re-validation,
+	// wrapped with %w) fell through to writeCrudError's generic
+	// writeInternalError below: an opaque, wrongly-500'd, unlogged-detail
+	// response for what is unambiguously a 400-class caller mistake
+	// (independent review: entity.ErrValidation was exported with no
+	// production caller ever checking it).
+	if errors.Is(err, entity.ErrValidation) {
+		log.Printf("api: %s: %v", logContext, err)
+		httpx.WriteError(w, http.StatusBadRequest, h.validationErrorMessage(localeFromRequest(w, r), err))
+		return
+	}
 	writeCrudError(w, logContext, err)
+}
+
+// writeValidationErrorLocalized translates an entity.ValidateRecord
+// failure into the viewer's locale before it reaches a form-save toast
+// or the JSON API's error envelope (uc-infra#96) — CLAUDE.md's "no
+// hardcoded user-facing strings" applies to *entity.ValidationError
+// exactly like it does to crud.TargetConstraintError
+// (writeCrudErrorLocalized above): the field name is resolved through
+// the same field.{EntityType}.{FieldName} label catalog form rendering
+// and the target-constraint mapping already use, substituted into a
+// per-Kind entity.validation.* template. logContext is logged alongside
+// the untranslated Detail (independent review) — same "translated
+// envelope, full untranslated detail server-side" split
+// writeCrudErrorLocalized's TargetConstraintError branch uses below, so
+// an operator debugging a "can't save" report still has the actual
+// field/reason, not just the generic per-Kind summary a user sees.
+func (h *Handler) writeValidationErrorLocalized(w http.ResponseWriter, r *http.Request, logContext string, err error) {
+	log.Printf("api: %s: %v", logContext, err)
+	httpx.WriteError(w, http.StatusBadRequest, h.validationErrorMessage(localeFromRequest(w, r), err))
+}
+
+// validationErrorMessage is writeValidationErrorLocalized's pure
+// message-building half, split out so a caller that already has the
+// viewer's locale, or that renders into a page fragment rather than a
+// fresh error envelope (extSQLSourceSave's inline form error), can reuse
+// the same translation. It does NOT log — a pure string builder has no
+// logContext to log against, so every caller that doesn't go through
+// writeValidationErrorLocalized (issuereport.go, extsqlsource.go) logs
+// the untranslated err itself first, same reasoning as
+// writeValidationErrorLocalized's own doc comment. Falls back to
+// err.Error() (the untranslated, English Detail) for any error that
+// isn't an *entity.ValidationError, so it's safe to call unconditionally
+// on anything ValidateRecord might return, including nil.
+func (h *Handler) validationErrorMessage(locale string, err error) string {
+	if err == nil {
+		return ""
+	}
+	var verr *entity.ValidationError
+	if !errors.As(err, &verr) {
+		return err.Error()
+	}
+	fieldLabel := h.catalog.TOrDefault(locale, "field."+verr.EntityType+"."+verr.FieldName, verr.FieldName)
+	msg := strings.ReplaceAll(h.catalog.T(locale, "entity.validation."+string(verr.Kind)), "{field}", fieldLabel)
+	if verr.Kind == entity.KindNotBefore {
+		otherLabel := h.catalog.TOrDefault(locale, "field."+verr.EntityType+"."+verr.OtherField, verr.OtherField)
+		msg = strings.ReplaceAll(msg, "{other_field}", otherLabel)
+	}
+	return msg
 }
 
 // sorReadOnlyMessage builds the translated system-of-record refusal for
@@ -665,7 +728,7 @@ func (h *Handler) createRecord(w http.ResponseWriter, r *http.Request) {
 	// itself still fails on past this point is a genuine internal/DB
 	// error (500, generic message, logged).
 	if err := entity.ValidateRecord(entDef, fields); err != nil {
-		httpx.WriteError(w, http.StatusBadRequest, err.Error())
+		h.writeValidationErrorLocalized(w, r, fmt.Sprintf("validate new %s", entityType), err)
 		return
 	}
 	// isCreate=true, id/version both ignored: Create generates the
@@ -746,7 +809,7 @@ func (h *Handler) updateRecord(w http.ResponseWriter, r *http.Request) {
 	// bad update is unambiguously a 400, not indistinguishable from a
 	// genuine 500.
 	if err := entity.ValidateRecord(entDef, fields); err != nil {
-		httpx.WriteError(w, http.StatusBadRequest, err.Error())
+		h.writeValidationErrorLocalized(w, r, fmt.Sprintf("validate update of %s %s", entityType, id), err)
 		return
 	}
 	// Extracted before ValidateStatusTransition, not after: a real status

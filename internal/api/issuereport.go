@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"log"
 	"net/http"
 
 	"github.com/universaltill/universal-core/internal/httpx"
@@ -194,7 +195,8 @@ func (h *Handler) issueReportSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := entity.ValidateRecord(def, fields); err != nil {
-		httpx.WriteError(w, http.StatusBadRequest, err.Error())
+		log.Printf("api: validate new IssueReport: %v", err)
+		httpx.WriteError(w, http.StatusBadRequest, h.validationErrorMessage(locale, err))
 		return
 	}
 	rec, err := ts.crud.Create(r.Context(), def, fields, rc.Actor)

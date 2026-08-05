@@ -417,8 +417,14 @@ func TestPurchaseOrderStages_ReversedDates_ToastInRealBrowser(t *testing.T) {
 	if err := chromedp.Run(bctx, chromedp.Text(`#uc-toast`, &toastText, chromedp.ByQuery)); err != nil {
 		t.Fatalf("read toast: %v", err)
 	}
-	if !strings.Contains(toastText, "must not be before") {
-		t.Fatalf("toast %q should carry the chronology error", toastText)
+	// Pinned to the exact translated text (uc-infra#96, independent
+	// review), not just the "must not be before" substring every locale's
+	// entity.validation.not_before template shares — that substring alone
+	// would still pass if the {field}/{other_field} label substitution
+	// silently broke and the field.PurchaseOrder.* labels below stopped
+	// resolving.
+	if want := "Shipped must not be before Production Ready."; !strings.Contains(toastText, want) {
+		t.Fatalf("toast %q should carry the translated chronology error %q", toastText, want)
 	}
 }
 

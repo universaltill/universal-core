@@ -793,5 +793,11 @@
   "sor.read_only_blocked_no_source": "این رکورد متعلق به یک سامانه مرجع خارجی فقط‌خواندنی است — ویرایش‌ها با ورود بعدی بازنویسی می‌شوند.",
   "sor.mode_reserved": "حالت \"bidirectional\" برای موتور همگام‌سازی آینده رزرو شده است و هنوز قابل ذخیره نیست.",
   "crud.error.target_constraint_violation": "مقدار انتخاب‌شده برای {field} محدودیت لازم این فیلد را برآورده نمی‌کند.",
-  "form.SystemOfRecord.section.details": "جزئیات"
+  "form.SystemOfRecord.section.details": "جزئیات",
+  "entity.validation.required": "{field} الزامی است.",
+  "entity.validation.type_mismatch": "{field} مقدار نامعتبری دارد.",
+  "entity.validation.enum_invalid": "{field} یک گزینه معتبر نیست.",
+  "entity.validation.i18n_text_invalid": "{field} مقدار نامعتبری دارد.",
+  "entity.validation.not_before": "{field} نمی‌تواند قبل از {other_field} باشد.",
+  "entity.validation.invalid": "{field} نامعتبر است."
 }
