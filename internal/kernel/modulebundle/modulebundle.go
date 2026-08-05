@@ -119,6 +119,23 @@ type Bundle struct {
 	StatusGraphs []StatusGraph
 }
 
+// BlockedItem is one bundle-declared entity or form Definition that
+// Install could not bring to published because its (key, version) is
+// rolled_back in this tenant's registry. moduleseed.PublishAll leaves a
+// rolled-back version alone deliberately — that is tested and correct
+// behavior there (TestPublishAll_LeavesRolledBackVersionAlone) — so
+// Install detects the outcome itself after PublishAll returns, rather
+// than treating "PublishAll returned nil" as "everything published."
+// Same class of gap, same fix shape, as cmd/sync-tenant-modules'
+// isRolledBack/blockedChange handling (uc-infra#70) — that command
+// covers the built-in-module re-publish path; this covers the
+// module-bundle install path (uc-infra#73).
+type BlockedItem struct {
+	Kind       string // "entity" or "form"
+	EntityType string
+	Version    int
+}
+
 // Load parses raw bundle bytes and runs every validation that needs no
 // database: strict manifest decode, format version, per-definition
 // Unmarshal+Validate, module-key consistency, in-bundle uniqueness,
@@ -269,7 +286,17 @@ func Load(raw []byte) (*Bundle, error) {
 // install completes**; there is no cleanup step to perform and no
 // half-written definition to repair (independent review asked for this
 // contract to be written down rather than inferred).
-func Install(ctx context.Context, db *sql.DB, b *Bundle, actor audit.Actor) error {
+//
+// A nil error is NOT the same as an unqualified success: the returned
+// []BlockedItem lists any bundle-declared entity/form Definition whose
+// (key, version) is rolled_back in this tenant's registry, which
+// moduleseed.PublishAll leaves alone rather than erroring on (see
+// BlockedItem's doc comment). Callers — cmd/install-module in
+// particular — must check len(blocked) > 0 and report it; a nil error
+// with a non-empty blocked list means the bundle's write phase
+// completed without error but the tenant did not end up with every
+// declared item live.
+func Install(ctx context.Context, db *sql.DB, b *Bundle, actor audit.Actor) ([]BlockedItem, error) {
 	entityRepo := data.NewEntityDefinitionRepo(db)
 	formRepo := data.NewFormDefinitionRepo(db)
 
@@ -277,7 +304,7 @@ func Install(ctx context.Context, db *sql.DB, b *Bundle, actor audit.Actor) erro
 	for _, def := range b.Entities {
 		raw, err := json.Marshal(def)
 		if err != nil {
-			return fmt.Errorf("modulebundle: marshal %s: %w", def.EntityType, err)
+			return nil, fmt.Errorf("modulebundle: marshal %s: %w", def.EntityType, err)
 		}
 		entityItems = append(entityItems, moduleseed.Item{Key: def.EntityType, Version: def.Version, Raw: raw})
 	}
@@ -285,7 +312,7 @@ func Install(ctx context.Context, db *sql.DB, b *Bundle, actor audit.Actor) erro
 	for _, def := range b.Forms {
 		raw, err := json.Marshal(def)
 		if err != nil {
-			return fmt.Errorf("modulebundle: marshal form %s: %w", def.EntityType, err)
+			return nil, fmt.Errorf("modulebundle: marshal form %s: %w", def.EntityType, err)
 		}
 		formItems = append(formItems, moduleseed.Item{Key: def.EntityType, Version: def.Version, Raw: raw})
 	}
@@ -311,10 +338,10 @@ func Install(ctx context.Context, db *sql.DB, b *Bundle, actor audit.Actor) erro
 		return nil
 	}
 	if err := checkConflicts(entityRepo, "entity", entityItems); err != nil {
-		return err
+		return nil, err
 	}
 	if err := checkConflicts(formRepo, "form", formItems); err != nil {
-		return err
+		return nil, err
 	}
 	// An entity type whose PUBLISHED definition belongs to another
 	// module may not be claimed by this bundle even at a fresh version —
@@ -325,11 +352,11 @@ func Install(ctx context.Context, db *sql.DB, b *Bundle, actor audit.Actor) erro
 			continue
 		}
 		if err != nil {
-			return fmt.Errorf("modulebundle: check published %s: %w", def.EntityType, err)
+			return nil, fmt.Errorf("modulebundle: check published %s: %w", def.EntityType, err)
 		}
 		published, err := entity.Unmarshal(v.Definition)
 		if err != nil {
-			return fmt.Errorf("modulebundle: unmarshal published %s: %w", def.EntityType, err)
+			return nil, fmt.Errorf("modulebundle: unmarshal published %s: %w", def.EntityType, err)
 		}
 		if published.Module != b.Module {
 			conflicts = append(conflicts, fmt.Sprintf("entity type %s is owned by module %q, not %q", def.EntityType, published.Module, b.Module))
@@ -349,12 +376,12 @@ func Install(ctx context.Context, db *sql.DB, b *Bundle, actor audit.Actor) erro
 		engine := crud.NewEngine(db)
 		statusTypeDef, err := publishedEntityDef(ctx, entityRepo, "StatusType")
 		if err != nil {
-			return err
+			return nil, err
 		}
 		for _, g := range b.StatusGraphs {
 			existing, err := engine.ListByField(ctx, statusTypeDef, "code", g.StatusTypeCode)
 			if err != nil {
-				return fmt.Errorf("modulebundle: check existing status type %s: %w", g.StatusTypeCode, err)
+				return nil, fmt.Errorf("modulebundle: check existing status type %s: %w", g.StatusTypeCode, err)
 			}
 			for _, row := range existing {
 				owner, _ := row.Data["entity_type"].(string)
@@ -368,31 +395,43 @@ func Install(ctx context.Context, db *sql.DB, b *Bundle, actor audit.Actor) erro
 	}
 
 	if len(conflicts) > 0 {
-		return fmt.Errorf("modulebundle: refusing to install %s: %s", b.Module, strings.Join(conflicts, "; "))
+		return nil, fmt.Errorf("modulebundle: refusing to install %s: %s", b.Module, strings.Join(conflicts, "; "))
 	}
 
 	if err := moduleseed.PublishAll(ctx, entityRepo, entityItems, actor); err != nil {
-		return fmt.Errorf("modulebundle: publish %s entities: %w", b.Module, err)
+		return nil, fmt.Errorf("modulebundle: publish %s entities: %w", b.Module, err)
 	}
 	if err := moduleseed.PublishAll(ctx, formRepo, formItems, actor); err != nil {
-		return fmt.Errorf("modulebundle: publish %s forms: %w", b.Module, err)
+		return nil, fmt.Errorf("modulebundle: publish %s forms: %w", b.Module, err)
 	}
 
+	var blocked []BlockedItem
+	entityBlocked, err := blockedItems(ctx, entityRepo, "entity", entityItems)
+	if err != nil {
+		return nil, err
+	}
+	blocked = append(blocked, entityBlocked...)
+	formBlocked, err := blockedItems(ctx, formRepo, "form", formItems)
+	if err != nil {
+		return nil, err
+	}
+	blocked = append(blocked, formBlocked...)
+
 	if len(b.StatusGraphs) == 0 {
-		return nil
+		return blocked, nil
 	}
 	engine := crud.NewEngine(db)
 	statusTypeDef, err := publishedEntityDef(ctx, entityRepo, "StatusType")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	statusDef, err := publishedEntityDef(ctx, entityRepo, "Status")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	transitionDef, err := publishedEntityDef(ctx, entityRepo, "StatusTransition")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	for _, g := range b.StatusGraphs {
 		specs := make([]statusgraph.Spec, 0, len(g.Statuses))
@@ -408,10 +447,30 @@ func Install(ctx context.Context, db *sql.DB, b *Bundle, actor audit.Actor) erro
 		}
 		if _, err := statusgraph.Seed(ctx, engine, statusTypeDef, statusDef, transitionDef,
 			g.EntityType, g.StatusTypeCode, g.StatusTypeName, specs, edges, actor); err != nil {
-			return fmt.Errorf("modulebundle: seed %s: %w", g.StatusTypeCode, err)
+			return nil, fmt.Errorf("modulebundle: seed %s: %w", g.StatusTypeCode, err)
 		}
 	}
-	return nil
+	return blocked, nil
+}
+
+// blockedItems checks each item's actual registry status right after a
+// successful PublishAll call and reports any that ended up
+// rolled_back rather than published. PublishAll returning nil only
+// promises "every item is now published or was already rolled_back and
+// deliberately left alone" (moduleseed.publishOne's two nil-return
+// branches) — this is what tells the two apart.
+func blockedItems(ctx context.Context, repo moduleseed.Repo, kind string, items []moduleseed.Item) ([]BlockedItem, error) {
+	var blocked []BlockedItem
+	for _, item := range items {
+		v, err := repo.GetVersion(ctx, item.Key, item.Version)
+		if err != nil {
+			return nil, fmt.Errorf("modulebundle: check %s %s v%d after publish: %w", kind, item.Key, item.Version, err)
+		}
+		if v.Status == data.StatusRolledBack {
+			blocked = append(blocked, BlockedItem{Kind: kind, EntityType: item.Key, Version: item.Version})
+		}
+	}
+	return blocked, nil
 }
 
 // rejectUnknownFields strict-decodes raw into a throwaway value of the

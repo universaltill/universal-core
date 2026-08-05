@@ -109,11 +109,29 @@ func main() {
 		log.Fatalf("resolve tenant %s database: %v", *tenantID, err)
 	}
 
-	if err := modulebundle.Install(ctx, tenantDB, b, actor); err != nil {
+	blocked, err := modulebundle.Install(ctx, tenantDB, b, actor)
+	if err != nil {
 		// Install is non-atomic but resumable (see its doc comment):
 		// the honest recovery instruction is "run this again", not
 		// "clean something up first".
 		log.Fatalf("install: %v\n(the install is resumable — re-running the same command completes a partial install)", err)
+	}
+	// A nil error is not the same as everything landing (uc-infra#73):
+	// an item whose version is rolled_back in this tenant's registry is
+	// deliberately left alone rather than erroring, so it has to be
+	// reported here instead of folded into the ordinary success line —
+	// the same shape of warning cmd/sync-tenant-modules already prints
+	// for the built-in-module re-publish path.
+	for _, item := range blocked {
+		log.Printf("WARNING: %s %s v%d is rolled_back in this tenant's registry — the install left it behind; it will stay unpublished until someone re-publishes that version by hand",
+			item.Kind, item.EntityType, item.Version)
+	}
+	if len(blocked) > 0 {
+		// Deliberately does NOT contain the success line's "installed
+		// into tenant" wording (independent review) — an operator
+		// grepping logs for that phrase must not get a false positive
+		// on a run that left items behind.
+		log.Fatalf("module %q was NOT fully installed into tenant %s — %d item(s) left behind (see warnings above)", b.Module, *tenantID, len(blocked))
 	}
 	log.Printf("module %q installed into tenant %s", b.Module, *tenantID)
 }

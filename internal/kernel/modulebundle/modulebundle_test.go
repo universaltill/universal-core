@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -20,6 +21,7 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
+	"github.com/universaltill/universal-core/internal/kernel/moduleseed"
 	"github.com/universaltill/universal-core/internal/kernel/purchasing"
 )
 
@@ -47,6 +49,39 @@ func mutate(t *testing.T, fn func(m map[string]any)) []byte {
 		t.Fatalf("re-marshal fixture: %v", err)
 	}
 	return out
+}
+
+// errGetVersionRepo is a minimal moduleseed.Repo stub whose GetVersion
+// always fails — the only method blockedItems calls, and the one
+// branch no DB-backed test can reach cheaply: a registry read failing
+// right after PublishAll already succeeded (independent review,
+// uc-infra#73). CreateDraft/Approve/Publish are never called by
+// blockedItems, so they panic if that assumption ever stops holding.
+type errGetVersionRepo struct{ err error }
+
+func (r errGetVersionRepo) GetVersion(ctx context.Context, key string, version int) (data.DefinitionVersion, error) {
+	return data.DefinitionVersion{}, r.err
+}
+
+func (r errGetVersionRepo) CreateDraft(ctx context.Context, key string, version int, definition []byte, actor audit.Actor) (data.DefinitionVersion, error) {
+	panic("errGetVersionRepo: blockedItems must never call CreateDraft")
+}
+
+func (r errGetVersionRepo) Approve(ctx context.Context, key string, version int, actor audit.Actor) error {
+	panic("errGetVersionRepo: blockedItems must never call Approve")
+}
+
+func (r errGetVersionRepo) Publish(ctx context.Context, key string, version int, actor audit.Actor) error {
+	panic("errGetVersionRepo: blockedItems must never call Publish")
+}
+
+func TestBlockedItems_PropagatesGetVersionError(t *testing.T) {
+	wantErr := errors.New("boom: registry unreachable")
+	items := []moduleseed.Item{{Key: "Widget", Version: 1}}
+	_, err := blockedItems(context.Background(), errGetVersionRepo{err: wantErr}, "entity", items)
+	if err == nil || !errors.Is(err, wantErr) {
+		t.Fatalf("expected blockedItems to wrap and propagate the GetVersion error, got %v", err)
+	}
 }
 
 func TestLoad_LibraryFixture(t *testing.T) {
@@ -306,8 +341,12 @@ func TestInstall_LibraryEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if err := Install(ctx, tenantDB, b, actor); err != nil {
+	blocked, err := Install(ctx, tenantDB, b, actor)
+	if err != nil {
 		t.Fatalf("Install: %v", err)
+	}
+	if len(blocked) != 0 {
+		t.Fatalf("expected no blocked items on a fresh install, got %+v", blocked)
 	}
 
 	// Registry state: every bundled definition published.
@@ -385,6 +424,83 @@ func TestInstall_LibraryEndToEnd(t *testing.T) {
 	}
 }
 
+// TestInstall_ReportsRolledBackVersionAsBlocked is the regression test
+// for uc-infra#73: before this fix, Install returned a bare nil error
+// in this exact scenario — moduleseed.PublishAll correctly leaves a
+// rolled-back version alone (that part is deliberate and separately
+// tested), but Install itself had no way to tell "already published"
+// apart from "rolled back and skipped," so a re-install after an
+// operator rollback reported unqualified success while the entity type
+// stayed unpublished and unusable.
+func TestInstall_ReportsRolledBackVersionAsBlocked(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	b, err := Load(libraryBundle(t))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if _, err := Install(ctx, tenantDB, b, actor); err != nil {
+		t.Fatalf("first Install: %v", err)
+	}
+
+	entityRepo := data.NewEntityDefinitionRepo(tenantDB)
+	formRepo := data.NewFormDefinitionRepo(tenantDB)
+	if err := entityRepo.Rollback(ctx, "LibraryLoan", 1, actor); err != nil {
+		t.Fatalf("Rollback LibraryLoan entity v1: %v", err)
+	}
+	if err := formRepo.Rollback(ctx, "LibraryLoan", 1, actor); err != nil {
+		t.Fatalf("Rollback LibraryLoan form v1: %v", err)
+	}
+
+	blocked, err := Install(ctx, tenantDB, b, actor)
+	if err != nil {
+		t.Fatalf("re-Install should still succeed (blocked, not failed): %v", err)
+	}
+	want := []BlockedItem{
+		{Kind: "entity", EntityType: "LibraryLoan", Version: 1},
+		{Kind: "form", EntityType: "LibraryLoan", Version: 1},
+	}
+	if len(blocked) != len(want) {
+		t.Fatalf("expected %d blocked item(s), got %d: %+v", len(want), len(blocked), blocked)
+	}
+	for _, w := range want {
+		found := false
+		for _, got := range blocked {
+			if got == w {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected %+v in blocked list, got %+v", w, blocked)
+		}
+	}
+
+	// The entity type itself never comes back as published — this is
+	// the actual user-visible symptom the issue describes: nothing of
+	// this type can be created, despite Install having reported (before
+	// this fix) an unqualified success.
+	if _, err := entityRepo.GetPublished(ctx, "LibraryLoan"); !errors.Is(err, data.ErrNotFound) {
+		t.Fatalf("expected LibraryLoan entity to have no published version after rollback + re-install, got err=%v", err)
+	}
+	if _, err := formRepo.GetPublished(ctx, "LibraryLoan"); !errors.Is(err, data.ErrNotFound) {
+		t.Fatalf("expected LibraryLoan form to have no published version after rollback + re-install, got err=%v", err)
+	}
+
+	// Everything else in the same bundle that was NOT rolled back must
+	// still be reported as fully installed, not swept into "blocked" —
+	// this is a partial, per-item report, not an all-or-nothing flag.
+	for _, et := range []string{"LibraryBook", "LibraryLoanLine"} {
+		if _, err := entityRepo.GetPublished(ctx, et); err != nil {
+			t.Errorf("%s should still be published (unaffected by LibraryLoan's rollback): %v", et, err)
+		}
+	}
+}
+
 func TestInstall_IdempotentReinstall(t *testing.T) {
 	tenantDB := freshTenantDB(t)
 	ctx := context.Background()
@@ -396,11 +512,15 @@ func TestInstall_IdempotentReinstall(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if err := Install(ctx, tenantDB, b, actor); err != nil {
+	if _, err := Install(ctx, tenantDB, b, actor); err != nil {
 		t.Fatalf("first Install: %v", err)
 	}
-	if err := Install(ctx, tenantDB, b, actor); err != nil {
+	blocked, err := Install(ctx, tenantDB, b, actor)
+	if err != nil {
 		t.Fatalf("re-Install should be a no-op success: %v", err)
+	}
+	if len(blocked) != 0 {
+		t.Fatalf("re-install of an untouched bundle should report nothing blocked, got %+v", blocked)
 	}
 	// No duplicate status rows from the re-run.
 	engine := crud.NewEngine(tenantDB)
@@ -421,7 +541,7 @@ func TestInstall_RefusesDivergentContent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if err := Install(ctx, tenantDB, b, actor); err != nil {
+	if _, err := Install(ctx, tenantDB, b, actor); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
 
@@ -434,7 +554,7 @@ func TestInstall_RefusesDivergentContent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load diverged: %v", err)
 	}
-	err = Install(ctx, tenantDB, diverged, actor)
+	_, err = Install(ctx, tenantDB, diverged, actor)
 	if err == nil || !strings.Contains(err.Error(), "different content") {
 		t.Fatalf("expected divergence refusal, got %v", err)
 	}
@@ -494,7 +614,7 @@ func TestInstall_RefusesForeignStatusTypeCode(t *testing.T) {
 		t.Fatalf("Load hijack bundle: %v", err)
 	}
 
-	err = Install(ctx, tenantDB, hijack, actor)
+	_, err = Install(ctx, tenantDB, hijack, actor)
 	if err == nil || !strings.Contains(err.Error(), "already owned by entity") {
 		t.Fatalf("expected status-type ownership refusal, got %v", err)
 	}
@@ -524,10 +644,10 @@ func TestInstall_ReinstallKeepsOwnStatusGraph(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if err := Install(ctx, tenantDB, b, actor); err != nil {
+	if _, err := Install(ctx, tenantDB, b, actor); err != nil {
 		t.Fatalf("first Install: %v", err)
 	}
-	if err := Install(ctx, tenantDB, b, actor); err != nil {
+	if _, err := Install(ctx, tenantDB, b, actor); err != nil {
 		t.Fatalf("re-install must not trip its own status-type ownership check: %v", err)
 	}
 }
@@ -545,7 +665,7 @@ func TestInstall_ReportsAllConflictsTogether(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if err := Install(ctx, tenantDB, b, actor); err != nil {
+	if _, err := Install(ctx, tenantDB, b, actor); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
 	diverged, err := Load(mutate(t, func(m map[string]any) {
@@ -557,7 +677,7 @@ func TestInstall_ReportsAllConflictsTogether(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load diverged: %v", err)
 	}
-	err = Install(ctx, tenantDB, diverged, actor)
+	_, err = Install(ctx, tenantDB, diverged, actor)
 	if err == nil {
 		t.Fatal("expected divergence refusal")
 	}
@@ -587,7 +707,7 @@ func TestInstall_RefusesForeignModuleEntityType(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load hijack bundle: %v", err)
 	}
-	err = Install(ctx, tenantDB, hijack, actor)
+	_, err = Install(ctx, tenantDB, hijack, actor)
 	if err == nil || !strings.Contains(err.Error(), "owned by module") {
 		t.Fatalf("expected foreign-module refusal, got %v", err)
 	}

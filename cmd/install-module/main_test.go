@@ -129,6 +129,85 @@ func TestInstall_EndToEndViaRealBinary(t *testing.T) {
 	}
 }
 
+// TestInstall_ReportsBlockedItemsAndFailsViaRealBinary is the smoke-test
+// counterpart of modulebundle's TestInstall_ReportsRolledBackVersionAsBlocked
+// (uc-infra#73): drives the real compiled binary, not just the library
+// function, through the exact operator-visible symptom the issue
+// reported — a rolled-back version must produce a loud warning and a
+// non-zero exit, never the bare "installed" success line.
+func TestInstall_ReportsBlockedItemsAndFailsViaRealBinary(t *testing.T) {
+	if os.Getenv("TEST_DATABASE_URL") == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping integration test")
+	}
+	controlDSN := testexec.FreshDatabase(t, "uc_test_installmod_blocked")
+	control := testexec.Open(t, controlDSN)
+	ctx := context.Background()
+	if err := db.ApplyControl(ctx, control); err != nil {
+		t.Fatalf("ApplyControl: %v", err)
+	}
+	router, err := tenantdb.NewRouter(control, controlDSN)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+	t.Cleanup(func() { router.Close() })
+	tenantID, err := router.Create(ctx, "Install Module Blocked Smoke Test", "eu-west")
+	if err != nil {
+		t.Fatalf("router.Create: %v", err)
+	}
+	testexec.DropTenantDatabase(t, testexec.Open(t, controlDSN), tenantID)
+	tenantDB, err := router.Get(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("router.Get: %v", err)
+	}
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "smoke-test-setup"}
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+
+	stdout, stderr, code := run(t, []string{"DATABASE_URL=" + controlDSN},
+		"-bundle", fixturePath(t), "-tenant-id", tenantID, "-actor-id", "smoke-test")
+	if code != 0 {
+		t.Fatalf("first install exited %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+
+	if err := data.NewEntityDefinitionRepo(tenantDB).Rollback(ctx, "LibraryLoan", 1, actor); err != nil {
+		t.Fatalf("rollback LibraryLoan entity v1: %v", err)
+	}
+	if err := data.NewFormDefinitionRepo(tenantDB).Rollback(ctx, "LibraryLoan", 1, actor); err != nil {
+		t.Fatalf("rollback LibraryLoan form v1: %v", err)
+	}
+
+	stdout, stderr, code = run(t, []string{"DATABASE_URL=" + controlDSN},
+		"-bundle", fixturePath(t), "-tenant-id", tenantID, "-actor-id", "smoke-test")
+	combined := stdout + stderr
+	if code == 0 {
+		t.Fatalf("re-install with a rolled-back item should exit non-zero, got 0: %s", combined)
+	}
+	if !strings.Contains(combined, "WARNING") || !strings.Contains(combined, "LibraryLoan") || !strings.Contains(combined, "rolled_back") {
+		t.Errorf("expected a loud WARNING naming LibraryLoan/rolled_back, got: %s", combined)
+	}
+	// A stable prefix, not the exact full line + trailing newline: the
+	// failure line deliberately reads "was NOT fully installed into
+	// tenant" (independent review — an operator grepping logs for the
+	// unqualified phrase must not get a false positive on a run that
+	// left items behind), so this substring can never appear in it
+	// regardless of how either message's punctuation evolves later.
+	if strings.Contains(combined, `"library" installed into tenant`) {
+		t.Errorf("must not print the unqualified success line when items were left behind: %s", combined)
+	}
+	if !strings.Contains(combined, "was NOT fully installed") {
+		t.Errorf("expected the qualified failure line, got: %s", combined)
+	}
+
+	// The unaffected entity/form types must still have published fine —
+	// this is a partial report, not an all-or-nothing failure.
+	for _, et := range []string{"LibraryBook", "LibraryLoanLine"} {
+		if _, err := data.NewEntityDefinitionRepo(tenantDB).GetPublished(ctx, et); err != nil {
+			t.Errorf("%s should still be published: %v", et, err)
+		}
+	}
+}
+
 func TestMissingFlags(t *testing.T) {
 	if _, stderr, code := run(t, []string{}); code == 0 || !strings.Contains(stderr, "-bundle is required") {
 		t.Errorf("expected -bundle requirement, got code %d: %s", code, stderr)
