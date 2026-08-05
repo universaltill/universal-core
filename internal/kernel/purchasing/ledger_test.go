@@ -20,13 +20,15 @@ import (
 // purchasing-package test, it only needs the real rows to exist, not
 // finance.SyncGLAccounts's own logic, which has its own tests in
 // internal/kernel/finance), and one Item + PurchaseOrder + POLine ready
-// to receive against.
+// to receive against, plus a Facility (uc-infra#54: GoodsReceipt.facility_id
+// is Required as of v2) every test's own GoodsReceipt create can point at.
 type goodsReceiptFixture struct {
-	tenantDB *sql.DB
-	engine   *crud.Engine
-	itemID   string
-	poID     string
-	poLineID string
+	tenantDB   *sql.DB
+	engine     *crud.Engine
+	itemID     string
+	poID       string
+	poLineID   string
+	facilityID string
 }
 
 func defFor(t *testing.T, tenantDB *sql.DB, entityType string) *entity.Definition {
@@ -124,6 +126,12 @@ func setUpGoodsReceiptFixture(t *testing.T, unitPrice float64) goodsReceiptFixtu
 	if err != nil {
 		t.Fatalf("create Item: %v", err)
 	}
+	facility, err := engine.Create(ctx, defFor(t, tenantDB, "Facility"), map[string]any{
+		"code": "MAIN", "name": "Main Warehouse", "facility_type": "warehouse", "is_active": true,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create Facility: %v", err)
+	}
 
 	draftStatusID := statusIDByCode(t, engine, tenantDB, "purchase_order_status", "draft")
 
@@ -141,7 +149,10 @@ func setUpGoodsReceiptFixture(t *testing.T, unitPrice float64) goodsReceiptFixtu
 		t.Fatalf("create POLine: %v", err)
 	}
 
-	return goodsReceiptFixture{tenantDB: tenantDB, engine: engine, itemID: item.ID, poID: po.ID, poLineID: line.ID}
+	return goodsReceiptFixture{
+		tenantDB: tenantDB, engine: engine, itemID: item.ID, poID: po.ID, poLineID: line.ID,
+		facilityID: facility.ID,
+	}
 }
 
 // vendorInvoiceFixture bundles a real PurchaseOrder + POLine + one
@@ -151,10 +162,11 @@ func setUpGoodsReceiptFixture(t *testing.T, unitPrice float64) goodsReceiptFixtu
 // never actually creates a GoodsReceiptLine, since PostGoodsReceiptLineToLedger's
 // own tests create that themselves to control the moment the hook fires).
 type vendorInvoiceFixture struct {
-	tenantDB *sql.DB
-	engine   *crud.Engine
-	vendorID string
-	poID     string
+	tenantDB   *sql.DB
+	engine     *crud.Engine
+	vendorID   string
+	poID       string
+	facilityID string
 }
 
 // setUpVendorInvoiceFixture creates a PurchaseOrder with one POLine
@@ -186,6 +198,12 @@ func setUpVendorInvoiceFixture(t *testing.T, qty, unitPrice, receivedQty float64
 	if err != nil {
 		t.Fatalf("create Item: %v", err)
 	}
+	facility, err := engine.Create(ctx, defFor(t, tenantDB, "Facility"), map[string]any{
+		"code": "MAIN", "name": "Main Warehouse", "facility_type": "warehouse", "is_active": true,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create Facility: %v", err)
+	}
 
 	draftStatusID := statusIDByCode(t, engine, tenantDB, "purchase_order_status", "draft")
 	po, err := engine.Create(ctx, defFor(t, tenantDB, "PurchaseOrder"), map[string]any{
@@ -204,7 +222,7 @@ func setUpVendorInvoiceFixture(t *testing.T, qty, unitPrice, receivedQty float64
 
 	if receivedQty > 0 {
 		gr, err := engine.Create(ctx, defFor(t, tenantDB, "GoodsReceipt"), map[string]any{
-			"purchase_order_id": po.ID, "received_date": "2026-01-10",
+			"purchase_order_id": po.ID, "received_date": "2026-01-10", "facility_id": facility.ID,
 		}, actor)
 		if err != nil {
 			t.Fatalf("create GoodsReceipt: %v", err)
@@ -216,7 +234,7 @@ func setUpVendorInvoiceFixture(t *testing.T, qty, unitPrice, receivedQty float64
 		}
 	}
 
-	return vendorInvoiceFixture{tenantDB: tenantDB, engine: engine, vendorID: vendor.ID, poID: po.ID}
+	return vendorInvoiceFixture{tenantDB: tenantDB, engine: engine, vendorID: vendor.ID, poID: po.ID, facilityID: facility.ID}
 }
 
 // createDraftVendorInvoice creates a VendorInvoice in "draft" (the only
@@ -245,7 +263,7 @@ func TestPostGoodsReceiptLineToLedger_PostsInventoryAndAP(t *testing.T) {
 	actor := humanActor()
 
 	gr, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceipt"), map[string]any{
-		"purchase_order_id": fx.poID, "received_date": "2026-01-10",
+		"purchase_order_id": fx.poID, "received_date": "2026-01-10", "facility_id": fx.facilityID,
 	}, actor)
 	if err != nil {
 		t.Fatalf("create GoodsReceipt: %v", err)
@@ -290,11 +308,53 @@ func TestPostGoodsReceiptLineToLedger_PostsInventoryAndAP(t *testing.T) {
 	if ap := byCode["2100"]; ap.CreditMinor != wantMinor {
 		t.Fatalf("expected AP Accrual (2100) credit %d, got %+v", wantMinor, ap)
 	}
+
+	// uc-infra#54: the same GoodsReceiptLine create must also have
+	// credited a new InventoryItem row at the receiving facility.
+	invDef := defFor(t, fx.tenantDB, "InventoryItem")
+	invRecs, err := fx.engine.List(ctx, invDef)
+	if err != nil {
+		t.Fatalf("list InventoryItem: %v", err)
+	}
+	if len(invRecs) != 1 {
+		t.Fatalf("expected exactly 1 InventoryItem row credited by the receipt, got %d", len(invRecs))
+	}
+	inv := invRecs[0]
+	if got, _ := inv.Data["item_id"].(string); got != fx.itemID {
+		t.Errorf("InventoryItem.item_id = %q, want %q", got, fx.itemID)
+	}
+	if got, _ := inv.Data["facility_id"].(string); got != fx.facilityID {
+		t.Errorf("InventoryItem.facility_id = %q, want the GoodsReceipt's own facility %q", got, fx.facilityID)
+	}
+	if got, _ := inv.Data["qty_on_hand"].(float64); got != 4 {
+		t.Errorf("InventoryItem.qty_on_hand = %v, want 4 (the received qty)", got)
+	}
+	if got, _ := inv.Data["qty_available_to_promise"].(float64); got != 4 {
+		t.Errorf("InventoryItem.qty_available_to_promise = %v, want 4 (credited alongside qty_on_hand)", got)
+	}
+
+	// The credit must have its own audit row, same discipline as every
+	// other in-hook write (CLAUDE.md's ADR-0001 §14: never bolted on
+	// after the fact).
+	var auditCount int
+	if err := fx.tenantDB.QueryRowContext(ctx,
+		`SELECT count(*) FROM audit_log WHERE entity_type = 'InventoryItem' AND record_id = $1 AND action = 'create'`,
+		inv.ID,
+	).Scan(&auditCount); err != nil {
+		t.Fatalf("count InventoryItem audit rows: %v", err)
+	}
+	if auditCount != 1 {
+		t.Fatalf("expected exactly 1 audit row for the credited InventoryItem, got %d", auditCount)
+	}
 }
 
 // TestPostGoodsReceiptLineToLedger_ZeroValueLine_PostsNothing confirms a
 // zero-price/zero-qty line (this hook's own doc comment: samples, a
-// data-entry-in-progress POLine) is a legitimate no-op, not an error.
+// data-entry-in-progress POLine) is a legitimate no-op, not an error —
+// but (uc-infra#54) also confirms the InventoryItem credit is NOT gated
+// on the ledger posting: this fixture receives a real qty (4) of a
+// zero-priced item (a free sample), which has nothing to post to the
+// ledger but has still physically arrived and must still bump stock.
 func TestPostGoodsReceiptLineToLedger_ZeroValueLine_PostsNothing(t *testing.T) {
 	fx := setUpGoodsReceiptFixture(t, 0)
 	fx.engine.SetHook("GoodsReceiptLine", PostGoodsReceiptLineToLedger)
@@ -302,7 +362,7 @@ func TestPostGoodsReceiptLineToLedger_ZeroValueLine_PostsNothing(t *testing.T) {
 	actor := humanActor()
 
 	gr, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceipt"), map[string]any{
-		"purchase_order_id": fx.poID, "received_date": "2026-01-10",
+		"purchase_order_id": fx.poID, "received_date": "2026-01-10", "facility_id": fx.facilityID,
 	}, actor)
 	if err != nil {
 		t.Fatalf("create GoodsReceipt: %v", err)
@@ -321,6 +381,95 @@ func TestPostGoodsReceiptLineToLedger_ZeroValueLine_PostsNothing(t *testing.T) {
 	}
 	if len(list) != 0 {
 		t.Fatalf("expected no journal entry for a zero-value line, got %d", len(list))
+	}
+
+	invRecs, err := fx.engine.List(ctx, defFor(t, fx.tenantDB, "InventoryItem"))
+	if err != nil {
+		t.Fatalf("list InventoryItem: %v", err)
+	}
+	if len(invRecs) != 1 {
+		t.Fatalf("expected the InventoryItem credit to happen despite no ledger posting, got %d rows", len(invRecs))
+	}
+	if got, _ := invRecs[0].Data["qty_on_hand"].(float64); got != 4 {
+		t.Errorf("InventoryItem.qty_on_hand = %v, want 4 even for a zero-priced line", got)
+	}
+}
+
+// TestPostGoodsReceiptLineToLedger_ZeroQty_NoInventoryCredit confirms
+// the reverse of the above: a zero qty_received line (a data-entry-in-
+// progress line, not yet a real receipt) is a legitimate no-op on the
+// InventoryItem side too — no phantom zero-quantity row.
+func TestPostGoodsReceiptLineToLedger_ZeroQty_NoInventoryCredit(t *testing.T) {
+	fx := setUpGoodsReceiptFixture(t, 10)
+	fx.engine.SetHook("GoodsReceiptLine", PostGoodsReceiptLineToLedger)
+	ctx := context.Background()
+	actor := humanActor()
+
+	gr, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceipt"), map[string]any{
+		"purchase_order_id": fx.poID, "received_date": "2026-01-10", "facility_id": fx.facilityID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create GoodsReceipt: %v", err)
+	}
+	if _, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"), map[string]any{
+		"goods_receipt_id": gr.ID, "po_line_id": fx.poLineID,
+		"item_id": fx.itemID, "qty_received": float64(0),
+	}, actor); err != nil {
+		t.Fatalf("create GoodsReceiptLine: %v", err)
+	}
+
+	invRecs, err := fx.engine.List(ctx, defFor(t, fx.tenantDB, "InventoryItem"))
+	if err != nil {
+		t.Fatalf("list InventoryItem: %v", err)
+	}
+	if len(invRecs) != 0 {
+		t.Fatalf("expected no InventoryItem row for a zero-qty line, got %d", len(invRecs))
+	}
+}
+
+// TestPostGoodsReceiptLineToLedger_MultipleReceipts_InsertSeparateInventoryRows
+// (uc-infra#54) pins the "insert a new row, don't upsert" design decision
+// this hook's own doc comment explains: two GoodsReceiptLines crediting
+// the same item at the same facility must each produce their own
+// InventoryItem row, summing correctly through the reporting layer —
+// exactly the "(item, facility) uniqueness is NOT enforced... every
+// aggregate sums" convention ADR-0015 §2 established for this entity.
+func TestPostGoodsReceiptLineToLedger_MultipleReceipts_InsertSeparateInventoryRows(t *testing.T) {
+	fx := setUpGoodsReceiptFixture(t, 10)
+	fx.engine.SetHook("GoodsReceiptLine", PostGoodsReceiptLineToLedger)
+	ctx := context.Background()
+	actor := humanActor()
+
+	for _, qty := range []float64{4, 6} {
+		gr, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceipt"), map[string]any{
+			"purchase_order_id": fx.poID, "received_date": "2026-01-10", "facility_id": fx.facilityID,
+		}, actor)
+		if err != nil {
+			t.Fatalf("create GoodsReceipt: %v", err)
+		}
+		if _, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"), map[string]any{
+			"goods_receipt_id": gr.ID, "po_line_id": fx.poLineID,
+			"item_id": fx.itemID, "qty_received": qty,
+		}, actor); err != nil {
+			t.Fatalf("create GoodsReceiptLine: %v", err)
+		}
+	}
+
+	invRecs, err := fx.engine.List(ctx, defFor(t, fx.tenantDB, "InventoryItem"))
+	if err != nil {
+		t.Fatalf("list InventoryItem: %v", err)
+	}
+	if len(invRecs) != 2 {
+		t.Fatalf("expected 2 separate InventoryItem rows (one per receipt), got %d", len(invRecs))
+	}
+
+	reporting := data.NewReportingRepo(fx.tenantDB)
+	onHand, err := reporting.OnHandQtyByItem(ctx)
+	if err != nil {
+		t.Fatalf("OnHandQtyByItem: %v", err)
+	}
+	if got := onHand[fx.itemID]; got != 10 {
+		t.Fatalf("on-hand for item = %v, want 10 (4 + 6 summed across the two credited rows)", got)
 	}
 }
 
@@ -342,7 +491,7 @@ func TestPostGoodsReceiptLineToLedger_UnknownAccountCode_RollsBackTheLine(t *tes
 	actor := humanActor()
 
 	gr, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceipt"), map[string]any{
-		"purchase_order_id": fx.poID, "received_date": "2026-01-10",
+		"purchase_order_id": fx.poID, "received_date": "2026-01-10", "facility_id": fx.facilityID,
 	}, actor)
 	if err != nil {
 		t.Fatalf("create GoodsReceipt: %v", err)
@@ -361,6 +510,17 @@ func TestPostGoodsReceiptLineToLedger_UnknownAccountCode_RollsBackTheLine(t *tes
 	}
 	if count != 0 {
 		t.Fatalf("expected the GoodsReceiptLine write to roll back too, found %d", count)
+	}
+
+	// uc-infra#54: the InventoryItem credit runs earlier in the same
+	// hook, in the same transaction — it must roll back too, not leave a
+	// credited InventoryItem behind a receipt line that never committed.
+	var invCount int
+	if err := fx.tenantDB.QueryRowContext(ctx, `SELECT count(*) FROM records WHERE entity_type = 'InventoryItem'`).Scan(&invCount); err != nil {
+		t.Fatalf("count InventoryItem records: %v", err)
+	}
+	if invCount != 0 {
+		t.Fatalf("expected the InventoryItem credit to roll back too, found %d", invCount)
 	}
 }
 
@@ -967,7 +1127,7 @@ func TestMatchVendorInvoiceOnUpdate_MultipleReceiptsSummed(t *testing.T) {
 		t.Fatalf("list POLine: %v (count %d)", err, len(poLines))
 	}
 	gr2, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceipt"), map[string]any{
-		"purchase_order_id": fx.poID, "received_date": "2026-01-12",
+		"purchase_order_id": fx.poID, "received_date": "2026-01-12", "facility_id": fx.facilityID,
 	}, actor)
 	if err != nil {
 		t.Fatalf("create second GoodsReceipt: %v", err)

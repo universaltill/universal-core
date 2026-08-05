@@ -142,8 +142,17 @@ func main() {
 	// half-seeded tenant (independent review). Falling back to the
 	// pre-#12 single-row shape keeps such a tenant seeding correctly
 	// rather than skipping inventory and gutting the reporting demo.
+	//
+	// facilities is declared here, not inside the branch, because
+	// seedGoodsReceipts (uc-infra#54) now needs a facility to receive
+	// against too — GoodsReceipt.facility_id is Required as of v2, so a
+	// pre-#12 tenant with no Facility published genuinely cannot have a
+	// valid GoodsReceipt at all, the same reason seedStockTransfers is
+	// already skipped below rather than attempted against a
+	// single-location shape.
+	var facilities map[string]string
 	if hasPublished(s.ctx, s.entityDefs, "Facility") {
-		facilities := s.seedFacilities()
+		facilities = s.seedFacilities()
 		s.seedInventory(items, facilities)
 		// Gated separately from Facility, not folded into the check
 		// above: a tenant provisioned before #13 has Facility published
@@ -159,7 +168,11 @@ func main() {
 	}
 	s.seedReorderRules(items)
 	s.seedPurchaseOrders(vendors, currencies, items)
-	s.seedGoodsReceipts()
+	if facilityID, ok := facilities[demoMainFacilityCode]; ok {
+		s.seedGoodsReceipts(facilityID)
+	} else {
+		log.Printf("Facility is not published for this tenant — skipping GoodsReceipt seeding (GoodsReceipt.facility_id is Required as of v2); re-run cmd/provision-tenant, then cmd/backfill-goods-receipt-facility, once Facility exists")
+	}
 	s.seedVendorInvoices(vendors, currencies)
 	soIDs := s.seedSalesOrders(customers, currencies, items)
 	s.seedCustomerInvoices(customers, currencies, soIDs)
@@ -699,6 +712,17 @@ var inventoryLevels = map[string][]inventoryLevel{
 	"SKU-1010": {{"MAIN", 60, 60}},
 }
 
+// demoMainFacilityCode is the one facility code this file's own code
+// (as opposed to inventoryLevels' per-SKU table, which legitimately
+// names every declared facility on its own terms) treats as "the"
+// default demo facility — every StockTransfer origin and every
+// GoodsReceipt this seeder creates receives at this one. A named
+// constant, not a repeated literal (independent review, uc-infra#54):
+// seedGoodsReceipts and seedStockTransfers both do a `facilities["MAIN"]`
+// lookup that fails silently (empty string / not-ok, not a compile
+// error) if this ever drifted from seedFacilities' own table below.
+const demoMainFacilityCode = "MAIN"
+
 // seedFacilities gives the demo tenant three stock locations — a main
 // warehouse, a retail store and a virtual bucket — so the (item,
 // facility) key #12 introduced has more than one facility to be a key
@@ -713,7 +737,7 @@ var inventoryLevels = map[string][]inventoryLevel{
 func (s *seeder) seedFacilities() map[string]string {
 	ids := map[string]string{}
 	for _, f := range []struct{ code, name, facilityType string }{
-		{"MAIN", "Main Warehouse", "warehouse"},
+		{demoMainFacilityCode, "Main Warehouse", "warehouse"},
 		{"STORE-01", "Doha Retail Store", "store"},
 		{"TRANSIT", "In Transit", "virtual"},
 	} {
@@ -842,6 +866,24 @@ func (s *seeder) seedInventory(items, facilities map[string]string) {
 		}
 		for _, extra := range loose {
 			fid, _ := extra.Data["facility_id"].(string)
+			// loose collects two genuinely different cases (independent
+			// review, uc-infra#54) and the message must not conflate
+			// them: a facility this SKU's declared levels never
+			// mention at all, versus a SECOND row at a facility that
+			// IS declared but whose one "declared" slot atFacility
+			// already gave to an earlier row — e.g. the row
+			// purchasing.PostGoodsReceiptLineToLedger's InventoryItem
+			// credit (ledger.go) inserted for a real receipt on top of
+			// this SKU's seedInventory baseline. That second case is
+			// not a data-hygiene problem to warn about the same way;
+			// it is this card's own insert-not-upsert design (see
+			// ledger.go's doc comment on that tradeoff) surfacing
+			// here, and it is expected, not a fixable drift.
+			if declared[fid] {
+				log.Printf("INFO: InventoryItem %s for %s is a second row at already-declared facility %q — left in place (likely a real GoodsReceipt credit on top of the declared baseline, not drift)",
+					extra.ID, sku, fid)
+				continue
+			}
 			log.Printf("WARNING: InventoryItem %s for %s sits at facility %q, which the demo data does not declare — left in place; it will skew stock totals",
 				extra.ID, sku, fid)
 		}
@@ -926,7 +968,7 @@ func (s *seeder) seedStockTransfers(items, facilities map[string]string) {
 	if !ok {
 		return
 	}
-	from, to := facilities["MAIN"], facilities["STORE-01"]
+	from, to := facilities[demoMainFacilityCode], facilities["STORE-01"]
 	if from == "" || to == "" {
 		return
 	}
@@ -1075,7 +1117,22 @@ func (s *seeder) seedPurchaseOrders(vendors, currencies, items map[string]string
 			[]line{{"SKU-1005", 60, 22}, {"SKU-1006", 30, 9.5}}},
 		{"PO-2026-0005", "Doha Fasteners LLC", "QAR", "2026-07-19", "received",
 			map[string]string{"sourced_at": "2026-07-20", "production_start_at": "2026-07-22", "production_ready_at": "2026-07-25", "shipped_at": "2026-07-26", "customs_cleared_at": "2026-07-28", "received_at": "2026-07-30"},
-			[]line{{"SKU-1004", 3000, 0.42}, {"SKU-1009", 5000, 0.08}}},
+			// SKU-1002/SKU-1003, not SKU-1004/SKU-1009 (independent
+			// review, uc-infra#54): those two are two of
+			// seedInventory's three DELIBERATELY at-risk SKUs
+			// (inventoryLevels below) and SKU-1004 is also the exact
+			// reorder-signal seedReorderRules/#30's own tests pin by
+			// number. Now that receiving genuinely credits
+			// InventoryItem (this card's whole point), putting either
+			// on a received PO would silently take it out of
+			// stockout-risk / stop its reorder signal from firing —
+			// the demo contradicting its own declared narrative, the
+			// same class of bug an earlier independent review already
+			// caught in this file. SKU-1002/SKU-1003 carry no such
+			// role. qty/unitCost unchanged so VINV-2026-0002's 3-way
+			// match total (qty x unit_price, not item identity) is
+			// unaffected by the swap.
+			[]line{{"SKU-1002", 3000, 0.42}, {"SKU-1003", 5000, 0.08}}},
 		{"PO-2026-0006", "Istanbul Weaving Mills", "TRY", "2026-07-19", "approved",
 			map[string]string{"sourced_at": "2026-07-21", "production_start_at": "2026-07-24"},
 			[]line{{"SKU-1010", 90, 26.5}}},
@@ -1188,9 +1245,16 @@ func (s *seeder) seedPurchaseOrders(vendors, currencies, items map[string]string
 // (PO-2026-0001, PO-2026-0004, PO-2026-0005 in seedPurchaseOrders' own
 // table above) a
 // real GoodsReceipt + one GoodsReceiptLine per POLine, received in full
-// 5 days after the order date — sample data that actually demonstrates
-// the entity purchasing.GoodsReceipt exists for, the same reasoning
-// seedParties gives for tagging PartyRole rather than leaving it empty.
+// 5 days after the order date, all received at facilityID — sample data
+// that actually demonstrates the entity purchasing.GoodsReceipt exists
+// for, the same reasoning seedParties gives for tagging PartyRole rather
+// than leaving it empty. Every line's creation also exercises
+// PostGoodsReceiptLineToLedger's InventoryItem-crediting side
+// (uc-infra#54): this demo tenant's stock-related reports show real
+// received quantities, not just the hand-seeded baseline
+// seedInventory/seedInventoryWithoutFacilities set directly. Caller-only
+// gated on Facility being published (run's own comment) — facilityID is
+// assumed valid, this function does not re-check.
 // Deliberately driven by querying PurchaseOrder's own status_id (not a
 // second hardcoded po_number list that could silently drift from
 // seedPurchaseOrders' table) — dedups on purchase_order_id, since
@@ -1202,7 +1266,7 @@ func (s *seeder) seedPurchaseOrders(vendors, currencies, items map[string]string
 // the missing lines. Accepted for demo-data tooling — no transaction
 // wraps this loop, same as every other seedX method in this file — but
 // worth knowing before assuming a re-run always "heals" a partial state.
-func (s *seeder) seedGoodsReceipts() {
+func (s *seeder) seedGoodsReceipts(facilityID string) {
 	poDef := s.def("PurchaseOrder")
 	lineDef := s.def("POLine")
 	grDef := s.def("GoodsReceipt")
@@ -1229,6 +1293,7 @@ func (s *seeder) seedGoodsReceipts() {
 		gr, err := s.crud.Create(s.ctx, grDef, map[string]any{
 			"purchase_order_id": po.ID,
 			"received_date":     receivedDate,
+			"facility_id":       facilityID,
 			"notes":             "Received in full",
 		}, s.actor)
 		if err != nil {

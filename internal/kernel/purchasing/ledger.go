@@ -43,7 +43,8 @@ const (
 // PostGoodsReceiptLineToLedger is a crud.Hook (internal/kernel/crud.Hook)
 // — register it for the "GoodsReceiptLine" entity type
 // (Engine.SetHook) to post Dr Inventory / Cr AP Accrual for one received
-// line's value the moment the line is created.
+// line's value AND credit InventoryItem.qty_on_hand at the receiving
+// facility, both the moment the line is created.
 //
 // Posted per-line, not per-GoodsReceipt header, deliberately:
 // GoodsReceipt and GoodsReceiptLine are saved as separate API calls (no
@@ -54,6 +55,43 @@ const (
 // received against one PO line) — posting it as soon as its value is
 // known avoids needing to detect "the receipt is now fully entered,"
 // which this kernel has no mechanism for anyway.
+//
+// The InventoryItem side (uc-infra#54, executing ADR-0015 §5's deferred
+// decision) is a second, independent effect of the same event, gated
+// only on qty > 0 below (a zero-or-negative qty_received credits
+// nothing — #80 tracks the missing Min concept that would otherwise
+// reject a negative one at the schema level) — NOT on the ledger
+// posting: a free-of-charge sample has no value to post (amountMinor
+// below is 0) but still physically arrived, so it still bumps stock.
+// Only crud.Engine has exactly one Hook per entity type (SetHook
+// overwrites), so both effects live in this one function rather than as
+// separate hooks — there is nowhere else to put the second one.
+//
+// **Inserts a NEW InventoryItem row rather than upserting an existing
+// (item_id, facility_id) one, on purpose but with a real, disclosed
+// cost.** InventoryItem's own doc comment and ADR-0015 §2 establish that
+// duplicate (item, facility) rows are TOLERATED — every aggregate sums
+// rather than picking a winner — but that tolerance exists as a
+// consequence of #81's missing uniqueness constraint, not as licence to
+// make duplication the normal write path. This function does exactly
+// that anyway, for one reason: an INSERT needs no read-modify-write, so
+// two GoodsReceiptLines crediting the same (item, facility) concurrently
+// can never lose an update the way an UPSERT without its own retry loop
+// would. That upside is real, but so is the downside independent review
+// surfaced: a tenant that receives the same item at the same facility
+// repeatedly accumulates one InventoryItem row per receipt forever
+// (unbounded growth every report in internal/data/reporting.go scans),
+// and the entity is also a first-class generic-CRUD screen — a user who
+// opens "the" InventoryItem row for an item now edits one arbitrary
+// sliver of a balance with no indication the rest exists. Upserting
+// with an optimistic-locking retry loop (the expectedVersion pattern
+// MatchVendorInvoiceOnUpdate already uses below) would close both gaps
+// at the cost of a first-create race that #81's still-missing
+// constraint can't fully close either way — deliberately NOT attempted
+// in this commit; tracked as a follow-up rather than expanded into here.
+// Idempotency-against-re-edits is handled the same way this function's
+// ledger side already handles it: the action != Create guard, since
+// GoodsReceiptLine has no update path today.
 //
 // Runs inside tx, the same transaction the GoodsReceiptLine write
 // itself is in (crud.Hook's own contract) — a posting failure rolls back
@@ -67,7 +105,14 @@ func PostGoodsReceiptLineToLedger(ctx context.Context, tx *sql.Tx, _ *entity.Def
 		return nil
 	}
 
-	qty, _ := rec.Data["qty_received"].(float64)
+	// numberFieldValue, not a bare `.(float64)` assertion: this file's own
+	// existing gap (numberFieldValue's doc comment already flags it for
+	// the ledger-posting hooks) — an int-typed qty_received (a Go caller
+	// writing a literal, e.g. cmd/seed-demo-data or a future importer)
+	// would silently read as 0 through a bare assertion, silently
+	// skipping the InventoryItem credit below on top of the pre-existing
+	// silently-zero ledger posting.
+	qty, _ := numberFieldValue(rec.Data["qty_received"])
 	poLineID, _ := rec.Data["po_line_id"].(string)
 	if poLineID == "" {
 		return fmt.Errorf("GoodsReceiptLine %s has no po_line_id", rec.ID)
@@ -75,6 +120,10 @@ func PostGoodsReceiptLineToLedger(ctx context.Context, tx *sql.Tx, _ *entity.Def
 	goodsReceiptID, _ := rec.Data["goods_receipt_id"].(string)
 	if goodsReceiptID == "" {
 		return fmt.Errorf("GoodsReceiptLine %s has no goods_receipt_id", rec.ID)
+	}
+	itemID, _ := rec.Data["item_id"].(string)
+	if itemID == "" {
+		return fmt.Errorf("GoodsReceiptLine %s has no item_id", rec.ID)
 	}
 
 	records := data.NewRecordRepo(nil)
@@ -89,13 +138,26 @@ func PostGoodsReceiptLineToLedger(ctx context.Context, tx *sql.Tx, _ *entity.Def
 		return fmt.Errorf("resolve GoodsReceipt %s: %w", goodsReceiptID, err)
 	}
 	receivedDate, _ := goodsReceipt.Data["received_date"].(string)
+	facilityID, _ := goodsReceipt.Data["facility_id"].(string)
+	if facilityID == "" {
+		return fmt.Errorf("GoodsReceipt %s has no facility_id", goodsReceiptID)
+	}
+
+	if qty > 0 {
+		if err := creditInventoryOnReceipt(ctx, tx, records, itemID, facilityID, qty, rec.ID, actor); err != nil {
+			return err
+		}
+	}
 
 	amountMinor := ledger.ToMinorUnits(qty * unitPrice)
 	if amountMinor == 0 {
 		// A zero-value line (no price on the POLine yet, a free-of-
 		// charge sample) has nothing to post — Entry.Validate would
 		// reject a zero-amount line as ErrBadLine anyway, so skipping
-		// here is a real, legitimate no-op, not a swallowed error.
+		// here is a real, legitimate no-op, not a swallowed error. The
+		// InventoryItem credit above already ran regardless — see this
+		// function's own doc comment on why the two are not gated
+		// together.
 		return nil
 	}
 
@@ -111,6 +173,60 @@ func PostGoodsReceiptLineToLedger(ctx context.Context, tx *sql.Tx, _ *entity.Def
 	}, actor)
 	if err != nil {
 		return fmt.Errorf("post GoodsReceiptLine %s to ledger: %w", rec.ID, err)
+	}
+	return nil
+}
+
+// creditInventoryOnReceipt is PostGoodsReceiptLineToLedger's InventoryItem
+// side, split out only for readability — see that function's own doc
+// comment for why this inserts a new row instead of upserting. Called
+// only when qty > 0 (that gate lives in the caller, not here — a
+// zero-or-negative qty_received has nothing to credit), and independent
+// of whether the ledger posting below it fires at all.
+//
+// qty_available_to_promise is credited by the same amount as
+// qty_on_hand: nothing in this kernel today reserves stock against ATP
+// separately (no SalesOrder-confirm path decrements it, no other writer
+// of this field exists outside seed/backfill tooling), so on this
+// kernel's current model the two move together. A real reservation
+// model, if one lands later, changes this — not a reason to invent one
+// here.
+//
+// Validates against the compiled-in InventoryItem() Definition, not the
+// tenant's own published one (contrast every write in
+// internal/kernel/crud.Engine, which always validates against
+// data.EntityDefinitionRepo.GetPublished) — a real, disclosed gap, not
+// an oversight: crud.Hook's signature hands this function a *sql.Tx and
+// nothing else, and EntityDefinitionRepo has no Tx-taking read method to
+// fetch the published Definition consistently within the same
+// transaction (see data.EntityDefinitionRepo — every method takes only
+// *sql.DB). Given #70 (existing tenants don't auto-adopt new
+// Definitions), a tenant whose published InventoryItem Definition hasn't
+// caught up, or one with a genuinely customized Definition, would have
+// this credit validate against a shape that isn't what that tenant's own
+// registry declares. Fixing this properly means either a Tx-capable
+// GetPublished or threading the published Definition through crud.Hook's
+// own signature — both real, separable changes, not attempted here.
+func creditInventoryOnReceipt(ctx context.Context, tx *sql.Tx, records *data.RecordRepo, itemID, facilityID string, qty float64, goodsReceiptLineID string, actor audit.Actor) error {
+	fields := map[string]any{
+		"item_id":                  itemID,
+		"facility_id":              facilityID,
+		"qty_on_hand":              qty,
+		"qty_available_to_promise": qty,
+	}
+	if err := entity.ValidateRecord(InventoryItem(), fields); err != nil {
+		return fmt.Errorf("build InventoryItem credit for GoodsReceiptLine %s: %w", goodsReceiptLineID, err)
+	}
+	invRec, err := records.CreateTx(ctx, tx, "InventoryItem", fields)
+	if err != nil {
+		return fmt.Errorf("credit InventoryItem for GoodsReceiptLine %s: %w", goodsReceiptLineID, err)
+	}
+	auditEntry, err := audit.New("InventoryItem", invRec.ID, audit.ActionCreate, actor, fields)
+	if err != nil {
+		return fmt.Errorf("build audit entry for InventoryItem %s: %w", invRec.ID, err)
+	}
+	if err := data.NewAuditRepo(nil).Insert(ctx, tx, auditEntry); err != nil {
+		return fmt.Errorf("write audit entry for InventoryItem %s: %w", invRec.ID, err)
 	}
 	return nil
 }

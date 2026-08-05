@@ -539,11 +539,22 @@ func itemIDBySKU(t *testing.T, tenantDB *sql.DB, sku string) string {
 
 // inventoryOnHand reads the single seeded InventoryItem row's
 // qty_on_hand for an item.
+// inventoryOnHand sums qty_on_hand across every live InventoryItem row
+// for itemID — SUMS, deliberately, not a single-row lookup. An item can
+// legitimately have more than one row (split across facilities per
+// #12/ADR-0015, or — since uc-infra#54 — one baseline row plus one per
+// GoodsReceiptLine credited against it, ledger.go's own doc comment on
+// why that wiring inserts rather than upserts); a bare `QueryRowContext`
+// over one row silently discards the rest and reports an arbitrary
+// partial total, exactly like ReportingRepo.OnHandQtyByItem would NOT
+// (independent review of this card: this helper used to be a single-row
+// `QueryRowContext`, which masked SKU-1004's real receipt-credited total
+// until reporting.go's own summing was used here too).
 func inventoryOnHand(t *testing.T, tenantDB *sql.DB, itemID string) float64 {
 	t.Helper()
 	var qty float64
 	if err := tenantDB.QueryRowContext(context.Background(),
-		`SELECT (data->>'qty_on_hand')::numeric FROM records
+		`SELECT coalesce(sum((data->>'qty_on_hand')::numeric), 0) FROM records
 		 WHERE entity_type = 'InventoryItem' AND data->>'item_id' = $1 AND deleted_at IS NULL`, itemID,
 	).Scan(&qty); err != nil {
 		t.Fatalf("look up InventoryItem for %s: %v", itemID, err)
@@ -937,8 +948,18 @@ func TestSeedDemoData_PipelineModelsTheContactShape(t *testing.T) {
 
 // wantTotalOnHand is the sum of cmd/seed-demo-data's inventoryLevels
 // table: 400+100 (SKU-1001) + 120 + 250+50 (SKU-1003) + 80 + 45 + 600 +
-// 25 + 200 + 0 + 60.
-const wantTotalOnHand = 1930.0
+// 25 + 200 + 0 + 60 = 1930, PLUS (uc-infra#54) every unit
+// seedGoodsReceipts now actually receives against the three "received"
+// PurchaseOrders — real physical arrivals that purchasing.
+// PostGoodsReceiptLineToLedger's InventoryItem-crediting wiring credits
+// for real, the same as it would for a live tenant: PO-2026-0001 (40,
+// SKU-1002) + PO-2026-0004 (60 + 30, SKU-1005/1006) + PO-2026-0005
+// (3000 + 5000, SKU-1004/1009) = 8130. 1930 + 8130 = 10060. Before this
+// wiring existed, receiving was a no-op on stock, so this constant only
+// ever needed the hand-declared baseline; now it is the baseline plus
+// what the demo data genuinely receives, same as any other tenant's
+// stock would be.
+const wantTotalOnHand = 10060.0
 
 func totalOnHand(t *testing.T, tenantDB *sql.DB) float64 {
 	t.Helper()

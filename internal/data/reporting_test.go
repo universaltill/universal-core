@@ -459,6 +459,174 @@ func TestOnOrderQtyByItem_SumsOpenStatusesOnly(t *testing.T) {
 	}
 }
 
+// TestOnOrderQtyByItem_NetsAgainstReceivedQty (uc-infra#54) pins the
+// per-line netting this function gained in the same commit as
+// purchasing.PostGoodsReceiptLineToLedger's InventoryItem-crediting
+// wiring: the moment receiving credits qty_on_hand, on-order must stop
+// counting the delivered portion too, or on_hand + on_order double-counts
+// the same units. Uses data.NewRecordRepo directly (bypassing
+// entity.ValidateRecord, same as every other test in this file) so a
+// GoodsReceipt fixture here does not need a facility_id — this function
+// only ever reads GoodsReceiptLine.po_line_id/qty_received, never
+// GoodsReceipt itself.
+func TestOnOrderQtyByItem_NetsAgainstReceivedQty(t *testing.T) {
+	ctx := context.Background()
+	tenantDB := freshTenantDB(t)
+	records := data.NewRecordRepo(tenantDB)
+	reporting := data.NewReportingRepo(tenantDB)
+
+	statusIDs := map[string]string{}
+	for _, code := range []string{"submitted", "approved"} {
+		rec, err := records.Create(ctx, "Status", map[string]any{"code": code, "name": code})
+		if err != nil {
+			t.Fatalf("create Status: %v", err)
+		}
+		statusIDs[code] = rec.ID
+	}
+	item, err := records.Create(ctx, "Item", map[string]any{"sku": "SKU-NET", "name": "Netted Widget", "item_type": "stock"})
+	if err != nil {
+		t.Fatalf("create Item: %v", err)
+	}
+	overItem, err := records.Create(ctx, "Item", map[string]any{"sku": "SKU-OVER", "name": "Over-Received Widget", "item_type": "stock"})
+	if err != nil {
+		t.Fatalf("create Item: %v", err)
+	}
+
+	mustCreatePOWithLine := func(poNumber, status, itemID string, qty float64) (poID, lineID string) {
+		t.Helper()
+		po, err := records.Create(ctx, "PurchaseOrder", map[string]any{
+			"po_number": poNumber, "order_date": "2026-07-01", "status_id": statusIDs[status],
+		})
+		if err != nil {
+			t.Fatalf("create PurchaseOrder: %v", err)
+		}
+		line, err := records.Create(ctx, "POLine", map[string]any{
+			"purchase_order_id": po.ID, "item_id": itemID, "qty": qty, "unit_price": 1.0,
+		})
+		if err != nil {
+			t.Fatalf("create POLine: %v", err)
+		}
+		return po.ID, line.ID
+	}
+	mustReceive := func(poID, lineID, itemID string, qtyReceived float64) {
+		t.Helper()
+		gr, err := records.Create(ctx, "GoodsReceipt", map[string]any{
+			"purchase_order_id": poID, "received_date": "2026-07-05",
+		})
+		if err != nil {
+			t.Fatalf("create GoodsReceipt: %v", err)
+		}
+		if _, err := records.Create(ctx, "GoodsReceiptLine", map[string]any{
+			"goods_receipt_id": gr.ID, "po_line_id": lineID, "item_id": itemID, "qty_received": qtyReceived,
+		}); err != nil {
+			t.Fatalf("create GoodsReceiptLine: %v", err)
+		}
+	}
+
+	// Partially received: ordered 100, received 30 in two GoodsReceiptLines
+	// (20 + 10) against the same line — remaining must be 70, netted
+	// against the SUM of both receipts, not just the last one.
+	partialPO, partialLine := mustCreatePOWithLine("PO-PARTIAL", "submitted", item.ID, 100)
+	mustReceive(partialPO, partialLine, item.ID, 20)
+	mustReceive(partialPO, partialLine, item.ID, 10)
+
+	// Fully received but still "approved" (not yet transitioned to
+	// "received") — remaining must be 0, not negative, and must not
+	// itself go missing from the map's arithmetic (it's summed into the
+	// same item as the partial line above: 70 + 0 = 70).
+	fullPO, fullLine := mustCreatePOWithLine("PO-FULL", "approved", item.ID, 50)
+	mustReceive(fullPO, fullLine, item.ID, 50)
+
+	// A second, unrelated submitted line for the same item with nothing
+	// received yet — remaining is its full ordered qty, unaffected by
+	// netting.
+	mustCreatePOWithLine("PO-OPEN", "submitted", item.ID, 25)
+
+	// Over-received (data inconsistency, e.g. a correction entered
+	// twice): received MORE than ordered. Must floor at 0 for THIS LINE,
+	// not go negative.
+	overPO, overLine := mustCreatePOWithLine("PO-OVERRECEIVED", "submitted", overItem.ID, 10)
+	mustReceive(overPO, overLine, overItem.ID, 15)
+
+	// A second, genuinely under-received line for the SAME item
+	// (independent review, uc-infra#54: the single over-received line
+	// above cannot actually distinguish per-line flooring from
+	// per-item flooring — flooring a lone negative-or-zero value gives
+	// the same answer either way). With both lines present:
+	//   - correct (floor PER LINE, then sum): max(10-15,0) + max(100-0,0)
+	//     = 0 + 100 = 100.
+	//   - the bug this guards against (sum raw remainders, THEN floor
+	//     the item total): max((10-15)+(100-0), 0) = max(95,0) = 95.
+	// The two disagree (100 vs 95), so this line is what actually pins
+	// the per-line semantics — a regression to item-level flooring
+	// would silently let the over-received line's negative remainder
+	// mask 5 units of this genuinely still-open line.
+	shortPO, shortLine := mustCreatePOWithLine("PO-UNDERRECEIVED", "submitted", overItem.ID, 100)
+
+	// A negative qty_received (no Min concept exists yet, #80 — data
+	// inconsistency, not a reachable normal path) must not REDUCE what
+	// counts as received and inflate on-order past the ordered qty: the
+	// per-line received total is floored at 0 before netting, same
+	// discipline as the remaining-qty floor above.
+	negPO, negLine := mustCreatePOWithLine("PO-NEGATIVE-RECEIPT", "submitted", item.ID, 5)
+	mustReceive(negPO, negLine, item.ID, -3)
+
+	// A GoodsReceiptLine with a malformed po_line_id must not abort the
+	// query (uuidPattern guard) and must not attach to any line.
+	strayGR, err := records.Create(ctx, "GoodsReceipt", map[string]any{
+		"purchase_order_id": partialPO, "received_date": "2026-07-06",
+	})
+	if err != nil {
+		t.Fatalf("create stray GoodsReceipt: %v", err)
+	}
+	if _, err := records.Create(ctx, "GoodsReceiptLine", map[string]any{
+		"goods_receipt_id": strayGR.ID, "po_line_id": "not-a-uuid", "item_id": item.ID, "qty_received": 999.0,
+	}); err != nil {
+		t.Fatalf("create malformed GoodsReceiptLine: %v", err)
+	}
+	// A GoodsReceiptLine with a malformed goods_receipt_id (the OTHER
+	// reference hop the netting subquery casts, uc-infra#54) must be
+	// excluded the same way, not abort the query either.
+	if _, err := records.Create(ctx, "GoodsReceiptLine", map[string]any{
+		"goods_receipt_id": "not-a-uuid", "po_line_id": partialLine, "item_id": item.ID, "qty_received": 999.0,
+	}); err != nil {
+		t.Fatalf("create GoodsReceiptLine with malformed goods_receipt_id: %v", err)
+	}
+
+	// A soft-deleted GoodsReceipt (crud.Engine.Delete does not cascade
+	// to composition children, internal/kernel/crud/crud.go) must not
+	// leave its still-live GoodsReceiptLine netting down on-order —
+	// deleting the receipt "un-receives" it for this purpose. shortLine
+	// (100 ordered, otherwise 0 received) is the target: if this
+	// deleted receipt's 40 wrongly netted in, shortLine would read
+	// 60 instead of 100.
+	deletedGR, err := records.Create(ctx, "GoodsReceipt", map[string]any{
+		"purchase_order_id": shortPO, "received_date": "2026-07-07",
+	})
+	if err != nil {
+		t.Fatalf("create GoodsReceipt to be deleted: %v", err)
+	}
+	if _, err := records.Create(ctx, "GoodsReceiptLine", map[string]any{
+		"goods_receipt_id": deletedGR.ID, "po_line_id": shortLine, "item_id": overItem.ID, "qty_received": 40.0,
+	}); err != nil {
+		t.Fatalf("create GoodsReceiptLine under the to-be-deleted GoodsReceipt: %v", err)
+	}
+	if err := records.Delete(ctx, "GoodsReceipt", deletedGR.ID); err != nil {
+		t.Fatalf("soft-delete GoodsReceipt: %v", err)
+	}
+
+	got, err := reporting.OnOrderQtyByItem(ctx)
+	if err != nil {
+		t.Fatalf("OnOrderQtyByItem: %v", err)
+	}
+	if qty := got[item.ID]; qty != 100 {
+		t.Errorf("on-order for netted item = %v, want 100 (70 partial-remaining + 0 fully-received + 25 untouched + 5 from the negative-receipt line, whose received qty must floor to 0, not -3)", qty)
+	}
+	if qty := got[overItem.ID]; qty != 100 {
+		t.Errorf("on-order for the over/under-received item = %v, want 100 (0 floored-per-line + 100 under-received, NOT 95 — see the per-line-vs-per-item comment above; a soft-deleted receipt against the 100 line must not net in either)", qty)
+	}
+}
+
 // TestOnHandQtyByItem sums qty_on_hand per item across every
 // InventoryItem row, skipping rows with no item_id.
 func TestOnHandQtyByItem(t *testing.T) {
