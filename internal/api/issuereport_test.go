@@ -360,4 +360,12 @@ func TestIssueReport_Submit_MissingRequiredFieldIs400(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for a missing required title, got %d: %s", rec.Code, rec.Body.String())
 	}
+	// Translated entity.validation.required envelope, not
+	// ValidateRecord's raw Detail text (uc-infra#96, independent review:
+	// this call site reuses validationErrorMessage directly rather than
+	// through writeValidationErrorLocalized, and had no assertion pinning
+	// that it actually translates).
+	if want := `title is required.`; !strings.Contains(rec.Body.String(), want) {
+		t.Fatalf("expected the translated envelope message %q, got: %s", want, rec.Body.String())
+	}
 }

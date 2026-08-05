@@ -662,6 +662,14 @@ func TestAPI_UpdateRecord_ValidationFailureIs400(t *testing.T) {
 	if updateRec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for a validation failure, got %d: %s", updateRec.Code, updateRec.Body.String())
 	}
+	// Same translated entity.validation.required envelope updateRecord's
+	// sibling TestAPI_CreateRecord_ValidationErrorIsLocalized pins for
+	// createRecord (uc-infra#96, independent review: only the create path
+	// had a message-content assertion, so a revert of updateRecord's own
+	// call site to raw err.Error() wouldn't have failed anything here).
+	if want := `name is required.`; !strings.Contains(updateRec.Body.String(), want) {
+		t.Fatalf("expected the translated envelope message %q, got: %s", want, updateRec.Body.String())
+	}
 }
 
 // TestAPI_UpdateRecord_SelfReferenceCycleIs400 is the HTTP-level proof
@@ -850,6 +858,43 @@ func TestAPI_CreateRecord_ValidationErrorIsLocalized(t *testing.T) {
 	}
 	if strings.Contains(rec.Body.String(), `field "name" is required`) {
 		t.Fatalf("expected ValidateRecord's raw untranslated Detail text NOT to reach the client, got: %s", rec.Body.String())
+	}
+}
+
+// TestWriteCrudErrorLocalized_ValidationErrorFallsThroughTranslated is a
+// direct Handler-method test (not a full HTTP round trip) for
+// writeCrudErrorLocalized's entity.ErrValidation branch (uc-infra#96,
+// independent review): every current create/update HTTP call site
+// pre-validates via entity.ValidateRecord before ever reaching
+// crud.Engine, so there's no reachable path through the real routes that
+// exercises crud.Engine's own internal re-validation failing — this
+// calls the Handler method directly with a synthetic *entity.
+// ValidationError, the same shape crud.go's "validation failed: %w"
+// wrap would produce, to prove the fallback (which would otherwise still
+// reach writeCrudError's generic writeInternalError — a wrongly-500'd,
+// untranslated response for what's unambiguously a 400) actually works,
+// not just compiles.
+func TestWriteCrudErrorLocalized_ValidationErrorFallsThroughTranslated(t *testing.T) {
+	router := newTestRouter(t)
+	h := testHandler(t, router)
+
+	verr := &entity.ValidationError{
+		Kind:       entity.KindRequired,
+		EntityType: "Vendor",
+		FieldName:  "name",
+		Detail:     `field "name" is required`,
+	}
+	wrapped := fmt.Errorf("validation failed: %w", verr) // crud.go's own wrap shape
+
+	req := newRequest("POST", "/api/records/Vendor", "t", "farshid", nil)
+	rec := httptest.NewRecorder()
+	h.writeCrudErrorLocalized(rec, req, "test validation fallback", wrapped)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a validation error reaching writeCrudErrorLocalized, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if want := `name is required.`; !strings.Contains(rec.Body.String(), want) {
+		t.Fatalf("expected the translated envelope message %q, got: %s", want, rec.Body.String())
 	}
 }
 

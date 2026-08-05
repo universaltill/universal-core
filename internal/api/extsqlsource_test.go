@@ -158,6 +158,44 @@ func TestExtSQLSources_Create_EncryptsPasswordAndNeverEchoesIt(t *testing.T) {
 	}
 }
 
+// TestExtSQLSources_Create_InvalidDriverIsTranslatedInlineError pins
+// buildExtSQLSourceFields' own entity.ValidateRecord call site through
+// the translated envelope (uc-infra#96, independent review: the other
+// three inline-error cases in this file — link-local host, bad port, no
+// cryptor — are pre-translated at extsqlsource.go's own call site and
+// already covered; this call site's own ValidateRecord path had no
+// assertion pinning it stayed translated once this fix landed).
+func TestExtSQLSources_Create_InvalidDriverIsTranslatedInlineError(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	// "oracle" isn't in ExternalSQLSource.driver's EnumValues (mssql/postgres).
+	rec := postExtSQLForm(mux, "/settings/sql-sources", tenantID,
+		extSQLSourceValues("Legacy Oracle", "oracle", "ora.example.internal", "", "ORCL", "reader", "", ""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 (inline error), got %d: %s", rec.Code, rec.Body.String())
+	}
+	if want := "driver is not a valid choice."; !strings.Contains(rec.Body.String(), want) {
+		t.Fatalf("expected the translated envelope message %q, got:\n%s", want, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), `field "driver": value`) {
+		t.Fatalf("expected ValidateRecord's raw untranslated Detail text NOT to reach the client, got:\n%s", rec.Body.String())
+	}
+
+	var count int
+	if err := db.QueryRow(`SELECT count(*) FROM records WHERE entity_type = 'ExternalSQLSource'`).Scan(&count); err != nil {
+		t.Fatalf("count ExternalSQLSource records: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected nothing stored for an invalid driver, found %d records", count)
+	}
+}
+
 // TestExtSQLSources_Create_PasswordWithoutCryptorFails confirms the page
 // refuses to store a password at all when no SECRET_ENCRYPTION_KEY is
 // configured, with a translated inline error — never silently storing

@@ -147,6 +147,7 @@ func (h *Handler) extSQLSourceSave(w http.ResponseWriter, r *http.Request, id st
 
 	fields, err := h.buildExtSQLSourceFields(def, locale, r.PostForm, existing)
 	if err != nil {
+		log.Printf("api: build ExternalSQLSource fields (id=%q): %v", id, err)
 		view := h.extSQLSourcesPageView(locale, records)
 		h.attachExtSQLError(&view, id, h.validationErrorMessage(locale, err))
 		h.writeExtSQLSourcesFragment(w, view)

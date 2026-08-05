@@ -48,6 +48,28 @@ const (
 	KindInvalid ValidationErrorKind = "invalid"
 )
 
+// AllValidationErrorKinds lists every ValidationErrorKind ValidateRecord
+// can produce. internal/api's own i18n coverage test walks this to
+// confirm every Kind has a translated entity.validation.{kind} catalog
+// key in every shipped locale — the same convention
+// internal/kernel/formrender/i18n_coverage_test.go established for
+// section titles and the Save action (universal-core/CLAUDE.md's i18n
+// section). Without it, a typo'd or newly-added Kind with no matching
+// catalog entry would put the literal key ("entity.validation.foo") on
+// a user's screen with no build-time signal — Catalog.T's fallback is
+// silent by design for exactly this failure mode (independent review,
+// uc-infra#96).
+func AllValidationErrorKinds() []ValidationErrorKind {
+	return []ValidationErrorKind{
+		KindRequired,
+		KindTypeMismatch,
+		KindEnumInvalid,
+		KindI18nTextInvalid,
+		KindNotBefore,
+		KindInvalid,
+	}
+}
+
 // ErrValidation is the sentinel every *ValidationError unwraps to, for a
 // caller that only needs errors.Is(err, ErrValidation) (tests, logs) —
 // mirrors crud.ErrTargetConstraintViolation/TargetConstraintError's own
