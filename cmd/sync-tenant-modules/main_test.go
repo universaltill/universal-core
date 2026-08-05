@@ -341,6 +341,90 @@ func TestSync_MissingActorID_FailsFast(t *testing.T) {
 	}
 }
 
+// An ai_agent sync run must carry a model version — ADR-0001 §14 makes
+// AI-actor identity first-class, and audit.Actor.Validate enforces it.
+// Hard-coding ActorHuman (the pre-fix shape, still carrying a
+// TODO(uc-infra#72 follow-up) until this card) would have written a
+// falsified actor_type onto every Definition an unattended pipeline
+// sync run re-published (uc-infra#123, same test shape as
+// cmd/provision-tenant's TestProvisionTenant_ActorTypeValidation).
+// Validation runs before any database work, so no control-plane
+// connection is needed for any of these to fail correctly.
+func TestSync_ActorTypeValidation(t *testing.T) {
+	dsn, _, _ := controlPlane(t)
+
+	_, stderr, code := run(t, []string{"DATABASE_URL=" + dsn}, "-actor-id=pipeline", "-actor-type=ai_agent")
+	if code == 0 || !strings.Contains(stderr, "model_version") {
+		t.Errorf("expected ai_agent to require -model-version, got code %d: %s", code, stderr)
+	}
+
+	_, stderr, code = run(t, []string{"DATABASE_URL=" + dsn}, "-actor-id=pipeline", "-actor-type=wizard")
+	if code == 0 || !strings.Contains(stderr, "invalid actor") {
+		t.Errorf("expected an unknown actor type to be rejected, got code %d: %s", code, stderr)
+	}
+
+	// The other half of the same falsification, the other direction —
+	// a human row carrying a model version (uc-infra#72 independent
+	// review, finding 4): Validate() alone only rejects an EMPTY
+	// ModelVersion on an agent, never a populated one on a human.
+	_, stderr, code = run(t, []string{"DATABASE_URL=" + dsn}, "-actor-id=pipeline", "-model-version=claude-x")
+	if code == 0 || !strings.Contains(stderr, "-model-version is only meaningful") {
+		t.Errorf("expected a human actor with -model-version set to be rejected, got code %d: %s", code, stderr)
+	}
+}
+
+// TestSync_ActorTypeAI_WritesRealAuditRows is the positive half
+// TestSync_ActorTypeValidation deliberately doesn't cover: every
+// rejection test above only proves the guardrail exists, never that a
+// SUCCESSFUL ai_agent run actually reaches the synced tenant's own
+// audit_log with the right values (same class of wiring mistake
+// uc-infra#72's independent review found — a validated actor built but
+// a different one passed downstream). Runs the real compiled binary
+// against a real stale tenant and reads its audit_log directly.
+func TestSync_ActorTypeAI_WritesRealAuditRows(t *testing.T) {
+	dsn, control, router := controlPlane(t)
+	_, tenantDB := staleTenant(t, control, router, "AI Actor Sync Smoke Test")
+
+	// staleTenant's own setup (PublishFoundation + the stale purchasing
+	// seed) already wrote human-actor audit_log rows for InventoryItem's
+	// pre-existing v1/v2 — unlike Facility (born fresh in this run),
+	// InventoryItem is NOT new, so an entity_type filter alone would
+	// still pick up those older rows. A watermark on `id` isolates only
+	// what THIS run writes.
+	var watermark int64
+	if err := tenantDB.QueryRowContext(context.Background(),
+		`SELECT COALESCE(max(id), 0) FROM audit_log`).Scan(&watermark); err != nil {
+		t.Fatalf("read audit_log watermark: %v", err)
+	}
+
+	stdout, stderr, code := run(t, []string{"DATABASE_URL=" + dsn}, "-actor-id=pipeline", "-actor-type=ai_agent", "-model-version=claude-test-1")
+	if code != 0 {
+		t.Fatalf("run: exit %d, stderr: %s", code, stderr)
+	}
+	if !strings.Contains(stdout, "Synced 1 tenant(s); 0 partially synced; 0 skipped.") {
+		t.Fatalf("expected the sync to actually run, got stdout: %q", stdout)
+	}
+
+	var total, wrongActor int
+	if err := tenantDB.QueryRowContext(context.Background(),
+		`SELECT count(*) FROM audit_log WHERE id > $1`, watermark,
+	).Scan(&total); err != nil {
+		t.Fatalf("count audit_log rows written by this run: %v", err)
+	}
+	if total == 0 {
+		t.Fatal("expected the sync to write at least one audit_log row for the definitions it published")
+	}
+	if err := tenantDB.QueryRowContext(context.Background(),
+		`SELECT count(*) FROM audit_log WHERE id > $1
+		 AND (actor_type != 'ai_agent' OR actor_id != 'pipeline' OR model_version IS DISTINCT FROM 'claude-test-1')`, watermark,
+	).Scan(&wrongActor); err != nil {
+		t.Fatalf("count wrong-actor audit_log rows: %v", err)
+	}
+	if wrongActor != 0 {
+		t.Errorf("expected every synced-definition audit_log row to carry actor_type=ai_agent, actor_id=pipeline, model_version=claude-test-1, got %d that don't", wrongActor)
+	}
+}
+
 // TestSync_BringsAStaleTenantUpToDate is the core case: the drift
 // measured on the live tenant, closed by one run.
 func TestSync_BringsAStaleTenantUpToDate(t *testing.T) {

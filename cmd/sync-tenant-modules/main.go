@@ -77,11 +77,39 @@ func main() {
 		log.Fatal("DATABASE_URL is required (the control-plane database — see this file's own doc comment)")
 	}
 	actorID := flag.String("actor-id", "", "audit actor id for every Definition this publishes (required)")
+	// An unattended pipeline sync run is an ai_agent actor, and
+	// ADR-0001 §14 makes that distinction first-class — hard-coding
+	// ActorHuman would write a falsified actor_type onto every
+	// Definition this command re-publishes (uc-infra#72/#123, same
+	// shape as cmd/provision-tenant's fix).
+	actorType := flag.String("actor-type", string(audit.ActorHuman), "audit actor type: human | ai_agent")
+	modelVersion := flag.String("model-version", "", "model version, required when -actor-type is ai_agent")
 	only := flag.String("tenant-id", "", "sync just this tenant instead of every provisioned one")
 	dryRun := flag.Bool("dry-run", false, "report what would change without publishing anything")
 	flag.Parse()
 	if *actorID == "" {
 		log.Fatal("-actor-id is required")
+	}
+	// Resolved and checked before any database work: an operator who
+	// mistyped the actor should learn that immediately, not after the
+	// control-plane connection and every tenant's publish work already
+	// ran (same discipline as cmd/provision-tenant).
+	actor := audit.Actor{Type: audit.ActorType(*actorType), ID: *actorID, ModelVersion: *modelVersion}
+	switch actor.Type {
+	case audit.ActorHuman, audit.ActorAgent:
+	default:
+		log.Fatalf("invalid actor: -actor-type must be %q or %q, got %q", audit.ActorHuman, audit.ActorAgent, *actorType)
+	}
+	// A human actor carrying a model version is the same class of
+	// falsified audit metadata this fix exists to prevent the other
+	// way around (uc-infra#72 independent review) — Validate() alone
+	// only rejects an EMPTY ModelVersion on an agent, never a populated
+	// one on a human, so that half of the mistake needs its own check.
+	if actor.Type == audit.ActorHuman && *modelVersion != "" {
+		log.Fatalf("invalid actor: -model-version is only meaningful when -actor-type is %q", audit.ActorAgent)
+	}
+	if err := actor.Validate(); err != nil {
+		log.Fatalf("invalid actor: %v", err)
 	}
 
 	controlDB, err := sql.Open("pgx", controlDBURL)
@@ -94,13 +122,6 @@ func main() {
 	}
 
 	ctx := context.Background()
-	// TODO(uc-infra#72 follow-up): this hardcodes ActorHuman, the exact
-	// falsified-audit-trail bug #72 fixed in cmd/provision-tenant,
-	// cmd/seed-demo-data and cmd/backfill-purchase-order-status — known,
-	// deliberately not fixed here (outside that card's named scope), not
-	// forgotten. Copy the same -actor-type/-model-version pattern when
-	// this file is next touched, or as its own follow-up card.
-	actor := audit.Actor{Type: audit.ActorHuman, ID: *actorID}
 	tenants := data.NewTenantRepo(controlDB)
 
 	ids := []string{*only}
