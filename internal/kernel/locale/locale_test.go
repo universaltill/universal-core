@@ -1,6 +1,8 @@
 package locale
 
 import (
+	"math"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -329,5 +331,381 @@ func TestFormatNumber_NegativeIsolatedInRTL(t *testing.T) {
 	// LTR locales never get isolate characters.
 	if got := Default("en").FormatNumber(-1234.5, 2); got != "-1,234.50" {
 		t.Errorf("en negative = %q, want a plain -1,234.50", got)
+	}
+}
+
+// ---- ParseNumber / ParseDate (board #74) ---------------------------------
+
+// TestParseNumber is FormatNumber's inverse, run against FormatNumber's own
+// output for a spread of locales — including the Indian lakh/crore grouping
+// and Arabic/Persian digit sets, so the same cases TestFormatNumber and
+// TestFormatNumber_IndianGrouping already trust are checked round-trip.
+func TestParseNumber(t *testing.T) {
+	for name, tc := range map[string]struct {
+		tag, in, want string
+	}{
+		// Trailing fractional zeros are trimmed so the result matches
+		// the stored value's own JSON text form regardless of how many
+		// decimals the typed text carried: a FieldNumber list cell only
+		// ever shows free-precision text (FormatNumber(v, -1) trims
+		// trailing zeros itself), so "1,234,567.50" — carrying a
+		// decimal precision the cell never actually displays — must
+		// still match the same stored 1234567.5 a viewer copying the
+		// cell verbatim would type.
+		"british thousands":   {"en-GB", "1,234,567.50", "1234567.5"},
+		"turkish separators":  {"tr-TR", "1.234.567,50", "1234567.5"},
+		"no grouping needed":  {"en-GB", "999", "999"},
+		"exactly four digits": {"en-GB", "1,000", "1000"},
+		"negative":            {"en-GB", "-1,234.50", "-1234.5"},
+		"negative turkish":    {"tr-TR", "-1.234,50", "-1234.5"},
+		"free precision":      {"en-GB", "1,234.5", "1234.5"},
+		// A fraction that's ALL zeros is dropped entirely, not just
+		// trimmed to a bare trailing ".".
+		"zero":                      {"en-GB", "0.00", "0"},
+		"arabic digits":             {"ar-AE", "١٬٢٣٤٫٥٠", "1234.5"},
+		"persian digits":            {"fa-IR", "۱٬۲۳۴٫۵۰", "1234.5"},
+		"indian grouping":           {"en-IN", "12,34,567.50", "1234567.5"},
+		"no trailing zeros to trim": {"en-GB", "1,234.56", "1234.56"},
+		"plain ascii already, no separators at all": {"en-GB", "1234567.5", "1234567.5"},
+		// A viewer who copy-pastes a formatted negative RTL cell brings
+		// the LRI…PDI isolate characters with it — ParseNumber must
+		// still recover the value.
+		"arabic negative with isolates": {"ar-AE", "⁦-١٬٢٣٤٫٥٠⁩", "-1234.5"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			l, err := Parse(tc.tag)
+			if err != nil {
+				t.Fatalf("Parse(%q): %v", tc.tag, err)
+			}
+			got, ok := l.ParseNumber(tc.in)
+			if !ok {
+				t.Fatalf("%s.ParseNumber(%q) reported not ok", tc.tag, tc.in)
+			}
+			if got != tc.want {
+				t.Errorf("%s.ParseNumber(%q) = %q, want %q", tc.tag, tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseNumber_Rejections covers input that must NOT parse: garbage
+// text, and — the case the whole grouping-validation exists for — digits
+// that don't fit this locale's actual grouping pattern, which a naive
+// "just strip the group separator" implementation would silently mangle
+// instead of rejecting (tr-TR's group separator is the SAME character as
+// en-GB's decimal separator, so "1234567.5" typed under tr-TR rules must
+// be rejected, not silently turned into 12345675).
+func TestParseNumber_Rejections(t *testing.T) {
+	for name, tc := range map[string]struct{ tag, in string }{
+		"empty":                                {"en-GB", ""},
+		"blank":                                {"en-GB", "   "},
+		"not a number":                         {"en-GB", "not a number"},
+		"bare minus":                           {"en-GB", "-"},
+		"en-GB decimal misread as tr grouping": {"tr-TR", "1234567.5"},
+		"malformed grouping (middle group wrong size)": {"en-GB", "1,23,45"},
+		"malformed grouping (leading group too long)":  {"en-GB", "12345,678"},
+		"empty group":        {"en-GB", "1,,234"},
+		"trailing separator": {"en-GB", "1,234,"},
+		"indian grouping applied to en-GB (wrong sizes)": {"en-GB", "12,34,567"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			l, err := Parse(tc.tag)
+			if err != nil {
+				t.Fatalf("Parse(%q): %v", tc.tag, err)
+			}
+			if got, ok := l.ParseNumber(tc.in); ok {
+				t.Errorf("%s.ParseNumber(%q) = %q, ok, want rejected", tc.tag, tc.in, got)
+			}
+		})
+	}
+}
+
+// TestParseNumber_RoundTrip is the property FormatNumber/ParseNumber exist
+// as a pair to satisfy: format a value in a locale, parse what that same
+// locale displayed, and get back the same number — across every region's
+// separator/digit convention this kernel ships, including RTL's isolated
+// negatives and India's non-uniform grouping.
+func TestParseNumber_RoundTrip(t *testing.T) {
+	tags := []string{"en-GB", "en-US", "en-IN", "tr-TR", "ar-AE", "fa-IR"}
+	cases := []struct {
+		v        float64
+		decimals int
+	}{
+		{0, 2}, {999, 0}, {1000, 0}, {100000, 0},
+		{1234567.5, 2}, {1234567.5, -1},
+		{-1234.5, 2}, {-1, 0},
+		{123456789.99, 2}, {-0.5, 2},
+	}
+	for _, tag := range tags {
+		l, err := Parse(tag)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tag, err)
+		}
+		for _, tc := range cases {
+			formatted := l.FormatNumber(tc.v, tc.decimals)
+			norm, ok := l.ParseNumber(formatted)
+			if !ok {
+				t.Fatalf("%s: ParseNumber(FormatNumber(%v, %d)=%q) reported not ok",
+					tag, tc.v, tc.decimals, formatted)
+			}
+			got, err := strconv.ParseFloat(norm, 64)
+			if err != nil {
+				t.Fatalf("%s: ParseNumber(%q) = %q, not a valid float: %v", tag, formatted, norm, err)
+			}
+			if math.Abs(got-tc.v) > 1e-6 {
+				t.Errorf("%s: round trip %v -(Format,%d)-> %q -(Parse)-> %v, want %v",
+					tag, tc.v, tc.decimals, formatted, got, tc.v)
+			}
+		}
+	}
+}
+
+// TestParseDate is FormatDate's inverse, run against the exact fixtures
+// TestFormatDate already trusts — including the Nowruz boundary and the
+// Farsi-locale-with-Gregorian-override case.
+func TestParseDate(t *testing.T) {
+	for name, tc := range map[string]struct {
+		tag, in, want string
+	}{
+		"british day first":             {"en-GB", "03/04/2026", "2026-04-03"},
+		"american month first":          {"en-US", "04/03/2026", "2026-04-03"},
+		"turkish dots":                  {"tr-TR", "03.04.2026", "2026-04-03"},
+		"arabic digits":                 {"ar-AE", "٠٣/٠٤/٢٠٢٦", "2026-04-03"},
+		"jalali":                        {"fa-IR", "۱۴۰۵/۰۱/۱۴", "2026-04-03"},
+		"jalali new year eve":           {"fa-IR", "۱۴۰۴/۱۲/۲۹", "2026-03-20"},
+		"jalali new year day":           {"fa-IR", "۱۴۰۵/۰۱/۰۱", "2026-03-21"},
+		"farsi with gregorian override": {"fa-IR-u-ca-gregory", "۲۰۲۶/۰۴/۰۳", "2026-04-03"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			l, err := Parse(tc.tag)
+			if err != nil {
+				t.Fatalf("Parse(%q): %v", tc.tag, err)
+			}
+			got, ok := l.ParseDate(tc.in)
+			if !ok {
+				t.Fatalf("%s.ParseDate(%q) reported not ok", tc.tag, tc.in)
+			}
+			if got != tc.want {
+				t.Errorf("%s.ParseDate(%q) = %q, want %q", tc.tag, tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseDate_Rejections covers text that must NOT parse into a date:
+// wrong shape, out-of-range fields, a day that gets silently normalized
+// into a different date by naive arithmetic (Feb 30), and — the Jalali-
+// specific case — a day that doesn't exist in a COMMON (non-leap) Jalali
+// year's Esfand. 1404 is a confirmed common year (TestFormatDate's own
+// "jalali new year eve" fixture: 1404/12/29 is that year's last day), so
+// 1404/12/30 must be rejected, not silently accepted as some nearby date.
+func TestParseDate_Rejections(t *testing.T) {
+	for name, tc := range map[string]struct{ tag, in string }{
+		"empty":                 {"en-GB", ""},
+		"not a date":            {"en-GB", "not a date"},
+		"wrong separator count": {"en-GB", "03/04"},
+		"non-numeric field":     {"en-GB", "aa/04/2026"},
+		"empty field":           {"en-GB", "03//2026"},
+		"month out of range":    {"en-GB", "03/13/2026"},
+		"day out of range":      {"en-GB", "32/04/2026"},
+		"year zero":             {"en-GB", "03/04/0000"},
+		// FormatDate always emits a 4-digit year — a 2-digit year isn't
+		// a shape this locale's own display ever produces, so it must
+		// be refused rather than silently parsed as year 26 (independent
+		// review: this was previously accepted).
+		"2-digit year": {"en-GB", "03/04/26"},
+		// Feb 30 doesn't exist; time.Date would silently normalize it to
+		// March 2 rather than reject it — the round-trip check catches
+		// that instead of accepting a mistyped date as a different day.
+		"nonexistent gregorian date":        {"en-GB", "30/02/2026"},
+		"esfand 30 in a common jalali year": {"fa-IR", "۱۴۰۴/۱۲/۳۰"},
+		// Outside FormatDate's own verified Jalali conversion window.
+		"jalali year far outside the window": {"fa-IR", "۰۰۰۱/۰۱/۰۱"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			l, err := Parse(tc.tag)
+			if err != nil {
+				t.Fatalf("Parse(%q): %v", tc.tag, err)
+			}
+			if got, ok := l.ParseDate(tc.in); ok {
+				t.Errorf("%s.ParseDate(%q) = %q, ok, want rejected", tc.tag, tc.in, got)
+			}
+		})
+	}
+}
+
+// TestParseDate_RoundTrip: FormatDate then ParseDate must return the
+// original ISO date, for every day across a multi-year span (crossing
+// several Nowruz boundaries and both common and leap Jalali years) and
+// every locale/calendar this kernel ships.
+func TestParseDate_RoundTrip(t *testing.T) {
+	tags := []string{"en-GB", "en-US", "tr-TR", "ar-AE", "fa-IR"}
+	for _, tag := range tags {
+		l, err := Parse(tag)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tag, err)
+		}
+		start := gregorianDayNumber(2018, 1, 1)
+		for i := 0; i < 3000; i += 11 { // sampled, not exhaustive — keeps the test fast
+			gy, gm, gd := gregorianDateFromDayNumber(start + i)
+			iso := isoDate(gy, gm, gd)
+			formatted := l.FormatDate(iso)
+			got, ok := l.ParseDate(formatted)
+			if !ok {
+				t.Fatalf("%s: ParseDate(FormatDate(%s)=%q) reported not ok", tag, iso, formatted)
+			}
+			if got != iso {
+				t.Fatalf("%s: round trip %s -(Format)-> %q -(Parse)-> %s", tag, iso, formatted, got)
+			}
+		}
+	}
+}
+
+// TestParseDate_JalaliLeapEsfand30 closes a gap the independent review
+// found in TestParseDate_RoundTrip: that test's sampling stride (every
+// 11th day over 2018-2020) never happens to land on a leap Jalali
+// year's Esfand 30th — the one day FormatDate/ParseDate's Jalali path
+// has to get right that TestParseDate_Rejections' "esfand 30 in a
+// COMMON year must be refused" case doesn't cover from the other side.
+// Rather than hardcode a guessed ISO date, this SEARCHES the supported
+// window for a real jm==12, jd==30 day (gregorianToJalali is already
+// verified elsewhere) and round-trips that.
+func TestParseDate_JalaliLeapEsfand30(t *testing.T) {
+	fa, err := Parse("fa-IR")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	lo := gregorianDayNumber(jalaliMinGregorian[0], jalaliMinGregorian[1], jalaliMinGregorian[2])
+	hi := gregorianDayNumber(jalaliMaxGregorian[0], jalaliMaxGregorian[1], jalaliMaxGregorian[2])
+	found := 0
+	for n := lo; n <= hi && found < 5; n++ {
+		gy, gm, gd := gregorianDateFromDayNumber(n)
+		jy, jm, jd := gregorianToJalali(gy, gm, gd)
+		if jm != 12 || jd != 30 {
+			continue
+		}
+		found++
+		iso := isoDate(gy, gm, gd)
+		formatted := fa.FormatDate(iso)
+		got, ok := fa.ParseDate(formatted)
+		if !ok {
+			t.Fatalf("leap Esfand 30 (jalali %d/12/30, gregorian %s): ParseDate(%q) reported not ok", jy, iso, formatted)
+		}
+		if got != iso {
+			t.Errorf("leap Esfand 30 (jalali %d/12/30): round trip %s -(Format)-> %q -(Parse)-> %s", jy, iso, formatted, got)
+		}
+	}
+	if found == 0 {
+		t.Fatal("found no leap Jalali Esfand-30 day in the supported window — the search itself is broken")
+	}
+}
+
+func isoDate(y, m, d int) string {
+	return strings.Join([]string{
+		strconv.Itoa(y),
+		fmt2(m),
+		fmt2(d),
+	}, "-")
+}
+
+func fmt2(v int) string {
+	s := strconv.Itoa(v)
+	if len(s) < 2 {
+		return "0" + s
+	}
+	return s
+}
+
+// TestDelocalizeDigits directly checks the ASCII round trip
+// localizeDigits/delocalizeDigits form: mapping a locale's own digit
+// shapes back to ASCII, and passing already-ASCII text (or a Latin-digit
+// locale) through unchanged.
+func TestDelocalizeDigits(t *testing.T) {
+	fa, err := Parse("fa-IR")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := fa.delocalizeDigits("۱۲۳/۴۵۶"); got != "123/456" {
+		t.Errorf("delocalizeDigits(persian) = %q, want 123/456", got)
+	}
+	en := Default("en")
+	if got := en.delocalizeDigits("123/456"); got != "123/456" {
+		t.Errorf("delocalizeDigits(already ascii) = %q, want unchanged", got)
+	}
+}
+
+// TestJalaliToGregorian_KnownCorrespondences cross-checks jalaliToGregorian
+// against the exact fixtures TestGregorianToJalali already trusts, in the
+// reverse direction.
+func TestJalaliToGregorian_KnownCorrespondences(t *testing.T) {
+	for _, tc := range []struct {
+		gy, gm, gd int
+		jy, jm, jd int
+	}{
+		{2026, 7, 31, 1405, 5, 9},
+		{2026, 3, 21, 1405, 1, 1},
+		{2026, 3, 20, 1404, 12, 29},
+		{2024, 3, 20, 1403, 1, 1},
+		{2025, 3, 21, 1404, 1, 1},
+		{2000, 1, 1, 1378, 10, 11},
+		{1979, 2, 11, 1357, 11, 22},
+		{2026, 9, 22, 1405, 6, 31},
+		{2026, 9, 23, 1405, 7, 1},
+	} {
+		gy, gm, gd, ok := jalaliToGregorian(tc.jy, tc.jm, tc.jd)
+		if !ok {
+			t.Fatalf("jalaliToGregorian(%d/%d/%d) reported not ok", tc.jy, tc.jm, tc.jd)
+		}
+		if gy != tc.gy || gm != tc.gm || gd != tc.gd {
+			t.Errorf("jalaliToGregorian(%d/%d/%d) = %04d-%02d-%02d, want %04d-%02d-%02d",
+				tc.jy, tc.jm, tc.jd, gy, gm, gd, tc.gy, tc.gm, tc.gd)
+		}
+	}
+}
+
+// TestJalaliToGregorian_RoundTripsWithGregorianToJalali sweeps a
+// multi-year run of consecutive Gregorian days (crossing several Jalali
+// leap-cycle boundaries, so both common and leap Esfand lengths are
+// exercised) and confirms gregorianToJalali then jalaliToGregorian
+// returns the exact original date — the property the binary-search
+// implementation exists to guarantee, rather than a hand-derived inverse
+// formula that could disagree with the forward one in a new, independent
+// way.
+func TestJalaliToGregorian_RoundTripsWithGregorianToJalali(t *testing.T) {
+	start := gregorianDayNumber(2015, 1, 1)
+	for i := 0; i < 6000; i++ {
+		gy, gm, gd := gregorianDateFromDayNumber(start + i)
+		jy, jm, jd := gregorianToJalali(gy, gm, gd)
+		backY, backM, backD, ok := jalaliToGregorian(jy, jm, jd)
+		if !ok {
+			t.Fatalf("jalaliToGregorian(%d/%d/%d) (from %04d-%02d-%02d) reported not ok",
+				jy, jm, jd, gy, gm, gd)
+		}
+		if backY != gy || backM != gm || backD != gd {
+			t.Fatalf("round trip mismatch: %04d-%02d-%02d -> jalali %d/%d/%d -> %04d-%02d-%02d",
+				gy, gm, gd, jy, jm, jd, backY, backM, backD)
+		}
+	}
+}
+
+// TestJalaliToGregorian_Rejections covers input jalaliToGregorian must
+// refuse: out-of-range month/day (rejected before the search even runs)
+// and a year far outside the window FormatDate itself supports (rejected
+// by the search finding no match).
+func TestJalaliToGregorian_Rejections(t *testing.T) {
+	for name, tc := range map[string]struct{ jy, jm, jd int }{
+		"zero month":            {1405, 0, 1},
+		"month 13":              {1405, 13, 1},
+		"zero day":              {1405, 1, 0},
+		"day 32":                {1405, 1, 32},
+		"year far below window": {1, 1, 1},
+		"year far above window": {9999, 1, 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if gy, gm, gd, ok := jalaliToGregorian(tc.jy, tc.jm, tc.jd); ok {
+				t.Errorf("jalaliToGregorian(%d,%d,%d) = %d/%d/%d, ok, want rejected",
+					tc.jy, tc.jm, tc.jd, gy, gm, gd)
+			}
+		})
 	}
 }

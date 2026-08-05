@@ -284,6 +284,12 @@ func (l Locale) FormatDate(iso string) string {
 	return l.localizeDigits(out)
 }
 
+// lri/pdi are the bidi isolate characters FormatNumber wraps around a
+// negative RTL amount (see the isolate comment below) and stripIsolates
+// removes on the way back in — one pair of literals shared by both
+// directions instead of two copies that could drift apart.
+const lri, pdi = "⁦", "⁩"
+
 // FormatNumber writes a number with this locale's grouping and decimal
 // separators. decimals < 0 keeps the value's own precision (trailing
 // zeros trimmed), matching the existing FormatFieldValue behaviour for
@@ -313,10 +319,220 @@ func (l Locale) FormatNumber(v float64, decimals int) string {
 			// (measured in a real browser by the independent review).
 			// LRI…PDI isolates the number so its sign stays where it
 			// belongs without affecting the surrounding text.
-			out = "⁦" + out + "⁩"
+			out = lri + out + pdi
 		}
 	}
 	return l.localizeDigits(out)
+}
+
+// ParseNumber is the inverse of FormatNumber: given text typed in this
+// locale's own digits/separators, it returns the plain ASCII decimal
+// string (no grouping, "." for the decimal point) that the stored
+// value's own JSON text representation compares against. This exists
+// for the list-filter box (board #74): since #22 a cell shows
+// "1,234,567.5" or "۱٬۲۳۴٬۵۶۷٫۵", but the stored/filtered value is
+// always plain ASCII, so a viewer who copies what the page shows them
+// into the filter and gets zero rows back is hitting exactly the gap
+// this closes.
+//
+// ok is false for text that isn't a valid number under this locale's
+// rules (wrong separators, stray characters, empty) — display-only
+// boundary, same as FormatDate/FormatNumber never erroring: the caller
+// falls back to matching the raw typed text rather than rejecting the
+// filter outright.
+func (l Locale) ParseNumber(s string) (string, bool) {
+	s = l.delocalizeDigits(stripIsolates(strings.TrimSpace(s)))
+	if s == "" {
+		return "", false
+	}
+	neg := strings.HasPrefix(s, "-")
+	if neg {
+		s = s[1:]
+	}
+	intPart, fracPart, hasFrac := s, "", false
+	if l.rules.decimalSep != "" {
+		if i, f, ok := strings.Cut(s, l.rules.decimalSep); ok {
+			intPart, fracPart, hasFrac = i, f, true
+		}
+	}
+	// Validate the grouping BEFORE stripping it: en-GB's decimal "." and
+	// tr-TR's group "." are the same character, so "1234567.5" typed
+	// under tr-TR rules would otherwise strip a false decimal point into
+	// a nonsense 8-digit run instead of being recognized as not a valid
+	// Turkish grouping. An ungrouped run (no separator present at all)
+	// is always accepted — that is the plain-ASCII case #74 itself is
+	// built around.
+	if !validGrouping(intPart, l.rules.groupSep, l.rules.groupSizes) {
+		return "", false
+	}
+	if l.rules.groupSep != "" {
+		intPart = strings.ReplaceAll(intPart, l.rules.groupSep, "")
+	}
+	if intPart == "" || !isASCIIDigits(intPart) || (hasFrac && !isASCIIDigits(fracPart)) {
+		return "", false
+	}
+	// Trailing fractional zeros are trimmed (and a fraction that's now
+	// all zeros is dropped entirely) so the result matches the stored
+	// value's OWN JSON text form regardless of how many decimals the
+	// typed text carried — a cell showing "1,234,567.5" (FormatNumber's
+	// free-precision -1) and a viewer who instead types "1,234,567.50"
+	// must both match the same stored 1234567.5 (independent review:
+	// without this, the fixed-precision form silently found nothing).
+	if hasFrac {
+		fracPart = strings.TrimRight(fracPart, "0")
+	}
+	out := intPart
+	if fracPart != "" {
+		out += "." + fracPart
+	}
+	if neg {
+		out = "-" + out
+	}
+	return out, true
+}
+
+// ParseDate is the inverse of FormatDate: given text typed in this
+// locale's script, field order and calendar, it returns the ISO-8601
+// form (`entity.FieldDate`'s storage form) the same way FormatDate
+// produces the display form from it. Same board #74 motivation as
+// ParseNumber, for the date half of the filter box.
+//
+// ok is false for text that doesn't parse as a real date under this
+// locale — an out-of-range day/month, a Jalali date outside the window
+// FormatDate itself refuses (jalaliSupported), or anything that isn't
+// three locale-digit groups separated by this region's date separator.
+// The caller falls back to matching the raw typed text, never an error
+// page — the same display-only-boundary contract FormatDate keeps.
+func (l Locale) ParseDate(s string) (string, bool) {
+	// FormatDate never wraps a date in LRI/PDI isolates (only
+	// FormatNumber's negative-RTL case does) — stripping them here
+	// anyway costs nothing and keeps ParseDate/ParseNumber symmetric
+	// rather than leaving a footgun for whichever one of them changes
+	// first.
+	s = l.delocalizeDigits(stripIsolates(strings.TrimSpace(s)))
+	if l.rules.dateSep == "" {
+		return "", false
+	}
+	parts := strings.Split(s, l.rules.dateSep)
+	if len(parts) != 3 {
+		return "", false
+	}
+	for _, p := range parts {
+		if !isASCIIDigits(p) {
+			return "", false
+		}
+	}
+	var y, m, d int
+	var yearPart string
+	switch l.rules.order {
+	case orderMDY:
+		m, _ = strconv.Atoi(parts[0])
+		d, _ = strconv.Atoi(parts[1])
+		yearPart = parts[2]
+	case orderYMD:
+		yearPart = parts[0]
+		m, _ = strconv.Atoi(parts[1])
+		d, _ = strconv.Atoi(parts[2])
+	default: // orderDMY
+		d, _ = strconv.Atoi(parts[0])
+		m, _ = strconv.Atoi(parts[1])
+		yearPart = parts[2]
+	}
+	// FormatDate always emits a 4-digit year (%04d) — anything else
+	// isn't a shape this locale's own display ever produces. Without
+	// this, "03/04/26" silently parses as the year 26 instead of being
+	// refused (independent review): not a false-match risk (no stored
+	// FieldDate is ever year 26), but it defeats the honest raw-text
+	// fallback for input that plainly isn't a real regional date.
+	if len(yearPart) != 4 {
+		return "", false
+	}
+	y, _ = strconv.Atoi(yearPart)
+	if y < 1 || m < 1 || m > 12 || d < 1 {
+		return "", false
+	}
+	if l.Calendar == CalendarJalali {
+		gy, gm, gd, ok := jalaliToGregorian(y, m, d)
+		if !ok {
+			return "", false
+		}
+		y, m, d = gy, gm, gd
+	}
+	// time.Date silently normalizes an out-of-range day (Feb 30 rolls
+	// into March) rather than erroring — checking the round trip
+	// against what was asked for is what catches that instead of
+	// silently accepting a mistyped date as a different, nearby one.
+	t := time.Date(y, time.Month(m), d, 0, 0, 0, 0, time.UTC)
+	if t.Year() != y || int(t.Month()) != m || t.Day() != d {
+		return "", false
+	}
+	return t.Format("2006-01-02"), true
+}
+
+// stripIsolates removes the LRI/PDI bidi-isolate characters FormatNumber
+// wraps around a negative RTL amount (see the isolate comment above) —
+// present if a viewer copy-pasted a formatted cell's text verbatim
+// rather than retyping it.
+func stripIsolates(s string) string {
+	s = strings.ReplaceAll(s, lri, "")
+	return strings.ReplaceAll(s, pdi, "")
+}
+
+// validGrouping reports whether intPart's digit groups (split on sep)
+// match the sizes a real FormatNumber output in this locale would have
+// produced — the exact inverse check for groupDigits, read right to
+// left: the rightmost group is sizes[0], each group in further reads
+// sizes[1], sizes[2]…, and the last size repeats for any remaining
+// leading groups, same as groupDigits' own iteration. The leftmost
+// group is allowed to be SHORTER than its expected size (a 4-digit
+// number like "1,234" has a 1-digit leading group), every other group
+// must match exactly. No separator present at all (a single segment)
+// is always valid — that's plain ASCII input, not a grouping claim to
+// validate.
+func validGrouping(intPart, sep string, sizes []int) bool {
+	if sep == "" {
+		return true
+	}
+	segs := strings.Split(intPart, sep)
+	if len(segs) == 1 {
+		return true
+	}
+	if len(sizes) == 0 {
+		sizes = []int{3}
+	}
+	n := len(segs)
+	for i, seg := range segs {
+		if seg == "" {
+			return false
+		}
+		groupIdx := n - 1 - i // 0 = rightmost/least-significant group
+		size := sizes[len(sizes)-1]
+		if groupIdx < len(sizes) {
+			size = sizes[groupIdx]
+		}
+		if i == 0 {
+			// The empty-segment check above already rules out len(seg)
+			// < 1 — only the upper bound is a real constraint here.
+			if len(seg) > size {
+				return false
+			}
+		} else if len(seg) != size {
+			return false
+		}
+	}
+	return true
+}
+
+func isASCIIDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // RTL reports whether this locale's script runs right to left — kept
@@ -374,6 +590,31 @@ func (l Locale) localizeDigits(s string) string {
 			continue
 		}
 		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// delocalizeDigits is localizeDigits' inverse: maps a locale's own
+// digit shapes back to ASCII. A locale with no non-Latin digit set
+// (digitRunes has no entry for it) is returned unchanged — its digits
+// are already ASCII, same identity behaviour localizeDigits itself has
+// for DigitsLatin.
+func (l Locale) delocalizeDigits(s string) string {
+	set, ok := digitRunes[l.rules.digits]
+	if !ok {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		mapped := r
+		for i, dr := range set {
+			if dr == r {
+				mapped = rune('0' + i)
+				break
+			}
+		}
+		b.WriteRune(mapped)
 	}
 	return b.String()
 }
@@ -470,4 +711,55 @@ func jalaliFromDayNumber(gregorianDays int) (jy, jm, jd int) {
 		dayNo -= jalaliMonthDays[i]
 	}
 	return jy, i + 1, dayNo + 1
+}
+
+// jalaliToGregorian is the inverse of gregorianToJalali: given a Solar
+// Hijri date, it returns the Gregorian date whose day count maps to it
+// (board #74, ParseDate). Implemented as a binary search over
+// gregorianDayNumber rather than a second, independently re-derived
+// cycle-arithmetic formula — the forward conversion is already the
+// tested source of truth for the 33-year-cycle math
+// (TestGregorianToJalali*), and the day-count basis both conversions
+// share is strictly monotonic
+// (TestGregorianToJalali_ConsecutiveDaysAreCoherent), so searching it is
+// exact, not approximate, and carries none of the risk of a second,
+// independently-wrong sign or off-by-one in the same arithmetic that
+// hand-deriving the inverse cycle math a second way would.
+//
+// ok is false for a (jy, jm, jd) with no Gregorian equivalent inside the
+// window FormatDate itself supports (jalaliSupported's bounds) —
+// including a day that doesn't exist in that Jalali month (Esfand 30 in
+// a common, non-leap Jalali year).
+func jalaliToGregorian(jy, jm, jd int) (gy, gm, gd int, ok bool) {
+	if jm < 1 || jm > 12 || jd < 1 || jd > 31 {
+		return 0, 0, 0, false
+	}
+	lo := gregorianDayNumber(jalaliMinGregorian[0], jalaliMinGregorian[1], jalaliMinGregorian[2])
+	hi := gregorianDayNumber(jalaliMaxGregorian[0], jalaliMaxGregorian[1], jalaliMaxGregorian[2])
+	target := [3]int{jy, jm, jd}
+	for lo <= hi {
+		mid := lo + (hi-lo)/2
+		y, m, d := jalaliFromDayNumber(mid)
+		got := [3]int{y, m, d}
+		switch {
+		case got == target:
+			gy, gm, gd = gregorianDateFromDayNumber(mid)
+			return gy, gm, gd, true
+		case lessThan(got, target):
+			lo = mid + 1
+		default:
+			hi = mid - 1
+		}
+	}
+	return 0, 0, 0, false
+}
+
+// gregorianDateFromDayNumber is gregorianDayNumber's inverse: the
+// Gregorian calendar date n days after the 1600-01-01 epoch. Delegates
+// to time.Time's own proleptic-Gregorian arithmetic rather than
+// hand-rolling a second month/leap-year table that would have to agree
+// with gregorianDayNumber's by construction instead of by test.
+func gregorianDateFromDayNumber(n int) (y, m, d int) {
+	t := time.Date(1600, time.January, 1, 0, 0, 0, 0, time.UTC).AddDate(0, 0, n)
+	return t.Year(), int(t.Month()), t.Day()
 }
