@@ -107,27 +107,58 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	filterValue := r.URL.Query().Get("q")
+	// displayFilterValue is what re-populates the filter box and
+	// survives into sort/page links — always the RAW text the viewer
+	// typed, never the normalized form ParseNumber/ParseDate below
+	// produce. Echoing the normalized form back would silently rewrite
+	// what they typed on every redisplay (board #74's own fix, applied
+	// one field too far, would just move the surprise from "no results"
+	// to "my search box changed under me").
+	displayFilterValue := ""
 	if filterValue != "" && isVisibleColumn(columns, filterField) && sortFilterableField(def, filterField) {
 		opts.FilterField = filterField
 		opts.FilterValue = filterValue
-		// A reference column stores the target's id, so matching what a
-		// human typed against it finds nothing: searching an attendance
-		// list for "EMP-0001" returned zero rows even though the cells
-		// plainly showed EMP-0001, because the cell is a resolved label
-		// and the stored value is a UUID (independent review, board
-		// #17). Resolve the text against the target's own label field
-		// and filter by the ids it matches. Generic — it reads the
-		// Definition, never a specific entity type — so every
-		// reference-first list gets it, not just this one.
-		if f, ok := def.FieldByName(filterField); ok && f.Type == entity.FieldReference {
-			ids, err := h.referenceIDsMatching(r.Context(), ts, f.Target, filterValue)
-			if err != nil {
-				h.writeCrudPageError(w, r, &rc, locale, fmt.Sprintf("resolve %s filter", filterField), err)
-				return
+		displayFilterValue = filterValue
+		if f, ok := def.FieldByName(filterField); ok {
+			switch f.Type {
+			case entity.FieldReference:
+				// A reference column stores the target's id, so matching
+				// what a human typed against it finds nothing: searching
+				// an attendance list for "EMP-0001" returned zero rows
+				// even though the cells plainly showed EMP-0001, because
+				// the cell is a resolved label and the stored value is a
+				// UUID (independent review, board #17). Resolve the text
+				// against the target's own label field and filter by the
+				// ids it matches. Generic — it reads the Definition,
+				// never a specific entity type — so every reference-first
+				// list gets it, not just this one.
+				ids, err := h.referenceIDsMatching(r.Context(), ts, f.Target, filterValue)
+				if err != nil {
+					h.writeCrudPageError(w, r, &rc, locale, fmt.Sprintf("resolve %s filter", filterField), err)
+					return
+				}
+				// Non-nil even when empty: "no target matched" must
+				// return no rows, not silently drop the filter.
+				opts.FilterIn = ids
+			case entity.FieldNumber:
+				// Since #22 a FieldNumber cell shows regional grouping/
+				// decimal separators and digit shapes, but the stored
+				// value the filter matches against is always plain
+				// ASCII (board #74). Normalize what was typed through
+				// the same rules that produced what's on screen before
+				// it reaches the query; a value that doesn't parse under
+				// this locale falls through to matching the raw typed
+				// text unchanged, same honest fallback FormatNumber
+				// itself uses for unexpected input.
+				if norm, ok := loc.ParseNumber(filterValue); ok {
+					opts.FilterValue = norm
+				}
+			case entity.FieldDate:
+				// Same reasoning for FieldDate's regional/Jalali display.
+				if norm, ok := loc.ParseDate(filterValue); ok {
+					opts.FilterValue = norm
+				}
 			}
-			// Non-nil even when empty: "no target matched" must return no
-			// rows, not silently drop the filter.
-			opts.FilterIn = ids
 		}
 	}
 
@@ -178,7 +209,7 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 		ExportLink:  h.catalog.T(locale, "dashboard.export_link"),
 		Empty:       h.catalog.T(locale, "list.empty"),
 		FilterField: opts.FilterField,
-		FilterValue: opts.FilterValue,
+		FilterValue: displayFilterValue,
 		FilterHref:  "/records/" + entityType,
 		FilterLabel: h.catalog.T(locale, "list.filter_placeholder"),
 		FilterGo:    h.catalog.T(locale, "list.filter_button"),
@@ -190,7 +221,7 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 		q := url.Values{}
 		if opts.FilterField != "" {
 			q.Set("filter", opts.FilterField)
-			q.Set("q", opts.FilterValue)
+			q.Set("q", displayFilterValue)
 		}
 		for k, vs := range extra {
 			for _, v := range vs {
