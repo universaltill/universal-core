@@ -2233,6 +2233,223 @@ func TestAPI_RenderRecordForm_ShowsMasterDetailChildren(t *testing.T) {
 	}
 }
 
+// itemEntityDef/itemFormDef and poLineWithItemRefEntityDef/
+// poLineWithItemRefFormDef are dedicated fixtures for
+// TestAPI_RenderRecordForm_MasterDetail* below (uc-infra#85) rather
+// than extending poLineEntityDef/poLineFormDef: those two are shared by
+// TestAPI_RenderRecordForm_ShowsMasterDetailChildren and other tests
+// above, and poLineEntityDef deliberately has no FieldReference column
+// (formrender's own unit tests already cover that shape in isolation —
+// this file's gap, per independent review, was that NO internal/api
+// integration test exercised a master_detail child row with a
+// FieldReference column against real Postgres/real RBAC at all).
+func itemEntityDef() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "Item",
+		Version:    1,
+		Fields:     []entity.Field{{Name: "name", Type: entity.FieldString, Required: true}},
+	}
+}
+
+func itemFormDef() *form.Definition {
+	return &form.Definition{
+		EntityType: "Item",
+		Version:    1,
+		Sections: []form.Section{{
+			Title:     "Details",
+			Component: form.ComponentFields,
+			Fields:    []form.FormField{{Name: "name", Label: "Name"}},
+		}},
+	}
+}
+
+func poLineWithItemRefEntityDef() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "POLine",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "purchase_order_id", Type: entity.FieldString, Required: true},
+			{Name: "item_id", Type: entity.FieldReference, Target: "Item"},
+			{Name: "line_total", Type: entity.FieldNumber, Required: true},
+		},
+	}
+}
+
+func poLineWithItemRefFormDef() *form.Definition {
+	return &form.Definition{
+		EntityType: "POLine",
+		Version:    1,
+		Sections: []form.Section{{
+			Title:     "Details",
+			Component: form.ComponentFields,
+			Fields: []form.FormField{
+				{Name: "item_id", Label: "Item"},
+				{Name: "line_total", Label: "Line Total"},
+			},
+		}},
+	}
+}
+
+// seedEntityPermission grants roleCode entity-level RBAC rules for
+// entityType (foundation.Permission — can_read/can_write), creates the
+// role, and grants it to userID — the master_detail-column analogue of
+// seedFieldRule above, at the entity level (authz.Resolver.CanRead)
+// rather than the field level (authz.Resolver.HiddenFields). Mirrors
+// internal/kernel/authz's own test fixture (authz_test.go's
+// fixture.permit), just seeded through the real HTTP-facing crud.Engine
+// path rather than authz's internal test harness.
+func seedEntityPermission(t *testing.T, db *sql.DB, roleCode, userID, entityType string, canRead, canWrite bool) string {
+	t.Helper()
+	ctx := context.Background()
+	engine := crud.NewEngine(db)
+	actor := humanActor()
+
+	role, err := engine.Create(ctx, foundation.Role(), map[string]any{"code": roleCode, "name": roleCode}, actor)
+	if err != nil {
+		t.Fatalf("create Role %s: %v", roleCode, err)
+	}
+	if _, err := engine.Create(ctx, foundation.UserRole(), map[string]any{"user_id": userID, "role_id": role.ID}, actor); err != nil {
+		t.Fatalf("grant %s to %s: %v", roleCode, userID, err)
+	}
+	if _, err := engine.Create(ctx, foundation.Permission(), map[string]any{
+		"role_id": role.ID, "entity_type": entityType, "can_read": canRead, "can_write": canWrite,
+	}, actor); err != nil {
+		t.Fatalf("create Permission for %s on %s: %v", roleCode, entityType, err)
+	}
+	return role.ID
+}
+
+// TestAPI_RenderRecordForm_MasterDetailReferenceColumnResolvesToLabel
+// (uc-infra#85): the internal/api-layer counterpart to formrender's own
+// unit tests — a master_detail child row's FieldReference column
+// resolves to the target's label against a REAL published Item and a
+// REAL Postgres round trip, not a synthetic ChildReferenceLabels map
+// handed to the renderer directly. This is the path formrender's tests
+// can't reach: whether loadMasterDetailChildren/pageReferenceLabels
+// actually wire the lookup up end to end.
+func TestAPI_RenderRecordForm_MasterDetailReferenceColumnResolvesToLabel(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, purchaseOrderEntityDef(), purchaseOrderFormDef())
+	publishEntityAndForm(t, db, poLineWithItemRefEntityDef(), poLineWithItemRefFormDef())
+	publishEntityAndForm(t, db, itemEntityDef(), itemFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	itemReq := newRequest("POST", "/api/records/Item", tenantID, "farshid", []byte(`{"name":"Acme Widget"}`))
+	itemRec := httptest.NewRecorder()
+	mux.ServeHTTP(itemRec, itemReq)
+	var item struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(itemRec.Body.Bytes(), &item); err != nil {
+		t.Fatalf("unmarshal Item: %v", err)
+	}
+
+	poReq := newRequest("POST", "/api/records/PurchaseOrder", tenantID, "farshid", []byte(`{"vendor_id":"v1"}`))
+	poRec := httptest.NewRecorder()
+	mux.ServeHTTP(poRec, poReq)
+	var po struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(poRec.Body.Bytes(), &po); err != nil {
+		t.Fatalf("unmarshal PO: %v", err)
+	}
+
+	lineBody := []byte(`{"purchase_order_id":"` + po.Data.ID + `","item_id":"` + item.Data.ID + `","line_total":150.5}`)
+	lineReq := newRequest("POST", "/api/records/POLine", tenantID, "farshid", lineBody)
+	lineRec := httptest.NewRecorder()
+	mux.ServeHTTP(lineRec, lineReq)
+	if lineRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 creating POLine, got %d: %s", lineRec.Code, lineRec.Body.String())
+	}
+
+	formReq := newRequest("GET", "/forms/PurchaseOrder/"+po.Data.ID, tenantID, "farshid", nil)
+	formRec := httptest.NewRecorder()
+	mux.ServeHTTP(formRec, formReq)
+	if formRec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", formRec.Code, formRec.Body.String())
+	}
+	body := formRec.Body.String()
+	if !strings.Contains(body, "Acme Widget") {
+		t.Errorf("expected the master-detail item_id column resolved to the item's name, got:\n%s", body)
+	}
+	if strings.Contains(body, item.Data.ID) {
+		t.Errorf("expected the raw item id NOT to leak into the rendered form once a label was available, got:\n%s", body)
+	}
+}
+
+// TestAPI_RenderRecordForm_MasterDetailReferenceColumnFallsBackToRawIDWhenTargetUnreadable
+// (uc-infra#85): the RBAC-degrade path CLAUDE.md's multi-tenancy
+// discipline treats as highest-stakes — a viewer who can read
+// PurchaseOrder/POLine but NOT Item must still get a working form (200,
+// not an error, not a hidden section), with the unreadable reference's
+// cell falling back to the raw id exactly like an unresolvable/dangling
+// one already does (childCellValue's documented fallback), never a
+// label the viewer has no permission to see. formrender's own unit
+// tests already prove the RENDERER's fallback given a map that's
+// missing an entry; this proves the missing entry is what a real
+// CanRead denial actually produces end to end.
+func TestAPI_RenderRecordForm_MasterDetailReferenceColumnFallsBackToRawIDWhenTargetUnreadable(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := foundation.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	publishEntityAndForm(t, db, purchaseOrderEntityDef(), purchaseOrderFormDef())
+	publishEntityAndForm(t, db, poLineWithItemRefEntityDef(), poLineWithItemRefFormDef())
+	publishEntityAndForm(t, db, itemEntityDef(), itemFormDef())
+	// Entity-level RBAC opts in the moment ANY Permission row exists for
+	// ANY entity type in the tenant (authz.Resolver.resolve's
+	// rulesExist), so PurchaseOrder/POLine need their own explicit
+	// can_read=true grant for "restricted" once Item's row exists —
+	// otherwise this test would 403 on the form itself instead of
+	// isolating the one column under test.
+	seedEntityPermission(t, db, "restricted", "user-restricted", "Item", false, false)
+	seedEntityPermission(t, db, "restricted", "user-restricted", "PurchaseOrder", true, true)
+	seedEntityPermission(t, db, "restricted", "user-restricted", "POLine", true, true)
+
+	engine := crud.NewEngine(db)
+	item, err := engine.Create(ctx, itemEntityDef(), map[string]any{"name": "Acme Widget"}, humanActor())
+	if err != nil {
+		t.Fatalf("seed Item: %v", err)
+	}
+	po, err := engine.Create(ctx, purchaseOrderEntityDef(), map[string]any{"vendor_id": "v1"}, humanActor())
+	if err != nil {
+		t.Fatalf("seed PurchaseOrder: %v", err)
+	}
+	if _, err := engine.Create(ctx, poLineWithItemRefEntityDef(), map[string]any{
+		"purchase_order_id": po.ID, "item_id": item.ID, "line_total": 150.5,
+	}, humanActor()); err != nil {
+		t.Fatalf("seed POLine: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	formReq := newRequest("GET", "/forms/PurchaseOrder/"+po.ID, tenantID, "user-restricted", nil)
+	formRec := httptest.NewRecorder()
+	mux.ServeHTTP(formRec, formReq)
+	if formRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 (the form itself must still render even though one child column is unresolvable), got %d: %s", formRec.Code, formRec.Body.String())
+	}
+	body := formRec.Body.String()
+	if strings.Contains(body, "Acme Widget") {
+		t.Errorf("expected the item's name NOT to leak to a viewer without read access to Item, got:\n%s", body)
+	}
+	if !strings.Contains(body, item.ID) {
+		t.Errorf("expected the item_id column to fall back to the raw id when the target is unreadable, got:\n%s", body)
+	}
+}
+
 // TestAPI_ServesHTMXScript_Unauthenticated confirms /static/htmx.min.js
 // is reachable without dev-auth headers — it has to be, since the page
 // requesting it (a real browser navigating to a route DevAuth would

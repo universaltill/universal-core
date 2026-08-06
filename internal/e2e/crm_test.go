@@ -255,12 +255,16 @@ func TestCRM_PipelineListsAndCampaignRelatedList(t *testing.T) {
 	browser := browserCtx(t, tenantID)
 
 	// The campaign form's related list shows this campaign's lead and
-	// not the other one's.
+	// not the other one's. Scoped to .uc-related-list, not the whole
+	// form: a whole-form text assertion for a bare word like "New" would
+	// go silently vacuous the moment any unrelated "New…" copy landed
+	// elsewhere on the Campaign form (independent review, uc-infra#85
+	// follow-up) — the related list is the thing actually under test.
 	var relatedText string
 	if err := chromedp.Run(browser,
 		chromedp.Navigate(srv.URL+"/forms/Campaign/"+expoID),
 		chromedp.WaitVisible(`form.uc-form`, chromedp.ByQuery),
-		chromedp.Text(`form.uc-form`, &relatedText, chromedp.ByQuery),
+		chromedp.Text(`.uc-related-list`, &relatedText, chromedp.ByQuery),
 	); err != nil {
 		t.Fatalf("render campaign form: %v", err)
 	}
@@ -269,6 +273,29 @@ func TestCRM_PipelineListsAndCampaignRelatedList(t *testing.T) {
 	}
 	if strings.Contains(relatedText, "Mailer Respondent") {
 		t.Errorf("the related list leaked another campaign's lead — it is not filtered by campaign_id:\n%s", relatedText)
+	}
+	// uc-infra#85: the related list's own reference/enum columns must
+	// resolve to labels, not the raw stored campaign_id/status_id/source
+	// UUIDs and codes — the same asymmetry the opportunity form's picker
+	// assertions below cover for a top-level FIELD, but this section
+	// never went through that resolution at all before the fix.
+	// "Autumn Expo" is the campaign's own name (this campaign IS the one
+	// the form is open on); "New" is lead_status's seeded label for the
+	// "new" code every lead created above carries; "Event" is
+	// field.Lead.source.event, the FieldEnum branch (source: "event",
+	// set by mkLead above) — exercised only in a unit test before this,
+	// now covered in a real browser too.
+	if !strings.Contains(relatedText, "Autumn Expo") {
+		t.Errorf("the related list's campaign_id column shows a raw id instead of the campaign name:\n%s", relatedText)
+	}
+	if !strings.Contains(relatedText, "New") {
+		t.Errorf("the related list's status_id column shows a raw id instead of the status name:\n%s", relatedText)
+	}
+	if !strings.Contains(relatedText, "Event") {
+		t.Errorf("the related list's source column (FieldEnum) shows a raw code instead of its translated label:\n%s", relatedText)
+	}
+	if strings.Contains(relatedText, expoID) {
+		t.Errorf("the related list leaked a raw record id into its text content:\n%s", relatedText)
 	}
 
 	// The Lead list resolves campaign_id to the campaign's name. Lead
