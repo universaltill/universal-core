@@ -1608,6 +1608,59 @@ func (s *seeder) seedProjects(currencies, customers map[string]string) {
 		"status_id":    s.statusID("project_status", "active"),
 	})
 
+	// ProjectBudgetLine (uc-infra#79) is its own module-licensing check
+	// (a tenant provisioned before this change has no ProjectBudgetLine
+	// Definition published yet) placed before the TimeEntry dedup
+	// return below (not independent of it — this function still runs
+	// top to bottom — but seeding budget lines only AFTER that return
+	// would skip them entirely on any re-run once time entries already
+	// exist, which is exactly the ordering bug this placement avoids).
+	// category has no natural key of its own (two different projects
+	// could share a category), so this uses the same per-row `seen`
+	// idempotency pattern seedHR's AttendanceRecord block below uses
+	// (a `len(existing) == 0` all-or-nothing guard would leave a
+	// partial set stuck forever if a run died after creating some but
+	// not all rows — the two other seeders in this same function,
+	// Task's title-index and TimeEntry's own dedup, both avoid that for
+	// the same reason). The four lines deliberately sum to the
+	// project's own 75000.0 budget above: an advisory breakdown that
+	// happens to match the total in the demo data, without the two
+	// being structurally tied together (see the package doc comment on
+	// why Project.budget is not derived from these).
+	if hasPublished(s.ctx, s.entityDefs, "ProjectBudgetLine") {
+		lineDef := s.def("ProjectBudgetLine")
+		existingLines, err := s.crud.ListByField(s.ctx, lineDef, "project_id", projectID)
+		if err != nil {
+			log.Fatalf("list existing budget lines: %v", err)
+		}
+		seenCategory := map[string]bool{}
+		for _, rec := range existingLines {
+			if c, ok := rec.Data["category"].(string); ok {
+				seenCategory[c] = true
+			}
+		}
+		for _, l := range []struct {
+			category string
+			planned  float64
+		}{
+			{"labour", 45000.0},
+			{"materials", 15000.0},
+			{"travel", 5000.0},
+			{"other", 10000.0},
+		} {
+			if seenCategory[l.category] {
+				continue
+			}
+			if _, err := s.crud.Create(s.ctx, lineDef, map[string]any{
+				"project_id":     projectID,
+				"category":       l.category,
+				"planned_amount": l.planned,
+			}, s.actor); err != nil {
+				log.Fatalf("create ProjectBudgetLine(%s): %v", l.category, err)
+			}
+		}
+	}
+
 	// Task has no single-field natural key — its title is an i18n map,
 	// so getOrCreate's field lookup can't address it (an earlier draft
 	// tried, matched nothing, and duplicated every task on re-run; the

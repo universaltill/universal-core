@@ -268,6 +268,23 @@ func TestRelatedList_ColumnHeadersAreLocalized_RealBrowser(t *testing.T) {
 		t.Errorf("leave_type header cell (x=%.1f) is not aligned with its row's value cell (x=%.1f) -- header and data are not real columns", headerLeft, cellLeft)
 	}
 
+	// The leave_type CELL's own text, not just its geometry: leave_type
+	// is a FieldEnum, and until uc-infra#79's childCellValue fix a
+	// related_list enum cell rendered the raw stored string ("annual")
+	// regardless of locale — only the column HEADER label was ever
+	// translated. This is the regression pin for that fix on an
+	// EXISTING production screen (formrender/render.go's own doc
+	// comment on the fix points back here): independent review of that
+	// change found it silently altered this screen's rendering with no
+	// test proving it either way.
+	var leaveTypeCellText string
+	if err := chromedp.Run(browser, chromedp.Text(`.uc-related-cell[data-field="leave_type"]`, &leaveTypeCellText, chromedp.ByQuery)); err != nil {
+		t.Fatalf("read leave_type cell text: %v", err)
+	}
+	if got := strings.TrimSpace(leaveTypeCellText); got != "Yıllık" {
+		t.Errorf("expected the Turkish translation of leave_type=annual in the cell, got %q", got)
+	}
+
 	var rowText string
 	if err := chromedp.Run(browser, chromedp.Text(`.uc-related-list`, &rowText, chromedp.ByQuery)); err != nil {
 		t.Fatalf("read related list content: %v", err)

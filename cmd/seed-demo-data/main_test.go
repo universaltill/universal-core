@@ -293,7 +293,7 @@ func TestSeedDemoData_SeedsSampleRecordsAndIsIdempotent(t *testing.T) {
 		"Party", "Item", "PurchaseOrder", "SalesOrder", "CustomerInvoice",
 		"Account", "FiscalYear", "Period", "TaxCode", "CostCenter", "ReorderRule",
 		"FixedAsset", "DepreciationSchedule", "MaintenanceOrder",
-		"Project", "Task", "TimeEntry",
+		"Project", "Task", "TimeEntry", "ProjectBudgetLine",
 		"Employee", "LeaveRequest", "AttendanceRecord",
 		"Case", "Campaign", "Lead", "Opportunity",
 		"Facility", "InventoryItem", "StockTransfer",

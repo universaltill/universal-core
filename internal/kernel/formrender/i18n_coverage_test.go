@@ -265,18 +265,44 @@ func TestMasterDetailAndRollUpCatalogCoverage(t *testing.T) {
 			}
 			for _, f := range childDef.Fields {
 				key := "field." + childDef.EntityType + "." + f.Name
-				if seenKeys[key] {
+				if !seenKeys[key] {
+					seenKeys[key] = true
+					for _, locale := range locales {
+						if !hasRealTranslation(catalog, locale, key) {
+							t.Errorf("no %s translation for child column %q of entity %q (missing catalog key %q, "+
+								"rendered by a master_detail/related_list section on %q)",
+								locale, f.Name, childDef.EntityType, key, def.EntityType)
+						}
+					}
+					checkedFields++
+				}
+				// A FieldEnum child column's CELL value (not just its
+				// header) resolves through "field.{Entity}.{Field}.
+				// {Value}" too (formrender.childCellValue, uc-infra#79) —
+				// same convention buildFields' <select> options and
+				// listview.go's list-view cells already use. Uncaught
+				// before this, this loop only checked the header key
+				// above; a future module's enum child column could ship
+				// with the header translated and every row's actual
+				// value silently un-translated in every locale.
+				if f.Type != entity.FieldEnum {
 					continue
 				}
-				seenKeys[key] = true
-				for _, locale := range locales {
-					if !hasRealTranslation(catalog, locale, key) {
-						t.Errorf("no %s translation for child column %q of entity %q (missing catalog key %q, "+
-							"rendered by a master_detail/related_list section on %q)",
-							locale, f.Name, childDef.EntityType, key, def.EntityType)
+				for _, ev := range f.EnumValues {
+					key := "field." + childDef.EntityType + "." + f.Name + "." + ev
+					if seenKeys[key] {
+						continue
 					}
+					seenKeys[key] = true
+					for _, locale := range locales {
+						if !hasRealTranslation(catalog, locale, key) {
+							t.Errorf("no %s translation for child column %q's enum value %q of entity %q (missing catalog key %q, "+
+								"rendered by a master_detail/related_list section on %q)",
+								locale, f.Name, ev, childDef.EntityType, key, def.EntityType)
+						}
+					}
+					checkedFields++
 				}
-				checkedFields++
 			}
 
 			if s.RollUp == "" {

@@ -941,6 +941,74 @@ func TestRender_MasterDetailColumnsFallBackToRawFieldNameWhenUntranslated(t *tes
 	}
 }
 
+// TestRender_MasterDetailEnumCellIsLocalized (uc-infra#79's
+// childCellValue fix): a FieldEnum child column's CELL value, not just
+// its column header, resolves through the same "field.{EntityType}.
+// {FieldName}.{Value}" catalog key buildFields' <select> options
+// already use — before this, no composition child anywhere declared a
+// FieldEnum field, so a table cell holding one had never actually been
+// exercised. Uses ProjectBudgetLine's real, shipped catalog keys rather
+// than a synthetic fixture, so this pins the real production behavior,
+// not just the mechanism in isolation.
+func TestRender_MasterDetailEnumCellIsLocalized(t *testing.T) {
+	r := testRenderer(t)
+	childDef := &entity.Definition{
+		EntityType: "ProjectBudgetLine", Version: 1,
+		Fields: []entity.Field{
+			{Name: "category", Type: entity.FieldEnum, EnumValues: []string{"labour", "materials"}},
+		},
+	}
+	data := Data{
+		RecordID: "po-1",
+		Record:   map[string]any{"payment_method": "Wire"},
+		Children: map[string][]map[string]any{
+			"POLine": {{"category": "labour"}},
+		},
+		ChildDefs: map[string]*entity.Definition{"POLine": childDef},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "tr"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, `<td data-field="category">İşçilik</td>`) {
+		t.Errorf("expected the Turkish translation of category=labour in the cell, got:\n%s", out)
+	}
+	if strings.Contains(out, `>labour<`) {
+		t.Errorf("raw untranslated enum value leaked into a Turkish-locale cell, got:\n%s", out)
+	}
+}
+
+// TestRender_MasterDetailEnumCellFallsBackToRawValueWhenUntranslated:
+// same "additive, never breaks an unkeyed field" contract every other
+// TOrDefault fallback in this file already guarantees — an enum value
+// with no catalog entry renders as the raw stored string, not blank
+// and not a template error.
+func TestRender_MasterDetailEnumCellFallsBackToRawValueWhenUntranslated(t *testing.T) {
+	r := testRenderer(t)
+	childDef := &entity.Definition{
+		EntityType: "Untranslated", Version: 1,
+		Fields: []entity.Field{
+			{Name: "priority", Type: entity.FieldEnum, EnumValues: []string{"high", "low"}},
+		},
+	}
+	data := Data{
+		RecordID: "po-1",
+		Record:   map[string]any{"payment_method": "Wire"},
+		Children: map[string][]map[string]any{
+			"POLine": {{"priority": "high"}},
+		},
+		ChildDefs: map[string]*entity.Definition{"POLine": childDef},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if !strings.Contains(buf.String(), `<td data-field="priority">high</td>`) {
+		t.Errorf("expected an untranslated enum cell to fall back to its raw value, got:\n%s", buf.String())
+	}
+}
+
 func TestRender_MasterDetailEmptyShowsI18nMessage(t *testing.T) {
 	r := testRenderer(t)
 	data := Data{Record: map[string]any{"payment_method": "Wire"}, Children: map[string][]map[string]any{}}

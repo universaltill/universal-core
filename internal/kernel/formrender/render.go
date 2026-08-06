@@ -823,7 +823,11 @@ func childCellValue(child map[string]any, name string, childDef *entity.Definiti
 	if childDef == nil || catalog == nil {
 		return v
 	}
-	if f, ok := childDef.FieldByName(name); ok && f.Type == entity.FieldI18nText {
+	f, ok := childDef.FieldByName(name)
+	if !ok {
+		return v
+	}
+	if f.Type == entity.FieldI18nText {
 		if s, ok := catalog.ResolveLocalized(v, locale); ok {
 			return s
 		}
@@ -831,6 +835,44 @@ func childCellValue(child map[string]any, name string, childDef *entity.Definiti
 		// map — a missing translation is not something to show as Go
 		// syntax.
 		return nil
+	}
+	if f.Type == entity.FieldEnum {
+		// Same "field.{EntityType}.{FieldName}.{Value}" convention
+		// buildFields' <select> option labels (see the FieldEnum case
+		// there) and internal/api/listview.go's top-level list-view
+		// cells already resolve through — not a new convention, just a
+		// third caller of it.
+		//
+		// This closes a real gap, but only for COMPOSITION children:
+		// until this, no composition child anywhere declared a FieldEnum
+		// column (POLine/SOLine/GoodsReceiptLine/RequestForQuotationLine/
+		// RequestForQuotationVendor/DepreciationSchedule/Task — none of
+		// them have one), so a master-detail table cell holding an enum
+		// value had always silently rendered the raw stored string (e.g.
+		// "labour") regardless of viewer locale. ProjectBudgetLine.category
+		// (uc-infra#79) is the first, and this closes the gap for that
+		// case generically rather than shipping a table only correct in
+		// English.
+		//
+		// It is NOT the first enum column in a RELATED LIST, though —
+		// this function serves both buildChildRows callers (master_detail
+		// and related_list use the identical helper), and three existing
+		// production related lists already show an enum child column:
+		// assets.FixedAssetForm's Maintenance History
+		// (MaintenanceOrder.maintenance_type), crm.CampaignForm's Leads
+		// (Lead.source), hr.EmployeeForm's Leave History
+		// (LeaveRequest.leave_type). Their CELL values (not just their
+		// headers, which already resolved via childColumns) start
+		// rendering translated the moment this lands — a real,
+		// previously-untested behavior change to those three screens,
+		// caught by independent review of this change. See
+		// TestRelatedList_ColumnHeadersAreLocalized_RealBrowser's
+		// leave_type CELL-text assertion (internal/e2e/related_list_
+		// test.go) for the regression pin — it already exercised this
+		// exact cell for geometry; that test now also asserts the text.
+		if s, ok := v.(string); ok {
+			return catalog.TOrDefault(locale, "field."+childDef.EntityType+"."+name+"."+s, s)
+		}
 	}
 	return v
 }
