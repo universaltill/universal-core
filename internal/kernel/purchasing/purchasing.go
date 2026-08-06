@@ -343,22 +343,38 @@ func StockTransfer() *entity.Definition {
 // so a StatusType/StatusTransition seed (PublishStatuses' own pattern)
 // would be pure ceremony with no real transition to enforce.
 //
-// Deliberately NOT built in this pass, a real next step not forgotten
-// (QUEUE.md): actually incrementing InventoryItem.qty_on_hand when a
-// GoodsReceiptLine is created. That's a genuine business-logic side
-// effect (concurrency-safe, idempotent against re-edits) worth its own
-// careful pass, not something to bolt onto a first CRUD slice — this
-// entity is real, tenant-visible, importable/reportable data on its own
-// even before that wiring exists, the same way POLine was useful before
-// PurchaseOrder.total's roll-up existed.
+// facility_id (v2, uc-infra#54, executing the decision ADR-0015 §5
+// already made and deliberately deferred here) is what makes the
+// GoodsReceipt→InventoryItem wiring below possible at all: a receipt
+// records WHERE goods arrived, not just that they did. Required, not
+// optional — an optional facility would let a receipt exist that cannot
+// say which InventoryItem row its own PostGoodsReceiptLineToLedger hook
+// (ledger.go) should credit, the same "hint attached, not really keyed"
+// problem ADR-0015 §2 rejected for InventoryItem itself. A GoodsReceipt
+// written before v2 has none and needs
+// cmd/backfill-goods-receipt-facility run once, same shape as
+// cmd/backfill-inventory-facility.
+//
+// The now-built wiring this field exists for: PostGoodsReceiptLineToLedger
+// (ledger.go) creates a new InventoryItem row — item_id from the line,
+// facility_id from here — crediting qty_on_hand (and
+// qty_available_to_promise, since nothing in this kernel yet reserves
+// against ATP separately) by the received quantity, in the same
+// transaction as the GoodsReceiptLine write and its ledger posting. See
+// that function's own doc comment for why a new row, not an
+// upsert-in-place. reporting.OnOrderQtyByItem was updated in the same
+// commit to net against what this wiring now records (uc-infra#54's own
+// prerequisite-coupling requirement) — the two ship together or the
+// on-hand+on-order position double-counts the moment either lands alone.
 func GoodsReceipt() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "GoodsReceipt",
-		Version:    1,
+		Version:    2,
 		Module:     "purchasing",
 		Fields: []entity.Field{
 			{Name: "purchase_order_id", Type: entity.FieldReference, Required: true, Target: "PurchaseOrder"},
 			{Name: "received_date", Type: entity.FieldDate, Required: true},
+			{Name: "facility_id", Type: entity.FieldReference, Required: true, Target: "Facility"},
 			{Name: "notes", Type: entity.FieldString},
 		},
 		Relationships: []entity.Relationship{

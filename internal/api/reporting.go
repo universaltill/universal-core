@@ -50,6 +50,11 @@ var poStatusDisplayOrder = []string{"draft", "submitted", "approved", "received"
 // and the reorder-signal section reads ReorderRule (via the guarded
 // engine, which would enforce this anyway — listed here too so the
 // whole-page gate stays one honest unit).
+// uc-infra#54's addition: OnOrderQtyByItem's netting subquery now also
+// reads GoodsReceiptLine.qty_received — a role denied read on
+// GoodsReceiptLine would otherwise still see its effect leak through
+// every netted on-order quantity in this report, even with
+// GoodsReceiptLine itself correctly gated everywhere else.
 // Missing a join target here is a real leak, not a cosmetic gap: a role
 // denied read on Status alone would otherwise still see every status
 // label and count in the breakdown even with PurchaseOrder itself
@@ -60,7 +65,7 @@ var poStatusDisplayOrder = []string{"draft", "submitted", "approved", "received"
 // the report, which is a separate, still-deferred design problem (there
 // is no entity.Definition for a hand-written aggregate to filter
 // against).
-var purchasingReportEntityTypes = []string{"PurchaseOrder", "Status", "Party", "InventoryItem", "Item", "POLine", "GoodsReceipt", "ReorderRule"}
+var purchasingReportEntityTypes = []string{"PurchaseOrder", "Status", "Party", "InventoryItem", "Item", "POLine", "GoodsReceipt", "GoodsReceiptLine", "ReorderRule"}
 
 // requireReportRead denies the whole report page unless the actor can
 // read every one of entityTypes, reusing ts.crud.CanRead (the same

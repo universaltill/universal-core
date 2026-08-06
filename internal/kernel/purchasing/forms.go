@@ -361,6 +361,7 @@ func GoodsReceiptForm() *form.Definition {
 				Fields: []form.FormField{
 					{Name: "purchase_order_id", Label: "Purchase Order"},
 					{Name: "received_date", Label: "Received Date"},
+					{Name: "facility_id", Label: "Facility"},
 					{Name: "notes", Label: "Notes"},
 				},
 			},

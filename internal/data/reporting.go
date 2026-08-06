@@ -18,6 +18,19 @@ import (
 // whole report" into "one bad row is silently excluded from it."
 const uuidPattern = `^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`
 
+// numericPattern is uuidPattern's own reasoning applied to a
+// FieldNumber instead of a FieldReference (uc-infra#54's netting
+// subquery is this file's first cast of a JSONB text value to
+// `::numeric` — every existing numeric cast here, e.g. `qty`/`unit_price`,
+// predates this guard and is a separately-tracked pre-existing gap, not
+// something this pattern retrofits everywhere at once): a malformed or
+// non-numeric value would abort the aggregate for every other valid row
+// with it. Accepts an optional leading `-` (a negative FieldNumber is
+// still a well-formed number, even though #80's missing Min concept
+// means one should not have reached storage) and an optional decimal
+// part.
+const numericPattern = `^-?[0-9]+(\.[0-9]+)?$`
+
 // ReportingRepo holds the read-only aggregate queries behind the
 // management reporting workbench (internal/api/reporting.go). Unlike
 // every other repo in this package, these queries are inherently
@@ -353,36 +366,91 @@ func (r *ReportingRepo) CompletedPOLeadTimes(ctx context.Context) ([]CompletedPO
 }
 
 // OnOrderQtyByItem sums POLine.qty per item over PurchaseOrders whose
-// status code is submitted or approved — the "on order" half of an
-// inventory position (issue #30's BA note R3). Deliberately kept
-// simple, per the Architect design: received and cancelled orders are
-// excluded wholesale (their goods either already count in qty_on_hand
-// or are never coming), drafts too (nothing is committed yet), and no
-// per-line received-qty netting is attempted — partial receipt against
-// a still-open PO is beyond this first worked example. Returned as a
-// map (item id -> qty) because every caller is a lookup, not a table.
-// Items with no open PO simply have no entry. Same uuidPattern guard as
-// every other join in this file, on all three reference hops.
+// status code is submitted or approved, NET of whatever has already
+// been received against each line — the "on order" half of an
+// inventory position (issue #30's BA note R3). Received and cancelled
+// orders are excluded wholesale (their goods either already count in
+// qty_on_hand or are never coming), drafts too (nothing is committed
+// yet).
+//
+// **Per-line netting against GoodsReceiptLine.qty_received** (uc-infra#54,
+// shipped in the same commit as the GoodsReceipt→InventoryItem wiring
+// it exists to stay correct against — see purchasing.GoodsReceipt's own
+// doc comment on why the two cannot ship separately): the moment
+// receiving credits qty_on_hand, a still-open PO's remaining line qty is
+// its ordered qty minus whatever that line has already received, not
+// the full ordered qty — otherwise a partially-received but still-open
+// PO double-counts the delivered portion on both sides of
+// on_hand + on_order. Netted PER LINE and floored at zero per line
+// (GREATEST) before summing per item, not netted at the item-total
+// level: flooring after summing would let an over-received line mask a
+// genuinely under-received one for the same item. Returned as a map
+// (item id -> qty) because every caller is a lookup, not a table. Items
+// with no open PO simply have no entry.
+//
+// The netting subquery guards THREE things independently, each a real,
+// separately-reachable bad-data case, not belt-and-suspenders for the
+// same one:
+//   - `numericPattern` on `qty_received` before the cast — same
+//     uuidPattern reasoning (this file's own doc comment above), applied
+//     to a numeric field for the first time: a CSV import or a
+//     hand-written Go caller can write anything into a JSONB text value,
+//     and an unguarded `::numeric` cast here would 500 the whole report
+//     over one bad row, same as an unguarded `::uuid` cast would.
+//   - a received qty is floored at zero (per line, via the inner
+//     `greatest(sum(...), 0)`) before it ever nets against the ordered
+//     qty — a negative `qty_received` (no Min concept exists yet, #80)
+//     must never REDUCE what counts as received, which would inflate
+//     remaining/on-order instead of the (still real, still worth fixing
+//     via #80) harm being confined to the receipt-side numbers.
+//   - the joined GoodsReceipt itself (not just the GoodsReceiptLine) must
+//     be live: `crud.Engine.Delete` does not cascade to composition
+//     children (internal/kernel/crud/crud.go), so a soft-deleted
+//     GoodsReceipt would otherwise leave its lines still netting down
+//     on-order and still crediting InventoryItem forever.
+//
+// Same uuidPattern guard as every other join in this file, now on five
+// reference hops (po_line_id and goods_receipt_id in the netting
+// subquery, in addition to the three PurchaseOrder/Status hops above).
 func (r *ReportingRepo) OnOrderQtyByItem(ctx context.Context) (map[string]float64, error) {
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT l.data->>'item_id', coalesce(sum((l.data->>'qty')::numeric), 0)
-		 FROM records l
-		 JOIN records po
-		   ON po.entity_type = 'PurchaseOrder'
-		  AND po.deleted_at IS NULL
-		  AND po.id = (l.data->>'purchase_order_id')::uuid
-		 JOIN records st
-		   ON st.entity_type = 'Status'
-		  AND st.deleted_at IS NULL
-		  AND st.id = (po.data->>'status_id')::uuid
-		 WHERE l.entity_type = 'POLine'
-		   AND l.deleted_at IS NULL
-		   AND l.data->>'purchase_order_id' ~ $1
-		   AND l.data->>'item_id' ~ $1
-		   AND po.data->>'status_id' ~ $1
-		   AND st.data->>'code' IN ('submitted', 'approved')
-		 GROUP BY l.data->>'item_id'`,
-		uuidPattern,
+		`SELECT sub.item_id, coalesce(sum(greatest(sub.remaining_qty, 0)), 0)
+		 FROM (
+			 SELECT l.data->>'item_id' AS item_id,
+			        (l.data->>'qty')::numeric - coalesce(gr.received_qty, 0) AS remaining_qty
+			 FROM records l
+			 JOIN records po
+			   ON po.entity_type = 'PurchaseOrder'
+			  AND po.deleted_at IS NULL
+			  AND po.id = (l.data->>'purchase_order_id')::uuid
+			 JOIN records st
+			   ON st.entity_type = 'Status'
+			  AND st.deleted_at IS NULL
+			  AND st.id = (po.data->>'status_id')::uuid
+			 LEFT JOIN (
+				 SELECT (grl.data->>'po_line_id')::uuid AS po_line_id,
+				        greatest(sum((grl.data->>'qty_received')::numeric), 0) AS received_qty
+				 FROM records grl
+				 JOIN records gr
+				   ON gr.entity_type = 'GoodsReceipt'
+				  AND gr.deleted_at IS NULL
+				  AND gr.id = (grl.data->>'goods_receipt_id')::uuid
+				 WHERE grl.entity_type = 'GoodsReceiptLine'
+				   AND grl.deleted_at IS NULL
+				   AND grl.data->>'po_line_id' ~ $1
+				   AND grl.data->>'goods_receipt_id' ~ $1
+				   AND grl.data->>'qty_received' ~ $2
+				 GROUP BY (grl.data->>'po_line_id')::uuid
+			 ) gr ON gr.po_line_id = l.id
+			 WHERE l.entity_type = 'POLine'
+			   AND l.deleted_at IS NULL
+			   AND l.data->>'purchase_order_id' ~ $1
+			   AND l.data->>'item_id' ~ $1
+			   AND po.data->>'status_id' ~ $1
+			   AND st.data->>'code' IN ('submitted', 'approved')
+		 ) sub
+		 GROUP BY sub.item_id`,
+		uuidPattern, numericPattern,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("on-order qty by item: %w", err)

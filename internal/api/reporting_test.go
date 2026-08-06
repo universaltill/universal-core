@@ -603,13 +603,14 @@ func TestAPI_PurchasingReport_EntityTypeListMatchesTheActualQueries(t *testing.T
 	// StockoutRiskItems reads InventoryItem and joins Item;
 	// CompletedPOLeadTimes (#30) reads PurchaseOrder and joins Party and
 	// GoodsReceipt; OnOrderQtyByItem reads POLine joined to PurchaseOrder
-	// and Status; OnHandQtyByItem reads InventoryItem;
+	// and Status, and (uc-infra#54) its netting subquery joins
+	// GoodsReceiptLine; OnHandQtyByItem reads InventoryItem;
 	// LatestPOVendorByItem reads POLine joined to PurchaseOrder;
 	// buildReorderSignals reads ReorderRule and Item through the guarded
 	// engine.
 	want := map[string]bool{
 		"PurchaseOrder": true, "Status": true, "Party": true, "InventoryItem": true, "Item": true,
-		"POLine": true, "GoodsReceipt": true, "ReorderRule": true,
+		"POLine": true, "GoodsReceipt": true, "GoodsReceiptLine": true, "ReorderRule": true,
 	}
 	got := make(map[string]bool, len(purchasingReportEntityTypes))
 	for _, et := range purchasingReportEntityTypes {

@@ -450,9 +450,42 @@ func TestGoodsReceipt_ReferencesPurchaseOrder(t *testing.T) {
 
 func TestGoodsReceipt_MissingRequiredReceivedDate(t *testing.T) {
 	def := GoodsReceipt()
-	data := map[string]any{"purchase_order_id": "po-1"}
+	data := map[string]any{"purchase_order_id": "po-1", "facility_id": "facility-1"}
 	if err := entity.ValidateRecord(def, data); err == nil {
 		t.Fatal("expected error for missing required received_date")
+	}
+}
+
+// TestGoodsReceipt_ReferencesFacility (v2, uc-infra#54) confirms
+// GoodsReceipt records WHERE goods arrived — required, since
+// PostGoodsReceiptLineToLedger (ledger.go) has no other way to know
+// which facility's InventoryItem to credit. Same shape as
+// TestGoodsReceipt_ReferencesPurchaseOrder above.
+func TestGoodsReceipt_ReferencesFacility(t *testing.T) {
+	def := GoodsReceipt()
+	f, ok := def.FieldByName("facility_id")
+	if !ok || f.Type != entity.FieldReference || f.Target != "Facility" || !f.Required {
+		t.Fatalf("expected a Required facility_id FieldReference targeting Facility, got %+v", f)
+	}
+}
+
+func TestGoodsReceipt_MissingRequiredFacilityID(t *testing.T) {
+	def := GoodsReceipt()
+	data := map[string]any{"purchase_order_id": "po-1", "received_date": "2026-01-01"}
+	if err := entity.ValidateRecord(def, data); err == nil {
+		t.Fatal("expected error for missing required facility_id")
+	}
+}
+
+// TestGoodsReceipt_VersionBumpedForFacilityID guards against silently
+// forgetting to bump Version the next time this Definition's fields
+// change — #117's own tracked gap (no fingerprint/hash test catches
+// this generally yet) means this is the one explicit check for THIS
+// entity until that lands. v1->v2 added facility_id.
+func TestGoodsReceipt_VersionBumpedForFacilityID(t *testing.T) {
+	def := GoodsReceipt()
+	if def.Version != 2 {
+		t.Fatalf("expected GoodsReceipt Version 2 after adding facility_id, got %d", def.Version)
 	}
 }
 
@@ -494,6 +527,29 @@ func TestGoodsReceiptLine_MissingRequiredQtyReceived(t *testing.T) {
 	if err := entity.ValidateRecord(def, data); err == nil {
 		t.Fatal("expected error for missing required qty_received")
 	}
+}
+
+// TestGoodsReceiptForm_HeaderIncludesFacility (uc-infra#54) confirms the
+// form actually exposes the new required facility_id field — a Required
+// entity field with no form field is unreachable through the UI, the
+// same gap independent review has caught elsewhere in this codebase.
+func TestGoodsReceiptForm_HeaderIncludesFacility(t *testing.T) {
+	f := GoodsReceiptForm()
+	var header *form.Section
+	for i := range f.Sections {
+		if f.Sections[i].Component == form.ComponentFields {
+			header = &f.Sections[i]
+		}
+	}
+	if header == nil {
+		t.Fatal("expected a fields section")
+	}
+	for _, ff := range header.Fields {
+		if ff.Name == "facility_id" {
+			return
+		}
+	}
+	t.Fatalf("expected facility_id in the Header section fields, got %+v", header.Fields)
 }
 
 // TestGoodsReceiptForm_MasterDetailTargetsGoodsReceiptLine mirrors

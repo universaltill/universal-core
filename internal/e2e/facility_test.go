@@ -10,6 +10,8 @@ import (
 	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
+	"github.com/universaltill/universal-core/internal/kernel/foundation"
+	"github.com/universaltill/universal-core/internal/kernel/purchasing"
 )
 
 // TestFacility_ListFormAndInventoryPicker (#12) drives the surface the
@@ -124,5 +126,82 @@ func TestFacility_ListFormAndInventoryPicker(t *testing.T) {
 	}
 	if facilityLabel != "Main Warehouse" {
 		t.Errorf("facility picker shows %q, want the facility name — a UUID here is the #16 regression", facilityLabel)
+	}
+}
+
+// TestGoodsReceiptForm_FacilityPickerRendersByName (uc-infra#54) is
+// TestFacility_ListFormAndInventoryPicker's own reasoning applied to
+// GoodsReceipt's new required facility_id (v2): a Definition-shape test
+// (purchasing_test.go's TestGoodsReceiptForm_HeaderIncludesFacility)
+// proves the field exists on the form, never that the reference picker
+// actually renders the facility by name rather than a raw UUID in the
+// real browser a buyer uses to log a receipt. Both entities got the
+// facility dimension in the same doc comment (ADR-0015 §5); only
+// InventoryItem had browser coverage for it until now.
+func TestGoodsReceiptForm_FacilityPickerRendersByName(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, tenantDB := testServer(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	// testServer publishes entities/forms but not the status graph —
+	// PurchaseOrder.status_id needs real Status records to point at
+	// (same setup purchasing_report_test.go's own comment describes).
+	if err := purchasing.PublishStatuses(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("PublishStatuses: %v", err)
+	}
+	engine := crud.NewEngine(tenantDB)
+
+	facility, err := engine.Create(ctx, purchasing.Facility(), map[string]any{
+		"code": "MAIN", "name": "Main Warehouse", "facility_type": "warehouse", "is_active": true,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create Facility: %v", err)
+	}
+	vendor, err := engine.Create(ctx, foundation.Party(), map[string]any{
+		"name": "GR E2E Vendor", "party_type": "organization", "status": "active",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create vendor Party: %v", err)
+	}
+	if _, err := engine.Create(ctx, foundation.PartyRole(), map[string]any{
+		"party_id": vendor.ID, "role_type": "vendor",
+	}, actor); err != nil {
+		t.Fatalf("create vendor PartyRole: %v", err)
+	}
+	draftID := publishedStatusID(t, tenantDB, "purchase_order_status", "draft")
+	po, err := engine.Create(ctx, purchasing.PurchaseOrder(), map[string]any{
+		"po_number": "PO-E2E-1", "vendor_id": vendor.ID, "order_date": "2026-01-01",
+		"status_id": draftID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create PurchaseOrder: %v", err)
+	}
+	// No GoodsReceiptLine created — this test only needs the header form
+	// to render, not the ledger/InventoryItem-crediting hook, which has
+	// its own dedicated coverage in internal/kernel/purchasing/ledger_test.go.
+	gr, err := engine.Create(ctx, purchasing.GoodsReceipt(), map[string]any{
+		"purchase_order_id": po.ID, "received_date": "2026-01-10", "facility_id": facility.ID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create GoodsReceipt: %v", err)
+	}
+
+	browser := browserCtx(t, tenantID)
+	var facilityLabel string
+	if err := chromedp.Run(browser,
+		chromedp.Navigate(srv.URL+"/forms/GoodsReceipt/"+gr.ID),
+		chromedp.WaitVisible(`form.uc-form`, chromedp.ByQuery),
+		chromedp.Evaluate(`(() => {
+			const wrap = document.querySelector('form.uc-form .uc-ref[data-field="facility_id"]');
+			if (!wrap) return '<no facility picker on the goods receipt form>';
+			const box = wrap.querySelector('.uc-ref-search');
+			return box ? box.value : '<no search box>';
+		})()`, &facilityLabel),
+	); err != nil {
+		t.Fatalf("render goods receipt form: %v", err)
+	}
+	if facilityLabel != "Main Warehouse" {
+		t.Errorf("facility picker shows %q, want the facility name — a raw UUID here is the same #16-class regression TestFacility_ListFormAndInventoryPicker guards for InventoryItem", facilityLabel)
 	}
 }

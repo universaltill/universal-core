@@ -1,24 +1,38 @@
-// Command backfill-inventory-facility stamps a facility_id onto every
-// InventoryItem written before that field existed.
+// Command backfill-goods-receipt-facility stamps a facility_id onto
+// every GoodsReceipt written before that field existed.
 //
-// InventoryItem v3 (#12, ADR-0015) added a REQUIRED facility_id, giving
-// the entity the (item, facility) key reference-data-model.md §3 always
-// described. Required-ness is the point of the change — an optional
-// facility would make "stock at no location" a permanently legal state
-// — but it means every row written under v2 is invalid until stamped.
+// GoodsReceipt v2 (uc-infra#54, executing ADR-0015 §5's deferred
+// decision) added a REQUIRED facility_id — what makes
+// purchasing.PostGoodsReceiptLineToLedger's InventoryItem-crediting
+// wiring possible at all: a receipt has to say WHERE goods arrived, not
+// just that they did. Required-ness is the point, same reasoning as
+// InventoryItem's own v3 migration (cmd/backfill-inventory-facility) —
+// but it means every row written under v1 is invalid until stamped.
 // Reads are unaffected (entity.ValidateRecord runs on write), so the
-// practical window is between publishing v3 and running this.
+// practical window is between publishing v2 and running this.
 //
-// **The assumption this migration makes, stated plainly: all
-// pre-existing stock was at one location.** That is safe by
-// construction rather than by luck — the v2 model had no location
-// dimension, so there is no other answer it could have had. Every
-// facility-less row lands on one facility, get-or-created by
-// -facility-code.
+// **The assumption this migration makes, stated plainly: every
+// pre-existing GoodsReceipt arrived at one location.** Safe by
+// construction, not by luck — the v1 model had no location dimension to
+// disagree with. Every facility-less row lands on one facility,
+// get-or-created by -facility-code — same default (MAIN) as
+// cmd/backfill-inventory-facility, and deliberately the SAME shared
+// purchasing.GetOrCreateFacility helper, so a tenant that runs both
+// backfills with default flags ends up with pre-existing stock and
+// pre-existing receipts pointing at the identical Facility row rather
+// than two coincidentally-named ones.
 //
 // Idempotent: a record that already has a facility_id is left alone, so
 // re-running after a partial failure, or against an already-migrated
 // tenant, is safe. Supports -dry-run.
+//
+// **Deliberately does NOT retroactively credit InventoryItem** for
+// receipts that predate the wiring. That is a second, materially
+// different decision (would it double-count against stock a tenant
+// already corrected by hand in the gap before this landed?) that this
+// migration does not make silently — it only makes GoodsReceipt records
+// valid again, the same narrow scope cmd/backfill-inventory-facility has
+// for InventoryItem itself.
 //
 // The shared loop is internal/kernel/recordmigrate — see that package
 // on why validation runs before the dry-run branch, and why a bad
@@ -26,7 +40,7 @@
 //
 // DATABASE_URL must point directly at the target tenant's own database
 // (ADR-0003, database-per-tenant), same as
-// cmd/backfill-purchase-order-status — neither tool has control-plane
+// cmd/backfill-inventory-facility — neither tool has control-plane
 // routing of its own.
 package main
 
@@ -54,39 +68,12 @@ func main() {
 		log.Fatal("DATABASE_URL is required")
 	}
 	actorID := flag.String("actor-id", "", "audit actor id for every record this updates (required)")
-	// An unattended pipeline backfill run is an ai_agent actor, and
-	// ADR-0001 §14 makes that distinction first-class — hard-coding
-	// ActorHuman would write a falsified actor_type onto every record
-	// this command migrates (uc-infra#72/#123, same shape as
-	// cmd/provision-tenant's fix).
-	actorType := flag.String("actor-type", string(audit.ActorHuman), "audit actor type: human | ai_agent")
-	modelVersion := flag.String("model-version", "", "model version, required when -actor-type is ai_agent")
-	facilityCode := flag.String("facility-code", "MAIN", "code of the Facility to assign pre-existing stock to; created if absent")
+	facilityCode := flag.String("facility-code", "MAIN", "code of the Facility to assign pre-existing receipts to; created if absent")
 	facilityName := flag.String("facility-name", "Main Warehouse", "name used only when the facility is created")
 	dryRun := flag.Bool("dry-run", false, "report what would change without writing anything")
 	flag.Parse()
 	if *actorID == "" {
 		log.Fatal("-actor-id is required")
-	}
-	// Resolved and checked before any database work: an operator who
-	// mistyped the actor should learn that immediately, not after the
-	// connection already ran (same discipline as cmd/provision-tenant).
-	actor := audit.Actor{Type: audit.ActorType(*actorType), ID: *actorID, ModelVersion: *modelVersion}
-	switch actor.Type {
-	case audit.ActorHuman, audit.ActorAgent:
-	default:
-		log.Fatalf("invalid actor: -actor-type must be %q or %q, got %q", audit.ActorHuman, audit.ActorAgent, *actorType)
-	}
-	// A human actor carrying a model version is the same class of
-	// falsified audit metadata this fix exists to prevent the other
-	// way around (uc-infra#72 independent review) — Validate() alone
-	// only rejects an EMPTY ModelVersion on an agent, never a populated
-	// one on a human, so that half of the mistake needs its own check.
-	if actor.Type == audit.ActorHuman && *modelVersion != "" {
-		log.Fatalf("invalid actor: -model-version is only meaningful when -actor-type is %q", audit.ActorAgent)
-	}
-	if err := actor.Validate(); err != nil {
-		log.Fatalf("invalid actor: %v", err)
 	}
 
 	sqlDB, err := sql.Open("pgx", dbURL)
@@ -99,19 +86,20 @@ func main() {
 	}
 
 	ctx := context.Background()
+	actor := audit.Actor{Type: audit.ActorHuman, ID: *actorID}
 	entityDefs := data.NewEntityDefinitionRepo(sqlDB)
 	engine := crud.NewEngine(sqlDB)
 
-	invDef, err := publishedDef(ctx, entityDefs, "InventoryItem")
+	grDef, err := publishedDef(ctx, entityDefs, "GoodsReceipt")
 	if err != nil {
-		log.Fatalf("look up InventoryItem definition: %v", err)
+		log.Fatalf("look up GoodsReceipt definition: %v", err)
 	}
-	if _, ok := invDef.FieldByName("facility_id"); !ok {
-		log.Fatal("the published InventoryItem definition has no facility_id field — publish v3 for this tenant first (cmd/provision-tenant does this)")
+	if _, ok := grDef.FieldByName("facility_id"); !ok {
+		log.Fatal("the published GoodsReceipt definition has no facility_id field — publish v2 for this tenant first (cmd/provision-tenant does this)")
 	}
 	facilityDef, err := publishedDef(ctx, entityDefs, "Facility")
 	if err != nil {
-		log.Fatalf("look up Facility definition (publish purchasing v3 for this tenant first): %v", err)
+		log.Fatalf("look up Facility definition (publish purchasing v3+ for this tenant first): %v", err)
 	}
 
 	facilityID, created, err := purchasing.GetOrCreateFacility(ctx, engine, facilityDef, *facilityCode, *facilityName, *dryRun, actor)
@@ -127,7 +115,7 @@ func main() {
 		log.Printf("using existing Facility %q: %s", *facilityCode, facilityID)
 	}
 
-	res, err := recordmigrate.Run(ctx, engine, invDef,
+	res, err := recordmigrate.Run(ctx, engine, grDef,
 		func(rec data.Record) (map[string]any, recordmigrate.Action, string) {
 			if fid, ok := rec.Data["facility_id"].(string); ok && fid != "" {
 				return nil, recordmigrate.AlreadyDone, ""
@@ -143,14 +131,14 @@ func main() {
 		recordmigrate.Options{DryRun: *dryRun, Logf: log.Printf},
 	)
 	if err != nil {
-		log.Fatalf("backfill InventoryItem facility: %v", err)
+		log.Fatalf("backfill GoodsReceipt facility: %v", err)
 	}
 
 	verb := "Migrated"
 	if *dryRun {
 		verb = "Would migrate"
 	}
-	fmt.Printf("%s %d InventoryItem record(s); %d already had facility_id; %d skipped for manual review.\n",
+	fmt.Printf("%s %d GoodsReceipt record(s); %d already had facility_id; %d skipped for manual review.\n",
 		verb, res.Migrated, res.AlreadyDone, res.Skipped)
 }
 
