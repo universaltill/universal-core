@@ -537,13 +537,25 @@ type GoodsReceiptLineQuality struct {
 }
 
 // GoodsReceiptLineQualities returns every GoodsReceiptLine resolvable to
-// a PurchaseOrder (via its GoodsReceipt's purchase_order_id), regardless
-// of whether it carries quality data — same "return everything, let the
-// forecast package decide validity" shape CompletedPOLeadTimes already
-// uses for on-time samples. The vendor join is LEFT and compares
-// id::text (not ::uuid-cast), so a line whose PO has a malformed or
-// absent vendor_id still contributes its quality data to the OVERALL
-// aggregate with an empty VendorID, rather than being dropped — the same
+// a live (non-deleted) PurchaseOrder via its GoodsReceipt's
+// purchase_order_id, regardless of whether the line carries quality
+// data — same "return everything, let the forecast package decide
+// validity" shape CompletedPOLeadTimes already uses for on-time samples.
+//
+// The GoodsReceipt and PurchaseOrder hops are INNER joins with
+// deleted_at IS NULL, deliberately: a line whose GoodsReceipt or
+// PurchaseOrder no longer exists (soft-deleted) is excluded, matching
+// CompletedPOLeadTimes' own precedent of requiring PurchaseOrder itself
+// to be a live record rather than treating a deleted one as still-valid
+// business history. This is NARROWER than the vendor hop below — a
+// correction, not the same rule applied twice (independent review of
+// uc-infra#82 caught an earlier doc comment overclaiming "never
+// dropped" here, which was only ever true of the vendor hop).
+//
+// The vendor join, in contrast, IS LEFT and compares id::text (not
+// ::uuid-cast): a line whose LIVE PO has a malformed or absent
+// vendor_id still contributes its quality data to the OVERALL aggregate
+// with an empty VendorID, rather than being dropped — the same
 // reasoning CompletedPOLeadTimes' own vendor join gives. The
 // GoodsReceipt/PurchaseOrder hops DO need the uuidPattern guard: unlike
 // the vendor hop, these are ::uuid casts (a malformed goods_receipt_id

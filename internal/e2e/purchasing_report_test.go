@@ -235,7 +235,7 @@ func TestPurchasingReport_QualitySection_RealBrowser(t *testing.T) {
 	engine.SetHook("GoodsReceiptLine", purchasing.PostGoodsReceiptLineToLedger)
 
 	vendor, err := engine.Create(ctx, foundation.Party(), map[string]any{
-		"name": "Quality Co", "party_type": "organization", "status": "active",
+		"name": "Inspected Co", "party_type": "organization", "status": "active",
 	}, actor)
 	if err != nil {
 		t.Fatalf("seed vendor: %v", err)
@@ -254,7 +254,7 @@ func TestPurchasingReport_QualitySection_RealBrowser(t *testing.T) {
 		t.Fatalf("seed PurchaseOrder: %v", err)
 	}
 	item, err := engine.Create(ctx, purchasing.Item(), map[string]any{
-		"sku": "SKU-Q-E2E", "name": "Quality Widget", "item_type": "stock",
+		"sku": "SKU-Q-E2E", "name": "Widget", "item_type": "stock",
 	}, actor)
 	if err != nil {
 		t.Fatalf("seed Item: %v", err)
@@ -302,8 +302,12 @@ func TestPurchasingReport_QualitySection_RealBrowser(t *testing.T) {
 	}
 
 	for _, want := range []string{
-		"Quality",
-		"Quality Co",
+		"Quality", // the section heading — genuinely pins its presence
+		// now that no seeded name ("Inspected Co"/"Widget") contains
+		// "Quality" itself; an earlier draft named the vendor "Quality
+		// Co", which made this assertion pass even with the section
+		// deleted (independent review of uc-infra#82).
+		"Inspected Co",
 		"90%",
 	} {
 		if !strings.Contains(bodyText, want) {

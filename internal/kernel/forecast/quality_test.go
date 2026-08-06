@@ -96,18 +96,30 @@ func TestComputeQuality_SkipsSamplesWithNoData(t *testing.T) {
 	}
 }
 
-// TestComputeQuality_ZeroAcceptedZeroRejectedWithDataStillCounts pins
-// the distinction QualitySample.HasData exists for: an explicit 0/0
-// quality record (a real, if unusual, outcome — nothing was inspected
-// as good or bad, e.g. a zero-qty correction line) is NOT the same as
-// "no quality data" and must still count toward N (even though it
-// contributes nothing to either total).
-func TestComputeQuality_ZeroAcceptedZeroRejectedWithDataStillCounts(t *testing.T) {
-	samples := []QualitySample{{VendorID: "v1", QtyAccepted: 0, QtyRejected: 0, HasData: true}}
+// TestComputeQuality_ZeroAcceptedZeroRejectedExcluded (independent
+// review of uc-infra#82) pins the fix for a real bug: an explicit 0/0
+// quality record (HasData=true, e.g. a zero-qty correction line) has no
+// quality VERDICT to contribute — before this fix, it counted toward N
+// with nothing in either total, so QualityStats.Rate()'s
+// divide-by-zero-guarded 0 silently reported "100% rejected" for a line
+// that inspected NOTHING. It must be excluded entirely, the same way a
+// LeadTimeSample/OnTimeSample with no usable data contributes nothing
+// rather than a fabricated number.
+func TestComputeQuality_ZeroAcceptedZeroRejectedExcluded(t *testing.T) {
+	samples := []QualitySample{
+		{VendorID: "v1", QtyAccepted: 0, QtyRejected: 0, HasData: true}, // no verdict — must not count
+		qualitySample("v1", 5, 0),
+	}
 	got := ComputeQuality(samples)
 	v := got.ByVendor["v1"]
 	if v.N != 1 {
-		t.Fatalf("N = %d, want 1 (HasData=true must count even at 0/0)", v.N)
+		t.Fatalf("N = %d, want 1 (the 0/0 sample must be excluded, not counted as a real observation)", v.N)
+	}
+	// N=1 is correctly insufficient — the point this test pins is that
+	// the 0/0 sample did NOT silently push this vendor to N=2 (which
+	// WOULD be Sufficient and would render a fabricated "100% rejected").
+	if v.Sufficient() {
+		t.Fatalf("v.Sufficient() = true at N=1; the 0/0 sample must not have counted toward N")
 	}
 }
 

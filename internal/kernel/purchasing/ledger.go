@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
@@ -43,7 +44,14 @@ const (
 // PostGoodsReceiptLineToLedger is a crud.Hook (internal/kernel/crud.Hook)
 // — register it for the "GoodsReceiptLine" entity type
 // (Engine.SetHook) to post Dr Inventory / Cr AP Accrual for one received
-// line's value the moment the line is created.
+// line's value the moment the line is created. It ALSO carries this
+// entity type's quality validation (validateGoodsReceiptLineQuality,
+// uc-infra#82) — crud.Engine.SetHook only supports one hook per entity
+// type (see SetHook's own doc comment), so both jobs share this
+// function rather than one silently overwriting the other's
+// registration. The two run under different action gates: quality
+// validation on every action, ledger posting on Create only — see each
+// section's own comment below for why.
 //
 // Posted per-line, not per-GoodsReceipt header, deliberately:
 // GoodsReceipt and GoodsReceiptLine are saved as separate API calls (no
@@ -59,16 +67,35 @@ const (
 // itself is in (crud.Hook's own contract) — a posting failure rolls back
 // the line write too, never leaving an un-posted receipt line behind.
 func PostGoodsReceiptLineToLedger(ctx context.Context, tx *sql.Tx, _ *entity.Definition, rec data.Record, action audit.Action, actor audit.Actor) error {
-	if action != audit.ActionCreate {
-		// GoodsReceiptLine has no status/quantity-correction workflow
-		// yet — nothing to do on Update (there's no real update path for
-		// a received line today; if one lands later, it needs its own
-		// reversing/adjusting entry, not a silent re-post here).
-		return nil
-	}
-
+	// validateGoodsReceiptLineQuality runs on EVERY action, Create AND
+	// Update, ahead of the ledger-posting action gate below — unlike the
+	// posting itself, quality is not a one-time event tied to the
+	// line's creation. GoodsReceiptLineForm (uc-infra#82) put
+	// qty_accepted/qty_rejected on the ordinary generic edit form, and
+	// that form's Save goes through the exact same
+	// PUT /api/records/GoodsReceiptLine/{id} -> crud.Engine.Update path
+	// every other entity's edit does (independent review of uc-infra#82:
+	// the original draft validated on Create only, on the mistaken
+	// belief — pinned by this file's OWN TestPostGoodsReceiptLineToLedger_
+	// UpdateAction_IsNoOp test, which proves Update calls this hook —
+	// that GoodsReceiptLine has no live update path). Skipping this on
+	// Update would let an edit silently break the required-together and
+	// netting invariants Create already enforces, corrupting
+	// forecast.ComputeQuality's aggregate with no write-time guard at
+	// all on that path.
 	if err := validateGoodsReceiptLineQuality(rec); err != nil {
 		return err
+	}
+
+	if action != audit.ActionCreate {
+		// The LEDGER POSTING below is still Create-only: GoodsReceiptLine
+		// has no status/quantity-correction workflow, so an Update never
+		// re-posts or reverses a journal entry (if one lands later, it
+		// needs its own reversing/adjusting entry, not a silent re-post
+		// here). Quality validation above is independent of that and
+		// must not be gated the same way — see this function's own
+		// doc comment.
+		return nil
 	}
 
 	qty, _ := rec.Data["qty_received"].(float64)
@@ -119,16 +146,38 @@ func PostGoodsReceiptLineToLedger(ctx context.Context, tx *sql.Tx, _ *entity.Def
 	return nil
 }
 
-// qtyNetEpsilon tolerates float64 rounding noise when comparing
-// qty_accepted + qty_rejected against qty_received — the three values
-// arrive as ordinary decimal input (a receiving clerk's typed quantity,
-// or a CSV import), and while most real quantities net exactly, a
-// fractional UoM (weight, length) can produce a sum that differs from
-// the stored qty_received in its last binary digit despite being
-// "equal" in every decimal sense a human typed. Not a business
+// qtyNetEpsilonAbs/qtyNetEpsilonRel tolerate float64 rounding noise when
+// comparing qty_accepted + qty_rejected against qty_received — the three
+// values arrive as ordinary decimal input (a receiving clerk's typed
+// quantity, or a CSV import), and while most real quantities net
+// exactly, a fractional UoM (weight, length) can produce a sum that
+// differs from the stored qty_received in its last binary digit despite
+// being "equal" in every decimal sense a human typed. Not a business
 // tolerance — an intentionally tiny guard against exactly this class of
 // binary floating-point noise, not a license to be off by a real unit.
-const qtyNetEpsilon = 1e-9
+//
+// Relative, not a single fixed absolute value (independent review of
+// uc-infra#82): float64 has ~15-17 significant decimal digits, so the
+// ABSOLUTE rounding noise on a large quantity is itself larger than a
+// fixed 1e-9 — a fine-grained UoM receipt in the billions of units would
+// spuriously fail netting on real, correct input. qtyNetTolerance scales
+// the allowance with qty_received's own magnitude, falling back to the
+// absolute floor for anything qty_received-sized-or-smaller (where 1e-9
+// is already generous relative to the value).
+const (
+	qtyNetEpsilonAbs = 1e-9
+	qtyNetEpsilonRel = 1e-9
+)
+
+// qtyNetTolerance returns the netting comparison's allowed slack for a
+// given qty_received — see qtyNetEpsilonAbs/qtyNetEpsilonRel's own doc
+// comment for why this scales rather than staying fixed.
+func qtyNetTolerance(received float64) float64 {
+	if abs := math.Abs(received); abs > 1 {
+		return qtyNetEpsilonRel * abs
+	}
+	return qtyNetEpsilonAbs
+}
 
 // validateGoodsReceiptLineQuality is the uc-infra#82 half of
 // PostGoodsReceiptLineToLedger's job: qty_accepted/qty_rejected
@@ -143,7 +192,7 @@ const qtyNetEpsilon = 1e-9
 //     would silently corrupt forecast.ComputeQuality's sums (uncounted
 //     "the other half" of a quantity) if let through.
 //  2. Netting: when both are set, qty_accepted + qty_rejected must equal
-//     qty_received (within qtyNetEpsilon) — this is a SPLIT of what
+//     qty_received (within qtyNetTolerance) — this is a SPLIT of what
 //     arrived, not an independent count that could disagree with it.
 //
 // entity.ValidateRecord already guarantees that whichever of the two
@@ -151,9 +200,12 @@ const qtyNetEpsilon = 1e-9
 // hook ever runs (crud.Engine.Create/Update call it first) — this
 // function only needs to decide presence (via the map's comma-ok, not
 // numberFieldValue, which can't tell "absent" from "wrong type") and
-// check the two business invariants above. Runs on Create only, same
-// action gate as the rest of this hook — GoodsReceiptLine has no update
-// path yet (see the action check above).
+// check the two business invariants above. Runs on EVERY action, Create
+// AND Update — GoodsReceiptLine's generic edit form (forms.go) puts
+// both fields on the ordinary PUT /api/records/{type}/{id} path, so an
+// edit can violate either invariant exactly as easily as a create can
+// (independent review of uc-infra#82 caught an earlier draft that
+// validated on Create only).
 func validateGoodsReceiptLineQuality(rec data.Record) error {
 	acceptedRaw, hasAccepted := rec.Data["qty_accepted"]
 	rejectedRaw, hasRejected := rec.Data["qty_rejected"]
@@ -183,7 +235,8 @@ func validateGoodsReceiptLineQuality(rec data.Record) error {
 	}
 
 	received, _ := numberFieldValue(rec.Data["qty_received"])
-	if diff := accepted + rejected - received; diff > qtyNetEpsilon || diff < -qtyNetEpsilon {
+	tolerance := qtyNetTolerance(received)
+	if diff := accepted + rejected - received; diff > tolerance || diff < -tolerance {
 		return fmt.Errorf("%w: GoodsReceiptLine qty_accepted (%v) + qty_rejected (%v) must equal qty_received (%v)",
 			crud.ErrHookRejected, accepted, rejected, received)
 	}

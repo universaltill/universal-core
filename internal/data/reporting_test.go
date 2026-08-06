@@ -1024,3 +1024,112 @@ func TestGoodsReceiptLineQualities_MalformedGoodsReceiptIDExcludedNotAborted(t *
 		t.Errorf("QtyAccepted = %q, want %q", got[0].QtyAccepted, "5")
 	}
 }
+
+// TestGoodsReceiptLineQualities_MalformedPurchaseOrderIDExcludedNotAborted
+// (uc-infra#82, independent review) is the second half of the guard the
+// previous test only covers one hop of: a GoodsReceipt whose
+// purchase_order_id is malformed must also be excluded, not abort the
+// whole query. Without the g.data->>'purchase_order_id' ~ $1 guard on
+// that hop specifically, this scenario would 500 the entire report page
+// for every tenant, not just fail to resolve one vendor.
+func TestGoodsReceiptLineQualities_MalformedPurchaseOrderIDExcludedNotAborted(t *testing.T) {
+	ctx := context.Background()
+	tenantDB := freshTenantDB(t)
+	records := data.NewRecordRepo(tenantDB)
+	reporting := data.NewReportingRepo(tenantDB)
+
+	vendor, err := records.Create(ctx, "Party", map[string]any{"name": "Guard Vendor 2", "party_type": "organization"})
+	if err != nil {
+		t.Fatalf("create Party: %v", err)
+	}
+	po, err := records.Create(ctx, "PurchaseOrder", map[string]any{
+		"po_number": "PO-QUALITY-GUARD-2", "vendor_id": vendor.ID, "order_date": "2026-07-01",
+	})
+	if err != nil {
+		t.Fatalf("create PurchaseOrder: %v", err)
+	}
+	validGR, err := records.Create(ctx, "GoodsReceipt", map[string]any{
+		"purchase_order_id": po.ID, "received_date": "2026-07-05",
+	})
+	if err != nil {
+		t.Fatalf("create GoodsReceipt: %v", err)
+	}
+	// A GoodsReceipt whose OWN purchase_order_id is malformed — a
+	// different hop than the previous test's malformed goods_receipt_id.
+	malformedGR, err := records.Create(ctx, "GoodsReceipt", map[string]any{
+		"purchase_order_id": "not-a-uuid", "received_date": "2026-07-06",
+	})
+	if err != nil {
+		t.Fatalf("create GoodsReceipt with malformed purchase_order_id: %v", err)
+	}
+	if _, err := records.Create(ctx, "GoodsReceiptLine", map[string]any{
+		"goods_receipt_id": malformedGR.ID, "qty_received": 3.0,
+	}); err != nil {
+		t.Fatalf("create GoodsReceiptLine against the malformed GoodsReceipt: %v", err)
+	}
+	if _, err := records.Create(ctx, "GoodsReceiptLine", map[string]any{
+		"goods_receipt_id": validGR.ID, "qty_received": 5.0, "qty_accepted": 5.0, "qty_rejected": 0.0,
+	}); err != nil {
+		t.Fatalf("create valid GoodsReceiptLine: %v", err)
+	}
+
+	got, err := reporting.GoodsReceiptLineQualities(ctx)
+	if err != nil {
+		t.Fatalf("GoodsReceiptLineQualities: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d rows, want 1 (the line behind a malformed purchase_order_id must be excluded, not abort the query)", len(got))
+	}
+	if got[0].QtyAccepted != "5" {
+		t.Errorf("QtyAccepted = %q, want %q", got[0].QtyAccepted, "5")
+	}
+}
+
+// TestGoodsReceiptLineQualities_DeletedPurchaseOrderExcludesItsLines
+// (uc-infra#82, independent review) pins the INNER-join behavior on the
+// GoodsReceipt/PurchaseOrder hops: a soft-deleted PurchaseOrder's
+// receipt lines are excluded from the quality aggregate entirely,
+// matching CompletedPOLeadTimes' own precedent of requiring
+// PurchaseOrder to be a live record. This is deliberately narrower than
+// the vendor hop (which IS left-joined) — see the method's own doc
+// comment for why the two hops behave differently.
+func TestGoodsReceiptLineQualities_DeletedPurchaseOrderExcludesItsLines(t *testing.T) {
+	ctx := context.Background()
+	tenantDB := freshTenantDB(t)
+	records := data.NewRecordRepo(tenantDB)
+	reporting := data.NewReportingRepo(tenantDB)
+
+	vendor, err := records.Create(ctx, "Party", map[string]any{"name": "Deleted PO Vendor", "party_type": "organization"})
+	if err != nil {
+		t.Fatalf("create Party: %v", err)
+	}
+	po, err := records.Create(ctx, "PurchaseOrder", map[string]any{
+		"po_number": "PO-QUALITY-DELETED", "vendor_id": vendor.ID, "order_date": "2026-07-01",
+	})
+	if err != nil {
+		t.Fatalf("create PurchaseOrder: %v", err)
+	}
+	gr, err := records.Create(ctx, "GoodsReceipt", map[string]any{
+		"purchase_order_id": po.ID, "received_date": "2026-07-05",
+	})
+	if err != nil {
+		t.Fatalf("create GoodsReceipt: %v", err)
+	}
+	if _, err := records.Create(ctx, "GoodsReceiptLine", map[string]any{
+		"goods_receipt_id": gr.ID, "qty_received": 5.0, "qty_accepted": 5.0, "qty_rejected": 0.0,
+	}); err != nil {
+		t.Fatalf("create GoodsReceiptLine: %v", err)
+	}
+
+	if err := records.Delete(ctx, "PurchaseOrder", po.ID); err != nil {
+		t.Fatalf("soft-delete PurchaseOrder: %v", err)
+	}
+
+	got, err := reporting.GoodsReceiptLineQualities(ctx)
+	if err != nil {
+		t.Fatalf("GoodsReceiptLineQualities: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("got %d rows, want 0 — a deleted PurchaseOrder's receipt lines must be excluded", len(got))
+	}
+}

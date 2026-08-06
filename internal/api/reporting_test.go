@@ -635,6 +635,16 @@ func TestAPI_PurchasingReport_QualitySection(t *testing.T) {
 		"goods_receipt_id": soloGR, "qty_received": 4.0, "qty_accepted": 4.0, "qty_rejected": 0.0,
 	})
 
+	// A PurchaseOrder with no vendor_id at all — its quality data must
+	// still count toward the OVERALL aggregate (same reasoning
+	// CompletedPOLeadTimes' own vendorless samples already get) but must
+	// NOT produce a broken/blank per-vendor row of its own.
+	novendorPO := mustCreate("PurchaseOrder", map[string]any{"po_number": "PO-Q-NOVENDOR", "order_date": "2026-07-03"})
+	novendorGR := mustCreate("GoodsReceipt", map[string]any{"purchase_order_id": novendorPO, "received_date": "2026-07-07"})
+	mustCreate("GoodsReceiptLine", map[string]any{
+		"goods_receipt_id": novendorGR, "qty_received": 2.0, "qty_accepted": 2.0, "qty_rejected": 0.0,
+	})
+
 	mux := http.NewServeMux()
 	testHandler(t, router).Routes(mux)
 	rec := getAs(t, mux, "/reports/purchasing", tenantID, "farshid")
@@ -654,10 +664,15 @@ func TestAPI_PurchasingReport_QualitySection(t *testing.T) {
 	if !strings.Contains(body, "<tr><td>Solo Inspected</td><td>1</td><td>Insufficient history</td></tr>") {
 		t.Errorf("expected the Solo Inspected row to say insufficient at n=1:\n%s", body)
 	}
-	// Overall across 3 inspected lines (Inspected Co's 2 + Solo's 1):
-	// 22 accepted / 24 total -> 91.7%.
-	if !strings.Contains(body, "<tr><td>All vendors</td><td>3</td><td>91.7%</td></tr>") {
-		t.Errorf("expected the all-vendors quality summary row at 3 samples / 91.7%%:\n%s", body)
+	// Overall across 4 inspected lines (Inspected Co's 2 + Solo's 1 + the
+	// vendorless PO's 1): 24 accepted / 26 total -> 92.3%.
+	if !strings.Contains(body, "<tr><td>All vendors</td><td>4</td><td>92.3%</td></tr>") {
+		t.Errorf("expected the all-vendors quality summary row at 4 samples / 92.3%%:\n%s", body)
+	}
+	// The vendorless PO's quality data must NOT produce its own
+	// per-vendor row — no row with an empty vendor cell.
+	if strings.Contains(body, "<tr><td></td><td>1</td>") {
+		t.Errorf("vendorless quality data produced its own (blank-vendor) row, must only count toward the overall row:\n%s", body)
 	}
 
 	recTR := getAs(t, mux, "/reports/purchasing?lang=tr", tenantID, "farshid")
@@ -713,6 +728,33 @@ func TestAPI_PurchasingReport_QualityEmptyState(t *testing.T) {
 	}
 	if !strings.Contains(body, "Supplier Lead Times") {
 		t.Errorf("expected the lead-time section to still render its own (non-empty) data:\n%s", body)
+	}
+}
+
+// TestQualitySamples_SkipsRowsWithOnlyOneQuantityParsing (uc-infra#82,
+// independent review) pins qualitySamples' own defensive branch: a row
+// where exactly one of QtyAccepted/QtyRejected fails to parse — reachable
+// once GoodsReceiptLine's generic edit path can persist a partial/
+// corrupted quality record despite the write-time hook's own
+// required-together check (a direct DB edit, a pre-hook migration, or a
+// hook bypassed some other way) — must be skipped entirely, not credited
+// with only the half that DID parse. This is the same "don't trust one
+// half of a pair without the other" discipline
+// validateGoodsReceiptLineQuality enforces at write time; this is the
+// read-time backstop for data that got past it anyway.
+func TestQualitySamples_SkipsRowsWithOnlyOneQuantityParsing(t *testing.T) {
+	rows := []data.GoodsReceiptLineQuality{
+		{LineID: "l1", VendorID: "v1", QtyAccepted: "8", QtyRejected: ""},             // only one set
+		{LineID: "l2", VendorID: "v1", QtyAccepted: "not-a-number", QtyRejected: "2"}, // one unparseable
+		{LineID: "l3", VendorID: "v1", QtyAccepted: "", QtyRejected: ""},              // neither set — the common case
+		{LineID: "l4", VendorID: "v1", QtyAccepted: "8", QtyRejected: "2"},            // the one real sample
+	}
+	got := qualitySamples(rows)
+	if len(got) != 1 {
+		t.Fatalf("got %d samples, want 1 (only the fully-parseable row): %+v", len(got), got)
+	}
+	if got[0].QtyAccepted != 8 || got[0].QtyRejected != 2 {
+		t.Fatalf("unexpected sample survived: %+v", got[0])
 	}
 }
 

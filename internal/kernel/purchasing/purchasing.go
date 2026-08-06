@@ -392,9 +392,11 @@ func GoodsReceipt() *entity.Definition {
 // neither field set, and is excluded from the quality-rate metric
 // entirely (forecast.ComputeQuality's own no-fabrication discipline) —
 // never coerced into a false 100%/0%. Required-together is enforced by
-// ValidateGoodsReceiptLineQuality (ledger.go) as a crud.Hook business
-// rule, not here: entity.Field has no cross-field concept yet (#80), the
-// same gap ValidateStockTransfer already works around for StockTransfer.
+// validateGoodsReceiptLineQuality (ledger.go, folded into
+// PostGoodsReceiptLineToLedger — crud.Engine.SetHook only supports one
+// hook per entity type) as a crud.Hook business rule, not here:
+// entity.Field has no cross-field concept yet (#80), the same gap
+// ValidateStockTransfer already works around for StockTransfer.
 // The invariant itself, when both ARE set: qty_accepted + qty_rejected
 // must equal qty_received — this is a quality *split* of what arrived,
 // not a second, independent count.

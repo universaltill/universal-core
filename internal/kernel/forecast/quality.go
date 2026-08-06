@@ -5,7 +5,9 @@ package forecast
 // GoodsReceiptLine (Version 2) — most lines, until a tenant starts using
 // them, have neither set. HasData distinguishes "this line has no
 // quality record at all" (the common case) from "this line's quality
-// record is 0 accepted / 0 rejected" (a real, if unusual, outcome) —
+// record is 0 accepted / 0 rejected" (a real, if degenerate, outcome —
+// only reachable when qty_received is itself 0, since
+// purchasing.validateGoodsReceiptLineQuality requires the two to net) —
 // neither QtyAccepted nor QtyRejected being non-zero is sufficient on
 // its own to mean "has data," the same reason OnTimeSample can't use a
 // zero time.Time as its own "no promise" sentinel.
@@ -24,15 +26,30 @@ type QualitySample struct {
 	HasData     bool
 }
 
-// valid reports whether this sample carries real quality data (HasData)
-// with no negative quantities — purchasing.validateGoodsReceiptLineQuality
-// already rejects a negative qty_accepted/qty_rejected at write time, so
-// a negative value reaching here would mean corrupt/pre-validation data
-// (a CSV import bypassing the hook, say); excluding it here is the same
-// defensive posture LeadTimeSample.valid() takes toward reversed
-// timestamps it also shouldn't normally see.
+// valid reports whether this sample carries real, countable quality
+// data: HasData, non-negative quantities, and a nonzero inspected total
+// (QtyAccepted+QtyRejected > 0). That last condition is not redundant
+// with HasData (independent review of uc-infra#82: an earlier draft let
+// a 0/0 line — HasData=true, both quantities legitimately zero — count
+// toward N with nothing in either total, so QualityStats.Rate()'s
+// divide-by-zero guard silently reported 0%, i.e. "100% rejected," for a
+// line that inspected NOTHING). A 0/0 sample is real data (it means the
+// receipt itself was a zero-quantity line — the only way
+// purchasing.validateGoodsReceiptLineQuality's netting invariant allows
+// 0/0 through, since it requires qty_accepted+qty_rejected==qty_received)
+// but it has no quality VERDICT to contribute, the same way a
+// LeadTimeSample or OnTimeSample with no usable date pair contributes
+// nothing rather than a fabricated zero. Excluding it here, not just at
+// render time, keeps Sufficient()/Rate() a single trustworthy source
+// of truth: N only ever counts lines that could have shifted the rate.
+// A negative quantity is a second, independent reason to exclude a
+// sample: purchasing.validateGoodsReceiptLineQuality already rejects a
+// negative qty_accepted/qty_rejected at write time, so one reaching here
+// would mean corrupt/pre-validation data (a CSV import bypassing the
+// hook, say) — the same defensive posture LeadTimeSample.valid() takes
+// toward reversed timestamps it also shouldn't normally see.
 func (s QualitySample) valid() bool {
-	return s.HasData && s.QtyAccepted >= 0 && s.QtyRejected >= 0
+	return s.HasData && s.QtyAccepted >= 0 && s.QtyRejected >= 0 && s.QtyAccepted+s.QtyRejected > 0
 }
 
 // QualityStats is the aggregate over a set of quality samples. Unlike

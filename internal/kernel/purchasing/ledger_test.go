@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 
@@ -410,6 +411,36 @@ func TestValidateGoodsReceiptLineQuality_OnlyOneFieldSet_Rejected(t *testing.T) 
 	}
 }
 
+// TestValidateGoodsReceiptLineQuality_NonNumericType_Rejected
+// (independent review of uc-infra#82) is a direct unit-level call —
+// entity.ValidateRecord already guarantees a real crud.Engine.Create/
+// Update never reaches this hook with a non-numeric qty_accepted/
+// qty_rejected (same reasoning ValidateStockTransfer's own
+// AcceptsEveryNumericTypeEntityValidationDoes test documents), so this
+// exercises the defensive branch directly, the same way
+// TestPostGoodsReceiptLineToLedger_UpdateAction_IsNoOp already calls the
+// hook function directly rather than through the engine.
+func TestValidateGoodsReceiptLineQuality_NonNumericType_Rejected(t *testing.T) {
+	tests := []struct {
+		name string
+		data map[string]any
+	}{
+		{"non-numeric qty_accepted", map[string]any{"qty_received": float64(10), "qty_accepted": "eight", "qty_rejected": float64(2)}},
+		{"non-numeric qty_rejected", map[string]any{"qty_received": float64(10), "qty_accepted": float64(8), "qty_rejected": "two"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateGoodsReceiptLineQuality(data.Record{ID: "x", Data: tc.data})
+			if !errors.Is(err, crud.ErrHookRejected) {
+				t.Fatalf("expected crud.ErrHookRejected, got: %v", err)
+			}
+			if !strings.Contains(err.Error(), "must be a number") {
+				t.Fatalf("expected a not-a-number message, got: %v", err)
+			}
+		})
+	}
+}
+
 // TestValidateGoodsReceiptLineQuality_NegativeQuantity_Rejected pins the
 // non-negative invariant on both fields independently.
 func TestValidateGoodsReceiptLineQuality_NegativeQuantity_Rejected(t *testing.T) {
@@ -475,15 +506,57 @@ func TestValidateGoodsReceiptLineQuality_ZeroZeroWithBothSet_IsNoOp(t *testing.T
 }
 
 // TestValidateGoodsReceiptLineQuality_FloatRoundingWithinEpsilon_IsNoOp
-// confirms qtyNetEpsilon absorbs ordinary binary floating-point noise
+// confirms qtyNetTolerance absorbs ordinary binary floating-point noise
 // (0.1 + 0.2 != 0.3 in float64) without becoming a license to be off by
-// a real unit — see qtyNetEpsilon's own doc comment.
+// a real unit — see qtyNetEpsilonAbs/qtyNetEpsilonRel's own doc comment.
 func TestValidateGoodsReceiptLineQuality_FloatRoundingWithinEpsilon_IsNoOp(t *testing.T) {
 	rec := data.Record{ID: "x", Data: map[string]any{
 		"qty_received": float64(0.3), "qty_accepted": float64(0.1), "qty_rejected": float64(0.2),
 	}}
 	if err := validateGoodsReceiptLineQuality(rec); err != nil {
-		t.Fatalf("expected qtyNetEpsilon to absorb float64 rounding noise, got: %v", err)
+		t.Fatalf("expected qtyNetTolerance to absorb float64 rounding noise, got: %v", err)
+	}
+}
+
+// TestQtyNetTolerance_ScalesWithMagnitude (independent review of
+// uc-infra#82) pins the fix for a fixed absolute epsilon being too
+// tight at scale: float64 has ~15-17 significant decimal digits, so the
+// ABSOLUTE rounding noise on a large quantity is itself larger than a
+// fixed 1e-9 — qtyNetTolerance must grow with qty_received's own
+// magnitude rather than staying fixed.
+func TestQtyNetTolerance_ScalesWithMagnitude(t *testing.T) {
+	if got := qtyNetTolerance(0.3); got != qtyNetEpsilonAbs {
+		t.Errorf("qtyNetTolerance(0.3) = %v, want the absolute floor %v", got, qtyNetEpsilonAbs)
+	}
+	if got := qtyNetTolerance(1e12); !approxEqualLedger(got, qtyNetEpsilonRel*1e12) {
+		t.Errorf("qtyNetTolerance(1e12) = %v, want %v (relative, not the fixed absolute floor)", got, qtyNetEpsilonRel*1e12)
+	}
+	// Sign must not matter — a received value stored as negative
+	// (shouldn't happen in practice, but this is a pure magnitude scale,
+	// not a business validity check) scales the same as its absolute value.
+	if got := qtyNetTolerance(-1e12); !approxEqualLedger(got, qtyNetEpsilonRel*1e12) {
+		t.Errorf("qtyNetTolerance(-1e12) = %v, want %v", got, qtyNetEpsilonRel*1e12)
+	}
+}
+
+func approxEqualLedger(a, b float64) bool {
+	return math.Abs(a-b) < 1e-9
+}
+
+// TestValidateGoodsReceiptLineQuality_LargeQuantityRealMismatch_StillRejected
+// is the negative control for the relative-tolerance fix above: scaling
+// the allowance with magnitude must not turn into "anything goes" for a
+// large quantity — a genuine, real-unit-sized mismatch is still rejected.
+func TestValidateGoodsReceiptLineQuality_LargeQuantityRealMismatch_StillRejected(t *testing.T) {
+	// At qty_received = 1e9, qtyNetTolerance is qtyNetEpsilonRel*1e9 = 1
+	// (a full unit) — a mismatch of 100 is unambiguously outside that,
+	// not a boundary case the relative scaling could accidentally absorb.
+	rec := data.Record{ID: "x", Data: map[string]any{
+		"qty_received": float64(1e9), "qty_accepted": float64(5e8), "qty_rejected": float64(5e8 - 100),
+	}}
+	err := validateGoodsReceiptLineQuality(rec)
+	if !errors.Is(err, crud.ErrHookRejected) {
+		t.Fatalf("expected crud.ErrHookRejected for a real 100-unit mismatch at scale, got: %v", err)
 	}
 }
 
