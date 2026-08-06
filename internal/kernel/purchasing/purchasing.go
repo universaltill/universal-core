@@ -611,12 +611,29 @@ func RequestForQuotationVendor() *entity.Definition {
 func RequestForQuotationQuoteLine() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "RequestForQuotationQuoteLine",
-		Version:    1,
-		Module:     "purchasing",
+		// Version 1->2 (uc-infra#68, independent review): unit_price's
+		// TYPE changed (FieldNumber major-unit float -> FieldMoney minor-
+		// unit integer), not just a new field added — the same class of
+		// change PurchaseOrder's v3->v4 bump made for "status" ->
+		// "status_id" (see that Definition's own doc comment). A row
+		// written under v1 still holds a major-unit decimal until
+		// cmd/backfill-quote-line-unit-price converts it;
+		// internal/data/rfq_reporting.go's moneyMinorUnitsPattern guard
+		// keeps an un-migrated row from 500ing the comparison report in
+		// the meantime (it's excluded from the grid, not fatal).
+		Version: 2,
+		Module:  "purchasing",
 		Fields: []entity.Field{
 			{Name: "rfq_line_id", Type: entity.FieldReference, Required: true, Target: "RequestForQuotationLine"},
 			{Name: "vendor_id", Type: entity.FieldReference, Required: true, Target: "Party"},
-			{Name: "unit_price", Type: entity.FieldNumber, Required: true},
+			// FieldMoney, not FieldNumber (uc-infra#68): this is the exact
+			// field the RFQ vendor-quote-comparison report's original
+			// independent review found summing to a visible IEEE
+			// artifact (0.1 + 0.2 = 0.30000000000000004) in its footer
+			// total — see internal/api/rfq_report.go's totals map and
+			// internal/data/rfq_reporting.go's own scan, both now
+			// int64-minor-units-based because of this change.
+			{Name: "unit_price", Type: entity.FieldMoney, Required: true},
 			{Name: "quoted_at", Type: entity.FieldDate},
 		},
 	}

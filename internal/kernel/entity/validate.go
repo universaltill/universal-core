@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"slices"
 	"time"
+
+	"github.com/universaltill/universal-core/internal/kernel/money"
 )
 
 // ValidationErrorKind classifies a ValidateRecord failure so a caller
@@ -250,6 +252,19 @@ func validateFieldValue(entityType string, f Field, v any) *ValidationError {
 		case float64, int, int64:
 		default:
 			return newErr(KindTypeMismatch, fmt.Sprintf("expected number, got %T", v))
+		}
+	case FieldMoney:
+		// A FieldMoney value is a WHOLE number of minor units — see
+		// FieldMoney's own doc comment for why that's the actual fix,
+		// not an arbitrary tightening. money.FromAny rejects both the
+		// wrong Go type and a fractional value with a single check;
+		// either failure is reported as the same KindTypeMismatch
+		// FieldNumber's own type check above uses (no new
+		// ValidationErrorKind needed — "not a valid whole-number amount"
+		// is still, at the API surface, "this field's value is the
+		// wrong shape").
+		if _, err := money.FromAny(v); err != nil {
+			return newErr(KindTypeMismatch, err.Error())
 		}
 	case FieldBool:
 		if _, ok := v.(bool); !ok {

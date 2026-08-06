@@ -29,6 +29,30 @@ func TestDefinitionValidate(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "valid definition with a money field",
+			def: Definition{
+				EntityType: "RequestForQuotationQuoteLine",
+				Version:    1,
+				Fields: []Field{
+					{Name: "unit_price", Type: FieldMoney, Required: true},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			// A money amount can't label a picker/list-cell any more
+			// sensibly than a reference or bool can (Definition.Validate's
+			// label-suitability switch) — same reasoning, extended to the
+			// new type.
+			name: "money field rejected as label_field",
+			def: Definition{
+				EntityType: "RequestForQuotationQuoteLine",
+				LabelField: "unit_price",
+				Fields:     []Field{{Name: "unit_price", Type: FieldMoney}},
+			},
+			wantErr: true,
+		},
+		{
 			name: "duplicate field",
 			def: Definition{
 				EntityType: "Vendor",

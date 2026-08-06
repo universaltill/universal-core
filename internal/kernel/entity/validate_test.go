@@ -87,6 +87,71 @@ func TestValidateRecord(t *testing.T) {
 	})
 }
 
+// TestValidateRecord_Money is the FieldMoney record-level matrix
+// (uc-infra#68): the whole-number-of-minor-units constraint is the
+// actual bug fix, so it gets its own dedicated coverage rather than
+// riding along inside TestValidateRecord's general matrix.
+func TestValidateRecord_Money(t *testing.T) {
+	def := &Definition{
+		EntityType: "RequestForQuotationQuoteLine",
+		Fields:     []Field{{Name: "unit_price", Type: FieldMoney, Required: true}},
+	}
+
+	t.Run("valid whole-minor-units float64", func(t *testing.T) {
+		if err := ValidateRecord(def, map[string]any{"unit_price": float64(1050)}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("valid int", func(t *testing.T) {
+		if err := ValidateRecord(def, map[string]any{"unit_price": 1050}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("valid zero", func(t *testing.T) {
+		if err := ValidateRecord(def, map[string]any{"unit_price": float64(0)}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("fractional value rejected", func(t *testing.T) {
+		// This is the exact shape a caller would submit if it mistakenly
+		// sent a major-unit float ($10.50) instead of minor units (1050)
+		// — must fail loud, not silently truncate to 10.
+		err := ValidateRecord(def, map[string]any{"unit_price": float64(10.5)})
+		verr, ok := err.(*ValidationError)
+		if !ok {
+			t.Fatalf("expected *ValidationError, got %T: %v", err, err)
+		}
+		if verr.Kind != KindTypeMismatch || verr.FieldName != "unit_price" {
+			t.Fatalf("unexpected fields: %+v", verr)
+		}
+	})
+
+	t.Run("wrong type rejected", func(t *testing.T) {
+		err := ValidateRecord(def, map[string]any{"unit_price": "10.50"})
+		verr, ok := err.(*ValidationError)
+		if !ok {
+			t.Fatalf("expected *ValidationError, got %T: %v", err, err)
+		}
+		if verr.Kind != KindTypeMismatch {
+			t.Fatalf("unexpected kind: %+v", verr)
+		}
+	})
+
+	t.Run("missing required", func(t *testing.T) {
+		err := ValidateRecord(def, map[string]any{})
+		verr, ok := err.(*ValidationError)
+		if !ok {
+			t.Fatalf("expected *ValidationError, got %T: %v", err, err)
+		}
+		if verr.Kind != KindRequired {
+			t.Fatalf("unexpected kind: %+v", verr)
+		}
+	})
+}
+
 // stagedDef is a minimal two-date chronology chain — the same shape
 // PurchaseOrder's staged lead-time timestamps (#29) declare, without
 // coupling this generic engine's tests to a purchasing entity.

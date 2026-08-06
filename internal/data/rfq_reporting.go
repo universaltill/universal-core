@@ -3,7 +3,27 @@ package data
 import (
 	"context"
 	"fmt"
+
+	"github.com/universaltill/universal-core/internal/kernel/money"
 )
+
+// moneyMinorUnitsPattern guards the unit_price cast below the same way
+// uuidPattern (reporting.go) guards a ::uuid cast: entity.ValidateRecord
+// requires a FieldMoney value be a whole number, but it validates only
+// values submitted through the validated write path — a row written
+// before RequestForQuotationQuoteLine's Version 1->2 bump (unit_price
+// was FieldNumber, a major-unit decimal like "9.5") still has a
+// fractional stored value until cmd/backfill-quote-line-unit-price
+// converts it (uc-infra#68's version-bump/backfill pair). Postgres's
+// ::bigint cast raises a hard error on "9.5" — without this guard that
+// aborts the WHOLE comparison report, not just this one vendor's quote
+// (independent review of uc-infra#68's own first pass, reproduced
+// directly against Postgres: `select ('9.5')::bigint` errors). Matching
+// uuidPattern's own "one bad row is silently excluded, not fatal"
+// resolution: a quote row whose unit_price isn't a plain integer string
+// is excluded from the grid (that vendor renders as not having quoted
+// this line) rather than 500ing the whole page.
+const moneyMinorUnitsPattern = `^-?[0-9]+$`
 
 // RFQComparisonLine is one line item on a RequestForQuotation's
 // vendor-comparison grid: the requested item + qty, plus each invited
@@ -11,11 +31,19 @@ import (
 // Party id. A vendor absent from QuotesByVendor simply never quoted this
 // line — that's a real, meaningful gap the report must show as a blank,
 // not a fabricated zero (see RFQComparison's own doc comment).
+//
+// QuotesByVendor is money.Money (minor units), not float64 (uc-infra#68)
+// — RequestForQuotationQuoteLine.unit_price is a FieldMoney field now,
+// and this is the exact map this report's own footer total sums, so
+// keeping it in minor units all the way through is what makes that sum
+// exact int64 addition instead of the float64 accumulation that produced
+// a visible IEEE artifact (0.1 + 0.2 = 0.30000000000000004) in the
+// originating review.
 type RFQComparisonLine struct {
 	ID             string
 	ItemName       string
 	Qty            float64
-	QuotesByVendor map[string]float64
+	QuotesByVendor map[string]money.Money
 }
 
 // RFQComparisonVendor is one vendor invited to quote against a
@@ -148,7 +176,7 @@ func (r *ReportingRepo) RFQComparison(ctx context.Context, rfqID string) ([]RFQC
 	// re-quoted line would depend on Postgres's scan order. Ordering
 	// makes "the most recently recorded quote wins" a real, stable rule.
 	quoteRows, err := r.db.QueryContext(ctx,
-		`SELECT l.id, (q.data->>'vendor_id')::uuid, coalesce((q.data->>'unit_price')::numeric, 0)
+		`SELECT l.id, (q.data->>'vendor_id')::uuid, coalesce((q.data->>'unit_price')::bigint, 0)
 		 FROM records q
 		 JOIN records l
 		   ON l.entity_type = 'RequestForQuotationLine'
@@ -158,28 +186,29 @@ func (r *ReportingRepo) RFQComparison(ctx context.Context, rfqID string) ([]RFQC
 		   AND q.deleted_at IS NULL
 		   AND q.data->>'rfq_line_id' ~ $2
 		   AND q.data->>'vendor_id' ~ $2
+		   AND q.data->>'unit_price' ~ $3
 		   AND l.data->>'request_for_quotation_id' = $1
 		 ORDER BY q.created_at, q.id`,
-		rfqID, uuidPattern,
+		rfqID, uuidPattern, moneyMinorUnitsPattern,
 	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("rfq comparison quotes: %w", err)
 	}
 	defer quoteRows.Close()
 
-	byLine := map[string]map[string]float64{}
+	byLine := map[string]map[string]money.Money{}
 	for quoteRows.Next() {
 		var lineID, vendorID string
-		var price float64
+		var price int64
 		if err := quoteRows.Scan(&lineID, &vendorID, &price); err != nil {
 			return nil, nil, fmt.Errorf("scan rfq comparison quote row: %w", err)
 		}
 		m, ok := byLine[lineID]
 		if !ok {
-			m = map[string]float64{}
+			m = map[string]money.Money{}
 			byLine[lineID] = m
 		}
-		m[vendorID] = price
+		m[vendorID] = money.Money(price)
 	}
 	if err := quoteRows.Err(); err != nil {
 		return nil, nil, fmt.Errorf("rfq comparison quotes: %w", err)

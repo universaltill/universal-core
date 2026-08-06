@@ -11,6 +11,7 @@ import (
 	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/httpx"
 	"github.com/universaltill/universal-core/internal/kernel/formrender"
+	"github.com/universaltill/universal-core/internal/kernel/money"
 )
 
 // rfqReportEntityTypes is every entity type renderRFQComparisonReport
@@ -151,11 +152,19 @@ func (h *Handler) buildRFQReportView(ctx context.Context, ts tenantScope, rfq da
 		view.Vendors = append(view.Vendors, rfqVendorColView{ID: v.ID, Name: v.Name})
 	}
 
-	totals := make(map[string]float64, len(vendors))
+	// totals accumulates in money.Money (minor-unit int64), not float64
+	// (uc-infra#68): this is the exact map the originating independent
+	// review found summing to a visible IEEE artifact (0.1 + 0.2 =
+	// 0.30000000000000004) when quoted prices were plain FieldNumber
+	// floats. RequestForQuotationQuoteLine.unit_price is FieldMoney now,
+	// data.ReportingRepo.RFQComparison hands back QuotesByVendor as
+	// money.Money already, and `totals[v.ID] += price` below is exact
+	// int64 addition — no float ever enters this accumulation.
+	totals := make(map[string]money.Money, len(vendors))
 	quoted := make(map[string]bool, len(vendors))
 	for _, line := range lines {
 		row := rfqLineRowView{Item: line.ItemName, Qty: formrender.FormatFieldValue(line.Qty)}
-		lowest := 0.0
+		var lowest money.Money
 		haveLowest := false
 		for _, v := range vendors {
 			price, ok := line.QuotesByVendor[v.ID]
@@ -167,7 +176,7 @@ func (h *Handler) buildRFQReportView(ctx context.Context, ts tenantScope, rfq da
 		for _, v := range vendors {
 			cell := rfqCellView{}
 			if price, ok := line.QuotesByVendor[v.ID]; ok {
-				cell.Value = formrender.FormatFieldValue(price)
+				cell.Value = price.String()
 				cell.Present = true
 				cell.Lowest = haveLowest && price == lowest
 				totals[v.ID] += price
@@ -181,7 +190,7 @@ func (h *Handler) buildRFQReportView(ctx context.Context, ts tenantScope, rfq da
 	for _, v := range vendors {
 		cell := rfqCellView{}
 		if quoted[v.ID] {
-			cell.Value = formrender.FormatFieldValue(totals[v.ID])
+			cell.Value = totals[v.ID].String()
 			cell.Present = true
 		}
 		view.FooterCells = append(view.FooterCells, cell)

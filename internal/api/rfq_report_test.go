@@ -12,6 +12,7 @@ import (
 	"github.com/universaltill/universal-core/internal/i18n"
 	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
+	"github.com/universaltill/universal-core/internal/kernel/money"
 	"github.com/universaltill/universal-core/internal/kernel/purchasing"
 )
 
@@ -150,19 +151,20 @@ func TestRFQComparisonReport_RendersGridWithCheapestMarked(t *testing.T) {
 	engine := crud.NewEngine(db)
 
 	// lineA: vendor X cheaper (9.50 < 10.25). lineB: only vendor X quoted
-	// — the deliberate missing-quote gap for vendor Y.
+	// — the deliberate missing-quote gap for vendor Y. unit_price is
+	// FieldMoney now (minor units, uc-infra#68): 950 == $9.50.
 	if _, err := engine.Create(ctx, purchasing.RequestForQuotationQuoteLine(), map[string]any{
-		"rfq_line_id": lineAID, "vendor_id": vendorXID, "unit_price": 9.5,
+		"rfq_line_id": lineAID, "vendor_id": vendorXID, "unit_price": 950,
 	}, actor); err != nil {
 		t.Fatalf("quote lineA/vendorX: %v", err)
 	}
 	if _, err := engine.Create(ctx, purchasing.RequestForQuotationQuoteLine(), map[string]any{
-		"rfq_line_id": lineAID, "vendor_id": vendorYID, "unit_price": 10.25,
+		"rfq_line_id": lineAID, "vendor_id": vendorYID, "unit_price": 1025,
 	}, actor); err != nil {
 		t.Fatalf("quote lineA/vendorY: %v", err)
 	}
 	if _, err := engine.Create(ctx, purchasing.RequestForQuotationQuoteLine(), map[string]any{
-		"rfq_line_id": lineBID, "vendor_id": vendorXID, "unit_price": 4.0,
+		"rfq_line_id": lineBID, "vendor_id": vendorXID, "unit_price": 400,
 	}, actor); err != nil {
 		t.Fatalf("quote lineB/vendorX: %v", err)
 	}
@@ -177,13 +179,13 @@ func TestRFQComparisonReport_RendersGridWithCheapestMarked(t *testing.T) {
 
 	for _, want := range []string{
 		"Widget A", "Widget B", "Vendor X", "Vendor Y",
-		"9.5", "10.25", "4",
+		"9.50", "10.25", "4.00",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("report body missing %q:\n%s", want, body)
 		}
 	}
-	// The cheapest price on lineA (9.5, vendor X) must be marked; the
+	// The cheapest price on lineA (9.50, vendor X) must be marked; the
 	// more expensive one (10.25, vendor Y) must not carry that class on
 	// its own cell. A crude but adequate proxy at this layer: the marker
 	// class appears exactly once (lineA's one cheapest cell — lineB has
@@ -193,10 +195,11 @@ func TestRFQComparisonReport_RendersGridWithCheapestMarked(t *testing.T) {
 	if got := strings.Count(body, `class="uc-rfq-lowest"`); got != 2 {
 		t.Errorf("expected 2 uc-rfq-lowest markers (lineA's cheapest cell + lineB's sole quote), got %d:\n%s", got, body)
 	}
-	// vendor X's footer total: 9.5 + 4 = 13.5. vendor Y's footer total:
-	// 10.25 only (never quoted lineB).
-	if !strings.Contains(body, "13.5") {
-		t.Errorf("report body missing vendor X's footer total 13.5:\n%s", body)
+	// vendor X's footer total: 9.50 + 4.00 = 13.50. vendor Y's footer
+	// total: 10.25 only (never quoted lineB). Exact int64 minor-unit
+	// addition (uc-infra#68) — no float ever enters this sum.
+	if !strings.Contains(body, "13.50") {
+		t.Errorf("report body missing vendor X's footer total 13.50:\n%s", body)
 	}
 }
 
@@ -362,11 +365,11 @@ func TestRFQComparisonReport_TiedLowestPriceMarksBoth(t *testing.T) {
 	actor := humanActor()
 	engine := crud.NewEngine(db)
 
-	// lineA: both vendors quote exactly 7.5 — the tie. lineB: nobody
-	// quoted, so no mark there at all.
+	// lineA: both vendors quote exactly 750 ($7.50) — the tie. lineB:
+	// nobody quoted, so no mark there at all.
 	for _, vendorID := range []string{vendorXID, vendorYID} {
 		if _, err := engine.Create(ctx, purchasing.RequestForQuotationQuoteLine(), map[string]any{
-			"rfq_line_id": lineAID, "vendor_id": vendorID, "unit_price": 7.5,
+			"rfq_line_id": lineAID, "vendor_id": vendorID, "unit_price": 750,
 		}, actor); err != nil {
 			t.Fatalf("quote lineA/%s: %v", vendorID, err)
 		}
@@ -390,6 +393,10 @@ func TestRFQComparisonReport_TiedLowestPriceMarksBoth(t *testing.T) {
 // free/waived line — Present, and genuinely the lowest, unlike a MISSING
 // quote which is neither), a negative price (a credit/rebate line), and
 // a row nobody quoted at all (no mark, no footer contribution).
+//
+// QuotesByVendor is money.Money (minor units, uc-infra#68) — cell.Value
+// is the major-unit decimal string money.Money.String() produces, not
+// the raw minor-units integer.
 func TestBuildRFQReportView_EdgeCasePrices(t *testing.T) {
 	catalog, err := i18n.Load("en")
 	if err != nil {
@@ -398,8 +405,8 @@ func TestBuildRFQReportView_EdgeCasePrices(t *testing.T) {
 	h := &Handler{catalog: catalog}
 	vendors := []data.RFQComparisonVendor{{ID: "v1", Name: "A"}, {ID: "v2", Name: "B"}}
 	lines := []data.RFQComparisonLine{
-		{ID: "l1", ItemName: "Free", Qty: 1, QuotesByVendor: map[string]float64{"v1": 0, "v2": 3}},
-		{ID: "l2", ItemName: "Rebate", Qty: 1, QuotesByVendor: map[string]float64{"v1": -2, "v2": 3}},
+		{ID: "l1", ItemName: "Free", Qty: 1, QuotesByVendor: map[string]money.Money{"v1": 0, "v2": 300}},
+		{ID: "l2", ItemName: "Rebate", Qty: 1, QuotesByVendor: map[string]money.Money{"v1": -200, "v2": 300}},
 		{ID: "l3", ItemName: "Unquoted", Qty: 1, QuotesByVendor: nil},
 	}
 	view := h.buildRFQReportView(context.Background(), tenantScope{}, data.Record{Data: map[string]any{}}, lines, vendors, "en")
@@ -409,23 +416,24 @@ func TestBuildRFQReportView_EdgeCasePrices(t *testing.T) {
 	}
 	// A real 0.00 quote is Present and lowest — it must not be confused
 	// with the missing-quote blank.
-	if c := view.Rows[0].Cells[0]; !c.Present || !c.Lowest || c.Value != "0" {
-		t.Errorf("row 0 vendor A = %+v, want a present, lowest 0", c)
+	if c := view.Rows[0].Cells[0]; !c.Present || !c.Lowest || c.Value != "0.00" {
+		t.Errorf("row 0 vendor A = %+v, want a present, lowest 0.00", c)
 	}
-	if c := view.Rows[1].Cells[0]; !c.Present || !c.Lowest || c.Value != "-2" {
-		t.Errorf("row 1 vendor A = %+v, want a present, lowest -2", c)
+	if c := view.Rows[1].Cells[0]; !c.Present || !c.Lowest || c.Value != "-2.00" {
+		t.Errorf("row 1 vendor A = %+v, want a present, lowest -2.00", c)
 	}
 	for i, c := range view.Rows[2].Cells {
 		if c.Present || c.Lowest {
 			t.Errorf("row 2 cell %d = %+v, want absent and unmarked (nobody quoted)", i, c)
 		}
 	}
-	// Footer: A = 0 + -2 = -2 (both real quotes), B = 3 + 3 = 6.
-	if view.FooterCells[0].Value != "-2" || !view.FooterCells[0].Present {
-		t.Errorf("vendor A footer = %+v, want -2", view.FooterCells[0])
+	// Footer: A = 0 + -200 = -200 ($-2.00, both real quotes), B = 300 +
+	// 300 = 600 ($6.00) — exact int64 minor-unit addition.
+	if view.FooterCells[0].Value != "-2.00" || !view.FooterCells[0].Present {
+		t.Errorf("vendor A footer = %+v, want -2.00", view.FooterCells[0])
 	}
-	if view.FooterCells[1].Value != "6" || !view.FooterCells[1].Present {
-		t.Errorf("vendor B footer = %+v, want 6", view.FooterCells[1])
+	if view.FooterCells[1].Value != "6.00" || !view.FooterCells[1].Present {
+		t.Errorf("vendor B footer = %+v, want 6.00", view.FooterCells[1])
 	}
 }
 
@@ -486,7 +494,7 @@ func TestRFQComparisonReport_WritesNothing(t *testing.T) {
 
 	rfqID, lineAID, _, vendorXID, _ := setupRFQTenant(t, db)
 	if _, err := crud.NewEngine(db).Create(ctx, purchasing.RequestForQuotationQuoteLine(), map[string]any{
-		"rfq_line_id": lineAID, "vendor_id": vendorXID, "unit_price": 9.5,
+		"rfq_line_id": lineAID, "vendor_id": vendorXID, "unit_price": 950,
 	}, humanActor()); err != nil {
 		t.Fatalf("quote lineA/vendorX: %v", err)
 	}

@@ -8,6 +8,7 @@ import (
 	"strconv"
 
 	"github.com/universaltill/universal-core/internal/kernel/entity"
+	"github.com/universaltill/universal-core/internal/kernel/money"
 )
 
 // ExportCSV writes records as CSV to w: a header row of def's own field
@@ -44,12 +45,41 @@ func ExportCSV(w io.Writer, def *entity.Definition, records []map[string]any) er
 	for _, rec := range records {
 		row := make([]string, len(def.Fields))
 		for i, f := range def.Fields {
-			cell := formatValue(rec[f.Name])
-			// FieldNumber/FieldBool are excluded: their text is always
-			// Go's own deterministic strconv formatting of an
-			// already-type-checked value (entity.ValidateRecord already
-			// required a real number/bool to get this far), never
-			// attacker-authored free text — and a negative FieldNumber
+			var cell string
+			if f.Type == entity.FieldMoney {
+				// A money field's stored value is minor units (1050) —
+				// formatValue's generic float64 case would export that
+				// raw integer, which does NOT round-trip through Coerce's
+				// own FieldMoney case (money.ParseString expects a
+				// major-unit decimal string, "10.50", the same human
+				// shape Coerce accepts on import).
+				//
+				// A value money.FromAny can't coerce (nil/absent, or a
+				// still-fractional pre-backfill legacy amount — uc-infra
+				// #68's Version 1->2 bump leaves a real, if transient,
+				// window where such rows exist) falls back to
+				// formatValue rather than silently exporting a blank
+				// cell (independent review): a blank cell reads as "this
+				// record has no price," which is false and, for an
+				// export whose whole point is moving data out reliably,
+				// worse than showing the value in whatever shape it's
+				// actually stored — nil still resolves to "" via
+				// formatValue's own nil case, so the ordinary "absent
+				// means empty cell" convention is unchanged.
+				if m, err := money.FromAny(rec[f.Name]); err == nil {
+					cell = m.String()
+				} else {
+					cell = formatValue(rec[f.Name])
+				}
+			} else {
+				cell = formatValue(rec[f.Name])
+			}
+			// FieldNumber/FieldBool/FieldMoney are excluded: their text is
+			// always Go's own deterministic formatting (strconv, or
+			// money.Money.String()) of an already-type-checked value
+			// (entity.ValidateRecord already required a real number/
+			// bool/whole-minor-units amount to get this far), never
+			// attacker-authored free text — and a negative amount
 			// genuinely starts with '-', which escapeFormulaPrefix must
 			// not mangle into a text-prefixed non-number. Every other
 			// field type (FieldString above all, but also FieldEnum/
@@ -57,7 +87,7 @@ func ExportCSV(w io.Writer, def *entity.Definition, records []map[string]any) er
 			// legitimately start with a formula-trigger character) gets
 			// the same defensive treatment rather than trying to prove
 			// per-type which ones could theoretically hold attacker text.
-			if f.Type != entity.FieldNumber && f.Type != entity.FieldBool {
+			if f.Type != entity.FieldNumber && f.Type != entity.FieldBool && f.Type != entity.FieldMoney {
 				cell = escapeFormulaPrefix(cell)
 			}
 			row[i] = cell

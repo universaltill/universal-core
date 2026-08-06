@@ -23,6 +23,7 @@ import (
 	"github.com/universaltill/universal-core/internal/i18n"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/form"
+	"github.com/universaltill/universal-core/internal/kernel/money"
 )
 
 // Renderer renders form.Definitions. One Renderer serves every entity
@@ -580,9 +581,31 @@ func buildHiddenFields(ent *entity.Definition, record map[string]any, rendered, 
 		if rendered[ef.Name] || redacted[ef.Name] {
 			continue
 		}
-		out = append(out, hiddenFieldView{Name: ef.Name, Value: FormatFieldValue(record[ef.Name])})
+		out = append(out, hiddenFieldView{Name: ef.Name, Value: hiddenFieldValue(ef, record[ef.Name])})
 	}
 	return out
+}
+
+// hiddenFieldValue renders a preserved-but-not-shown field's value for a
+// hidden input — the same value buildFields' fv.Value would carry had
+// this field actually been on the form. A plain FormatFieldValue would
+// be wrong for FieldMoney (independent review, uc-infra#68): the stored
+// value is minor units (1050), but csvimport.Coerce's FieldMoney case
+// (what parseRecordFields feeds a resubmitted hidden input back through)
+// expects the human major-unit decimal ("10.50"), the same as a visible
+// money input's value attribute. Without this, EVERY save of a form that
+// has a money field declared on the entity but not shown — a real,
+// reachable shape (a VisibleIf-hidden field, or a tenant's own form
+// Definition simply omitting it) — would silently multiply that field's
+// stored amount by 100.
+func hiddenFieldValue(ef entity.Field, v any) string {
+	if ef.Type == entity.FieldMoney {
+		if m, err := money.FromAny(v); err == nil {
+			return m.String()
+		}
+		return ""
+	}
+	return FormatFieldValue(v)
 }
 
 // FormatFieldValue renders a record field's stored Go value (whatever
@@ -660,6 +683,21 @@ func (r *Renderer) buildFields(s form.Section, ent *entity.Definition, record ma
 		}
 
 		switch ef.Type {
+		case entity.FieldMoney:
+			// The stored value is minor units (1050); the input's value
+			// attribute must be the human major-unit decimal ("10.50") a
+			// step="0.01" number input expects — the generic
+			// FormatFieldValue assignment above would otherwise render
+			// the raw integer verbatim (fv.Value already set to "1050"
+			// by then, overridden here). A record with no value yet
+			// (create form) leaves record[ff.Name] nil, money.FromAny
+			// errors, and fv.Value stays "" from FormatFieldValue(nil) —
+			// an empty input, not "0.00", so a required money field's
+			// browser-native validation still fires on an untouched
+			// field.
+			if m, err := money.FromAny(record[ff.Name]); err == nil {
+				fv.Value = m.String()
+			}
 		case entity.FieldBool:
 			fv.Checked, _ = record[ff.Name].(bool)
 		case entity.FieldEnum:
@@ -823,14 +861,31 @@ func childCellValue(child map[string]any, name string, childDef *entity.Definiti
 	if childDef == nil || catalog == nil {
 		return v
 	}
-	if f, ok := childDef.FieldByName(name); ok && f.Type == entity.FieldI18nText {
-		if s, ok := catalog.ResolveLocalized(v, locale); ok {
-			return s
+	if f, ok := childDef.FieldByName(name); ok {
+		switch f.Type {
+		case entity.FieldI18nText:
+			if s, ok := catalog.ResolveLocalized(v, locale); ok {
+				return s
+			}
+			// An unresolvable i18n value renders blank rather than as a
+			// raw map — a missing translation is not something to show
+			// as Go syntax.
+			return nil
+		case entity.FieldMoney:
+			// Same fix as buildFields'/buildHiddenFields' own FieldMoney
+			// cases (uc-infra#68): the stored value is minor units
+			// (1050), and a master-detail/related-list child cell must
+			// show the major-unit decimal ("10.50"), not the raw
+			// integer a naive text/template stringification of the
+			// float64 would print. An un-coercible value (absent,
+			// fractional-legacy pre-backfill) falls through to nil —
+			// same "blank rather than garbage" choice as the i18n_text
+			// case above.
+			if m, err := money.FromAny(v); err == nil {
+				return m.String()
+			}
+			return nil
 		}
-		// An unresolvable i18n value renders blank rather than as a raw
-		// map — a missing translation is not something to show as Go
-		// syntax.
-		return nil
 	}
 	return v
 }
@@ -862,6 +917,7 @@ const tmplSrc = `<form class="uc-form" data-entity-type="{{.EntityType}}"{{if .R
 </select>
 {{else if eq .Type "date"}}<input type="date" id="{{.Name}}" name="{{.Name}}" value="{{.Value}}"{{if .Required}} required{{end}}>
 {{else if eq .Type "number"}}<input type="number" id="{{.Name}}" name="{{.Name}}" value="{{.Value}}"{{if .Required}} required{{end}}>
+{{else if eq .Type "money"}}<input type="number" step="0.01" id="{{.Name}}" name="{{.Name}}" value="{{.Value}}"{{if .Required}} required{{end}}>
 {{else}}<input type="text" id="{{.Name}}" name="{{.Name}}" value="{{.Value}}"{{if .Required}} required{{end}}>
 {{end}}
 </div>

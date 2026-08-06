@@ -157,8 +157,8 @@ func TestRequestForQuotationQuoteLine_ShapeAndRequiredFields(t *testing.T) {
 		t.Fatalf("expected a Required vendor_id FieldReference targeting Party, got %+v", vendorField)
 	}
 	priceField, ok := def.FieldByName("unit_price")
-	if !ok || priceField.Type != entity.FieldNumber || !priceField.Required {
-		t.Fatalf("expected a Required unit_price FieldNumber, got %+v", priceField)
+	if !ok || priceField.Type != entity.FieldMoney || !priceField.Required {
+		t.Fatalf("expected a Required unit_price FieldMoney, got %+v", priceField)
 	}
 	quotedAtField, ok := def.FieldByName("quoted_at")
 	if !ok || quotedAtField.Type != entity.FieldDate || quotedAtField.Required {
@@ -168,18 +168,38 @@ func TestRequestForQuotationQuoteLine_ShapeAndRequiredFields(t *testing.T) {
 
 func TestRequestForQuotationQuoteLine_MissingRequiredFields(t *testing.T) {
 	def := RequestForQuotationQuoteLine()
-	if err := entity.ValidateRecord(def, map[string]any{"vendor_id": "party-1", "unit_price": float64(9.5)}); err == nil {
+	// unit_price is FieldMoney (uc-infra#68): its value is a whole number
+	// of minor units, so $9.50 is 950 here, not 9.5.
+	if err := entity.ValidateRecord(def, map[string]any{"vendor_id": "party-1", "unit_price": float64(950)}); err == nil {
 		t.Fatal("expected error for missing required rfq_line_id")
 	}
-	if err := entity.ValidateRecord(def, map[string]any{"rfq_line_id": "line-1", "unit_price": float64(9.5)}); err == nil {
+	if err := entity.ValidateRecord(def, map[string]any{"rfq_line_id": "line-1", "unit_price": float64(950)}); err == nil {
 		t.Fatal("expected error for missing required vendor_id")
 	}
 	if err := entity.ValidateRecord(def, map[string]any{"rfq_line_id": "line-1", "vendor_id": "party-1"}); err == nil {
 		t.Fatal("expected error for missing required unit_price")
 	}
 	// quoted_at is optional — omitting it must still pass.
-	if err := entity.ValidateRecord(def, map[string]any{"rfq_line_id": "line-1", "vendor_id": "party-1", "unit_price": float64(9.5)}); err != nil {
+	if err := entity.ValidateRecord(def, map[string]any{"rfq_line_id": "line-1", "vendor_id": "party-1", "unit_price": float64(950)}); err != nil {
 		t.Fatalf("expected no error with quoted_at omitted, got %v", err)
+	}
+}
+
+// TestRequestForQuotationQuoteLine_UnitPriceRejectsMajorUnitFraction
+// (uc-infra#68) pins the actual bug fix: before this field was
+// FieldMoney, a caller could submit a major-unit dollar amount like 9.5
+// directly and it would validate fine as a FieldNumber — which is
+// exactly how the vendor-comparison report's footer total ended up
+// summing fractional floats and showing an IEEE artifact. Now that same
+// submission must fail loud instead of silently being treated as "9.5
+// minor units."
+func TestRequestForQuotationQuoteLine_UnitPriceRejectsMajorUnitFraction(t *testing.T) {
+	def := RequestForQuotationQuoteLine()
+	err := entity.ValidateRecord(def, map[string]any{
+		"rfq_line_id": "line-1", "vendor_id": "party-1", "unit_price": float64(9.5),
+	})
+	if err == nil {
+		t.Fatal("expected a fractional unit_price to be rejected as not a whole number of minor units")
 	}
 }
 
@@ -216,21 +236,27 @@ func TestRequestForQuotationForm_VendorsAndLinesAreMasterDetailWithNoRollUp(t *t
 // carries all four new Definitions — a Definition that exists as a Go
 // function but isn't in All() is invisible to Publish (seed.go) and
 // never reaches a real tenant.
+//
+// RequestForQuotationQuoteLine expects Version 2, not 1: its unit_price
+// field's TYPE changed (FieldNumber -> FieldMoney, uc-infra#68), the
+// same class of change that bumps a Definition's Version (see that
+// function's own doc comment on the bump).
 func TestRequestForQuotationEntitiesAreInAll(t *testing.T) {
-	want := map[string]bool{
-		"RequestForQuotation": false, "RequestForQuotationLine": false,
-		"RequestForQuotationVendor": false, "RequestForQuotationQuoteLine": false,
+	wantVersion := map[string]int{
+		"RequestForQuotation": 1, "RequestForQuotationLine": 1,
+		"RequestForQuotationVendor": 1, "RequestForQuotationQuoteLine": 2,
 	}
+	found := map[string]bool{}
 	for _, def := range All() {
-		if _, ok := want[def.EntityType]; ok {
-			want[def.EntityType] = true
-			if def.Version != 1 {
-				t.Errorf("%s: expected Version 1 (new entity), got %d", def.EntityType, def.Version)
+		if want, ok := wantVersion[def.EntityType]; ok {
+			found[def.EntityType] = true
+			if def.Version != want {
+				t.Errorf("%s: expected Version %d, got %d", def.EntityType, want, def.Version)
 			}
 		}
 	}
-	for entityType, found := range want {
-		if !found {
+	for entityType := range wantVersion {
+		if !found[entityType] {
 			t.Errorf("%s missing from All()", entityType)
 		}
 	}

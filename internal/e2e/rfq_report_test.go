@@ -95,19 +95,20 @@ func TestRFQComparisonReport_RealBrowser(t *testing.T) {
 	// lineA: vendor X quotes cheaper (9.50 < 10.25) — the cheapest-price
 	// mark this test asserts against as a real computed style. lineB:
 	// only vendor X quoted — the deliberate missing-quote gap for vendor
-	// Y, rendered as a blank cell, not a fabricated zero.
+	// Y, rendered as a blank cell, not a fabricated zero. unit_price is
+	// FieldMoney now (minor units, uc-infra#68): 950 == $9.50.
 	if _, err := engine.Create(ctx, purchasing.RequestForQuotationQuoteLine(), map[string]any{
-		"rfq_line_id": lineA.ID, "vendor_id": vendorX.ID, "unit_price": 9.5,
+		"rfq_line_id": lineA.ID, "vendor_id": vendorX.ID, "unit_price": 950,
 	}, actor); err != nil {
 		t.Fatalf("seed quote lineA/vendorX: %v", err)
 	}
 	if _, err := engine.Create(ctx, purchasing.RequestForQuotationQuoteLine(), map[string]any{
-		"rfq_line_id": lineA.ID, "vendor_id": vendorY.ID, "unit_price": 10.25,
+		"rfq_line_id": lineA.ID, "vendor_id": vendorY.ID, "unit_price": 1025,
 	}, actor); err != nil {
 		t.Fatalf("seed quote lineA/vendorY: %v", err)
 	}
 	if _, err := engine.Create(ctx, purchasing.RequestForQuotationQuoteLine(), map[string]any{
-		"rfq_line_id": lineB.ID, "vendor_id": vendorX.ID, "unit_price": 4.0,
+		"rfq_line_id": lineB.ID, "vendor_id": vendorX.ID, "unit_price": 400,
 	}, actor); err != nil {
 		t.Fatalf("seed quote lineB/vendorX: %v", err)
 	}
@@ -124,7 +125,7 @@ func TestRFQComparisonReport_RealBrowser(t *testing.T) {
 
 	for _, want := range []string{
 		"E2E Widget A", "E2E Widget B", "E2E Vendor X", "E2E Vendor Y",
-		"9.5", "10.25", "4",
+		"9.50", "10.25", "4.00",
 	} {
 		if !strings.Contains(bodyText, want) {
 			t.Errorf("report page missing %q; body text:\n%s", want, bodyText)
@@ -137,7 +138,7 @@ func TestRFQComparisonReport_RealBrowser(t *testing.T) {
 		t.Errorf("report page missing the missing-quote placeholder; body text:\n%s", bodyText)
 	}
 
-	// The real DOM/CSS proof: the cheapest cell on lineA (vendor X's 9.5)
+	// The real DOM/CSS proof: the cheapest cell on lineA (vendor X's 9.50)
 	// must carry the .uc-rfq-lowest class AND that class must actually
 	// resolve to a real, non-default computed background — proving the
 	// stylesheet is really loaded and applied, not just that the class

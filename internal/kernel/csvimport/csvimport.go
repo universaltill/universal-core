@@ -41,6 +41,7 @@ import (
 	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
+	"github.com/universaltill/universal-core/internal/kernel/money"
 )
 
 // ColumnMapping maps a CSV header name to the entity field it fills.
@@ -284,6 +285,29 @@ func Coerce(t entity.FieldType, raw string) (any, error) {
 			return nil, fmt.Errorf("%q is not a number", raw)
 		}
 		return n, nil
+	case entity.FieldMoney:
+		// A money cell/form field is typed by a human as a major-unit
+		// decimal amount ("10.50"), same canonical ASCII convention
+		// FieldNumber's own ParseFloat uses above (locale-formatted
+		// grouping/separators are a display-only concern — see
+		// money.ParseString's own doc comment). money.ParseString both
+		// converts to minor units AND rejects more than money.Decimals
+		// fractional digits, so a mistyped extra digit fails loud here
+		// rather than silently entering entity.ValidateRecord as an
+		// already-invalid fractional minor-unit value.
+		m, err := money.ParseString(raw)
+		if err != nil {
+			return nil, fmt.Errorf("%q is not a valid money amount", raw)
+		}
+		// float64, not int64: every other Coerce case that produces a
+		// number returns the same Go type a JSON-decoded record would
+		// carry (see formatValue's own doc comment — "a JSON-decoded
+		// record's number is always float64, per encoding/json's own
+		// default"). Money(1050) converts to float64 exactly (minor-unit
+		// amounts are always far below 2^53), so this costs nothing and
+		// keeps a CSV-imported value indistinguishable in-memory from one
+		// that round-tripped through the database.
+		return float64(m), nil
 	case entity.FieldBool:
 		// strconv.ParseBool's accepted set: 1/t/T/TRUE/true/True and
 		// 0/f/F/FALSE/false/False. Accepting bare "1"/"0" is a known
