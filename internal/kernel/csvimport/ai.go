@@ -14,9 +14,9 @@ import (
 // maxSampleRowsForAI caps how many data rows SampleRows/SampleRowsXLSX
 // read for an AI mapping suggestion's prompt — enough for a model to see
 // real variation in a column's values without the prompt (and the
-// model's limited context budget on the small, homelab-scale model this
-// platform runs — see aiassist's own doc comment) growing with file
-// size.
+// model's limited context budget on the small, self-hosted-scale model
+// this platform runs — see aiassist's own doc comment) growing with
+// file size.
 const maxSampleRowsForAI = 5
 
 // maxSampleValuesPerHeader caps how many of a header's sample values
@@ -54,8 +54,8 @@ func sampleRows(r io.Reader, read reader) (headers []string, rows [][]string, er
 
 // aiMappingSchema is the JSON Schema handed to aiassist.Client.GenerateJSON
 // as Ollama's structured-output "format" constraint — proven directly
-// against the live homelab-k8s Ollama instance (llama3.2:3b) before this
-// was written: an earlier, more ambiguous schema/prompt pairing (generic
+// against a live Ollama instance (llama3.2:3b) before this was written:
+// an earlier, more ambiguous schema/prompt pairing (generic
 // "field" property name, no explicit "don't invent new values"
 // instruction) had the model echo the column header back as the field
 // name instead of actually mapping it. "database_field" as the property

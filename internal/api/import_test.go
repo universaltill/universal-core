@@ -435,9 +435,9 @@ func fakeAIServer(t *testing.T, mappings []map[string]string, called *bool) *htt
 }
 
 // TestImport_Preview_AIFillsGapsAndMarksSuggestedRows is the API-layer
-// end-to-end proof, mirroring what was manually verified against the
-// real homelab-k8s Ollama instance: a CSV whose headers don't exact-
-// match any field gets AI-suggested selections pre-filled, each visibly
+// end-to-end proof, mirroring what was manually verified against a real
+// self-hosted Ollama instance: a CSV whose headers don't exact-match
+// any field gets AI-suggested selections pre-filled, each visibly
 // flagged in the rendered HTML — still just the same editable <select>
 // every mapping row already had.
 func TestImport_Preview_AIFillsGapsAndMarksSuggestedRows(t *testing.T) {

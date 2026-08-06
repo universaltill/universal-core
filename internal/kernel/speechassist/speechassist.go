@@ -27,10 +27,10 @@ import (
 )
 
 // Client talks to one self-hosted Whisper ASR server (the
-// onerahmet/openai-whisper-asr-webservice API shape — see
-// ../../../../unitill/homelab-k8s/kubernetes/apps/whisper/README.md for
-// the reference deployment this was written and verified against). The
-// zero value is unusable — construct via NewClient, which is also where
+// onerahmet/openai-whisper-asr-webservice API shape — this was written
+// and verified against the platform's reference self-hosted
+// deployment). The zero value is unusable — construct via NewClient,
+// which is also where
 // "no STT configured" becomes a legitimate, always-safe state (see
 // Enabled), mirroring aiassist.NewClient exactly.
 type Client struct {
@@ -81,10 +81,10 @@ func (c *Client) Enabled() bool {
 // server auto-detect. Found necessary in practice, not just in theory:
 // a short voice note (a few seconds) gives Whisper's language-ID very
 // little signal to work with, and the reference deployment runs the
-// smallest "base" model (see kubernetes/apps/whisper's own README) —
-// auto-detection on short, non-English audio against that model
-// unreliably settled on English rather than the language actually
-// spoken. A caller that already knows the speaker's language (e.g. the
+// smallest "base" model — auto-detection on short, non-English audio
+// against that model unreliably settled on English rather than the
+// language actually spoken. A caller that already knows the speaker's
+// language (e.g. the
 // issue logger, from the page's own current UI locale) should always
 // pass it — it costs nothing when right and fixes exactly this failure
 // mode when auto-detect would have guessed wrong.
