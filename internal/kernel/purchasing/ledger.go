@@ -67,6 +67,10 @@ func PostGoodsReceiptLineToLedger(ctx context.Context, tx *sql.Tx, _ *entity.Def
 		return nil
 	}
 
+	if err := validateGoodsReceiptLineQuality(rec); err != nil {
+		return err
+	}
+
 	qty, _ := rec.Data["qty_received"].(float64)
 	poLineID, _ := rec.Data["po_line_id"].(string)
 	if poLineID == "" {
@@ -111,6 +115,77 @@ func PostGoodsReceiptLineToLedger(ctx context.Context, tx *sql.Tx, _ *entity.Def
 	}, actor)
 	if err != nil {
 		return fmt.Errorf("post GoodsReceiptLine %s to ledger: %w", rec.ID, err)
+	}
+	return nil
+}
+
+// qtyNetEpsilon tolerates float64 rounding noise when comparing
+// qty_accepted + qty_rejected against qty_received — the three values
+// arrive as ordinary decimal input (a receiving clerk's typed quantity,
+// or a CSV import), and while most real quantities net exactly, a
+// fractional UoM (weight, length) can produce a sum that differs from
+// the stored qty_received in its last binary digit despite being
+// "equal" in every decimal sense a human typed. Not a business
+// tolerance — an intentionally tiny guard against exactly this class of
+// binary floating-point noise, not a license to be off by a real unit.
+const qtyNetEpsilon = 1e-9
+
+// validateGoodsReceiptLineQuality is the uc-infra#82 half of
+// PostGoodsReceiptLineToLedger's job: qty_accepted/qty_rejected
+// (GoodsReceiptLine's own doc comment, Version 2) are declared OPTIONAL
+// at the entity.Field level because entity.Field has no
+// required-together concept (#80's same Min/Max gap), so this crud.Hook
+// enforces the two invariants a plain field declaration can't:
+//
+//  1. Required together: a line records BOTH an accepted and a rejected
+//     quantity or NEITHER — a line with only one set is a partial,
+//     probably-still-being-entered quality record, not a real one, and
+//     would silently corrupt forecast.ComputeQuality's sums (uncounted
+//     "the other half" of a quantity) if let through.
+//  2. Netting: when both are set, qty_accepted + qty_rejected must equal
+//     qty_received (within qtyNetEpsilon) — this is a SPLIT of what
+//     arrived, not an independent count that could disagree with it.
+//
+// entity.ValidateRecord already guarantees that whichever of the two
+// fields IS present in rec.Data is a well-formed FieldNumber before this
+// hook ever runs (crud.Engine.Create/Update call it first) — this
+// function only needs to decide presence (via the map's comma-ok, not
+// numberFieldValue, which can't tell "absent" from "wrong type") and
+// check the two business invariants above. Runs on Create only, same
+// action gate as the rest of this hook — GoodsReceiptLine has no update
+// path yet (see the action check above).
+func validateGoodsReceiptLineQuality(rec data.Record) error {
+	acceptedRaw, hasAccepted := rec.Data["qty_accepted"]
+	rejectedRaw, hasRejected := rec.Data["qty_rejected"]
+	if !hasAccepted && !hasRejected {
+		// No quality data recorded for this line at all — a valid,
+		// expected state (GoodsReceiptLine's own doc comment): most
+		// lines, until a tenant starts using this.
+		return nil
+	}
+	if hasAccepted != hasRejected {
+		return fmt.Errorf("%w: GoodsReceiptLine qty_accepted and qty_rejected must both be set or both be omitted", crud.ErrHookRejected)
+	}
+
+	accepted, ok := numberFieldValue(acceptedRaw)
+	if !ok {
+		return fmt.Errorf("%w: GoodsReceiptLine qty_accepted must be a number, got %T", crud.ErrHookRejected, acceptedRaw)
+	}
+	rejected, ok := numberFieldValue(rejectedRaw)
+	if !ok {
+		return fmt.Errorf("%w: GoodsReceiptLine qty_rejected must be a number, got %T", crud.ErrHookRejected, rejectedRaw)
+	}
+	if accepted < 0 {
+		return fmt.Errorf("%w: GoodsReceiptLine qty_accepted must not be negative, got %v", crud.ErrHookRejected, accepted)
+	}
+	if rejected < 0 {
+		return fmt.Errorf("%w: GoodsReceiptLine qty_rejected must not be negative, got %v", crud.ErrHookRejected, rejected)
+	}
+
+	received, _ := numberFieldValue(rec.Data["qty_received"])
+	if diff := accepted + rejected - received; diff > qtyNetEpsilon || diff < -qtyNetEpsilon {
+		return fmt.Errorf("%w: GoodsReceiptLine qty_accepted (%v) + qty_rejected (%v) must equal qty_received (%v)",
+			crud.ErrHookRejected, accepted, rejected, received)
 	}
 	return nil
 }

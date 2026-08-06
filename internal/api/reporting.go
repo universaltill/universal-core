@@ -49,7 +49,9 @@ var poStatusDisplayOrder = []string{"draft", "submitted", "approved", "received"
 // LatestPOVendorByItem read POLine joined to PurchaseOrder (+Status),
 // and the reorder-signal section reads ReorderRule (via the guarded
 // engine, which would enforce this anyway — listed here too so the
-// whole-page gate stays one honest unit).
+// whole-page gate stays one honest unit). uc-infra#82's addition:
+// GoodsReceiptLineQualities reads GoodsReceiptLine joined to GoodsReceipt,
+// PurchaseOrder, and Party.
 // Missing a join target here is a real leak, not a cosmetic gap: a role
 // denied read on Status alone would otherwise still see every status
 // label and count in the breakdown even with PurchaseOrder itself
@@ -60,7 +62,7 @@ var poStatusDisplayOrder = []string{"draft", "submitted", "approved", "received"
 // the report, which is a separate, still-deferred design problem (there
 // is no entity.Definition for a hand-written aggregate to filter
 // against).
-var purchasingReportEntityTypes = []string{"PurchaseOrder", "Status", "Party", "InventoryItem", "Item", "POLine", "GoodsReceipt", "ReorderRule"}
+var purchasingReportEntityTypes = []string{"PurchaseOrder", "Status", "Party", "InventoryItem", "Item", "POLine", "GoodsReceipt", "GoodsReceiptLine", "ReorderRule"}
 
 // requireReportRead denies the whole report page unless the actor can
 // read every one of entityTypes, reusing ts.crud.CanRead (the same
@@ -161,6 +163,13 @@ func (h *Handler) renderPurchasingReport(w http.ResponseWriter, r *http.Request)
 	stats := forecast.Compute(leadTimeSamples(leadTimes))
 	onTimeStats := forecast.ComputeOnTime(onTimeSamples(leadTimes))
 
+	qualityLines, err := ts.reporting.GoodsReceiptLineQualities(ctx)
+	if err != nil {
+		writeInternalError(w, "goods receipt line qualities", err)
+		return
+	}
+	qualityStats := forecast.ComputeQuality(qualitySamples(qualityLines))
+
 	signals, err := h.buildReorderSignals(ctx, ts, stats, locale)
 	if err != nil {
 		writeInternalError(w, "build reorder signals", err)
@@ -209,6 +218,12 @@ func (h *Handler) renderPurchasingReport(w http.ResponseWriter, r *http.Request)
 		OnTimeSamplesCol: h.catalog.T(locale, "report.purchasing.ontime_samples_col"),
 		OnTimeRateCol:    h.catalog.T(locale, "report.purchasing.ontime_rate_col"),
 
+		QualityHeading:    h.catalog.T(locale, "report.purchasing.quality_heading"),
+		QualityEmpty:      h.catalog.T(locale, "report.purchasing.quality_empty"),
+		QualityVendorCol:  h.catalog.TOrDefault(locale, "field.PurchaseOrder.vendor_id", "Vendor"),
+		QualitySamplesCol: h.catalog.T(locale, "report.purchasing.quality_samples_col"),
+		QualityRateCol:    h.catalog.T(locale, "report.purchasing.quality_rate_col"),
+
 		ReorderHeading:     h.catalog.T(locale, "report.purchasing.reorder_heading"),
 		ReorderEmpty:       h.catalog.T(locale, "report.purchasing.reorder_empty"),
 		ReorderItemCol:     h.catalog.TOrDefault(locale, "entity.Item.name", "Item"),
@@ -221,6 +236,7 @@ func (h *Handler) renderPurchasingReport(w http.ResponseWriter, r *http.Request)
 	}
 	view.LeadTimeRows = h.buildLeadTimeRows(stats, leadTimes, locale)
 	view.OnTimeRows = h.buildOnTimeRows(onTimeStats, leadTimes, locale)
+	view.QualityRows = h.buildQualityRows(qualityStats, qualityLines, locale)
 	for _, status := range poStatusDisplayOrder {
 		row, ok := byStatus[status]
 		if !ok {
@@ -311,6 +327,38 @@ func onTimeSamples(rows []data.CompletedPOLeadTime) []forecast.OnTimeSample {
 			continue
 		}
 		samples = append(samples, forecast.OnTimeSample{VendorID: row.VendorID, PromisedDate: promised, ReceivedDate: received})
+	}
+	return samples
+}
+
+// qualitySamples converts the raw GoodsReceiptLine quality rows into
+// forecast quality samples (uc-infra#82). A row's QtyAccepted/
+// QtyRejected being empty — expected to be most of them, since both
+// fields are optional and every line written before uc-infra#82 has
+// neither — means HasData stays false, the same "absent, not a
+// fabricated zero" treatment onTimeSamples gives an unparseable date. A
+// row where exactly one of the two parses (data corrupted after
+// bypassing the write-time hook, e.g. a direct DB edit) is treated the
+// same as neither parsing: purchasing.validateGoodsReceiptLineQuality's
+// whole point is that these two fields are only ever meaningful
+// together, so a sample this package can't trust both halves of is not
+// a sample it should count as HasData at all, rather than silently
+// crediting an accepted (or rejected) total that has no matching other
+// half.
+func qualitySamples(rows []data.GoodsReceiptLineQuality) []forecast.QualitySample {
+	samples := make([]forecast.QualitySample, 0, len(rows))
+	for _, row := range rows {
+		if row.QtyAccepted == "" && row.QtyRejected == "" {
+			continue
+		}
+		accepted, errA := strconv.ParseFloat(row.QtyAccepted, 64)
+		rejected, errR := strconv.ParseFloat(row.QtyRejected, 64)
+		if errA != nil || errR != nil {
+			continue
+		}
+		samples = append(samples, forecast.QualitySample{
+			VendorID: row.VendorID, QtyAccepted: accepted, QtyRejected: rejected, HasData: true,
+		})
 	}
 	return samples
 }
@@ -425,6 +473,57 @@ func (h *Handler) buildOnTimeRows(stats forecast.OnTimeResult, rows []data.Compl
 	})
 
 	out := make([]onTimeRowView, 0, len(vendorIDs)+1)
+	for _, id := range vendorIDs {
+		out = append(out, row(nameByVendor[id], stats.ByVendor[id]))
+	}
+	out = append(out, row(h.catalog.T(locale, "report.purchasing.leadtime_overall_label"), stats.Overall))
+	return out
+}
+
+// buildQualityRows shapes forecast.QualityResult into the quality table
+// (uc-infra#82): one row per vendor with at least one GoodsReceiptLine
+// carrying quality data (alphabetical, stable — same ordering as
+// buildOnTimeRows/buildLeadTimeRows) plus an all-vendors summary row
+// last. A vendor below forecast.MinSamples shows the localized
+// insufficient-history text instead of a rate — never a fabricated
+// percentage, same no-fabrication discipline every other section here
+// already applies. An empty result is the COMMON case (most tenants
+// will have no qty_accepted/qty_rejected set on anything yet), not a
+// sign of no purchasing activity at all — the empty state's own copy
+// says so, same reasoning buildOnTimeRows' doc comment gives for its own
+// empty case.
+func (h *Handler) buildQualityRows(stats forecast.QualityResult, rows []data.GoodsReceiptLineQuality, locale string) []qualityRowView {
+	if stats.Overall.N == 0 {
+		return nil
+	}
+	insufficient := h.catalog.T(locale, "report.purchasing.quality_insufficient")
+
+	nameByVendor := make(map[string]string, len(rows))
+	for _, r := range rows {
+		nameByVendor[r.VendorID] = r.VendorName
+	}
+
+	row := func(label string, s forecast.QualityStats) qualityRowView {
+		v := qualityRowView{Vendor: label, N: strconv.Itoa(s.N), Rate: insufficient}
+		if s.Sufficient() {
+			v.Rate = formatRate(s.Rate())
+		}
+		return v
+	}
+
+	vendorIDs := make([]string, 0, len(stats.ByVendor))
+	for id := range stats.ByVendor {
+		vendorIDs = append(vendorIDs, id)
+	}
+	sort.Slice(vendorIDs, func(i, j int) bool {
+		ni, nj := nameByVendor[vendorIDs[i]], nameByVendor[vendorIDs[j]]
+		if ni != nj {
+			return ni < nj
+		}
+		return vendorIDs[i] < vendorIDs[j]
+	})
+
+	out := make([]qualityRowView, 0, len(vendorIDs)+1)
 	for _, id := range vendorIDs {
 		out = append(out, row(nameByVendor[id], stats.ByVendor[id]))
 	}
@@ -606,6 +705,13 @@ type purchasingReportView struct {
 	OnTimeRateCol    string
 	OnTimeRows       []onTimeRowView
 
+	QualityHeading    string
+	QualityEmpty      string
+	QualityVendorCol  string
+	QualitySamplesCol string
+	QualityRateCol    string
+	QualityRows       []qualityRowView
+
 	ReorderHeading     string
 	ReorderEmpty       string
 	ReorderItemCol     string
@@ -625,6 +731,12 @@ type leadTimeRowView struct {
 }
 
 type onTimeRowView struct {
+	Vendor string
+	N      string
+	Rate   string
+}
+
+type qualityRowView struct {
 	Vendor string
 	N      string
 	Rate   string
@@ -744,6 +856,20 @@ var purchasingReportTmpl = template.Must(template.New("purchasingReport").Parse(
 </table>
 {{else}}
 <p class="uc-empty">{{.OnTimeEmpty}}</p>
+{{end}}
+
+<h2>{{.QualityHeading}}</h2>
+{{if .QualityRows}}
+<table class="uc-table">
+<thead><tr><th>{{.QualityVendorCol}}</th><th>{{.QualitySamplesCol}}</th><th>{{.QualityRateCol}}</th></tr></thead>
+<tbody>
+{{range .QualityRows}}
+<tr><td>{{.Vendor}}</td><td>{{.N}}</td><td>{{.Rate}}</td></tr>
+{{end}}
+</tbody>
+</table>
+{{else}}
+<p class="uc-empty">{{.QualityEmpty}}</p>
 {{end}}
 
 <h2>{{.ReorderHeading}}</h2>

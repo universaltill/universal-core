@@ -516,3 +516,76 @@ func (r *ReportingRepo) StockoutRiskItems(ctx context.Context, limit int) ([]Sto
 	}
 	return out, rows.Err()
 }
+
+// GoodsReceiptLineQuality is one GoodsReceiptLine's vendor + recorded
+// inspection outcome (uc-infra#82). QtyAccepted/QtyRejected are the
+// stored qty_accepted/qty_rejected FieldNumber values, passed through as
+// text and empty when either is absent — same "coalesce to empty
+// string, let the caller decide what absence means" division of
+// responsibility CompletedPOLeadTime.PromisedDeliveryDate already uses;
+// forecast.QualitySample is the caller that turns "" into HasData=false.
+// A line's own quality invariant (accepted+rejected == received when
+// both are set) is enforced at write time by
+// purchasing.validateGoodsReceiptLineQuality, not re-checked here — this
+// is a read path, not a second source of truth for it.
+type GoodsReceiptLineQuality struct {
+	LineID      string
+	VendorID    string
+	VendorName  string
+	QtyAccepted string
+	QtyRejected string
+}
+
+// GoodsReceiptLineQualities returns every GoodsReceiptLine resolvable to
+// a PurchaseOrder (via its GoodsReceipt's purchase_order_id), regardless
+// of whether it carries quality data — same "return everything, let the
+// forecast package decide validity" shape CompletedPOLeadTimes already
+// uses for on-time samples. The vendor join is LEFT and compares
+// id::text (not ::uuid-cast), so a line whose PO has a malformed or
+// absent vendor_id still contributes its quality data to the OVERALL
+// aggregate with an empty VendorID, rather than being dropped — the same
+// reasoning CompletedPOLeadTimes' own vendor join gives. The
+// GoodsReceipt/PurchaseOrder hops DO need the uuidPattern guard: unlike
+// the vendor hop, these are ::uuid casts (a malformed goods_receipt_id
+// or purchase_order_id would otherwise abort the whole query for every
+// other, perfectly valid line too). Ordered by line id for a
+// deterministic result.
+func (r *ReportingRepo) GoodsReceiptLineQualities(ctx context.Context) ([]GoodsReceiptLineQuality, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT l.id, coalesce(v.id::text, ''), coalesce(v.data->>'name', v.id::text, ''),
+		        coalesce(l.data->>'qty_accepted', ''), coalesce(l.data->>'qty_rejected', '')
+		 FROM records l
+		 JOIN records g
+		   ON g.entity_type = 'GoodsReceipt'
+		  AND g.deleted_at IS NULL
+		  AND g.id = (l.data->>'goods_receipt_id')::uuid
+		 JOIN records po
+		   ON po.entity_type = 'PurchaseOrder'
+		  AND po.deleted_at IS NULL
+		  AND po.id = (g.data->>'purchase_order_id')::uuid
+		 LEFT JOIN records v
+		   ON v.entity_type = 'Party'
+		  AND v.deleted_at IS NULL
+		  AND v.id::text = po.data->>'vendor_id'
+		 WHERE l.entity_type = 'GoodsReceiptLine'
+		   AND l.deleted_at IS NULL
+		   AND l.data->>'goods_receipt_id' ~ $1
+		   AND g.data->>'purchase_order_id' ~ $1
+		 ORDER BY l.id`,
+		uuidPattern,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("goods receipt line qualities: %w", err)
+	}
+	defer rows.Close()
+
+	var out []GoodsReceiptLineQuality
+	for rows.Next() {
+		var row GoodsReceiptLineQuality
+		if err := rows.Scan(&row.LineID, &row.VendorID, &row.VendorName, &row.QtyAccepted, &row.QtyRejected); err != nil {
+			return nil, fmt.Errorf("scan goods receipt line quality row: %w", err)
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}

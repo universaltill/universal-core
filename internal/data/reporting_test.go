@@ -827,3 +827,200 @@ func TestStockSummary_MissingATPIsNotAStockout(t *testing.T) {
 		t.Errorf("StockoutCount = %d, want 0 — an absent qty_available_to_promise is unknown, not exhausted", summary.StockoutCount)
 	}
 }
+
+// TestGoodsReceiptLineQualities_ReturnsQuantitiesAndResolvesVendor
+// (uc-infra#82) pins the basic read path: a line with quality data set
+// resolves through GoodsReceipt.purchase_order_id to the PurchaseOrder's
+// vendor, and QtyAccepted/QtyRejected pass through as the exact stored
+// values.
+func TestGoodsReceiptLineQualities_ReturnsQuantitiesAndResolvesVendor(t *testing.T) {
+	ctx := context.Background()
+	tenantDB := freshTenantDB(t)
+	records := data.NewRecordRepo(tenantDB)
+	reporting := data.NewReportingRepo(tenantDB)
+
+	vendor, err := records.Create(ctx, "Party", map[string]any{"name": "Quality Vendor", "party_type": "organization"})
+	if err != nil {
+		t.Fatalf("create Party: %v", err)
+	}
+	po, err := records.Create(ctx, "PurchaseOrder", map[string]any{
+		"po_number": "PO-QUALITY-1", "vendor_id": vendor.ID, "order_date": "2026-07-01",
+	})
+	if err != nil {
+		t.Fatalf("create PurchaseOrder: %v", err)
+	}
+	gr, err := records.Create(ctx, "GoodsReceipt", map[string]any{
+		"purchase_order_id": po.ID, "received_date": "2026-07-05",
+	})
+	if err != nil {
+		t.Fatalf("create GoodsReceipt: %v", err)
+	}
+	line, err := records.Create(ctx, "GoodsReceiptLine", map[string]any{
+		"goods_receipt_id": gr.ID, "qty_received": 10.0, "qty_accepted": 8.0, "qty_rejected": 2.0,
+	})
+	if err != nil {
+		t.Fatalf("create GoodsReceiptLine: %v", err)
+	}
+
+	got, err := reporting.GoodsReceiptLineQualities(ctx)
+	if err != nil {
+		t.Fatalf("GoodsReceiptLineQualities: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d rows, want 1", len(got))
+	}
+	row := got[0]
+	if row.LineID != line.ID {
+		t.Errorf("LineID = %q, want %q", row.LineID, line.ID)
+	}
+	if row.VendorID != vendor.ID {
+		t.Errorf("VendorID = %q, want %q", row.VendorID, vendor.ID)
+	}
+	if row.VendorName != "Quality Vendor" {
+		t.Errorf("VendorName = %q, want %q", row.VendorName, "Quality Vendor")
+	}
+	if row.QtyAccepted != "8" {
+		t.Errorf("QtyAccepted = %q, want %q", row.QtyAccepted, "8")
+	}
+	if row.QtyRejected != "2" {
+		t.Errorf("QtyRejected = %q, want %q", row.QtyRejected, "2")
+	}
+}
+
+// TestGoodsReceiptLineQualities_NoQualityDataIsEmptyNotZero (uc-infra#82)
+// pins the "absent, not zero" distinction the forecast package's
+// HasData flag depends on: a line written without qty_accepted/
+// qty_rejected at all (every line before uc-infra#82, or a tenant that
+// never uses the feature) must come back with EMPTY strings, not "0".
+func TestGoodsReceiptLineQualities_NoQualityDataIsEmptyNotZero(t *testing.T) {
+	ctx := context.Background()
+	tenantDB := freshTenantDB(t)
+	records := data.NewRecordRepo(tenantDB)
+	reporting := data.NewReportingRepo(tenantDB)
+
+	vendor, err := records.Create(ctx, "Party", map[string]any{"name": "No Quality Vendor", "party_type": "organization"})
+	if err != nil {
+		t.Fatalf("create Party: %v", err)
+	}
+	po, err := records.Create(ctx, "PurchaseOrder", map[string]any{
+		"po_number": "PO-QUALITY-2", "vendor_id": vendor.ID, "order_date": "2026-07-01",
+	})
+	if err != nil {
+		t.Fatalf("create PurchaseOrder: %v", err)
+	}
+	gr, err := records.Create(ctx, "GoodsReceipt", map[string]any{
+		"purchase_order_id": po.ID, "received_date": "2026-07-05",
+	})
+	if err != nil {
+		t.Fatalf("create GoodsReceipt: %v", err)
+	}
+	if _, err := records.Create(ctx, "GoodsReceiptLine", map[string]any{
+		"goods_receipt_id": gr.ID, "qty_received": 10.0,
+	}); err != nil {
+		t.Fatalf("create GoodsReceiptLine: %v", err)
+	}
+
+	got, err := reporting.GoodsReceiptLineQualities(ctx)
+	if err != nil {
+		t.Fatalf("GoodsReceiptLineQualities: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d rows, want 1", len(got))
+	}
+	if got[0].QtyAccepted != "" || got[0].QtyRejected != "" {
+		t.Errorf("QtyAccepted=%q QtyRejected=%q, want both empty (no quality data recorded)", got[0].QtyAccepted, got[0].QtyRejected)
+	}
+}
+
+// TestGoodsReceiptLineQualities_MissingVendorStillReturnsRowWithEmptyVendorID
+// (uc-infra#82) mirrors CompletedPOLeadTimes' own vendor-join reasoning:
+// a line whose PurchaseOrder has no (or a dangling/malformed) vendor_id
+// still holds real quality evidence for the OVERALL aggregate, so it
+// must be returned with an empty VendorID rather than dropped.
+func TestGoodsReceiptLineQualities_MissingVendorStillReturnsRowWithEmptyVendorID(t *testing.T) {
+	ctx := context.Background()
+	tenantDB := freshTenantDB(t)
+	records := data.NewRecordRepo(tenantDB)
+	reporting := data.NewReportingRepo(tenantDB)
+
+	po, err := records.Create(ctx, "PurchaseOrder", map[string]any{
+		"po_number": "PO-QUALITY-NOVENDOR", "order_date": "2026-07-01",
+	})
+	if err != nil {
+		t.Fatalf("create PurchaseOrder: %v", err)
+	}
+	gr, err := records.Create(ctx, "GoodsReceipt", map[string]any{
+		"purchase_order_id": po.ID, "received_date": "2026-07-05",
+	})
+	if err != nil {
+		t.Fatalf("create GoodsReceipt: %v", err)
+	}
+	if _, err := records.Create(ctx, "GoodsReceiptLine", map[string]any{
+		"goods_receipt_id": gr.ID, "qty_received": 5.0, "qty_accepted": 5.0, "qty_rejected": 0.0,
+	}); err != nil {
+		t.Fatalf("create GoodsReceiptLine: %v", err)
+	}
+
+	got, err := reporting.GoodsReceiptLineQualities(ctx)
+	if err != nil {
+		t.Fatalf("GoodsReceiptLineQualities: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d rows, want 1", len(got))
+	}
+	if got[0].VendorID != "" {
+		t.Errorf("VendorID = %q, want empty (PurchaseOrder has no vendor_id)", got[0].VendorID)
+	}
+	if got[0].QtyAccepted != "5" {
+		t.Errorf("QtyAccepted = %q, want %q — quality data must still be returned despite no vendor", got[0].QtyAccepted, "5")
+	}
+}
+
+// TestGoodsReceiptLineQualities_MalformedGoodsReceiptIDExcludedNotAborted
+// (uc-infra#82) mirrors the uuidPattern guard's own purpose everywhere
+// else in this file: one line with a malformed goods_receipt_id must not
+// abort the whole query for every other, perfectly valid line.
+func TestGoodsReceiptLineQualities_MalformedGoodsReceiptIDExcludedNotAborted(t *testing.T) {
+	ctx := context.Background()
+	tenantDB := freshTenantDB(t)
+	records := data.NewRecordRepo(tenantDB)
+	reporting := data.NewReportingRepo(tenantDB)
+
+	vendor, err := records.Create(ctx, "Party", map[string]any{"name": "Guard Vendor", "party_type": "organization"})
+	if err != nil {
+		t.Fatalf("create Party: %v", err)
+	}
+	po, err := records.Create(ctx, "PurchaseOrder", map[string]any{
+		"po_number": "PO-QUALITY-GUARD", "vendor_id": vendor.ID, "order_date": "2026-07-01",
+	})
+	if err != nil {
+		t.Fatalf("create PurchaseOrder: %v", err)
+	}
+	gr, err := records.Create(ctx, "GoodsReceipt", map[string]any{
+		"purchase_order_id": po.ID, "received_date": "2026-07-05",
+	})
+	if err != nil {
+		t.Fatalf("create GoodsReceipt: %v", err)
+	}
+	if _, err := records.Create(ctx, "GoodsReceiptLine", map[string]any{
+		"goods_receipt_id": "not-a-uuid", "qty_received": 3.0,
+	}); err != nil {
+		t.Fatalf("create malformed GoodsReceiptLine: %v", err)
+	}
+	if _, err := records.Create(ctx, "GoodsReceiptLine", map[string]any{
+		"goods_receipt_id": gr.ID, "qty_received": 5.0, "qty_accepted": 5.0, "qty_rejected": 0.0,
+	}); err != nil {
+		t.Fatalf("create valid GoodsReceiptLine: %v", err)
+	}
+
+	got, err := reporting.GoodsReceiptLineQualities(ctx)
+	if err != nil {
+		t.Fatalf("GoodsReceiptLineQualities: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d rows, want 1 (the malformed line must be excluded, not abort the query)", len(got))
+	}
+	if got[0].QtyAccepted != "5" {
+		t.Errorf("QtyAccepted = %q, want %q", got[0].QtyAccepted, "5")
+	}
+}

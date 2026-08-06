@@ -369,7 +369,7 @@ func GoodsReceiptForm() *form.Definition {
 func GoodsReceiptLineForm() *form.Definition {
 	return &form.Definition{
 		EntityType: "GoodsReceiptLine",
-		Version:    1,
+		Version:    2,
 		Sections: []form.Section{
 			{
 				Title:     "Details",
@@ -379,6 +379,12 @@ func GoodsReceiptLineForm() *form.Definition {
 					{Name: "po_line_id", Label: "PO Line"},
 					{Name: "item_id", Label: "Item"},
 					{Name: "qty_received", Label: "Qty Received"},
+					// qty_accepted/qty_rejected (Version 2, uc-infra#82):
+					// both optional — see the entity Definition's own
+					// doc comment for why leaving both blank is a valid,
+					// expected state, not a partial save.
+					{Name: "qty_accepted", Label: "Qty Accepted"},
+					{Name: "qty_rejected", Label: "Qty Rejected"},
 				},
 			},
 		},
