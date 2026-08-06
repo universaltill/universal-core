@@ -228,6 +228,16 @@ func TestSectionAndSaveActionCatalogCoverage(t *testing.T) {
 	} else {
 		t.Error("no OpSave action found on any module form — the Save label check below never ran")
 	}
+	// HelpAffordanceCatalogKey (ADR-0023, uc-infra#143) is checked
+	// unconditionally, unlike SaveActionCatalogKey's sawSaveAction gate
+	// above: every form's buildViewModel sets vm.Help regardless of
+	// whether the form has an OpSave action, so there is no "does any
+	// form actually render this" precondition to establish first.
+	for _, locale := range locales {
+		if !hasRealTranslation(catalog, locale, formrender.HelpAffordanceCatalogKey) {
+			t.Errorf("no %s translation for the global help affordance key %q", locale, formrender.HelpAffordanceCatalogKey)
+		}
+	}
 	if checked == 0 {
 		t.Fatal("no sections found across any module's AllForms() — moduleFormSets is stale or every module returned nothing, either way this test isn't checking anything")
 	}

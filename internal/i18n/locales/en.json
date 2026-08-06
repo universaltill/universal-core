@@ -380,6 +380,7 @@
   "action.cancel": "Cancel",
   "toast.error_fallback": "Something went wrong. Please try again.",
   "toast.network_error": "Couldn't reach the server. Check your connection and try again.",
+  "help.affordance.label": "Help",
   "field.Permission.role_id": "Role",
   "field.Permission.entity_type": "Entity type",
   "field.Permission.can_read": "Can read",

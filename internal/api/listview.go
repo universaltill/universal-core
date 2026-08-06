@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/universaltill/universal-core/internal/data"
+	"github.com/universaltill/universal-core/internal/help"
 	"github.com/universaltill/universal-core/internal/kernel/authz"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/formrender"
@@ -237,6 +238,7 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 		FilterLabel: h.catalog.T(locale, "list.filter_placeholder"),
 		FilterGo:    h.catalog.T(locale, "list.filter_button"),
 		FilterClear: h.catalog.T(locale, "list.filter_clear"),
+		Help:        h.buildHelpView(locale, help.TopicID(entityType), help.HasContent(locale, help.TopicID(entityType))),
 	}
 	// keepQuery preserves the active filter across sort and page links, so
 	// sorting a filtered list doesn't silently clear the filter. Gated on
@@ -566,6 +568,53 @@ type recordListView struct {
 	PrevLabel string
 	NextHref  string
 	NextLabel string
+	// Help is the page-level "?" affordance (ADR-0023, uc-infra#143) —
+	// one per list page, since the page documents exactly one topic
+	// (the entity type's own). See buildHelpView.
+	Help helpView
+}
+
+// helpView mirrors formrender's own helpView (unexported there, so not
+// shared directly — each renderer owns its view types, same as
+// columnView/recordRowView above already do independently of
+// formrender's equivalents) — see that package's helpView doc comment
+// for what each field means; both are built the same way, from
+// help.HasContent.
+type helpView struct {
+	// TopicID is rendered unconditionally as a data-help-topic attribute
+	// regardless of Disabled — see formrender's identically-shaped field
+	// for why (independent review, uc-infra#143): without it, this
+	// package's own entityType->TopicID wiring at renderRecordList's
+	// call site was unobservable by any test, since Href only appears
+	// once HasContent is true, which is false for every topic today.
+	TopicID  string
+	Label    string
+	Href     string
+	Disabled bool
+}
+
+// buildHelpView computes a list page's help affordance — the listview
+// analog of formrender.buildHelpView, kept here rather than shared
+// because there is nothing else in common between the two packages'
+// view models to justify importing across them for two structurally
+// identical but independently-owned types (same "each renderer owns its
+// view types" reasoning columnView/recordRowView already establish in
+// this file). Takes hasContent as an explicit bool, computed by the
+// caller via help.HasContent, rather than calling that lookup itself —
+// same reason formrender.buildHelpView does: both branches then have a
+// direct unit test that doesn't depend on real embedded help content
+// existing (it doesn't, as of this slice — see internal/help/content/
+// README.md).
+func (h *Handler) buildHelpView(locale, topicID string, hasContent bool) helpView {
+	hv := helpView{
+		TopicID:  topicID,
+		Label:    h.catalog.TOrDefault(locale, formrender.HelpAffordanceCatalogKey, formrender.HelpAffordanceDefaultLabel),
+		Disabled: !hasContent,
+	}
+	if hasContent {
+		hv.Href = help.Href(topicID)
+	}
+	return hv
 }
 
 type recordRowView struct {
@@ -575,7 +624,7 @@ type recordRowView struct {
 
 var recordListTmpl = template.Must(template.New("recordList").Parse(`
 <div class="uc-list-toolbar">
-<h1>{{.Name}} <span class="uc-menu-item-code">{{.Code}}</span></h1>
+<h1>{{.Name}} <span class="uc-menu-item-code">{{.Code}}</span> <a class="uc-help-affordance" role="link" data-help-topic="{{.Help.TopicID}}"{{if .Help.Href}} href="{{.Help.Href}}"{{end}}{{if .Help.Disabled}} aria-disabled="true"{{end}} tabindex="0" aria-label="{{.Help.Label}}">?</a></h1>
 <div><a href="{{.NewHref}}">{{.NewLabel}}</a> · <a href="{{.ImportHref}}">{{.ImportLink}}</a> · <a href="{{.ExportHref}}">{{.ExportLink}}</a></div>
 </div>
 <form class="uc-list-filter" method="get" action="{{.FilterHref}}">
