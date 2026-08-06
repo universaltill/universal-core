@@ -226,3 +226,200 @@ func TestListPage_DefaultFilterOnReferenceColumn_UnlicensedTarget(t *testing.T) 
 		t.Fatalf("q=Widgets should match nothing when the target type isn't licensed (no target to resolve a label against):\n%s", resp.Body.String())
 	}
 }
+
+// TestListPage_DefaultFilterOnReferenceColumn_UnreadableTarget is a
+// regression test for uc-infra#89: referenceIDsMatching's data.ErrNotFound
+// degrade branch (exercised above) has a sibling gap — a reference
+// target that IS licensed/published but that THIS VIEWER may not read
+// (entity-level RBAC, ADR-0006) used to propagate authz.ErrDenied out of
+// ts.crud.ListPageFiltered, through writeCrudPageError, into a 403 for
+// the whole Gadget list page — even though the viewer can read Gadget
+// itself and is simply typing into the filter box. Every neighbouring
+// resolution path already degrades for this actor (the cell just shows
+// the raw id); the filter path must degrade the same way: zero matches,
+// not a page-wide access-denied.
+func TestListPage_DefaultFilterOnReferenceColumn_UnreadableTarget(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := foundation.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	publishEntityAndForm(t, db, categoryEntityDef(), &form.Definition{
+		EntityType: "Category", Version: 1,
+		Sections: []form.Section{{Title: "D", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "name"}}}},
+	})
+	publishEntityAndForm(t, db, referenceFirstEntityDef(), &form.Definition{
+		EntityType: "Gadget", Version: 1,
+		Sections: []form.Section{{Title: "D", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "category"}, {Name: "name"}}}},
+	})
+
+	eng := crud.NewEngine(db)
+	widgets, err := eng.Create(ctx, categoryEntityDef(), map[string]any{"name": "Widgets"}, humanActor())
+	if err != nil {
+		t.Fatalf("create Widgets category: %v", err)
+	}
+	if _, err := eng.Create(ctx, referenceFirstEntityDef(), map[string]any{"category": widgets.ID, "name": "Sprocket"}, humanActor()); err != nil {
+		t.Fatalf("seed Sprocket: %v", err)
+	}
+
+	// clerk can read Gadget but is explicitly denied read on Category.
+	// This row is what makes the difference from "no rule at all": RBAC
+	// is opt-in per entity type (authz.go), so a Permission row naming
+	// Category for ANY role switches Category to deny-unless-granted,
+	// and clerk's roles grant it nothing there.
+	seedRBAC(t, db,
+		map[string][]string{"clerk": {"user-clerk"}},
+		[]map[string]any{
+			{"role": "clerk", "entity_type": "Gadget", "can_read": true, "can_write": false},
+			{"role": "clerk", "entity_type": "Category", "can_read": false, "can_write": false},
+		},
+	)
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	// Sanity check: clerk can see the Gadget list at all (Gadget itself
+	// is granted). The reference cell degrades to the raw id, same as
+	// every other resolution path when the target isn't readable.
+	plain := getAs(t, mux, "/records/Gadget", tenantID, "user-clerk")
+	if plain.Code != http.StatusOK {
+		t.Fatalf("clerk should be able to view the Gadget list at all: %d:\n%s", plain.Code, plain.Body.String())
+	}
+
+	// Typing into the (default, reference) filter box must degrade to
+	// "no matches" — not turn a page clerk can otherwise view into a 403.
+	// Assert the mechanism, not just the outcome: the hidden input must
+	// confirm the filter actually landed on "category" (the reference
+	// column) — otherwise a 200-with-no-Sprocket could just as easily
+	// mean the default filter silently stopped resolving to a reference
+	// column at all, which would pass this assertion for the wrong
+	// reason (same guard TestListPage_DefaultFilterOnReferenceColumn_ResolvesByLabel
+	// uses).
+	resp := getAs(t, mux, "/records/Gadget?q=Widgets", tenantID, "user-clerk")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("filtering by a reference target the viewer can't read should degrade to a normal page, not %d:\n%s", resp.Code, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), `name="filter" value="category"`) {
+		t.Fatalf("expected the default filter field to still resolve to the reference column \"category\":\n%s", resp.Body.String())
+	}
+	if strings.Contains(resp.Body.String(), "Sprocket") {
+		t.Fatalf("q=Widgets should match nothing when the viewer can't read the target type:\n%s", resp.Body.String())
+	}
+
+	// Negative control: an actor with NO roles at all has no Permission
+	// rows applying to them, but RBAC's opt-in is per entity type, not
+	// per actor — Category already has a rule (naming clerk), so it is
+	// NOT open to a roleless actor either. Prove the denial path is what
+	// the assertions above actually exercise by using a genuinely
+	// unrestricted setup instead: a fresh tenant with no RBAC configured
+	// for Category at all, where the same filter DOES match.
+	unrestrictedTenantID, unrestrictedDB := newTestTenant(t, router)
+	if err := foundation.Publish(ctx, unrestrictedDB, humanActor()); err != nil {
+		t.Fatalf("foundation.Publish (unrestricted tenant): %v", err)
+	}
+	publishEntityAndForm(t, unrestrictedDB, categoryEntityDef(), &form.Definition{
+		EntityType: "Category", Version: 1,
+		Sections: []form.Section{{Title: "D", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "name"}}}},
+	})
+	publishEntityAndForm(t, unrestrictedDB, referenceFirstEntityDef(), &form.Definition{
+		EntityType: "Gadget", Version: 1,
+		Sections: []form.Section{{Title: "D", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "category"}, {Name: "name"}}}},
+	})
+	unrestrictedEng := crud.NewEngine(unrestrictedDB)
+	unrestrictedWidgets, err := unrestrictedEng.Create(ctx, categoryEntityDef(), map[string]any{"name": "Widgets"}, humanActor())
+	if err != nil {
+		t.Fatalf("create Widgets category (unrestricted tenant): %v", err)
+	}
+	if _, err := unrestrictedEng.Create(ctx, referenceFirstEntityDef(), map[string]any{"category": unrestrictedWidgets.ID, "name": "Sprocket"}, humanActor()); err != nil {
+		t.Fatalf("seed Sprocket (unrestricted tenant): %v", err)
+	}
+	unrestrictedMux := http.NewServeMux()
+	testHandler(t, router).Routes(unrestrictedMux)
+	control := getAs(t, unrestrictedMux, "/records/Gadget?q=Widgets", unrestrictedTenantID, "anyone")
+	if control.Code != http.StatusOK {
+		t.Fatalf("control tenant (no RBAC on Category): expected 200, got %d:\n%s", control.Code, control.Body.String())
+	}
+	if !strings.Contains(control.Body.String(), "Sprocket") {
+		t.Fatalf("control tenant (no RBAC on Category) should still find Sprocket by label — this proves the denial in the main case above is what's actually being exercised:\n%s", control.Body.String())
+	}
+}
+
+// TestListPage_DefaultFilterOnReferenceColumn_HiddenLabelField is a
+// regression test for the SECOND, distinct source of authz.ErrDenied
+// referenceIDsMatching's degrade branch now catches (independent
+// review, uc-infra#89): rejectHiddenSortFilter refuses to sort/filter by
+// a FIELD the viewer can't read, even when the viewer CAN read the
+// target entity type overall. This fires when the target's own label
+// field (the column referenceIDsMatching filters by) is hidden via
+// FieldPermission, not when the whole entity type is RBAC-denied — a
+// different rule (authz.go's rejectHiddenSortFilter) tripping the same
+// ErrDenied sentinel. Same required outcome: degrade to no-match, not a
+// page-wide 403, and for the same "widening to unfiltered would be
+// worse" reason listview.go's ErrDenied branch comment now documents.
+func TestListPage_DefaultFilterOnReferenceColumn_HiddenLabelField(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := foundation.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	publishEntityAndForm(t, db, categoryEntityDef(), &form.Definition{
+		EntityType: "Category", Version: 1,
+		Sections: []form.Section{{Title: "D", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "name"}}}},
+	})
+	publishEntityAndForm(t, db, referenceFirstEntityDef(), &form.Definition{
+		EntityType: "Gadget", Version: 1,
+		Sections: []form.Section{{Title: "D", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "category"}, {Name: "name"}}}},
+	})
+
+	eng := crud.NewEngine(db)
+	widgets, err := eng.Create(ctx, categoryEntityDef(), map[string]any{"name": "Widgets"}, humanActor())
+	if err != nil {
+		t.Fatalf("create Widgets category: %v", err)
+	}
+	if _, err := eng.Create(ctx, referenceFirstEntityDef(), map[string]any{"category": widgets.ID, "name": "Sprocket"}, humanActor()); err != nil {
+		t.Fatalf("seed Sprocket: %v", err)
+	}
+
+	// clerk can read Category as an entity type — the entity-level rule
+	// this test must NOT be exercising — but Category.name (the label
+	// field referenceIDsMatching filters by) is hidden from clerk via
+	// FieldPermission, which is a field-level rule. Field hiding applies
+	// only when EVERY role the user holds hides the field (authz.go), so
+	// this must be ONE role carrying both the entity-level grant and the
+	// field-level hide — composing seedRBAC + seedFieldRule would create
+	// TWO "clerk" roles, and the second (no FieldPermission row) would
+	// implicitly see Category.name, defeating the hide.
+	roleIDs := seedRBAC(t, db,
+		map[string][]string{"clerk": {"user-clerk"}},
+		[]map[string]any{
+			{"role": "clerk", "entity_type": "Gadget", "can_read": true, "can_write": false},
+			{"role": "clerk", "entity_type": "Category", "can_read": true, "can_write": false},
+		},
+	)
+	if _, err := crud.NewEngine(db).Create(ctx, foundation.FieldPermission(), map[string]any{
+		"role_id": roleIDs["clerk"], "entity_type": "Category", "field_name": "name", "hidden": true,
+	}, humanActor()); err != nil {
+		t.Fatalf("create FieldPermission: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	resp := getAs(t, mux, "/records/Gadget?q=Widgets", tenantID, "user-clerk")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("filtering by a reference target whose label field is hidden should degrade to a normal page, not %d:\n%s", resp.Code, resp.Body.String())
+	}
+	if strings.Contains(resp.Body.String(), "Sprocket") {
+		t.Fatalf("q=Widgets should match nothing when the viewer can't read the target's label field:\n%s", resp.Body.String())
+	}
+}

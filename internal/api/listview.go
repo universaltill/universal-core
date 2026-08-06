@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/universaltill/universal-core/internal/data"
+	"github.com/universaltill/universal-core/internal/kernel/authz"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/formrender"
 	uclocale "github.com/universaltill/universal-core/internal/kernel/locale"
@@ -396,6 +397,26 @@ func (h *Handler) referenceIDsMatching(ctx context.Context, ts tenantScope, targ
 		// for no practical gain.
 		Limit: referenceFilterMatchLimit,
 	})
+	if errors.Is(err, authz.ErrDenied) {
+		// Two distinct RBAC refusals both wrap ErrDenied here and both
+		// get the same truthful-degrade answer: checkRead (entity-level
+		// — the viewer can't read the TARGET type at all) and
+		// rejectHiddenSortFilter (field-level — the viewer CAN read the
+		// target type, but labelField itself is FieldPermission-hidden
+		// from them, e.g. an admin marks a target's name column
+		// sensitive). Either way the viewer cannot see what labelField
+		// holds for any target record, so there is nothing legitimate to
+		// match text against. Degrading to "matches nothing" (like the
+		// data.ErrNotFound case above) is the only safe answer for both:
+		// 403ing a list page the viewer otherwise has full permission to
+		// view is wrong (uc-infra#89), and silently falling back to
+		// unfiltered (what reference_search.go does when it PRE-checks
+		// HiddenFields for its own, different use case) would widen a
+		// filter into "every row" here, which this function's own
+		// no-label-field branch above already treats as worse than an
+		// empty, correctable result.
+		return []string{}, nil
+	}
 	if err != nil {
 		return nil, fmt.Errorf("search %s by %s: %w", targetType, labelField, err)
 	}
