@@ -113,23 +113,34 @@ func PostDueDepreciation(ctx context.Context, db *sql.DB, actor audit.Actor) (po
 	}
 
 	for assetID, rows := range rowsByAsset {
+		if ctx.Err() != nil {
+			return posted, ctx.Err()
+		}
+		// posted += n unconditionally, even on error: postAssetDepreciation
+		// returns real partial progress (it posts each due row in its own
+		// transaction, so an error on row 6 of 8 still leaves rows 1-5
+		// truly posted) — discarding n on the error path would undercount
+		// this run's actual work and could suppress the "posted N rows"
+		// log line below even though N rows really were posted (independent
+		// review's finding: this was previously discarded here).
 		n, err := postAssetDepreciation(ctx, db, records, assetID, rows, today, actor)
+		posted += n
 		if err != nil {
 			log.Printf("assets: post depreciation for FixedAsset %s: %v", assetID, err)
-			continue
 		}
-		posted += n
 	}
 	return posted, nil
 }
 
 // postAssetDepreciation posts every due, unposted row in rows (a
-// snapshot of one FixedAsset's own DepreciationSchedule rows, taken
-// before this run) and, if that exhausts the asset's schedule, advances
-// its status to fully_depreciated. Returns how many rows it posted; a
-// non-nil error means the WHOLE asset was skipped (bad status, missing
-// account wiring, an unresolvable account) before any row was posted —
-// PostDueDepreciation logs it and moves on to the next asset.
+// snapshot of one FixedAsset's own DepreciationSchedule rows, taken at
+// the top of this run) and, if the asset's full useful life has now
+// been posted, advances its status to fully_depreciated. Returns how
+// many rows it posted; a non-nil error means the rest of the asset's
+// due rows this run were skipped (bad status read, missing account
+// wiring, an unresolvable account, or a mid-loop posting failure) —
+// PostDueDepreciation logs it, keeps whatever was posted before the
+// error, and moves on to the next asset.
 func postAssetDepreciation(ctx context.Context, db *sql.DB, records *data.RecordRepo, assetID string, rows []data.Record, today string, actor audit.Actor) (int, error) {
 	asset, err := records.Get(ctx, "FixedAsset", assetID)
 	if err != nil {
@@ -147,73 +158,117 @@ func postAssetDepreciation(ctx context.Context, db *sql.DB, records *data.Record
 		return 0, nil
 	}
 
-	expenseAccountID, _ := asset.Data["depreciation_expense_account_id"].(string)
-	accumAccountID, _ := asset.Data["accumulated_depreciation_account_id"].(string)
-	assetAccountID, _ := asset.Data["asset_account_id"].(string)
-	if expenseAccountID == "" || accumAccountID == "" || assetAccountID == "" {
-		return 0, fmt.Errorf("FixedAsset %s is in_service with due depreciation but missing one or more of asset_account_id/depreciation_expense_account_id/accumulated_depreciation_account_id", assetID)
-	}
-	expenseCode, err := accountCode(ctx, records, expenseAccountID)
-	if err != nil {
-		return 0, fmt.Errorf("resolve depreciation_expense_account_id: %w", err)
-	}
-	accumCode, err := accountCode(ctx, records, accumAccountID)
-	if err != nil {
-		return 0, fmt.Errorf("resolve accumulated_depreciation_account_id: %w", err)
-	}
-	// asset_account_id itself is validated present and resolvable above
-	// but not otherwise used — see PostDueDepreciation's own doc comment.
-	if _, err := accountCode(ctx, records, assetAccountID); err != nil {
-		return 0, fmt.Errorf("resolve asset_account_id: %w", err)
-	}
-
-	minorUnit := defaultCurrencyMinorUnit
-	if currencyID, _ := asset.Data["currency_id"].(string); currencyID != "" {
-		if v, err := currencyMinorUnit(ctx, records, currencyID); err == nil {
-			minorUnit = v
-		}
-		// An unresolvable currency_id falls back to the default rather
-		// than skipping the whole asset — same "known gap, documented,
-		// not a hard failure" treatment ledger.ToMinorUnits' own doc
-		// comment already gives every other module's fixed-2dp
-		// assumption.
-	}
-
-	totalUnpostedBefore := 0
+	// Filter to due rows BEFORE resolving/validating account wiring.
+	// An in_service asset can legitimately have no due rows yet (its
+	// first period hasn't come round) even with its GL accounts still
+	// unset — that's an ordinary in-progress data-entry state per
+	// assets.go's own doc comment, not a fault. Checking wiring first
+	// (the original order) meant every such asset logged a false
+	// "missing accounts" error, every throttle interval, forever, until
+	// someone actually finished configuring it — independent review's
+	// finding.
+	var due []data.Record
 	for _, r := range rows {
-		if postedAt, _ := r.Data["posted_at"].(string); postedAt == "" {
-			totalUnpostedBefore++
-		}
-	}
-
-	posted := 0
-	for _, r := range rows {
-		postedAt, _ := r.Data["posted_at"].(string)
-		if postedAt != "" {
+		if postedAt, _ := r.Data["posted_at"].(string); postedAt != "" {
 			continue
 		}
 		periodEnd, _ := r.Data["period_end"].(string)
 		if periodEnd == "" || periodEnd > today {
 			continue // not due yet
 		}
-		ok, err := postDepreciationRow(ctx, db, records, asset, r, expenseCode, accumCode, minorUnit, actor)
-		if err != nil {
-			return posted, fmt.Errorf("post DepreciationSchedule %s: %w", r.ID, err)
+		due = append(due, r)
+	}
+
+	posted := 0
+	if len(due) > 0 {
+		expenseAccountID, _ := asset.Data["depreciation_expense_account_id"].(string)
+		accumAccountID, _ := asset.Data["accumulated_depreciation_account_id"].(string)
+		assetAccountID, _ := asset.Data["asset_account_id"].(string)
+		if expenseAccountID == "" || accumAccountID == "" || assetAccountID == "" {
+			return 0, fmt.Errorf("FixedAsset %s is in_service with due depreciation but missing one or more of asset_account_id/depreciation_expense_account_id/accumulated_depreciation_account_id", assetID)
 		}
-		if ok {
-			posted++
+		expenseCode, err := accountCode(ctx, records, expenseAccountID)
+		if err != nil {
+			return 0, fmt.Errorf("resolve depreciation_expense_account_id: %w", err)
+		}
+		accumCode, err := accountCode(ctx, records, accumAccountID)
+		if err != nil {
+			return 0, fmt.Errorf("resolve accumulated_depreciation_account_id: %w", err)
+		}
+		// asset_account_id itself is validated present and resolvable
+		// above but not otherwise used — see PostDueDepreciation's own
+		// doc comment.
+		if _, err := accountCode(ctx, records, assetAccountID); err != nil {
+			return 0, fmt.Errorf("resolve asset_account_id: %w", err)
+		}
+
+		minorUnit := defaultCurrencyMinorUnit
+		if currencyID, _ := asset.Data["currency_id"].(string); currencyID != "" {
+			if v, err := currencyMinorUnit(ctx, records, currencyID); err == nil {
+				minorUnit = v
+			}
+			// An unresolvable currency_id falls back to the default rather
+			// than skipping the whole asset — same "known gap, documented,
+			// not a hard failure" treatment ledger.ToMinorUnits' own doc
+			// comment already gives every other module's fixed-2dp
+			// assumption.
+		}
+
+		for _, r := range due {
+			if ctx.Err() != nil {
+				return posted, ctx.Err()
+			}
+			ok, err := postDepreciationRow(ctx, db, records, asset, r, expenseCode, accumCode, minorUnit, actor)
+			if err != nil {
+				return posted, fmt.Errorf("post DepreciationSchedule %s: %w", r.ID, err)
+			}
+			if ok {
+				posted++
+			}
 		}
 	}
 
-	if posted > 0 && posted == totalUnpostedBefore {
-		// Every row this asset had left unposted just got posted — the
-		// schedule is exhausted. Re-check status fresh rather than
-		// trusting the inService read from the top of this function:
-		// nothing else in this process changes it concurrently, but a
-		// stale check here would be a silent latent bug the moment
-		// something else does.
-		if err := transitionToFullyDepreciated(ctx, db, records, assetID, actor); err != nil {
-			return posted, fmt.Errorf("transition FixedAsset %s to fully_depreciated: %w", assetID, err)
+	// Retry-safe, life-aware completion check. Runs every call, whether
+	// or not this call itself posted anything — NOT gated on "this run
+	// posted the exhausting row" (the previous shape: `posted > 0 &&
+	// posted == totalUnpostedBefore`), which independent review showed
+	// is a fire-once-or-never condition: once every entered row is
+	// already posted, `posted` is 0 on every later call and the
+	// transition can never be retried — a transient error, a version
+	// conflict from a concurrent edit, or an overlapping second poller
+	// (worker.go's own throttle records a start time, not an exclusive
+	// lock across the run) all leave the asset stuck reading in_service
+	// forever. Recomputing "is this asset's schedule actually finished"
+	// from scratch on every call, independent of what (if anything) this
+	// specific call posted, makes a previously-stuck asset heal itself
+	// on its very next tick instead.
+	//
+	// "Finished" is also now life-aware, not just "every entered row is
+	// posted": rows is compared against the asset's own
+	// useful_life_months, not merely its own length. cmd/seed-demo-data
+	// deliberately seeds only the first 12 of a 60-period schedule ("60
+	// rows would bury the rest of the demo data") — reading "no unposted
+	// rows currently exist" as "life complete" would flip that asset to
+	// fully_depreciated after 12 months with 48 unbooked periods and
+	// ~$39,600 of undepreciated cost, a state with no way back (the
+	// status graph has no fully_depreciated -> in_service edge). This
+	// count also folds in `posted` — the rows this very call just
+	// posted, which the stale `rows` snapshot's own posted_at fields
+	// don't yet reflect — without a second database round trip, since
+	// `rows` was already loaded fresh (this run's own top-level List) by
+	// the caller.
+	usefulLifeMonths, _ := asset.Data["useful_life_months"].(float64)
+	if usefulLifeMonths > 0 {
+		postedCount := posted
+		for _, r := range rows {
+			if postedAt, _ := r.Data["posted_at"].(string); postedAt != "" {
+				postedCount++
+			}
+		}
+		if postedCount >= int(usefulLifeMonths) {
+			if err := transitionToFullyDepreciated(ctx, db, records, assetID, actor); err != nil {
+				return posted, fmt.Errorf("transition FixedAsset %s to fully_depreciated: %w", assetID, err)
+			}
 		}
 	}
 	return posted, nil
@@ -224,9 +279,20 @@ func postAssetDepreciation(ctx context.Context, db *sql.DB, records *data.Record
 // leave a row marked posted_at with no corresponding journal entry, or
 // vice versa. Returns (false, nil) if the row turned out to already be
 // posted by the time this transaction opened (a concurrent run, or two
-// worker pollers) — ExistsForSource is the authoritative idempotency
-// check; the posted_at field read before calling this function is only
-// a cheap pre-filter.
+// worker pollers).
+//
+// What actually PREVENTS a double post under READ COMMITTED (this
+// package's transactions all use the default isolation level) is the
+// records.UpdateTx call below with expectedVersion set: two concurrent
+// transactions can both read ExistsForSource as false (it's a plain,
+// non-locking read), but only one of them can win the row-version check
+// — the loser gets ErrVersionConflict and rolls back its whole
+// transaction, including the journal entry it just wrote. ExistsForSource
+// is still worth keeping as an early, cheap exit (skip the ledger.PostTx
+// call entirely for the common already-posted case), but it is not by
+// itself what makes this safe — don't read its presence here as license
+// to pass expectedVersion=nil the way purchasing/ledger.go's own
+// same-shaped call does in a context where that really is safe.
 func postDepreciationRow(ctx context.Context, db *sql.DB, records *data.RecordRepo, asset, row data.Record, expenseCode, accumCode string, minorUnit int, actor audit.Actor) (bool, error) {
 	amount, _ := row.Data["depreciation_amount"].(float64)
 	amountMinor, err := MinorUnits(amount, minorUnit)
@@ -234,10 +300,23 @@ func postDepreciationRow(ctx context.Context, db *sql.DB, records *data.RecordRe
 		return false, fmt.Errorf("convert depreciation_amount: %w", err)
 	}
 	if amountMinor == 0 {
-		// depreciation.Build never emits a zero-amount period for a
-		// positive depreciable base, but guard the way every other
-		// posting hook in this kernel guards a zero-value source rather
-		// than assume the invariant always holds by the time this runs.
+		// A genuinely zero depreciable base (cost == salvage_value) is a
+		// legitimate schedule depreciation.Build can produce — every
+		// period really is $0, and marking it posted with no journal
+		// entry is correct, not a guard against an invariant violation.
+		// But a malformed row (e.g. depreciation_amount missing entirely,
+		// which the map type assertion above silently reads as 0.0) looks
+		// IDENTICAL at this point, and closing it out with no journal
+		// entry and no trace is exactly how a real period's expense goes
+		// permanently unbooked without anyone noticing (independent
+		// review's finding: the prior version of this branch was
+		// completely silent here, unlike sales/purchasing's own zero-guard,
+		// which is a pure no-op that changes no state and has nothing to
+		// go silently wrong). Logging doesn't distinguish the two cases
+		// either, but it at least makes a zero-amount posting visible
+		// rather than indistinguishable from an ordinary one.
+		log.Printf("assets: DepreciationSchedule %s has a zero depreciation_amount (period_end %s) — marking posted with no journal entry",
+			row.ID, row.Data["period_end"])
 		if err := markPosted(ctx, db, records, row, actor); err != nil {
 			return false, err
 		}
@@ -320,11 +399,19 @@ func markPosted(ctx context.Context, db *sql.DB, records *data.RecordRepo, row d
 }
 
 // transitionToFullyDepreciated advances a FixedAsset from in_service to
-// fully_depreciated once its schedule is exhausted. Re-reads the asset
-// and its status fresh (not the caller's earlier snapshot) and is a
-// no-op, not an error, if the asset is no longer in_service by the time
-// this runs (e.g. disposed in between) — same "steady state, not a bug"
-// reasoning PostDueDepreciation's own doc comment gives.
+// fully_depreciated — the caller (postAssetDepreciation) has already
+// decided the asset's full useful life is posted; this function's own
+// job is just the atomic, safe write. Re-reads the asset and its status
+// fresh (not the caller's earlier snapshot) and is a no-op, not an
+// error, if the asset is no longer in_service by the time this runs
+// (e.g. disposed in between, or a concurrent call already transitioned
+// it) — same "steady state, not a bug" reasoning PostDueDepreciation's
+// own doc comment gives. Being called repeatedly for an
+// already-fully_depreciated asset is expected and cheap (one no-op
+// transaction), not guarded against separately — the caller's own
+// life-aware check already only calls this when it currently believes
+// there's something to do, and this function is the authority on
+// whether that's still true.
 func transitionToFullyDepreciated(ctx context.Context, db *sql.DB, records *data.RecordRepo, assetID string, actor audit.Actor) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {

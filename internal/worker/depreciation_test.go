@@ -15,10 +15,20 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
 )
 
-// shouldPostDepreciation/forgetDepreciationPost are pure logic, no
-// database needed — same "test the throttle math directly on a
-// hand-built Runner" approach this package already uses for
-// Config.withDefaults() elsewhere.
+// shouldPostDepreciation/finishDepreciationPost/forgetDepreciationPost
+// are pure logic, no database needed — same "test the throttle math
+// directly on a hand-built Runner" approach this package already uses
+// for Config.withDefaults() elsewhere.
+//
+// Every shouldPostDepreciation(tenantID, ...) == true in these tests is
+// paired with a finishDepreciationPost(tenantID) call immediately after,
+// matching tickTenant's own real, unconditional pairing (see
+// worker.go) — shouldPostDepreciation now also claims an in-flight slot
+// (see depreciationInFlight's own doc comment), so a test that omitted
+// the matching finish call would see every later check for that tenant
+// return false regardless of elapsed time, which is exactly the
+// intended behavior for a run that's still actually in flight, not a
+// bug in these tests forgetting to release it.
 func TestShouldPostDepreciation_ThrottlesPerTenantIndependently(t *testing.T) {
 	r := &Runner{cfg: Config{DepreciationPostInterval: time.Minute}.withDefaults()}
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -26,6 +36,7 @@ func TestShouldPostDepreciation_ThrottlesPerTenantIndependently(t *testing.T) {
 	if !r.shouldPostDepreciation("tenant-a", now) {
 		t.Fatal("first check for tenant-a should be due (never run before)")
 	}
+	r.finishDepreciationPost("tenant-a")
 	if r.shouldPostDepreciation("tenant-a", now.Add(10*time.Second)) {
 		t.Fatal("tenant-a should be throttled: only 10s elapsed of a 1m interval")
 	}
@@ -33,9 +44,11 @@ func TestShouldPostDepreciation_ThrottlesPerTenantIndependently(t *testing.T) {
 	if !r.shouldPostDepreciation("tenant-b", now.Add(10*time.Second)) {
 		t.Fatal("tenant-b's first check should be due regardless of tenant-a's throttle state")
 	}
+	r.finishDepreciationPost("tenant-b")
 	if !r.shouldPostDepreciation("tenant-a", now.Add(61*time.Second)) {
 		t.Fatal("tenant-a should be due again once the interval has elapsed")
 	}
+	r.finishDepreciationPost("tenant-a")
 }
 
 func TestShouldPostDepreciation_ZeroIntervalUsesDefault(t *testing.T) {
@@ -52,10 +65,47 @@ func TestForgetDepreciationPost_ClearsThrottleForRetry(t *testing.T) {
 	if !r.shouldPostDepreciation("tenant-a", now) {
 		t.Fatal("first check should be due")
 	}
+	// forgetDepreciationPost alone (no finishDepreciationPost) is exactly
+	// what tickTenant does on a run that ends in error — see worker.go.
 	r.forgetDepreciationPost("tenant-a")
-	if !r.shouldPostDepreciation("tenant-a", now.Add(time.Second)) {
-		t.Fatal("after forgetDepreciationPost, the very next check should be due again, not throttled")
+	if r.shouldPostDepreciation("tenant-a", now.Add(time.Second)) {
+		t.Fatal("still in flight (finishDepreciationPost never called): forgetDepreciationPost alone must not be enough to become due again")
 	}
+	r.finishDepreciationPost("tenant-a")
+	if !r.shouldPostDepreciation("tenant-a", now.Add(time.Second)) {
+		t.Fatal("after both forgetDepreciationPost and finishDepreciationPost, the very next check should be due again, not throttled")
+	}
+	r.finishDepreciationPost("tenant-a")
+}
+
+// TestShouldPostDepreciation_InFlightGuard_BlocksAConcurrentSecondRun is
+// the direct regression test for independent review's blocker: two
+// RunConcurrent pollers (Config.Concurrency, default 2) must never both
+// be allowed to call assets.PostDueDepreciation for the SAME tenant at
+// once, even if the run is slow enough that DepreciationPostInterval
+// elapses while it's still in progress — an overlapping run is what
+// reproduced a permanently-stuck in_service asset (two runs racing to
+// post the same rows and transition the same asset).
+func TestShouldPostDepreciation_InFlightGuard_BlocksAConcurrentSecondRun(t *testing.T) {
+	r := &Runner{cfg: Config{DepreciationPostInterval: time.Second}.withDefaults()}
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	if !r.shouldPostDepreciation("tenant-a", now) {
+		t.Fatal("first check should be due")
+	}
+	// A slow run that hasn't called finishDepreciationPost yet — even
+	// well past the (short, 1s) interval, a concurrent poller's check
+	// for the SAME tenant must still be refused.
+	if r.shouldPostDepreciation("tenant-a", now.Add(10*time.Second)) {
+		t.Fatal("a concurrent poller must not be able to start a second run for a tenant whose run is still in flight")
+	}
+	// The first run finishes...
+	r.finishDepreciationPost("tenant-a")
+	// ...and only now can the next run start.
+	if !r.shouldPostDepreciation("tenant-a", now.Add(10*time.Second)) {
+		t.Fatal("once the in-flight run finished, a new run should be allowed (interval already elapsed)")
+	}
+	r.finishDepreciationPost("tenant-a")
 }
 
 // depreciationDef resolves a published entity Definition — same helper

@@ -110,6 +110,13 @@ func workerConfigFromEnv() worker.Config {
 			log.Printf("WORKFLOW_WORKER_CONCURRENCY=%q is not a valid integer, using default", raw)
 		}
 	}
+	if raw := os.Getenv("WORKFLOW_DEPRECIATION_POST_INTERVAL"); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil {
+			cfg.DepreciationPostInterval = d
+		} else {
+			log.Printf("WORKFLOW_DEPRECIATION_POST_INTERVAL=%q is not a valid duration, using default", raw)
+		}
+	}
 	return cfg
 }
 

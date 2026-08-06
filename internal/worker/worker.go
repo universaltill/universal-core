@@ -113,6 +113,19 @@ type Runner struct {
 	// by tenant would conflate them.
 	depMu                sync.Mutex
 	lastDepreciationPost map[string]time.Time
+	// depreciationInFlight guards against two RunConcurrent pollers
+	// (Config.Concurrency, default 2) both calling
+	// assets.PostDueDepreciation for the SAME tenant at once.
+	// lastDepreciationPost alone only throttles by start time, so a run
+	// that takes longer than DepreciationPostInterval (a large catch-up:
+	// a tenant licensing Assets after periods had already accrued) would
+	// still be running when the next tick's throttle check says "due
+	// again" — two overlapping runs racing to post the same rows and
+	// transition the same asset is exactly how independent review
+	// reproduced a permanently-stuck in_service asset (see
+	// shouldPostDepreciation/finishDepreciationPost). Keyed by tenant,
+	// not global, so unrelated tenants' runs never block each other.
+	depreciationInFlight map[string]bool
 }
 
 // New builds a Runner. handlers is passed straight through to
@@ -238,7 +251,16 @@ func (r *Runner) tickTenant(ctx context.Context, tenantID string, q *workflow.Qu
 		// and skipped, never fatal to this tenant's tick — same
 		// isolation as every other per-tenant step in this function.
 		if r.shouldPostDepreciation(tenantID, now) {
-			if posted, err := assets.PostDueDepreciation(ctx, db, assets.SchedulerActor()); err != nil {
+			posted, err := assets.PostDueDepreciation(ctx, db, assets.SchedulerActor())
+			// finishDepreciationPost unconditionally, success or error:
+			// this is what lets a SECOND poller (RunConcurrent) pick this
+			// tenant back up as soon as this run ends, rather than staying
+			// blocked until DepreciationPostInterval elapses from this
+			// run's START time — see depreciationInFlight's own doc
+			// comment for why an overlapping run is the dangerous case,
+			// not merely a redundant one.
+			r.finishDepreciationPost(tenantID)
+			if err != nil {
 				log.Printf("worker: tenant %s: post due depreciation: %v", tenantID, err)
 				r.forgetDepreciationPost(tenantID) // retry next tick, not next interval
 			} else if posted > 0 {
@@ -320,10 +342,14 @@ func (r *Runner) forgetScheduleSync(tenantID string) {
 }
 
 // shouldPostDepreciation reports whether tenantID's
-// assets.PostDueDepreciation run is due, and records the attempt.
-// Same shape and same mutex-per-throttle reasoning as
-// shouldSyncSchedules, deliberately kept as a separate method/map pair
-// rather than generalized — see the depMu field's own doc comment.
+// assets.PostDueDepreciation run is due, and — if so — records the
+// attempt AND claims the in-flight slot in the same locked section, so
+// a second poller's concurrent call for the same tenant cannot both see
+// "not in flight" and both proceed (see depreciationInFlight's own doc
+// comment for why an overlapping run is unsafe, not just redundant).
+// Every call that returns true MUST be paired with a later
+// finishDepreciationPost(tenantID) call, success or failure — tickTenant
+// is the only caller and does this unconditionally.
 func (r *Runner) shouldPostDepreciation(tenantID string, now time.Time) bool {
 	interval := r.cfg.DepreciationPostInterval
 	if interval <= 0 {
@@ -331,6 +357,12 @@ func (r *Runner) shouldPostDepreciation(tenantID string, now time.Time) bool {
 	}
 	r.depMu.Lock()
 	defer r.depMu.Unlock()
+	if r.depreciationInFlight == nil {
+		r.depreciationInFlight = map[string]bool{}
+	}
+	if r.depreciationInFlight[tenantID] {
+		return false
+	}
 	if r.lastDepreciationPost == nil {
 		r.lastDepreciationPost = map[string]time.Time{}
 	}
@@ -338,11 +370,26 @@ func (r *Runner) shouldPostDepreciation(tenantID string, now time.Time) bool {
 		return false
 	}
 	r.lastDepreciationPost[tenantID] = now
+	r.depreciationInFlight[tenantID] = true
 	return true
+}
+
+// finishDepreciationPost releases tenantID's in-flight claim once its
+// assets.PostDueDepreciation call has returned (success or error) — the
+// counterpart every shouldPostDepreciation(tenantID, ...) == true must
+// eventually call, exactly once, so a later poller can claim the slot
+// again.
+func (r *Runner) finishDepreciationPost(tenantID string) {
+	r.depMu.Lock()
+	defer r.depMu.Unlock()
+	delete(r.depreciationInFlight, tenantID)
 }
 
 // forgetDepreciationPost clears the throttle after a FAILED run, so the
 // next tick retries instead of waiting out the interval on an error.
+// finishDepreciationPost already released the in-flight claim (it must
+// run first — see tickTenant) — this only resets the start-time
+// throttle, a separate concern.
 func (r *Runner) forgetDepreciationPost(tenantID string) {
 	r.depMu.Lock()
 	defer r.depMu.Unlock()
