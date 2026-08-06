@@ -270,8 +270,19 @@ func TestPurchasingReport_QualitySection_RealBrowser(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed POLine: %v", err)
 	}
+	// facility_id became Required on GoodsReceipt with uc-infra#54, which
+	// landed in parallel with this test — a receipt now has to say where
+	// the goods physically arrived. The receiving facility is incidental
+	// to what this test asserts (the Quality report section), but it has
+	// to exist for the seed to validate at all.
+	qFacility, err := engine.Create(ctx, purchasing.Facility(), map[string]any{
+		"code": "E2E-Q-MAIN", "name": "E2E Quality Warehouse", "facility_type": "warehouse", "is_active": true,
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed Facility: %v", err)
+	}
 	gr, err := engine.Create(ctx, purchasing.GoodsReceipt(), map[string]any{
-		"purchase_order_id": po.ID, "received_date": "2026-07-05",
+		"purchase_order_id": po.ID, "received_date": "2026-07-05", "facility_id": qFacility.ID,
 	}, actor)
 	if err != nil {
 		t.Fatalf("seed GoodsReceipt: %v", err)
