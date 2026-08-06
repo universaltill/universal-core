@@ -210,3 +210,108 @@ func TestPurchasingReport_OnTimeDeliverySection_RealBrowser(t *testing.T) {
 		}
 	}
 }
+
+// TestPurchasingReport_QualitySection_RealBrowser (uc-infra#82): the
+// fourth completed-receipt-derived section — "Quality" — renders in a
+// real headless Chrome alongside the sections it sits next to on the
+// same page. The internal/api tests already pin the exact row markup/
+// percentage math; this proves the page a buyer actually loads carries
+// the section through the real server + browser stack, AND that a real
+// GoodsReceiptLine write with qty_accepted/qty_rejected set actually
+// passes purchasing.validateGoodsReceiptLineQuality's write-time hook
+// (crud.Engine.Create, not a raw RecordRepo seed) — the internal/api
+// tests bypass that hook entirely, so this is the only layer proving the
+// whole real write -> read -> render path works end to end.
+func TestPurchasingReport_QualitySection_RealBrowser(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, tenantDB := testServer(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	if err := purchasing.PublishStatuses(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("PublishStatuses: %v", err)
+	}
+	engine := crud.NewEngine(tenantDB)
+	engine.SetHook("GoodsReceiptLine", purchasing.PostGoodsReceiptLineToLedger)
+
+	vendor, err := engine.Create(ctx, foundation.Party(), map[string]any{
+		"name": "Inspected Co", "party_type": "organization", "status": "active",
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed vendor: %v", err)
+	}
+	if _, err := engine.Create(ctx, foundation.PartyRole(), map[string]any{
+		"party_id": vendor.ID, "role_type": "vendor",
+	}, actor); err != nil {
+		t.Fatalf("seed vendor PartyRole: %v", err)
+	}
+	draftID := publishedStatusID(t, tenantDB, "purchase_order_status", "draft")
+
+	po, err := engine.Create(ctx, purchasing.PurchaseOrder(), map[string]any{
+		"po_number": "PO-Q-E2E-1", "vendor_id": vendor.ID, "order_date": "2026-07-01", "status_id": draftID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed PurchaseOrder: %v", err)
+	}
+	item, err := engine.Create(ctx, purchasing.Item(), map[string]any{
+		"sku": "SKU-Q-E2E", "name": "Widget", "item_type": "stock",
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed Item: %v", err)
+	}
+	// unit_price 0 deliberately: PostGoodsReceiptLineToLedger's
+	// zero-value-line short-circuit (its own doc comment) means this
+	// exercises validateGoodsReceiptLineQuality without also needing a
+	// seeded chart of accounts (1300/2100) just to post a ledger entry
+	// this test isn't about.
+	poLine, err := engine.Create(ctx, purchasing.POLine(), map[string]any{
+		"purchase_order_id": po.ID, "item_id": item.ID, "qty": float64(10), "unit_price": float64(0),
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed POLine: %v", err)
+	}
+	gr, err := engine.Create(ctx, purchasing.GoodsReceipt(), map[string]any{
+		"purchase_order_id": po.ID, "received_date": "2026-07-05",
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed GoodsReceipt: %v", err)
+	}
+	// Two lines, each 9 accepted / 1 rejected -> N=2 (>= MinSamples, a
+	// single line would show "Insufficient history" instead of a rate),
+	// 18/20 = 90%. Written through the real crud.Engine path so
+	// validateGoodsReceiptLineQuality's netting invariant (9 + 1 ==
+	// qty_received 10) is actually exercised, not just asserted against
+	// a raw seeded record.
+	for i := 0; i < 2; i++ {
+		if _, err := engine.Create(ctx, purchasing.GoodsReceiptLine(), map[string]any{
+			"goods_receipt_id": gr.ID, "po_line_id": poLine.ID, "item_id": item.ID,
+			"qty_received": float64(10), "qty_accepted": float64(9), "qty_rejected": float64(1),
+		}, actor); err != nil {
+			t.Fatalf("seed GoodsReceiptLine with quality data: %v", err)
+		}
+	}
+
+	bctx := browserCtx(t, tenantID)
+	var bodyText string
+	if err := chromedp.Run(bctx,
+		chromedp.Navigate(srv.URL+"/reports/purchasing"),
+		chromedp.WaitVisible(`table.uc-table`, chromedp.ByQuery),
+		chromedp.Text(`body`, &bodyText, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("open /reports/purchasing: %v", err)
+	}
+
+	for _, want := range []string{
+		"Quality", // the section heading — genuinely pins its presence
+		// now that no seeded name ("Inspected Co"/"Widget") contains
+		// "Quality" itself; an earlier draft named the vendor "Quality
+		// Co", which made this assertion pass even with the section
+		// deleted (independent review of uc-infra#82).
+		"Inspected Co",
+		"90%",
+	} {
+		if !strings.Contains(bodyText, want) {
+			t.Errorf("report page missing %q; body text:\n%s", want, bodyText)
+		}
+	}
+}

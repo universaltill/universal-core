@@ -584,6 +584,180 @@ func TestAPI_PurchasingReport_OnTimeDeliveryEmptyState(t *testing.T) {
 	}
 }
 
+// TestAPI_PurchasingReport_QualitySection (uc-infra#82) exercises the
+// quality table end to end: a vendor with enough inspected lines to
+// show a real, quantity-weighted rate, a vendor with only one line
+// (insufficient), and a line with NO quality data at all (must be
+// excluded from every count, not counted as a defect) — plus the
+// overall summary row and localized (tr) rendering, same structure as
+// TestAPI_PurchasingReport_OnTimeDeliverySection.
+func TestAPI_PurchasingReport_QualitySection(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := purchasing.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("purchasing.Publish: %v", err)
+	}
+	records := data.NewRecordRepo(db)
+
+	mustCreate := func(entityType string, fields map[string]any) string {
+		t.Helper()
+		rec, err := records.Create(ctx, entityType, fields)
+		if err != nil {
+			t.Fatalf("create %s: %v", entityType, err)
+		}
+		return rec.ID
+	}
+
+	vendor := mustCreate("Party", map[string]any{"name": "Inspected Co", "party_type": "organization"})
+	soloVendor := mustCreate("Party", map[string]any{"name": "Solo Inspected", "party_type": "organization"})
+
+	po := mustCreate("PurchaseOrder", map[string]any{"po_number": "PO-Q-1", "vendor_id": vendor, "order_date": "2026-07-01"})
+	gr := mustCreate("GoodsReceipt", map[string]any{"purchase_order_id": po, "received_date": "2026-07-05"})
+	// Inspected Co: two lines, 18 accepted / 2 rejected across both -> 90%.
+	mustCreate("GoodsReceiptLine", map[string]any{
+		"goods_receipt_id": gr, "qty_received": 10.0, "qty_accepted": 8.0, "qty_rejected": 2.0,
+	})
+	mustCreate("GoodsReceiptLine", map[string]any{
+		"goods_receipt_id": gr, "qty_received": 10.0, "qty_accepted": 10.0, "qty_rejected": 0.0,
+	})
+	// A line with no quality data at all — must not appear in any count
+	// for Inspected Co, even though it's a real received line.
+	mustCreate("GoodsReceiptLine", map[string]any{
+		"goods_receipt_id": gr, "qty_received": 5.0,
+	})
+
+	soloPO := mustCreate("PurchaseOrder", map[string]any{"po_number": "PO-Q-SOLO", "vendor_id": soloVendor, "order_date": "2026-07-02"})
+	soloGR := mustCreate("GoodsReceipt", map[string]any{"purchase_order_id": soloPO, "received_date": "2026-07-06"})
+	// Solo Inspected: one inspected line -> insufficient.
+	mustCreate("GoodsReceiptLine", map[string]any{
+		"goods_receipt_id": soloGR, "qty_received": 4.0, "qty_accepted": 4.0, "qty_rejected": 0.0,
+	})
+
+	// A PurchaseOrder with no vendor_id at all — its quality data must
+	// still count toward the OVERALL aggregate (same reasoning
+	// CompletedPOLeadTimes' own vendorless samples already get) but must
+	// NOT produce a broken/blank per-vendor row of its own.
+	novendorPO := mustCreate("PurchaseOrder", map[string]any{"po_number": "PO-Q-NOVENDOR", "order_date": "2026-07-03"})
+	novendorGR := mustCreate("GoodsReceipt", map[string]any{"purchase_order_id": novendorPO, "received_date": "2026-07-07"})
+	mustCreate("GoodsReceiptLine", map[string]any{
+		"goods_receipt_id": novendorGR, "qty_received": 2.0, "qty_accepted": 2.0, "qty_rejected": 0.0,
+	})
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+	rec := getAs(t, mux, "/reports/purchasing", tenantID, "farshid")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+
+	if !strings.Contains(body, "Quality") {
+		t.Fatalf("expected the uc-infra#82 Quality section heading:\n%s", body)
+	}
+	// Inspected Co: N=2 (the no-data line excluded), 18/20 accepted -> 90%.
+	if !strings.Contains(body, "<tr><td>Inspected Co</td><td>2</td><td>90%</td></tr>") {
+		t.Errorf("expected the Inspected Co quality row at 2 samples / 90%%:\n%s", body)
+	}
+	// Solo Inspected: N=1, insufficient — never a fabricated rate.
+	if !strings.Contains(body, "<tr><td>Solo Inspected</td><td>1</td><td>Insufficient history</td></tr>") {
+		t.Errorf("expected the Solo Inspected row to say insufficient at n=1:\n%s", body)
+	}
+	// Overall across 4 inspected lines (Inspected Co's 2 + Solo's 1 + the
+	// vendorless PO's 1): 24 accepted / 26 total -> 92.3%.
+	if !strings.Contains(body, "<tr><td>All vendors</td><td>4</td><td>92.3%</td></tr>") {
+		t.Errorf("expected the all-vendors quality summary row at 4 samples / 92.3%%:\n%s", body)
+	}
+	// The vendorless PO's quality data must NOT produce its own
+	// per-vendor row — no row with an empty vendor cell.
+	if strings.Contains(body, "<tr><td></td><td>1</td>") {
+		t.Errorf("vendorless quality data produced its own (blank-vendor) row, must only count toward the overall row:\n%s", body)
+	}
+
+	recTR := getAs(t, mux, "/reports/purchasing?lang=tr", tenantID, "farshid")
+	if recTR.Code != http.StatusOK {
+		t.Fatalf("expected 200 for ?lang=tr, got %d: %s", recTR.Code, recTR.Body.String())
+	}
+	if !strings.Contains(recTR.Body.String(), "Kalite") {
+		t.Errorf("expected the localized (tr) Quality heading:\n%s", recTR.Body.String())
+	}
+}
+
+// TestAPI_PurchasingReport_QualityEmptyState (uc-infra#82): when no
+// GoodsReceiptLine carries qty_accepted/qty_rejected at all — true for
+// every tenant until someone starts filling it in — the section must
+// render its own empty-state copy, not an empty table and not the
+// on-time section's unrelated one.
+func TestAPI_PurchasingReport_QualityEmptyState(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := purchasing.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("purchasing.Publish: %v", err)
+	}
+	records := data.NewRecordRepo(db)
+	vendor, err := records.Create(ctx, "Party", map[string]any{"name": "No Quality Vendor", "party_type": "organization"})
+	if err != nil {
+		t.Fatalf("create Party: %v", err)
+	}
+	po, err := records.Create(ctx, "PurchaseOrder", map[string]any{"po_number": "PO-NOQ-1", "vendor_id": vendor.ID, "order_date": "2026-07-01"})
+	if err != nil {
+		t.Fatalf("create PurchaseOrder: %v", err)
+	}
+	gr, err := records.Create(ctx, "GoodsReceipt", map[string]any{"purchase_order_id": po.ID, "received_date": "2026-07-05"})
+	if err != nil {
+		t.Fatalf("create GoodsReceipt: %v", err)
+	}
+	if _, err := records.Create(ctx, "GoodsReceiptLine", map[string]any{
+		"goods_receipt_id": gr.ID, "qty_received": 5.0,
+	}); err != nil {
+		t.Fatalf("create GoodsReceiptLine: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+	rec := getAs(t, mux, "/reports/purchasing", tenantID, "farshid")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "No goods receipt lines with a recorded quality outcome yet.") {
+		t.Errorf("expected the quality empty state:\n%s", body)
+	}
+	if !strings.Contains(body, "Supplier Lead Times") {
+		t.Errorf("expected the lead-time section to still render its own (non-empty) data:\n%s", body)
+	}
+}
+
+// TestQualitySamples_SkipsRowsWithOnlyOneQuantityParsing (uc-infra#82,
+// independent review) pins qualitySamples' own defensive branch: a row
+// where exactly one of QtyAccepted/QtyRejected fails to parse — reachable
+// once GoodsReceiptLine's generic edit path can persist a partial/
+// corrupted quality record despite the write-time hook's own
+// required-together check (a direct DB edit, a pre-hook migration, or a
+// hook bypassed some other way) — must be skipped entirely, not credited
+// with only the half that DID parse. This is the same "don't trust one
+// half of a pair without the other" discipline
+// validateGoodsReceiptLineQuality enforces at write time; this is the
+// read-time backstop for data that got past it anyway.
+func TestQualitySamples_SkipsRowsWithOnlyOneQuantityParsing(t *testing.T) {
+	rows := []data.GoodsReceiptLineQuality{
+		{LineID: "l1", VendorID: "v1", QtyAccepted: "8", QtyRejected: ""},             // only one set
+		{LineID: "l2", VendorID: "v1", QtyAccepted: "not-a-number", QtyRejected: "2"}, // one unparseable
+		{LineID: "l3", VendorID: "v1", QtyAccepted: "", QtyRejected: ""},              // neither set — the common case
+		{LineID: "l4", VendorID: "v1", QtyAccepted: "8", QtyRejected: "2"},            // the one real sample
+	}
+	got := qualitySamples(rows)
+	if len(got) != 1 {
+		t.Fatalf("got %d samples, want 1 (only the fully-parseable row): %+v", len(got), got)
+	}
+	if got[0].QtyAccepted != 8 || got[0].QtyRejected != 2 {
+		t.Fatalf("unexpected sample survived: %+v", got[0])
+	}
+}
+
 // TestAPI_PurchasingReport_EntityTypeListMatchesTheActualQueries pins
 // purchasingReportEntityTypes to a hardcoded, independently-derived set
 // so a change to the var — an addition OR an omission — fails loudly
@@ -607,7 +781,8 @@ func TestAPI_PurchasingReport_EntityTypeListMatchesTheActualQueries(t *testing.T
 	// GoodsReceiptLine; OnHandQtyByItem reads InventoryItem;
 	// LatestPOVendorByItem reads POLine joined to PurchaseOrder;
 	// buildReorderSignals reads ReorderRule and Item through the guarded
-	// engine.
+	// engine; GoodsReceiptLineQualities (uc-infra#82) reads
+	// GoodsReceiptLine joined to GoodsReceipt, PurchaseOrder, and Party.
 	want := map[string]bool{
 		"PurchaseOrder": true, "Status": true, "Party": true, "InventoryItem": true, "Item": true,
 		"POLine": true, "GoodsReceipt": true, "GoodsReceiptLine": true, "ReorderRule": true,

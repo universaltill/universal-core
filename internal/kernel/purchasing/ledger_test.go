@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 
@@ -531,6 +532,236 @@ func TestPostGoodsReceiptLineToLedger_UpdateAction_IsNoOp(t *testing.T) {
 	rec := data.Record{ID: "x", Data: map[string]any{"qty_received": float64(1), "po_line_id": "y", "goods_receipt_id": "z"}}
 	if err := PostGoodsReceiptLineToLedger(context.Background(), nil, nil, rec, audit.ActionUpdate, humanActor()); err != nil {
 		t.Fatalf("expected Update action to no-op without even touching tx, got: %v", err)
+	}
+}
+
+// TestValidateGoodsReceiptLineQuality_NeitherFieldSet_IsNoOp (uc-infra#82)
+// is the common case: a line with no quality data recorded at all, the
+// same "additive optional field" state every GoodsReceiptLine written
+// before this feature has.
+func TestValidateGoodsReceiptLineQuality_NeitherFieldSet_IsNoOp(t *testing.T) {
+	rec := data.Record{ID: "x", Data: map[string]any{"qty_received": float64(10)}}
+	if err := validateGoodsReceiptLineQuality(rec); err != nil {
+		t.Fatalf("expected no error with neither field set, got: %v", err)
+	}
+}
+
+// TestValidateGoodsReceiptLineQuality_OnlyOneFieldSet_Rejected pins the
+// required-together invariant: a line with only one of qty_accepted/
+// qty_rejected is a partial, probably-still-being-entered record, not a
+// real one.
+func TestValidateGoodsReceiptLineQuality_OnlyOneFieldSet_Rejected(t *testing.T) {
+	tests := []struct {
+		name string
+		data map[string]any
+	}{
+		{"only qty_accepted", map[string]any{"qty_received": float64(10), "qty_accepted": float64(8)}},
+		{"only qty_rejected", map[string]any{"qty_received": float64(10), "qty_rejected": float64(2)}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateGoodsReceiptLineQuality(data.Record{ID: "x", Data: tc.data})
+			if !errors.Is(err, crud.ErrHookRejected) {
+				t.Fatalf("expected crud.ErrHookRejected, got: %v", err)
+			}
+			if !strings.Contains(err.Error(), "must both be set or both be omitted") {
+				t.Fatalf("expected a required-together message, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestValidateGoodsReceiptLineQuality_NonNumericType_Rejected
+// (independent review of uc-infra#82) is a direct unit-level call —
+// entity.ValidateRecord already guarantees a real crud.Engine.Create/
+// Update never reaches this hook with a non-numeric qty_accepted/
+// qty_rejected (same reasoning ValidateStockTransfer's own
+// AcceptsEveryNumericTypeEntityValidationDoes test documents), so this
+// exercises the defensive branch directly, the same way
+// TestPostGoodsReceiptLineToLedger_UpdateAction_IsNoOp already calls the
+// hook function directly rather than through the engine.
+func TestValidateGoodsReceiptLineQuality_NonNumericType_Rejected(t *testing.T) {
+	tests := []struct {
+		name string
+		data map[string]any
+	}{
+		{"non-numeric qty_accepted", map[string]any{"qty_received": float64(10), "qty_accepted": "eight", "qty_rejected": float64(2)}},
+		{"non-numeric qty_rejected", map[string]any{"qty_received": float64(10), "qty_accepted": float64(8), "qty_rejected": "two"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateGoodsReceiptLineQuality(data.Record{ID: "x", Data: tc.data})
+			if !errors.Is(err, crud.ErrHookRejected) {
+				t.Fatalf("expected crud.ErrHookRejected, got: %v", err)
+			}
+			if !strings.Contains(err.Error(), "must be a number") {
+				t.Fatalf("expected a not-a-number message, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestValidateGoodsReceiptLineQuality_NegativeQuantity_Rejected pins the
+// non-negative invariant on both fields independently.
+func TestValidateGoodsReceiptLineQuality_NegativeQuantity_Rejected(t *testing.T) {
+	tests := []struct {
+		name string
+		data map[string]any
+	}{
+		{"negative qty_accepted", map[string]any{"qty_received": float64(10), "qty_accepted": float64(-1), "qty_rejected": float64(11)}},
+		{"negative qty_rejected", map[string]any{"qty_received": float64(10), "qty_accepted": float64(11), "qty_rejected": float64(-1)}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateGoodsReceiptLineQuality(data.Record{ID: "x", Data: tc.data})
+			if !errors.Is(err, crud.ErrHookRejected) {
+				t.Fatalf("expected crud.ErrHookRejected, got: %v", err)
+			}
+			if !strings.Contains(err.Error(), "must not be negative") {
+				t.Fatalf("expected a non-negative message, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestValidateGoodsReceiptLineQuality_DoesNotNetToReceived_Rejected pins
+// the core invariant: qty_accepted + qty_rejected must equal
+// qty_received — a quality SPLIT of what arrived, not an independent
+// count that can disagree with it.
+func TestValidateGoodsReceiptLineQuality_DoesNotNetToReceived_Rejected(t *testing.T) {
+	rec := data.Record{ID: "x", Data: map[string]any{
+		"qty_received": float64(10), "qty_accepted": float64(8), "qty_rejected": float64(1),
+	}}
+	err := validateGoodsReceiptLineQuality(rec)
+	if !errors.Is(err, crud.ErrHookRejected) {
+		t.Fatalf("expected crud.ErrHookRejected, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "must equal qty_received") {
+		t.Fatalf("expected a netting message, got: %v", err)
+	}
+}
+
+// TestValidateGoodsReceiptLineQuality_NetsExactly_IsNoOp is the valid
+// case: qty_accepted + qty_rejected == qty_received exactly.
+func TestValidateGoodsReceiptLineQuality_NetsExactly_IsNoOp(t *testing.T) {
+	rec := data.Record{ID: "x", Data: map[string]any{
+		"qty_received": float64(10), "qty_accepted": float64(7), "qty_rejected": float64(3),
+	}}
+	if err := validateGoodsReceiptLineQuality(rec); err != nil {
+		t.Fatalf("expected no error when quantities net exactly, got: %v", err)
+	}
+}
+
+// TestValidateGoodsReceiptLineQuality_ZeroZeroWithBothSet_IsNoOp is the
+// real, if unusual, 0/0 outcome (matching forecast.QualitySample's own
+// HasData distinction): both fields explicitly present and zero,
+// netting to a qty_received of zero.
+func TestValidateGoodsReceiptLineQuality_ZeroZeroWithBothSet_IsNoOp(t *testing.T) {
+	rec := data.Record{ID: "x", Data: map[string]any{
+		"qty_received": float64(0), "qty_accepted": float64(0), "qty_rejected": float64(0),
+	}}
+	if err := validateGoodsReceiptLineQuality(rec); err != nil {
+		t.Fatalf("expected no error for an explicit 0/0/0 record, got: %v", err)
+	}
+}
+
+// TestValidateGoodsReceiptLineQuality_FloatRoundingWithinEpsilon_IsNoOp
+// confirms qtyNetTolerance absorbs ordinary binary floating-point noise
+// (0.1 + 0.2 != 0.3 in float64) without becoming a license to be off by
+// a real unit — see qtyNetEpsilonAbs/qtyNetEpsilonRel's own doc comment.
+func TestValidateGoodsReceiptLineQuality_FloatRoundingWithinEpsilon_IsNoOp(t *testing.T) {
+	rec := data.Record{ID: "x", Data: map[string]any{
+		"qty_received": float64(0.3), "qty_accepted": float64(0.1), "qty_rejected": float64(0.2),
+	}}
+	if err := validateGoodsReceiptLineQuality(rec); err != nil {
+		t.Fatalf("expected qtyNetTolerance to absorb float64 rounding noise, got: %v", err)
+	}
+}
+
+// TestQtyNetTolerance_ScalesWithMagnitude (independent review of
+// uc-infra#82) pins the fix for a fixed absolute epsilon being too
+// tight at scale: float64 has ~15-17 significant decimal digits, so the
+// ABSOLUTE rounding noise on a large quantity is itself larger than a
+// fixed 1e-9 — qtyNetTolerance must grow with qty_received's own
+// magnitude rather than staying fixed.
+func TestQtyNetTolerance_ScalesWithMagnitude(t *testing.T) {
+	if got := qtyNetTolerance(0.3); got != qtyNetEpsilonAbs {
+		t.Errorf("qtyNetTolerance(0.3) = %v, want the absolute floor %v", got, qtyNetEpsilonAbs)
+	}
+	if got := qtyNetTolerance(1e12); !approxEqualLedger(got, qtyNetEpsilonRel*1e12) {
+		t.Errorf("qtyNetTolerance(1e12) = %v, want %v (relative, not the fixed absolute floor)", got, qtyNetEpsilonRel*1e12)
+	}
+	// Sign must not matter — a received value stored as negative
+	// (shouldn't happen in practice, but this is a pure magnitude scale,
+	// not a business validity check) scales the same as its absolute value.
+	if got := qtyNetTolerance(-1e12); !approxEqualLedger(got, qtyNetEpsilonRel*1e12) {
+		t.Errorf("qtyNetTolerance(-1e12) = %v, want %v", got, qtyNetEpsilonRel*1e12)
+	}
+}
+
+func approxEqualLedger(a, b float64) bool {
+	return math.Abs(a-b) < 1e-9
+}
+
+// TestValidateGoodsReceiptLineQuality_LargeQuantityRealMismatch_StillRejected
+// is the negative control for the relative-tolerance fix above: scaling
+// the allowance with magnitude must not turn into "anything goes" for a
+// large quantity — a genuine, real-unit-sized mismatch is still rejected.
+func TestValidateGoodsReceiptLineQuality_LargeQuantityRealMismatch_StillRejected(t *testing.T) {
+	// At qty_received = 1e9, qtyNetTolerance is qtyNetEpsilonRel*1e9 = 1
+	// (a full unit) — a mismatch of 100 is unambiguously outside that,
+	// not a boundary case the relative scaling could accidentally absorb.
+	rec := data.Record{ID: "x", Data: map[string]any{
+		"qty_received": float64(1e9), "qty_accepted": float64(5e8), "qty_rejected": float64(5e8 - 100),
+	}}
+	err := validateGoodsReceiptLineQuality(rec)
+	if !errors.Is(err, crud.ErrHookRejected) {
+		t.Fatalf("expected crud.ErrHookRejected for a real 100-unit mismatch at scale, got: %v", err)
+	}
+}
+
+// TestPostGoodsReceiptLineToLedger_QualityMismatch_RollsBackTheWholeWrite
+// is the end-to-end regression: a quality-invalid GoodsReceiptLine must
+// never reach the database at all — not the record, not a ledger
+// posting — same "hook rejection rolls back everything" contract
+// TestPostGoodsReceiptLineToLedger_UnknownAccountCode_RollsBackTheLine
+// already pins for the ledger-posting half of this same hook.
+func TestPostGoodsReceiptLineToLedger_QualityMismatch_RollsBackTheWholeWrite(t *testing.T) {
+	fx := setUpGoodsReceiptFixture(t, 12.50)
+	fx.engine.SetHook("GoodsReceiptLine", PostGoodsReceiptLineToLedger)
+	ctx := context.Background()
+	actor := humanActor()
+
+	gr, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceipt"), map[string]any{
+		"purchase_order_id": fx.poID, "received_date": "2026-01-10", "facility_id": fx.facilityID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create GoodsReceipt: %v", err)
+	}
+
+	_, err = fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"), map[string]any{
+		"goods_receipt_id": gr.ID, "po_line_id": fx.poLineID, "item_id": fx.itemID,
+		"qty_received": float64(4), "qty_accepted": float64(1), "qty_rejected": float64(1), // 1+1 != 4
+	}, actor)
+	if !errors.Is(err, crud.ErrHookRejected) {
+		t.Fatalf("expected crud.ErrHookRejected, got: %v", err)
+	}
+
+	records := data.NewRecordRepo(fx.tenantDB)
+	list, err := records.List(ctx, "GoodsReceiptLine")
+	if err != nil {
+		t.Fatalf("List GoodsReceiptLine: %v", err)
+	}
+	if len(list) != 0 {
+		t.Fatalf("expected the rejected GoodsReceiptLine write to be rolled back entirely, found %d", len(list))
+	}
+	entries := data.NewJournalEntryRepo(fx.tenantDB)
+	entryList, err := entries.List(ctx)
+	if err != nil {
+		t.Fatalf("List journal entries: %v", err)
+	}
+	if len(entryList) != 0 {
+		t.Fatalf("expected no journal entry to be posted for a rejected line, got %d", len(entryList))
 	}
 }
 

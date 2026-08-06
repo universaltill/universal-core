@@ -395,16 +395,39 @@ func GoodsReceipt() *entity.Definition {
 // this kernel that references an Item does so directly, and a report or
 // CSV import over GoodsReceiptLine shouldn't need a join through POLine
 // just to know what was actually received.
+//
+// qty_accepted/qty_rejected (Version 2, uc-infra#82) are the missing
+// quality/rejection concept SupplierScorecard's own quality_rate field
+// (reference-data-model.md §2) needs and never had: qty_received alone
+// only says how much of the order showed up, not whether it was any
+// good — netting qty_accepted against POLine.qty would measure
+// fulfillment completeness, a real but different metric, not quality.
+// Both fields are additive and OPTIONAL, same pattern as PurchaseOrder's
+// promised_delivery_date (#11): a line written before this bump, or a
+// tenant that never bothers recording inspection outcomes, simply has
+// neither field set, and is excluded from the quality-rate metric
+// entirely (forecast.ComputeQuality's own no-fabrication discipline) —
+// never coerced into a false 100%/0%. Required-together is enforced by
+// validateGoodsReceiptLineQuality (ledger.go, folded into
+// PostGoodsReceiptLineToLedger — crud.Engine.SetHook only supports one
+// hook per entity type) as a crud.Hook business rule, not here:
+// entity.Field has no cross-field concept yet (#80), the same gap
+// ValidateStockTransfer already works around for StockTransfer.
+// The invariant itself, when both ARE set: qty_accepted + qty_rejected
+// must equal qty_received — this is a quality *split* of what arrived,
+// not a second, independent count.
 func GoodsReceiptLine() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "GoodsReceiptLine",
-		Version:    1,
+		Version:    2,
 		Module:     "purchasing",
 		Fields: []entity.Field{
 			{Name: "goods_receipt_id", Type: entity.FieldReference, Required: true, Target: "GoodsReceipt"},
 			{Name: "po_line_id", Type: entity.FieldReference, Required: true, Target: "POLine"},
 			{Name: "item_id", Type: entity.FieldReference, Required: true, Target: "Item"},
 			{Name: "qty_received", Type: entity.FieldNumber, Required: true},
+			{Name: "qty_accepted", Type: entity.FieldNumber},
+			{Name: "qty_rejected", Type: entity.FieldNumber},
 		},
 	}
 }
