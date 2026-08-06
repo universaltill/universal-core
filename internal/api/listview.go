@@ -90,7 +90,8 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 			opts.SortNumeric = true
 		}
 	}
-	filterField := r.URL.Query().Get("filter")
+	explicitFilterField := r.URL.Query().Get("filter")
+	filterField := explicitFilterField
 	if filterField == "" {
 		// No explicit field: the single filter box (no column picker in the
 		// current UI) targets the first visible column that can actually be
@@ -107,6 +108,7 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	filterFieldValid := isVisibleColumn(columns, filterField) && sortFilterableField(def, filterField)
 	filterValue := r.URL.Query().Get("q")
 	// displayFilterValue is what re-populates the filter box and
 	// survives into sort/page links — always the RAW text the viewer
@@ -116,7 +118,7 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 	// one field too far, would just move the surprise from "no results"
 	// to "my search box changed under me").
 	displayFilterValue := ""
-	if filterValue != "" && isVisibleColumn(columns, filterField) && sortFilterableField(def, filterField) {
+	if filterValue != "" && filterFieldValid {
 		opts.FilterField = filterField
 		opts.FilterValue = filterValue
 		displayFilterValue = filterValue
@@ -161,6 +163,23 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+	}
+	// The hidden field that carries the active column into the next form
+	// submit (below, view.FilterField) must reflect an EXPLICIT ?filter=
+	// from the URL even before any ?q= has been typed — otherwise a page
+	// loaded via a bookmarked/shared "?filter=weight" link renders a
+	// filter box with no hidden field at all, and the next submit (once
+	// someone types into it) carries no filter= param, silently reverting
+	// to the default column instead of the one the URL named (uc-infra#129).
+	// Deliberately NOT extended to the implicit-default case (no ?filter=
+	// in the URL at all): that default is re-derived identically by the
+	// server on every request regardless of what a bare "?q=" submit
+	// carries, so there's no equivalent silent-revert bug to fix there,
+	// and rendering a hidden field for it would put filter= on every
+	// plain list-page landing for no behavioral gain.
+	viewFilterField := opts.FilterField
+	if explicitFilterField != "" && filterFieldValid {
+		viewFilterField = explicitFilterField
 	}
 
 	total, err := ts.crud.CountFiltered(r.Context(), def, opts)
@@ -209,7 +228,7 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 		ImportLink:  h.catalog.T(locale, "dashboard.import_link"),
 		ExportLink:  h.catalog.T(locale, "dashboard.export_link"),
 		Empty:       h.catalog.T(locale, "list.empty"),
-		FilterField: opts.FilterField,
+		FilterField: viewFilterField,
 		FilterValue: displayFilterValue,
 		FilterHref:  "/records/" + entityType,
 		FilterLabel: h.catalog.T(locale, "list.filter_placeholder"),
@@ -217,12 +236,28 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 		FilterClear: h.catalog.T(locale, "list.filter_clear"),
 	}
 	// keepQuery preserves the active filter across sort and page links, so
-	// sorting a filtered list doesn't silently clear the filter.
+	// sorting a filtered list doesn't silently clear the filter. Gated on
+	// viewFilterField, NOT opts.FilterField: the latter is "" whenever
+	// there's no ?q= yet (see above), which would otherwise reproduce
+	// uc-infra#129 one click away from the very page this fix repairs —
+	// a sort/page link clicked from "?filter=weight" with no ?q= typed
+	// yet would drop filter= from its own href, same silent revert to
+	// the default column on the NEXT link click instead of the next form
+	// submit. q is only set when there's an actual value to carry
+	// (displayFilterValue == "" whenever viewFilterField came from the
+	// no-?q=-yet branch), so this never adds a spurious empty q=.
+	//
+	// Carries displayFilterValue, not opts.FilterValue (uc-infra#74's
+	// half of this merge): the link must round-trip the RAW text the
+	// viewer typed, not the ParseNumber/ParseDate-normalized form — see
+	// displayFilterValue's own declaration above.
 	keepQuery := func(extra url.Values) string {
 		q := url.Values{}
-		if opts.FilterField != "" {
-			q.Set("filter", opts.FilterField)
-			q.Set("q", displayFilterValue)
+		if viewFilterField != "" {
+			q.Set("filter", viewFilterField)
+			if displayFilterValue != "" {
+				q.Set("q", displayFilterValue)
+			}
 		}
 		for k, vs := range extra {
 			for _, v := range vs {

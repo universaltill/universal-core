@@ -88,6 +88,160 @@ func TestListPage_FilterAndSort(t *testing.T) {
 	}
 }
 
+// TestListPage_ExplicitFilterFieldWithoutQuery_SurvivesNextSubmit is a
+// regression test for uc-infra#129: a list page loaded with an explicit
+// ?filter=X naming a non-default column but no ?q= yet (a bookmarked or
+// shared link, before anyone has typed into the search box) must still
+// render a hidden `filter` input carrying X — otherwise the next real
+// form submit (typed value + Go) posts with no `filter=` param at all,
+// and the handler silently falls back to the default column instead of
+// the one the URL named.
+func TestListPage_ExplicitFilterFieldWithoutQuery_SurvivesNextSubmit(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := foundation.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	publishEntityAndForm(t, db, widgetFilterEntityDef(), &form.Definition{
+		EntityType: "Widget", Version: 1,
+		Sections: []form.Section{{Title: "D", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "name"}, {Name: "secret"}}}},
+	})
+
+	eng := crud.NewEngine(db)
+	if _, err := eng.Create(ctx, widgetFilterEntityDef(), map[string]any{"name": "Apple", "secret": "alpha"}, humanActor()); err != nil {
+		t.Fatalf("seed Apple: %v", err)
+	}
+	if _, err := eng.Create(ctx, widgetFilterEntityDef(), map[string]any{"name": "Banana", "secret": "beta"}, humanActor()); err != nil {
+		t.Fatalf("seed Banana: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	// A plain landing page (no ?filter= at all) renders no hidden filter
+	// field — the implicit per-page default is re-derived by the server
+	// on every request regardless, so there's nothing for a bare form
+	// submit to lose. Asserted here as the boundary this fix must NOT
+	// widen past.
+	plain := getAs(t, mux, "/records/Widget", tenantID, "anyone").Body.String()
+	if strings.Contains(plain, `name="filter"`) {
+		t.Fatalf("plain landing page (no ?filter=) should render no hidden filter field:\n%s", plain)
+	}
+
+	// ?filter=secret with NO ?q= yet: "secret" is not the default column
+	// (name is, being declared first) — the hidden field must name it
+	// explicitly so a later submit doesn't silently revert to "name".
+	loaded := getAs(t, mux, "/records/Widget?filter=secret", tenantID, "anyone").Body.String()
+	if !strings.Contains(loaded, `name="filter" value="secret"`) {
+		t.Fatalf("?filter=secret with no ?q= should render a hidden filter field naming \"secret\":\n%s", loaded)
+	}
+
+	// The actual next submit a browser would send once someone types into
+	// that box: filter=secret carried forward via the (now-fixed) hidden
+	// field, plus q=beta. Must match Banana (secret=beta) by the EXPLICIT
+	// column, not silently fall back to filtering "name" by "beta" (which
+	// would match nothing). NOTE: this specific assertion would also pass
+	// against the pre-fix code (both filter and q are present, so it
+	// exercises the untouched opts.FilterField path) — it's extra
+	// coverage, not the #129 regression guard; the hidden-field assertion
+	// above is.
+	submitted := getAs(t, mux, "/records/Widget?filter=secret&q=beta", tenantID, "anyone").Body.String()
+	if !strings.Contains(submitted, "Banana") || strings.Contains(submitted, "Apple") {
+		t.Fatalf("filter=secret q=beta should match Banana (secret=beta) via the explicit column, not the default:\n%s", submitted)
+	}
+}
+
+// TestListPage_ExplicitFilterFieldWithoutQuery_SurvivesSortClick is a
+// regression test for the gap independent review found in uc-infra#129's
+// own fix: the hidden form field alone isn't enough — every sort-header
+// and pager link on the SAME page is built by keepQuery, which must also
+// carry the explicit filter column forward. Before this, a page loaded
+// via "?filter=secret" (no ?q= yet) rendered the hidden field correctly,
+// but clicking a column header still linked to a bare "?sort=name" with
+// no filter= at all — one click away from reproducing the exact bug the
+// hidden field was fixed to prevent, just via a link instead of a submit.
+func TestListPage_ExplicitFilterFieldWithoutQuery_SurvivesSortClick(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := foundation.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	publishEntityAndForm(t, db, widgetFilterEntityDef(), &form.Definition{
+		EntityType: "Widget", Version: 1,
+		Sections: []form.Section{{Title: "D", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "name"}, {Name: "secret"}}}},
+	})
+	eng := crud.NewEngine(db)
+	if _, err := eng.Create(ctx, widgetFilterEntityDef(), map[string]any{"name": "Apple", "secret": "alpha"}, humanActor()); err != nil {
+		t.Fatalf("seed Apple: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	loaded := getAs(t, mux, "/records/Widget?filter=secret", tenantID, "anyone").Body.String()
+	if !strings.Contains(loaded, `href="/records/Widget?filter=secret&amp;sort=name"`) {
+		t.Fatalf("the \"name\" column's sort link should carry filter=secret forward from a ?filter=secret (no ?q=) page, not drop it:\n%s", loaded)
+	}
+	// No q= should be tacked on when there was never a value to carry —
+	// only filter+sort, not a spurious empty q=.
+	if strings.Contains(loaded, `sort=name&amp;q=`) || strings.Contains(loaded, `q=&amp;sort=name`) {
+		t.Fatalf("sort link should not carry an empty q= when no filter value was ever typed:\n%s", loaded)
+	}
+}
+
+// TestListPage_FilterFieldHidden_RendersNoHiddenInput is a regression
+// guard for the false-path of the condition uc-infra#129's fix
+// introduced (filterFieldValid): an explicit ?filter= naming a column
+// the viewer cannot see (RBAC-redacted) or that does not exist on the
+// Definition at all must render NO hidden filter input — echoing the
+// requested field name back into the DOM either way would be a direct
+// RBAC oracle (the same class of leak isVisibleColumn/sortFilterableField
+// exist to prevent for sort= elsewhere in this file).
+func TestListPage_FilterFieldHidden_RendersNoHiddenInput(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := foundation.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	publishEntityAndForm(t, db, widgetFilterEntityDef(), &form.Definition{
+		EntityType: "Widget", Version: 1,
+		Sections: []form.Section{{Title: "D", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "name"}, {Name: "secret"}}}},
+	})
+	if _, err := crud.NewEngine(db).Create(ctx, widgetFilterEntityDef(), map[string]any{"name": "Apple", "secret": "alpha"}, humanActor()); err != nil {
+		t.Fatalf("seed Apple: %v", err)
+	}
+	seedFieldRule(t, db, "clerk", "user-clerk", "Widget", "secret")
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	// A role that cannot see "secret" must not have it echoed back as a
+	// hidden field just because it named the column explicitly in the URL.
+	hidden := getAs(t, mux, "/records/Widget?filter=secret", tenantID, "user-clerk").Body.String()
+	if strings.Contains(hidden, `name="filter"`) {
+		t.Fatalf("?filter=secret from a viewer who cannot see \"secret\" must render no hidden filter field (RBAC oracle):\n%s", hidden)
+	}
+
+	// A field name that doesn't exist on the Definition at all degrades
+	// the same way — no panic, no hidden field.
+	unknown := getAs(t, mux, "/records/Widget?filter=does_not_exist", tenantID, "anyone")
+	if unknown.Code != http.StatusOK {
+		t.Fatalf("?filter=<unknown field> should degrade to a normal 200 page, not %d", unknown.Code)
+	}
+	if strings.Contains(unknown.Body.String(), `name="filter"`) {
+		t.Fatalf("?filter=<unknown field> must render no hidden filter field:\n%s", unknown.Body.String())
+	}
+}
+
 // referenceFirstEntityDef declares "category" (a Reference) as the FIRST
 // field, so the no-explicit-filter default (renderRecordList's own loop
 // over columns) lands on it — the exact shape board #49 flagged: for an
