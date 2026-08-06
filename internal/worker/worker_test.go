@@ -381,6 +381,26 @@ func waitFor(t *testing.T, ctx context.Context, timeout time.Duration, cond func
 	}
 }
 
+// waitForJobStatus polls repo (via waitFor above) until job reaches want,
+// failing the test if it hasn't within 3 seconds. Needed because a job
+// becomes queryable as status==want only once Queue.ProcessOne's
+// MarkDone commits, which happens strictly after the StepHandler runs
+// (queue.go's ProcessOne calls the handler, then MarkDone) — so a
+// caller's own in-process signal that the handler ran (e.g. a
+// "processed" map) is not proof the row is queryable yet.
+func waitForJobStatus(t *testing.T, ctx context.Context, repo *data.WorkflowJobRepo, jobID, want string) data.WorkflowJob {
+	t.Helper()
+	var got data.WorkflowJob
+	waitFor(t, ctx, 3*time.Second, func() bool {
+		var err error
+		if got, err = repo.Get(ctx, jobID); err != nil {
+			t.Fatalf("Get job %s: %v", jobID, err)
+		}
+		return got.Status == want
+	})
+	return got
+}
+
 func TestRunner_StopsOnContextCancellation(t *testing.T) {
 	router, control := newTestRouter(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -577,22 +597,36 @@ func TestRunner_ProcessesMultipleTenantsIndependentlyInOneTick(t *testing.T) {
 		}
 	}
 
+	// Poll for each job's terminal DB status (waitForJobStatus) rather
+	// than asserting right after the processedBy wait loop above exits:
+	// that loop only proves the in-process StepHandler ran, and
+	// ProcessOne calls the handler before it commits MarkDone
+	// (queue.go) — so a query issued the instant processedBy fills in
+	// can still observe status="running", an unsynchronized
+	// handler-vs-commit race, not a logic bug in the multi-tenant
+	// isolation this test is actually about. Confirmed by forcing the
+	// race with an artificial delay before MarkDone: it reproduces this
+	// exact "expected tenant B's job done, got running" failure
+	// (uc-infra#115). Same poll-until-done shape as
+	// TestRunner_RunConcurrent_ProcessesAllJobsExactlyOnce's countDone()
+	// above, which already avoids this by polling the DB for the
+	// terminal state instead of trusting an in-process callback as its
+	// sole wait condition.
+	//
+	// A wait tolerant enough to let a reclaim/retry cycle finish inside
+	// its deadline would silently accept that as equivalent to a single
+	// clean run, which defeats what this test is actually proving — so
+	// require zero retries too, not just the terminal status.
 	repoA := data.NewWorkflowJobRepo(tenantADB)
-	gotA, err := repoA.Get(ctx, jobA.ID)
-	if err != nil {
-		t.Fatalf("Get tenant A job: %v", err)
-	}
-	if gotA.Status != "done" {
-		t.Fatalf("expected tenant A's job done, got %q", gotA.Status)
+	gotA := waitForJobStatus(t, ctx, repoA, jobA.ID, "done")
+	if gotA.Attempts != 0 || gotA.LastError != "" {
+		t.Fatalf("tenant A's job reached done only after %d retries (last_error %q) — expected one clean pass, not a reclaim/retry loop", gotA.Attempts, gotA.LastError)
 	}
 
 	repoB := data.NewWorkflowJobRepo(tenantBDB)
-	gotB, err := repoB.Get(ctx, jobB.ID)
-	if err != nil {
-		t.Fatalf("Get tenant B job: %v", err)
-	}
-	if gotB.Status != "done" {
-		t.Fatalf("expected tenant B's job done, got %q", gotB.Status)
+	gotB := waitForJobStatus(t, ctx, repoB, jobB.ID, "done")
+	if gotB.Attempts != 0 || gotB.LastError != "" {
+		t.Fatalf("tenant B's job reached done only after %d retries (last_error %q) — expected one clean pass, not a reclaim/retry loop", gotB.Attempts, gotB.LastError)
 	}
 
 	// tenant A's own connection must never see tenant B's job row (and

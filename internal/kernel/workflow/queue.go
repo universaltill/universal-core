@@ -125,6 +125,14 @@ func (q *Queue) Enqueue(ctx context.Context, def *Definition, entityType, record
 // not the primary one: if the process is killed outright (OOM, SIGKILL)
 // between the claim and any Mark* call, no recover runs either, which is
 // what ReclaimStale exists for.
+//
+// A step's StepHandler runs to completion before this method commits
+// MarkDone (or the failure/approval-wait equivalents) — those cannot be
+// made atomic without transactional-outbox semantics. A caller must not
+// treat "the handler ran" (e.g. its own in-process side effect or
+// callback) as proof the job is queryable as status=="done" yet; poll
+// the row itself if that is what's needed (see internal/worker's
+// waitForJobStatus, added for exactly this after uc-infra#115).
 func (q *Queue) ProcessOne(ctx context.Context, lookup DefinitionLookup) (job data.WorkflowJob, err error) {
 	job, err = q.jobs.ClaimNext(ctx)
 	if err != nil {
