@@ -6,6 +6,8 @@ import (
 	"math"
 	"slices"
 	"time"
+
+	"github.com/universaltill/universal-core/internal/kernel/money"
 )
 
 // ValidationErrorKind classifies a ValidateRecord failure so a caller
@@ -303,6 +305,32 @@ func validateFieldValue(entityType string, f Field, v any) *ValidationError {
 		}
 		if f.Max != nil && num > *f.Max {
 			return newErr(KindAboveMaximum, fmt.Sprintf("value %v is above the maximum %v", num, *f.Max))
+		}
+	case FieldMoney:
+		// A FieldMoney value is a WHOLE number of minor units — see
+		// FieldMoney's own doc comment for why that's the actual fix,
+		// not an arbitrary tightening. money.FromAny rejects both the
+		// wrong Go type and a fractional value with a single check;
+		// either failure is reported as the same KindTypeMismatch
+		// FieldNumber's own type check above uses (no new
+		// ValidationErrorKind needed — "not a valid whole-number amount"
+		// is still, at the API surface, "this field's value is the
+		// wrong shape").
+		m, err := money.FromAny(v)
+		if err != nil {
+			return newErr(KindTypeMismatch, err.Error())
+		}
+		// Min/Max apply to money too (see Definition.Validate's own
+		// comment for why, and for the minor-units caveat) — same kinds
+		// and same message shape as FieldNumber's bounds above, so a
+		// negative amount reports identically whichever type carries it.
+		// No NaN/Inf guard is needed here: money.FromAny has already
+		// rejected anything that isn't a whole int64 of minor units.
+		if f.Min != nil && float64(m) < *f.Min {
+			return newErr(KindBelowMinimum, fmt.Sprintf("value %v is below the minimum %v", int64(m), *f.Min))
+		}
+		if f.Max != nil && float64(m) > *f.Max {
+			return newErr(KindAboveMaximum, fmt.Sprintf("value %v is above the maximum %v", int64(m), *f.Max))
 		}
 	case FieldBool:
 		if _, ok := v.(bool); !ok {

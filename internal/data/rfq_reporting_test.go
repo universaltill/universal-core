@@ -107,24 +107,25 @@ func TestRFQComparison_GridWithMissingQuotesAndExcludedMalformedRefs(t *testing.
 
 	// Quote coverage: lineA quoted by both vendors, lineB quoted only by
 	// vendor X — the deliberate missing-quote gap this test pins.
+	// unit_price is FieldMoney (minor units, uc-infra#68): 950 == $9.50.
 	if _, err := records.Create(ctx, "RequestForQuotationQuoteLine", map[string]any{
-		"rfq_line_id": lineA.ID, "vendor_id": vendorX.ID, "unit_price": 9.5,
+		"rfq_line_id": lineA.ID, "vendor_id": vendorX.ID, "unit_price": 950,
 	}); err != nil {
 		t.Fatalf("quote lineA/vendorX: %v", err)
 	}
 	if _, err := records.Create(ctx, "RequestForQuotationQuoteLine", map[string]any{
-		"rfq_line_id": lineA.ID, "vendor_id": vendorY.ID, "unit_price": 10.25,
+		"rfq_line_id": lineA.ID, "vendor_id": vendorY.ID, "unit_price": 1025,
 	}); err != nil {
 		t.Fatalf("quote lineA/vendorY: %v", err)
 	}
 	if _, err := records.Create(ctx, "RequestForQuotationQuoteLine", map[string]any{
-		"rfq_line_id": lineB.ID, "vendor_id": vendorX.ID, "unit_price": 4.0,
+		"rfq_line_id": lineB.ID, "vendor_id": vendorX.ID, "unit_price": 400,
 	}); err != nil {
 		t.Fatalf("quote lineB/vendorX: %v", err)
 	}
 	// A quote against a malformed rfq_line_id must be excluded, not fatal.
 	if _, err := records.Create(ctx, "RequestForQuotationQuoteLine", map[string]any{
-		"rfq_line_id": "not-a-uuid", "vendor_id": vendorX.ID, "unit_price": 1.0,
+		"rfq_line_id": "not-a-uuid", "vendor_id": vendorX.ID, "unit_price": 100,
 	}); err != nil {
 		t.Fatalf("create malformed quote line: %v", err)
 	}
@@ -154,17 +155,98 @@ func TestRFQComparison_GridWithMissingQuotesAndExcludedMalformedRefs(t *testing.
 		t.Errorf("vendor 1 = %+v, want Vendor Y", vendors[1])
 	}
 
-	if got := lines[0].QuotesByVendor[vendorX.ID]; got != 9.5 {
-		t.Errorf("lineA/vendorX quote = %v, want 9.5", got)
+	if got := lines[0].QuotesByVendor[vendorX.ID]; got != 950 {
+		t.Errorf("lineA/vendorX quote = %v, want 950 ($9.50)", got)
 	}
-	if got := lines[0].QuotesByVendor[vendorY.ID]; got != 10.25 {
-		t.Errorf("lineA/vendorY quote = %v, want 10.25", got)
+	if got := lines[0].QuotesByVendor[vendorY.ID]; got != 1025 {
+		t.Errorf("lineA/vendorY quote = %v, want 1025 ($10.25)", got)
 	}
-	if got := lines[1].QuotesByVendor[vendorX.ID]; got != 4.0 {
-		t.Errorf("lineB/vendorX quote = %v, want 4.0", got)
+	if got := lines[1].QuotesByVendor[vendorX.ID]; got != 400 {
+		t.Errorf("lineB/vendorX quote = %v, want 400 ($4.00)", got)
 	}
 	if _, ok := lines[1].QuotesByVendor[vendorY.ID]; ok {
 		t.Errorf("lineB/vendorY must have NO quote (the deliberate gap), got %v", lines[1].QuotesByVendor[vendorY.ID])
+	}
+}
+
+// TestRFQComparison_LegacyFractionalUnitPriceExcludedNotFatal
+// (independent review of uc-infra#68's own first pass) is the regression
+// test for the actual bug found: a RequestForQuotationQuoteLine row
+// written before the Version 1->2 bump (unit_price still a FieldNumber
+// major-unit decimal, e.g. "9.5") must not abort the whole comparison
+// query — Postgres's ::bigint cast errors hard on a non-integer string,
+// unlike the ::numeric cast this replaced. Reproduced directly against
+// Postgres before this fix: `select ('9.5')::bigint` errors, so a single
+// un-backfilled legacy row would have 500'd the entire report page, not
+// just rendered one vendor as unquoted.
+func TestRFQComparison_LegacyFractionalUnitPriceExcludedNotFatal(t *testing.T) {
+	ctx := context.Background()
+	tenantDB := freshTenantDB(t)
+	records := data.NewRecordRepo(tenantDB)
+	reporting := data.NewReportingRepo(tenantDB)
+
+	rfq, err := records.Create(ctx, "RequestForQuotation", map[string]any{
+		"rfq_number": "RFQ-LEGACY", "due_date": "2026-08-15",
+	})
+	if err != nil {
+		t.Fatalf("create RequestForQuotation: %v", err)
+	}
+	item, err := records.Create(ctx, "Item", map[string]any{"sku": "SKU-LEGACY", "name": "Widget", "item_type": "stock"})
+	if err != nil {
+		t.Fatalf("create Item: %v", err)
+	}
+	line, err := records.Create(ctx, "RequestForQuotationLine", map[string]any{
+		"request_for_quotation_id": rfq.ID, "item_id": item.ID, "qty": 1.0,
+	})
+	if err != nil {
+		t.Fatalf("create line: %v", err)
+	}
+	vendorLegacy, err := records.Create(ctx, "Party", map[string]any{"name": "Vendor Legacy", "party_type": "organization"})
+	if err != nil {
+		t.Fatalf("create vendor Legacy: %v", err)
+	}
+	vendorMigrated, err := records.Create(ctx, "Party", map[string]any{"name": "Vendor Migrated", "party_type": "organization"})
+	if err != nil {
+		t.Fatalf("create vendor Migrated: %v", err)
+	}
+	if _, err := records.Create(ctx, "RequestForQuotationVendor", map[string]any{
+		"request_for_quotation_id": rfq.ID, "vendor_id": vendorLegacy.ID,
+	}); err != nil {
+		t.Fatalf("invite vendor Legacy: %v", err)
+	}
+	if _, err := records.Create(ctx, "RequestForQuotationVendor", map[string]any{
+		"request_for_quotation_id": rfq.ID, "vendor_id": vendorMigrated.ID,
+	}); err != nil {
+		t.Fatalf("invite vendor Migrated: %v", err)
+	}
+	// The pre-migration shape: a real major-unit decimal, exactly what
+	// unit_price held before the Version bump.
+	if _, err := records.Create(ctx, "RequestForQuotationQuoteLine", map[string]any{
+		"rfq_line_id": line.ID, "vendor_id": vendorLegacy.ID, "unit_price": 9.5,
+	}); err != nil {
+		t.Fatalf("create legacy quote line: %v", err)
+	}
+	// A real, already-migrated (post-backfill) minor-units row on the
+	// same line — must still resolve normally alongside the excluded
+	// legacy row, proving the guard excludes only the bad row.
+	if _, err := records.Create(ctx, "RequestForQuotationQuoteLine", map[string]any{
+		"rfq_line_id": line.ID, "vendor_id": vendorMigrated.ID, "unit_price": 1025,
+	}); err != nil {
+		t.Fatalf("create migrated quote line: %v", err)
+	}
+
+	lines, vendors, err := reporting.RFQComparison(ctx, rfq.ID)
+	if err != nil {
+		t.Fatalf("RFQComparison must not error on a legacy fractional unit_price: %v", err)
+	}
+	if len(lines) != 1 || len(vendors) != 2 {
+		t.Fatalf("expected 1 line and 2 vendors, got %d/%d", len(lines), len(vendors))
+	}
+	if _, ok := lines[0].QuotesByVendor[vendorLegacy.ID]; ok {
+		t.Errorf("expected the legacy fractional quote to be excluded, got %+v", lines[0].QuotesByVendor)
+	}
+	if got := lines[0].QuotesByVendor[vendorMigrated.ID]; got != 1025 {
+		t.Errorf("expected the migrated vendor's quote to still resolve as 1025, got %v", got)
 	}
 }
 
@@ -242,14 +324,14 @@ func TestRFQComparison_NonCanonicalUUIDReferencesStillResolve(t *testing.T) {
 		t.Fatalf("invite vendor: %v", err)
 	}
 	if _, err := records.Create(ctx, "RequestForQuotationQuoteLine", map[string]any{
-		"rfq_line_id": strings.ToUpper(line.ID), "vendor_id": strings.ToUpper(vendor.ID), "unit_price": 7.25,
+		"rfq_line_id": strings.ToUpper(line.ID), "vendor_id": strings.ToUpper(vendor.ID), "unit_price": 725,
 	}); err != nil {
 		t.Fatalf("create quote line: %v", err)
 	}
 	// A quote line with a malformed vendor_id must be excluded, not abort
 	// the query (the guard added alongside the cast).
 	if _, err := records.Create(ctx, "RequestForQuotationQuoteLine", map[string]any{
-		"rfq_line_id": line.ID, "vendor_id": "not-a-uuid", "unit_price": 1.0,
+		"rfq_line_id": line.ID, "vendor_id": "not-a-uuid", "unit_price": 100,
 	}); err != nil {
 		t.Fatalf("create malformed-vendor quote line: %v", err)
 	}
@@ -268,8 +350,8 @@ func TestRFQComparison_NonCanonicalUUIDReferencesStillResolve(t *testing.T) {
 	if !ok {
 		t.Fatalf("quote lost: QuotesByVendor = %+v, vendor column id = %s", lines[0].QuotesByVendor, vendors[0].ID)
 	}
-	if got != 7.25 {
-		t.Errorf("quote = %v, want 7.25", got)
+	if got != 725 {
+		t.Errorf("quote = %v, want 725 ($7.25)", got)
 	}
 	if len(lines[0].QuotesByVendor) != 1 {
 		t.Errorf("expected exactly 1 quote (the malformed-vendor row excluded), got %+v", lines[0].QuotesByVendor)
@@ -313,7 +395,7 @@ func TestRFQComparison_DuplicateQuoteRowsResolveToTheLatest(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("invite vendor: %v", err)
 	}
-	for _, price := range []float64{5.0, 8.0} {
+	for _, price := range []int{500, 800} {
 		if _, err := records.Create(ctx, "RequestForQuotationQuoteLine", map[string]any{
 			"rfq_line_id": line.ID, "vendor_id": vendor.ID, "unit_price": price,
 		}); err != nil {
@@ -328,7 +410,7 @@ func TestRFQComparison_DuplicateQuoteRowsResolveToTheLatest(t *testing.T) {
 	if len(lines) != 1 || len(vendors) != 1 {
 		t.Fatalf("expected 1 line and 1 vendor, got %d/%d", len(lines), len(vendors))
 	}
-	if got := lines[0].QuotesByVendor[vendors[0].ID]; got != 8.0 {
-		t.Errorf("quote = %v, want 8 (the later-created of the two rows)", got)
+	if got := lines[0].QuotesByVendor[vendors[0].ID]; got != 800 {
+		t.Errorf("quote = %v, want 800 ($8.00, the later-created of the two rows)", got)
 	}
 }

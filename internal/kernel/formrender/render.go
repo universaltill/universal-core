@@ -23,6 +23,7 @@ import (
 	"github.com/universaltill/universal-core/internal/i18n"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/form"
+	"github.com/universaltill/universal-core/internal/kernel/money"
 )
 
 // Renderer renders form.Definitions. One Renderer serves every entity
@@ -609,9 +610,31 @@ func buildHiddenFields(ent *entity.Definition, record map[string]any, rendered, 
 		if rendered[ef.Name] || redacted[ef.Name] {
 			continue
 		}
-		out = append(out, hiddenFieldView{Name: ef.Name, Value: FormatFieldValue(record[ef.Name])})
+		out = append(out, hiddenFieldView{Name: ef.Name, Value: hiddenFieldValue(ef, record[ef.Name])})
 	}
 	return out
+}
+
+// hiddenFieldValue renders a preserved-but-not-shown field's value for a
+// hidden input — the same value buildFields' fv.Value would carry had
+// this field actually been on the form. A plain FormatFieldValue would
+// be wrong for FieldMoney (independent review, uc-infra#68): the stored
+// value is minor units (1050), but csvimport.Coerce's FieldMoney case
+// (what parseRecordFields feeds a resubmitted hidden input back through)
+// expects the human major-unit decimal ("10.50"), the same as a visible
+// money input's value attribute. Without this, EVERY save of a form that
+// has a money field declared on the entity but not shown — a real,
+// reachable shape (a VisibleIf-hidden field, or a tenant's own form
+// Definition simply omitting it) — would silently multiply that field's
+// stored amount by 100.
+func hiddenFieldValue(ef entity.Field, v any) string {
+	if ef.Type == entity.FieldMoney {
+		if m, err := money.FromAny(v); err == nil {
+			return m.String()
+		}
+		return ""
+	}
+	return FormatFieldValue(v)
 }
 
 // FormatFieldValue renders a record field's stored Go value (whatever
@@ -687,6 +710,15 @@ func (r *Renderer) buildFields(s form.Section, ent *entity.Definition, record ma
 			Required: ef.Required,
 			Value:    FormatFieldValue(record[ff.Name]),
 		}
+		// Min/Max become the browser-native min=/max= attributes on a
+		// number input (uc-infra#80). They are NOT emitted for a
+		// FieldMoney input, even though entity.Field now accepts a bound
+		// on one: the bound is declared in MINOR units while a money
+		// input displays and submits MAJOR units, so putting the raw
+		// bound on that input would enforce a value 100x off. Server-side
+		// ValidateRecord still applies it — see the FieldMoney case in
+		// entity/validate.go. Converting the bound for display needs the
+		// currency's exponent, which this renderer is not given.
 		if ef.Min != nil {
 			fv.Min = strconv.FormatFloat(*ef.Min, 'f', -1, 64)
 		}
@@ -695,6 +727,21 @@ func (r *Renderer) buildFields(s form.Section, ent *entity.Definition, record ma
 		}
 
 		switch ef.Type {
+		case entity.FieldMoney:
+			// The stored value is minor units (1050); the input's value
+			// attribute must be the human major-unit decimal ("10.50") a
+			// step="0.01" number input expects — the generic
+			// FormatFieldValue assignment above would otherwise render
+			// the raw integer verbatim (fv.Value already set to "1050"
+			// by then, overridden here). A record with no value yet
+			// (create form) leaves record[ff.Name] nil, money.FromAny
+			// errors, and fv.Value stays "" from FormatFieldValue(nil) —
+			// an empty input, not "0.00", so a required money field's
+			// browser-native validation still fires on an untouched
+			// field.
+			if m, err := money.FromAny(record[ff.Name]); err == nil {
+				fv.Value = m.String()
+			}
 		case entity.FieldBool:
 			fv.Checked, _ = record[ff.Name].(bool)
 		case entity.FieldEnum:
@@ -906,6 +953,19 @@ func childCellValue(child map[string]any, name string, childDef *entity.Definiti
 		// map — a missing translation is not something to show as Go
 		// syntax.
 		return nil
+	case entity.FieldMoney:
+		// Same fix as buildFields'/buildHiddenFields' own FieldMoney
+		// cases (uc-infra#68): the stored value is minor units (1050),
+		// and a master-detail/related-list child cell must show the
+		// major-unit decimal ("10.50"), not the raw integer a naive
+		// stringification of the float64 would print. An un-coercible
+		// value (absent, fractional-legacy pre-backfill) falls through
+		// to nil — same "blank rather than garbage" choice as the
+		// i18n_text case above.
+		if m, err := money.FromAny(v); err == nil {
+			return m.String()
+		}
+		return nil
 	case entity.FieldReference:
 		if id, ok := v.(string); ok && id != "" {
 			if label, ok := referenceLabels[name][id]; ok {
@@ -987,6 +1047,7 @@ const tmplSrc = `<form class="uc-form" data-entity-type="{{.EntityType}}"{{if .R
 </select>
 {{else if eq .Type "date"}}<input type="date" id="{{.Name}}" name="{{.Name}}" value="{{.Value}}"{{if .Required}} required{{end}}>
 {{else if eq .Type "number"}}<input type="number" id="{{.Name}}" name="{{.Name}}" value="{{.Value}}"{{if .Min}} min="{{.Min}}"{{end}}{{if .Max}} max="{{.Max}}"{{end}}{{if .Required}} required{{end}}>
+{{else if eq .Type "money"}}<input type="number" step="0.01" id="{{.Name}}" name="{{.Name}}" value="{{.Value}}"{{if .Required}} required{{end}}>
 {{else}}<input type="text" id="{{.Name}}" name="{{.Name}}" value="{{.Value}}"{{if .Required}} required{{end}}>
 {{end}}
 </div>

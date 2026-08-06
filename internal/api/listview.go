@@ -16,6 +16,7 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/formrender"
 	uclocale "github.com/universaltill/universal-core/internal/kernel/locale"
+	"github.com/universaltill/universal-core/internal/kernel/money"
 )
 
 // listPageSize is how many records one list-page shows before paginating
@@ -84,9 +85,11 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 	if sf := r.URL.Query().Get("sort"); sf != "" && isVisibleColumn(columns, sf) && sortFilterableField(def, sf) {
 		opts.SortField = sf
 		opts.SortDesc = r.URL.Query().Get("dir") == "desc"
-		// A number field sorts numerically, not as text — otherwise a
-		// list of purchase orders by total puts 100 before 90.
-		if f, ok := def.FieldByName(sf); ok && f.Type == entity.FieldNumber {
+		// A number (or money) field sorts numerically, not as text —
+		// otherwise a list of purchase orders by total puts 100 before
+		// 90. A money field's stored value is a plain number too (minor
+		// units), so it sorts identically.
+		if f, ok := def.FieldByName(sf); ok && (f.Type == entity.FieldNumber || f.Type == entity.FieldMoney) {
 			opts.SortNumeric = true
 		}
 	}
@@ -494,6 +497,19 @@ func (h *Handler) cellText(entityType string, f entity.Field, value any, referen
 		// work, filed on the board.
 		if v, ok := value.(float64); ok {
 			return loc.FormatNumber(v, -1)
+		}
+	case entity.FieldMoney:
+		// The stored value is minor units (1050); the list column must
+		// show the major-unit amount, regionally grouped like FieldNumber
+		// above — but at a FIXED money.Decimals precision (2), not -1:
+		// unlike a plain number, a money value's "natural" precision IS
+		// the minor unit itself, so leaving it at -1 would print "10.5"
+		// for a $10.50 amount instead of "10.50". True per-currency
+		// decimals (JPY's 0, KWD's 3) is the same tracked follow-up the
+		// comment above already points at — this only fixes the
+		// FieldNumber-vs-FieldMoney precision bug, not that gap.
+		if m, err := money.FromAny(value); err == nil {
+			return loc.FormatNumber(m.Major(), money.Decimals)
 		}
 	case entity.FieldReference:
 		if id, ok := value.(string); ok && id != "" {

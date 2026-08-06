@@ -30,6 +30,31 @@ const (
 	// never checks which locales are valid — that stays at the i18n/render
 	// layer, keeping this generic engine decoupled from the catalog.
 	FieldI18nText FieldType = "i18n_text"
+	// FieldMoney is CLAUDE.md's own long-declared-but-never-implemented
+	// convention ("money via a money.Money-equivalent integer-minor-units
+	// type") made real (uc-infra#68). Its stored value is a WHOLE number
+	// of minor units (e.g. 1050 meaning $10.50), never a fractional
+	// major-unit float — that's the actual fix: summing FieldNumber
+	// floats produces visible IEEE artifacts (0.1 + 0.2 =
+	// 0.30000000000000004), which int64 minor-unit addition (see
+	// internal/kernel/money) cannot. validateFieldValue enforces the
+	// whole-number constraint (see money.FromAny); formrender/csvimport
+	// convert to/from the human major-unit decimal string ("10.50") at
+	// the form/CSV edge, the same "canonical stored value, locale
+	// formatting only for read-only display" split
+	// internal/kernel/locale's own doc comment establishes for dates.
+	//
+	// First-increment scope, deliberately not "every money field in the
+	// kernel": a currency-agnostic, fixed 2-decimal-place minor unit
+	// (money.Decimals) — true per-currency decimal places (JPY's 0, KWD's
+	// 3) is a tracked, separate follow-up, not guessed at here without a
+	// currency actually driving it yet. Only
+	// RequestForQuotationQuoteLine.unit_price (the field the originating
+	// review actually found broken) uses this type so far; every other
+	// FieldNumber money field (PurchaseOrder.total, POLine.unit_price,
+	// etc.) migrates the same mechanical way in its own follow-up card
+	// (uc-infra#136).
+	FieldMoney FieldType = "money"
 )
 
 // allFieldTypes is the exhaustive set of FieldType values a Definition may
@@ -39,7 +64,7 @@ const (
 // it becomes unpublishable) rather than silently accepted, but it's still
 // two places to remember.
 var allFieldTypes = []FieldType{
-	FieldString, FieldNumber, FieldBool, FieldDate, FieldEnum, FieldReference, FieldI18nText,
+	FieldString, FieldNumber, FieldBool, FieldDate, FieldEnum, FieldReference, FieldI18nText, FieldMoney,
 }
 
 func (t FieldType) valid() bool {
@@ -399,8 +424,17 @@ func (d *Definition) Validate() error {
 				return fmt.Errorf("field %q must_match_parent_field %q is not a field of %s", f.Name, f.MustMatchParentField, d.EntityType)
 			}
 		}
-		if (f.Min != nil || f.Max != nil) && f.Type != FieldNumber {
-			return fmt.Errorf("field %q has min/max but is type %q, not number", f.Name, f.Type)
+		// FieldMoney accepts a bound too, not just FieldNumber
+		// (uc-infra#80 + uc-infra#68 met at merge: #80 put Min:0 on
+		// unit_price while #68 changed that same field's type to
+		// FieldMoney, which would otherwise have made the Definition
+		// unpublishable). A money amount is a number — an int64 of minor
+		// units — so "must not be negative" is exactly as meaningful for
+		// it as for a plain number. NOTE the unit: a Min/Max on a
+		// FieldMoney is compared against the stored MINOR-unit value, so
+		// a €5.00 floor is Min: 500, not Min: 5.
+		if (f.Min != nil || f.Max != nil) && f.Type != FieldNumber && f.Type != FieldMoney {
+			return fmt.Errorf("field %q has min/max but is type %q, not number or money", f.Name, f.Type)
 		}
 		if f.Min != nil && f.Max != nil && *f.Min > *f.Max {
 			return fmt.Errorf("field %q has min %v greater than max %v", f.Name, *f.Min, *f.Max)

@@ -683,13 +683,36 @@ func RequestForQuotationVendor() *entity.Definition {
 func RequestForQuotationQuoteLine() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "RequestForQuotationQuoteLine",
-		// Version 2 (uc-infra#80): unit_price gained a Min:0 bound.
+		// Version 2 carries two changes to unit_price that were developed
+		// in parallel: uc-infra#80's Min:0 bound and uc-infra#68's type
+		// change below.
+		//
+		// Version 1->2 (uc-infra#68, independent review): unit_price's
+		// TYPE changed (FieldNumber major-unit float -> FieldMoney minor-
+		// unit integer), not just a new field added — the same class of
+		// change PurchaseOrder's v3->v4 bump made for "status" ->
+		// "status_id" (see that Definition's own doc comment). A row
+		// written under v1 still holds a major-unit decimal until
+		// cmd/backfill-quote-line-unit-price converts it;
+		// internal/data/rfq_reporting.go's moneyMinorUnitsPattern guard
+		// keeps an un-migrated row from 500ing the comparison report in
+		// the meantime (it's excluded from the grid, not fatal).
 		Version: 2,
 		Module:  "purchasing",
 		Fields: []entity.Field{
 			{Name: "rfq_line_id", Type: entity.FieldReference, Required: true, Target: "RequestForQuotationLine"},
 			{Name: "vendor_id", Type: entity.FieldReference, Required: true, Target: "Party"},
-			{Name: "unit_price", Type: entity.FieldNumber, Required: true, Min: entity.Float64Ptr(0)},
+			// FieldMoney, not FieldNumber (uc-infra#68): this is the exact
+			// field the RFQ vendor-quote-comparison report's original
+			// independent review found summing to a visible IEEE
+			// artifact (0.1 + 0.2 = 0.30000000000000004) in its footer
+			// total — see internal/api/rfq_report.go's totals map and
+			// internal/data/rfq_reporting.go's own scan, both now
+			// int64-minor-units-based because of this change.
+			// Min:0 is uc-infra#80's bound, kept across the type change —
+			// in MINOR units now (0 is 0 either way, so this particular
+			// bound needed no conversion).
+			{Name: "unit_price", Type: entity.FieldMoney, Required: true, Min: entity.Float64Ptr(0)},
 			{Name: "quoted_at", Type: entity.FieldDate},
 		},
 	}
