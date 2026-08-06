@@ -22,7 +22,7 @@
 // actually uses (the platform's own self-hosted Ollama by default, or
 // a customer-supplied Anthropic/OpenAI API key they've configured) is
 // resolved per request by internal/api — see that package's
-// resolveAIProvider.
+// aiProviderFor.
 package aiprovider
 
 import "context"

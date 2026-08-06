@@ -57,6 +57,26 @@ the first)? See [`INTEGRATIONS.md`](INTEGRATIONS.md) for the API surface,
 the multi-tenancy/auth model, and what's still missing before a real
 unattended connector can be built.
 
+## AI assistance
+
+In-product AI assistance (CSV import mapping suggestions, and voice-note
+transcription for the in-app issue logger) is **off by default and
+opt-in for anything paid**: the platform's own default is a self-hosted
+[Ollama](https://ollama.com) instance, gated on `OLLAMA_URL` (an
+optional `OLLAMA_MODEL` selects which model) — with `OLLAMA_URL` unset,
+AI assistance is off and every feature it touches falls back to its
+non-AI behavior. Voice transcription follows the same self-hosted-by-
+default stance via `WHISPER_URL`.
+
+A tenant may additionally configure their own AI provider connection —
+their own Ollama endpoint, or an Anthropic/OpenAI API key
+(`internal/kernel/claudeassist`, `internal/kernel/openaiassist`) — as a
+bring-your-own-key override; that call runs against the tenant's own
+account and cost, never the platform's, and requires the deployment to
+have `SECRET_ENCRYPTION_KEY` set before a tenant key can even be
+stored. No paid third-party AI API is ever a default or a required
+dependency of the product itself.
+
 ## Running the tests
 
 ```
