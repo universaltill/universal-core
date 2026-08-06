@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/universaltill/universal-core/internal/data"
+	"github.com/universaltill/universal-core/internal/kernel/assets"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
 	"github.com/universaltill/universal-core/internal/kernel/workflow"
 	"github.com/universaltill/universal-core/internal/tenantdb"
@@ -54,12 +55,22 @@ type Config struct {
 	// concurrency here just trades "jobs wait for the next poll tick" for
 	// "more DB connections held polling."
 	Concurrency int
+	// DepreciationPostInterval is how often (per tenant, at most)
+	// assets.PostDueDepreciation runs (uc-infra#76, ADR-0022). Zero means
+	// the 30s default. Separate from PollInterval for the same reason
+	// ScheduleSyncInterval is: scanning every DepreciationSchedule row in
+	// the tenant is an O(n) table scan, and a depreciation posting is
+	// due at most once a day per asset — running that every 2s forever
+	// is pure waste for a job nothing needs sub-minute latency on. A
+	// period that came due mid-interval waits at most this long to post.
+	DepreciationPostInterval time.Duration
 }
 
 const (
-	defaultPollInterval = 2 * time.Second
-	defaultLeaseTimeout = 5 * time.Minute
-	defaultConcurrency  = 2
+	defaultPollInterval             = 2 * time.Second
+	defaultLeaseTimeout             = 5 * time.Minute
+	defaultConcurrency              = 2
+	defaultDepreciationPostInterval = 30 * time.Second
 )
 
 func (c Config) withDefaults() Config {
@@ -71,6 +82,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.Concurrency <= 0 {
 		c.Concurrency = defaultConcurrency
+	}
+	if c.DepreciationPostInterval <= 0 {
+		c.DepreciationPostInterval = defaultDepreciationPostInterval
 	}
 	return c
 }
@@ -92,6 +106,13 @@ type Runner struct {
 	// guarded because RunConcurrent runs several poll loops on one Runner.
 	syncMu           sync.Mutex
 	lastScheduleSync map[string]time.Time
+	// Depreciation-post throttle state — see shouldPostDepreciation.
+	// Separate mutex/map from the schedule-sync ones above: the two
+	// throttle independently (different intervals, different tenants
+	// can be due for one and not the other), and sharing one map keyed
+	// by tenant would conflate them.
+	depMu                sync.Mutex
+	lastDepreciationPost map[string]time.Time
 }
 
 // New builds a Runner. handlers is passed straight through to
@@ -207,6 +228,23 @@ func (r *Runner) tickTenant(ctx context.Context, tenantID string, q *workflow.Qu
 		} else if len(fired) > 0 {
 			log.Printf("worker: tenant %s: fired %d scheduled workflow(s): %v", tenantID, len(fired), fired)
 		}
+
+		// assets.PostDueDepreciation (uc-infra#76, ADR-0022): a plain
+		// per-tenant function call, not a workflow — see ADR-0022 for
+		// why this isn't routed through the workflow StepKind engine.
+		// Throttled the same way schedule-sync is, and for the same
+		// reason: it's a full DepreciationSchedule table scan, and
+		// nothing here needs sub-minute latency. Failures are logged
+		// and skipped, never fatal to this tenant's tick — same
+		// isolation as every other per-tenant step in this function.
+		if r.shouldPostDepreciation(tenantID, now) {
+			if posted, err := assets.PostDueDepreciation(ctx, db, assets.SchedulerActor()); err != nil {
+				log.Printf("worker: tenant %s: post due depreciation: %v", tenantID, err)
+				r.forgetDepreciationPost(tenantID) // retry next tick, not next interval
+			} else if posted > 0 {
+				log.Printf("worker: tenant %s: posted %d depreciation schedule row(s)", tenantID, posted)
+			}
+		}
 	}
 
 	if reclaimed, err := q.ReclaimStale(ctx, r.cfg.LeaseTimeout); err != nil {
@@ -279,4 +317,34 @@ func (r *Runner) forgetScheduleSync(tenantID string) {
 	r.syncMu.Lock()
 	defer r.syncMu.Unlock()
 	delete(r.lastScheduleSync, tenantID)
+}
+
+// shouldPostDepreciation reports whether tenantID's
+// assets.PostDueDepreciation run is due, and records the attempt.
+// Same shape and same mutex-per-throttle reasoning as
+// shouldSyncSchedules, deliberately kept as a separate method/map pair
+// rather than generalized — see the depMu field's own doc comment.
+func (r *Runner) shouldPostDepreciation(tenantID string, now time.Time) bool {
+	interval := r.cfg.DepreciationPostInterval
+	if interval <= 0 {
+		interval = defaultDepreciationPostInterval
+	}
+	r.depMu.Lock()
+	defer r.depMu.Unlock()
+	if r.lastDepreciationPost == nil {
+		r.lastDepreciationPost = map[string]time.Time{}
+	}
+	if last, ok := r.lastDepreciationPost[tenantID]; ok && now.Sub(last) < interval {
+		return false
+	}
+	r.lastDepreciationPost[tenantID] = now
+	return true
+}
+
+// forgetDepreciationPost clears the throttle after a FAILED run, so the
+// next tick retries instead of waiting out the interval on an error.
+func (r *Runner) forgetDepreciationPost(tenantID string) {
+	r.depMu.Lock()
+	defer r.depMu.Unlock()
+	delete(r.lastDepreciationPost, tenantID)
 }
