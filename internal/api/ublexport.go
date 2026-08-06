@@ -171,7 +171,7 @@ func writeUBLError(w http.ResponseWriter, entityType, id string, err error) {
 	case errors.Is(err, data.ErrNotFound):
 		httpx.WriteError(w, http.StatusNotFound, entityType+" "+id+" not found")
 	case errors.As(err, &inputErr):
-		httpx.WriteError(w, http.StatusBadRequest, inputErr.msg)
+		httpx.WriteError(w, http.StatusBadRequest, inputErr.Error())
 	default:
 		writeInternalError(w, "assemble UBL document for "+entityType, err)
 	}

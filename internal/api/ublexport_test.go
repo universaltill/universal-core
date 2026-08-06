@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"encoding/xml"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -676,5 +677,24 @@ func TestUBLExport_RBAC_WholeDocumentGate(t *testing.T) {
 	f.mux.ServeHTTP(adminRec, adminReq)
 	if adminRec.Code != http.StatusOK {
 		t.Fatalf("admin export: expected 200, got %d: %s", adminRec.Code, adminRec.Body.String())
+	}
+}
+
+// TestUBLInputError_Error: ublInputError's Error() method carries the
+// record-state message verbatim. writeUBLError now calls Error()
+// rather than reaching into the unexported field directly (a one-line
+// tidy alongside this fix — same behavior, but it means the method is
+// genuinely load-bearing instead of dead code a coverage test merely
+// pins). TestUBLExport_ErrorPaths's "order without lines"/"missing
+// currency" cases already exercise that call site end-to-end; this
+// test isolates the type itself, plus the %v path a log line would
+// take, which no existing test reaches (uc-infra#110).
+func TestUBLInputError_Error(t *testing.T) {
+	err := ublInputError{msg: "missing currency"}
+	if got := err.Error(); got != "missing currency" {
+		t.Fatalf("Error() = %q, want %q", got, "missing currency")
+	}
+	if got := fmt.Sprintf("%v", err); got != "missing currency" {
+		t.Fatalf("%%v of ublInputError = %q, want %q", got, "missing currency")
 	}
 }
