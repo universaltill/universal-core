@@ -237,6 +237,39 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 		FilterLabel: h.catalog.T(locale, "list.filter_placeholder"),
 		FilterGo:    h.catalog.T(locale, "list.filter_button"),
 		FilterClear: h.catalog.T(locale, "list.filter_clear"),
+		SortField:   opts.SortField,
+	}
+	if opts.SortField != "" && opts.SortDesc {
+		view.SortDir = "desc"
+	}
+	// sortParams appends the active sort (if any) to a base url.Values,
+	// same convention as the sort-header/pager links below: "dir" only
+	// appears when descending, ascending being the implicit, never-in-
+	// the-URL default. Hoisted out of the totalPages>1 block (its only
+	// caller until now) because ClearHref, just below, needs it
+	// unconditionally — a single-page list still has to carry its sort
+	// forward when the "Clear" link is clicked, not just its pager.
+	sortParams := func(base url.Values) url.Values {
+		if opts.SortField != "" {
+			base.Set("sort", opts.SortField)
+			if opts.SortDesc {
+				base.Set("dir", "desc")
+			}
+		}
+		return base
+	}
+	// ClearHref is the "Clear" link's target: drop the filter entirely
+	// but keep the active sort (uc-infra#139's independent review — the
+	// hidden sort/dir inputs above fix the SEARCH box's own submit, but
+	// this link sits two lines below in the same form and was found
+	// silently reverting the sort to the default the same way, one
+	// click away from the very page this fix repairs). Deliberately NOT
+	// built from FilterHref/keepQuery: those carry the filter forward,
+	// which is exactly what "Clear" must drop.
+	clearParams := sortParams(url.Values{})
+	view.ClearHref = "/records/" + entityType
+	if len(clearParams) > 0 {
+		view.ClearHref += "?" + clearParams.Encode()
 	}
 	// keepQuery preserves the active filter across sort and page links, so
 	// sorting a filtered list doesn't silently clear the filter. Gated on
@@ -277,15 +310,6 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 		pageLabel = strings.ReplaceAll(pageLabel, "{page}", strconv.Itoa(page))
 		pageLabel = strings.ReplaceAll(pageLabel, "{total}", strconv.Itoa(totalPages))
 		view.PageLabel = pageLabel
-		sortParams := func(base url.Values) url.Values {
-			if opts.SortField != "" {
-				base.Set("sort", opts.SortField)
-				if opts.SortDesc {
-					base.Set("dir", "desc")
-				}
-			}
-			return base
-		}
 		if page > 1 {
 			view.PrevHref = keepQuery(sortParams(url.Values{"page": {strconv.Itoa(page - 1)}}))
 			view.PrevLabel = h.catalog.T(locale, "list.prev")
@@ -557,6 +581,21 @@ type recordListView struct {
 	FilterLabel string
 	FilterGo    string
 	FilterClear string
+	// ClearHref is where the "Clear" link goes: the plain list path plus
+	// the active sort (if any), but never the filter — see its own
+	// computation below for why this can't just reuse FilterHref/
+	// keepQuery.
+	ClearHref string
+	// SortField/SortDir carry the active sort into the filter FORM itself
+	// (uc-infra#139) — the sort-header/pager links already survive a
+	// filter via keepQuery, but the filter form had no equivalent for the
+	// other direction: submitting a search from an already-sorted list
+	// silently reverted to the default ordering. SortDir is only ever
+	// "desc" (mirroring sortParams below: ascending is the implicit
+	// default and never appears in the URL), so it's blank whenever
+	// there's nothing non-default to carry.
+	SortField string
+	SortDir   string
 	// PageLabel is "" when there's only one page (no pager to show) —
 	// PrevHref/NextHref are independently "" at whichever boundary has
 	// no such page (first/last), so the template can render each link
@@ -580,9 +619,11 @@ var recordListTmpl = template.Must(template.New("recordList").Parse(`
 </div>
 <form class="uc-list-filter" method="get" action="{{.FilterHref}}">
 {{if .FilterField}}<input type="hidden" name="filter" value="{{.FilterField}}">{{end}}
+{{if .SortField}}<input type="hidden" name="sort" value="{{.SortField}}">{{end}}
+{{if .SortDir}}<input type="hidden" name="dir" value="{{.SortDir}}">{{end}}
 <input type="search" name="q" value="{{.FilterValue}}" placeholder="{{.FilterLabel}}" aria-label="{{.FilterLabel}}">
 <button type="submit">{{.FilterGo}}</button>
-{{if .FilterValue}}<a href="{{.FilterHref}}">{{.FilterClear}}</a>{{end}}
+{{if .FilterValue}}<a href="{{.ClearHref}}">{{.FilterClear}}</a>{{end}}
 </form>
 {{if not .Rows}}
 <p class="uc-empty">{{.Empty}}</p>
