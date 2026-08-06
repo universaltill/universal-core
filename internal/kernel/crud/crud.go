@@ -46,6 +46,7 @@ type Engine struct {
 	db      *sql.DB
 	records *data.RecordRepo
 	audit   *data.AuditRepo
+	keys    *data.RecordUniqueKeyRepo
 	hooks   map[string]Hook
 }
 
@@ -54,6 +55,7 @@ func NewEngine(db *sql.DB) *Engine {
 		db:      db,
 		records: data.NewRecordRepo(db),
 		audit:   data.NewAuditRepo(db),
+		keys:    data.NewRecordUniqueKeyRepo(db),
 		hooks:   map[string]Hook{},
 	}
 }
@@ -105,6 +107,10 @@ func (e *Engine) Create(ctx context.Context, def *entity.Definition, fields map[
 	rec, err := e.records.CreateTx(ctx, tx, def.EntityType, fields)
 	if err != nil {
 		return data.Record{}, fmt.Errorf("create record: %w", err)
+	}
+
+	if err := writeUniqueConstraintKeys(ctx, tx, e.keys, def, rec.ID, fields); err != nil {
+		return data.Record{}, err
 	}
 
 	auditEntry, err := audit.New(def.EntityType, rec.ID, audit.ActionCreate, actor, fields)
@@ -341,6 +347,10 @@ func (e *Engine) Update(ctx context.Context, def *entity.Definition, id string, 
 		return 0, fmt.Errorf("update record: %w", err)
 	}
 
+	if err := updateUniqueConstraintKeys(ctx, tx, e.keys, def, id, fields); err != nil {
+		return 0, err
+	}
+
 	auditEntry, err := audit.New(def.EntityType, id, audit.ActionUpdate, actor, fields)
 	if err != nil {
 		return 0, fmt.Errorf("build audit entry: %w", err)
@@ -395,6 +405,10 @@ func (e *Engine) Delete(ctx context.Context, def *entity.Definition, id string, 
 
 	if err := e.records.DeleteTx(ctx, tx, def.EntityType, id); err != nil {
 		return fmt.Errorf("delete record: %w", err)
+	}
+
+	if err := deleteUniqueConstraintKeys(ctx, tx, e.keys, id); err != nil {
+		return err
 	}
 
 	auditEntry, err := audit.New(def.EntityType, id, audit.ActionDelete, actor, nil)

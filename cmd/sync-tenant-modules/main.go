@@ -34,6 +34,19 @@
 // assert all prior stock was at one location), and a generic tool
 // guessing at that would be far worse than a loud pointer.
 //
+// **One narrow, deliberate exception** (uc-infra#81):
+// backfillNewUniqueConstraints DOES write something on a real run — but
+// only to record_unique_keys, the Unique-constraint mechanism's own
+// bookkeeping table, never to records.data itself. Populating it
+// requires no entity-specific judgement (unlike inventing a
+// facility_id): it is a deterministic function of data already on the
+// record. Without it, a Unique constraint added to an entity type that
+// already has data would protect nothing already there — a fresh
+// duplicate against an un-keyed pre-existing record would be silently
+// accepted — so "report, never write" would leave the constraint it just
+// warned about only half-real. Records that already collide with each
+// other are still left for a human (see uniqueConstraintWarnings).
+//
 // **Dry-run limitation, stated so it is not mistaken for a guarantee:**
 // the preview compares ENTITY Definitions only. Form Definitions and
 // status graphs are published by a real run but do not appear in the
@@ -286,6 +299,7 @@ func syncTenant(
 		warnings := requiredFieldWarnings(ctx, tenantDB, name, changes, defFor)
 		warnings = append(warnings, targetConstraintWarnings(ctx, tenantDB, entityDefs, name, changes, defFor)...)
 		warnings = append(warnings, numericBoundWarnings(ctx, tenantDB, entityDefs, name, changes, defFor)...)
+		warnings = append(warnings, uniqueConstraintWarnings(ctx, tenantDB, entityDefs, name, changes, defFor)...)
 		return warnings, outcomeSynced
 	}
 
@@ -352,6 +366,11 @@ func syncTenant(
 	warnings := requiredFieldWarnings(ctx, tenantDB, name, changes, defFor)
 	warnings = append(warnings, targetConstraintWarnings(ctx, tenantDB, entityDefs, name, changes, defFor)...)
 	warnings = append(warnings, numericBoundWarnings(ctx, tenantDB, entityDefs, name, changes, defFor)...)
+	warnings = append(warnings, uniqueConstraintWarnings(ctx, tenantDB, entityDefs, name, changes, defFor)...)
+	// Real run only — a dry run must not write record_unique_keys rows,
+	// same "nothing is published" contract this whole branch's dry-run
+	// sibling above holds for entity/form definitions.
+	backfillNewUniqueConstraints(ctx, tenantDB, entityDefs, name, changes, defFor)
 	return warnings, result
 }
 
@@ -777,4 +796,146 @@ func numericBoundChanged(oldDef *entity.Definition, newField entity.Field) bool 
 		return true
 	}
 	return false
+}
+
+// uniqueConstraintWarnings is targetConstraintWarnings' counterpart for
+// Definition.Unique (uc-infra#81): a version bump that adds a new field
+// set to Unique can find existing records that already collide on it —
+// crud's enforcement stage only ever sees writes going forward, so
+// without this warning an operator sees "0 data migrations needed" and
+// the first edit-and-save of one of those already-colliding records then
+// fails with no warning it was coming, the exact same gap
+// targetConstraintWarnings closed for #78.
+//
+// "Added" is judged by set membership on the OLD published Definition
+// (c.from, looked up via entityDefs) against newDef.Unique, canonicalized
+// via entity.UniqueConstraintName so declaration order never matters — a
+// set unchanged from the previous version needs no new check, same
+// reasoning targetConstraintChanged already documents. A brand-new-to-
+// the-registry type (c.from == 0) is not skipped, for the same
+// "new to the published registry does not mean no records" reason
+// requiredFieldWarnings' own doc comment gives.
+func uniqueConstraintWarnings(
+	ctx context.Context,
+	tenantDB *sql.DB,
+	entityDefs *data.EntityDefinitionRepo,
+	tenantName string,
+	changes []change,
+	defFor func(entityType string) (*entity.Definition, bool),
+) []string {
+	records := data.NewRecordRepo(tenantDB)
+	var out []string
+	for _, c := range changes {
+		newDef, ok := defFor(c.entityType)
+		if !ok {
+			continue
+		}
+		for _, set := range newlyAddedUniqueSets(ctx, entityDefs, c, newDef) {
+			name := entity.UniqueConstraintName(set)
+			n, err := crud.CountUniqueConstraintViolations(ctx, records, c.entityType, set)
+			if err != nil || n == 0 {
+				continue
+			}
+			out = append(out, fmt.Sprintf(
+				"%s: %s — %d record(s) already collide on the new unique constraint %q and will fail validation on next edit",
+				tenantName, c.entityType, n, name))
+		}
+	}
+	return out
+}
+
+// newlyAddedUniqueSets returns newDef.Unique's sets that were NOT already
+// declared on c's old published version — the shared "what's actually
+// new" logic uniqueConstraintWarnings and backfillNewUniqueConstraints
+// both need, extracted so the two can never quietly disagree about which
+// sets are new. A brand-new-to-the-registry type (c.from == 0) treats
+// every declared set as new, same reasoning requiredFieldWarnings' own
+// doc comment gives for not skipping it ("new to the published registry"
+// does not mean "no records" — a rolled-back version's records are still
+// there).
+func newlyAddedUniqueSets(ctx context.Context, entityDefs *data.EntityDefinitionRepo, c change, newDef *entity.Definition) [][]string {
+	var oldNames map[string]bool
+	if c.from > 0 {
+		v, err := entityDefs.GetVersion(ctx, c.entityType, c.from)
+		if err == nil {
+			var d entity.Definition
+			if json.Unmarshal(v.Definition, &d) == nil {
+				oldNames = make(map[string]bool, len(d.Unique))
+				for _, set := range d.Unique {
+					oldNames[entity.UniqueConstraintName(set)] = true
+				}
+			}
+		}
+	}
+	var out [][]string
+	for _, set := range newDef.Unique {
+		if oldNames != nil && oldNames[entity.UniqueConstraintName(set)] {
+			continue
+		}
+		out = append(out, set)
+	}
+	return out
+}
+
+// backfillNewUniqueConstraints populates record_unique_keys for every
+// EXISTING live record against each newly-declared Unique set — without
+// this, the constraint protects nothing that predates it: a pre-existing
+// record has no key row, so a BRAND-NEW record can silently duplicate
+// its combination even though the old record's own data was perfectly
+// valid (independent review, uc-infra#81 follow-up — a real gap distinct
+// from uniqueConstraintWarnings' report above, which only covers records
+// that already collide with EACH OTHER, not "old record has no key at
+// all"). Called only on a real (non-dry-run) sync, after publish, so
+// newDef reflects what's actually live.
+//
+// This is a deliberate, narrow exception to this command's own stated
+// "does not attempt the migration itself" stance (this file's own header
+// comment) — that stance is about records.data backfills, which are
+// entity-specific and judgement-laden (cmd/backfill-inventory-facility
+// has to INVENT a facility_id and assert where prior stock was). This
+// backfill invents nothing and never touches records.data: it
+// deterministically populates the constraint mechanism's OWN bookkeeping
+// table (record_unique_keys) from data already there, generically over
+// any Definition's Unique sets — no entity-specific knowledge needed,
+// the same "generic, no entity knowledge required" bar publishing itself
+// already clears. Colliding records are left unbacked (oldest wins,
+// crud.BackfillUniqueConstraintKeys' own doc comment) and are exactly
+// what uniqueConstraintWarnings above already reports — the two never
+// disagree about which records need attention.
+func backfillNewUniqueConstraints(
+	ctx context.Context,
+	tenantDB *sql.DB,
+	entityDefs *data.EntityDefinitionRepo,
+	tenantName string,
+	changes []change,
+	defFor func(entityType string) (*entity.Definition, bool),
+) {
+	records := data.NewRecordRepo(tenantDB)
+	keys := data.NewRecordUniqueKeyRepo(tenantDB)
+	for _, c := range changes {
+		newDef, ok := defFor(c.entityType)
+		if !ok {
+			continue
+		}
+		for _, set := range newlyAddedUniqueSets(ctx, entityDefs, c, newDef) {
+			name := entity.UniqueConstraintName(set)
+			backfilled, skipped, err := crud.BackfillUniqueConstraintKeys(ctx, tenantDB, records, keys, c.entityType, set)
+			if err != nil {
+				log.Printf("WARNING: %s: %s — could not backfill unique constraint %q, existing records are unprotected until this is retried: %v",
+					tenantName, c.entityType, name, err)
+				continue
+			}
+			if backfilled == 0 && skipped == 0 {
+				continue
+			}
+			log.Printf("%s: %s — backfilled unique constraint %q for %d existing record(s)%s",
+				tenantName, c.entityType, name, backfilled,
+				func() string {
+					if skipped == 0 {
+						return ""
+					}
+					return fmt.Sprintf(" (%d left unprotected due to an existing collision, see the warning above)", skipped)
+				}())
+		}
+	}
 }

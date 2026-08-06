@@ -422,6 +422,30 @@ func TestDefinitionValidate(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "unique constraint with an empty field set",
+			def: Definition{
+				EntityType: "AttendanceRecord",
+				Fields: []Field{
+					{Name: "employee_id", Type: FieldReference, Target: "Employee"},
+					{Name: "entry_date", Type: FieldDate},
+				},
+				Unique: [][]string{{}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "unique constraint referencing an unknown field",
+			def: Definition{
+				EntityType: "AttendanceRecord",
+				Fields: []Field{
+					{Name: "employee_id", Type: FieldReference, Target: "Employee"},
+					{Name: "entry_date", Type: FieldDate},
+				},
+				Unique: [][]string{{"employee_id", "no_such_field"}},
+			},
+			wantErr: true,
+		},
+		{
 			name: "min equal to max is allowed (a fixed-value field)",
 			def: Definition{
 				EntityType: "Rate",
@@ -442,6 +466,33 @@ func TestDefinitionValidate(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "unique constraint repeats a field within one set",
+			def: Definition{
+				EntityType: "AttendanceRecord",
+				Fields: []Field{
+					{Name: "employee_id", Type: FieldReference, Target: "Employee"},
+					{Name: "entry_date", Type: FieldDate},
+				},
+				Unique: [][]string{{"employee_id", "employee_id"}},
+			},
+			wantErr: true,
+		},
+		{
+			// {"employee_id","entry_date"} and {"entry_date","employee_id"}
+			// name the SAME constraint once canonicalized — declaring both
+			// is a duplicate, not two different constraints.
+			name: "unique constraint declared twice under different field order",
+			def: Definition{
+				EntityType: "AttendanceRecord",
+				Fields: []Field{
+					{Name: "employee_id", Type: FieldReference, Target: "Employee"},
+					{Name: "entry_date", Type: FieldDate},
+				},
+				Unique: [][]string{{"employee_id", "entry_date"}, {"entry_date", "employee_id"}},
+			},
+			wantErr: true,
+		},
+		{
 			name: "max on a non-number field is rejected",
 			def: Definition{
 				EntityType: "Vendor",
@@ -450,6 +501,19 @@ func TestDefinitionValidate(t *testing.T) {
 				},
 			},
 			wantErr: true,
+		},
+		{
+			name: "valid single-field and composite unique constraints",
+			def: Definition{
+				EntityType: "AttendanceRecord",
+				Fields: []Field{
+					{Name: "employee_id", Type: FieldReference, Target: "Employee"},
+					{Name: "entry_date", Type: FieldDate},
+					{Name: "badge_number", Type: FieldString},
+				},
+				Unique: [][]string{{"employee_id", "entry_date"}, {"badge_number"}},
+			},
+			wantErr: false,
 		},
 	}
 
@@ -549,5 +613,38 @@ func TestDefinitionValidate_NotBeforeCycle(t *testing.T) {
 	}
 	if err := def.Validate(); err == nil {
 		t.Fatal("expected a cycle reached via a non-cyclic entry to fail")
+	}
+}
+
+// TestUniqueConstraintName confirms the canonicalization
+// entity.UniqueConstraintName and Definition.Validate's duplicate-set
+// detection both rely on: field names sorted then joined by "+", so
+// declaration order never changes a constraint's identity.
+func TestUniqueConstraintName(t *testing.T) {
+	cases := []struct {
+		name   string
+		fields []string
+		want   string
+	}{
+		{name: "single field", fields: []string{"employee_number"}, want: "employee_number"},
+		{name: "already sorted", fields: []string{"employee_id", "entry_date"}, want: "employee_id+entry_date"},
+		{name: "reverse order canonicalizes the same", fields: []string{"entry_date", "employee_id"}, want: "employee_id+entry_date"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := UniqueConstraintName(tc.fields); got != tc.want {
+				t.Fatalf("UniqueConstraintName(%v) = %q, want %q", tc.fields, got, tc.want)
+			}
+		})
+	}
+
+	// Must not mutate the caller's slice — a Definition's own Unique
+	// entries are read repeatedly (Validate, crud's enforcement stage);
+	// silently reordering them out from under the caller would be an
+	// action-at-a-distance bug.
+	original := []string{"entry_date", "employee_id"}
+	_ = UniqueConstraintName(original)
+	if original[0] != "entry_date" || original[1] != "employee_id" {
+		t.Fatalf("UniqueConstraintName mutated its input slice: %v", original)
 	}
 }

@@ -512,6 +512,25 @@ func (h *Handler) writeCrudErrorLocalized(w http.ResponseWriter, r *http.Request
 		httpx.WriteError(w, http.StatusBadRequest, msg)
 		return
 	}
+	// crud.UniqueConstraintError (uc-infra#81) gets the same translated-
+	// envelope treatment as TargetConstraintError above, for the same
+	// reason: a duplicate (employee_id, entry_date) is a routine
+	// data-entry mistake a real end user hits, not a rare admin action.
+	// Every named field's label resolves through the same field-label
+	// catalog key (field.{EntityType}.{FieldName}) TargetConstraintError
+	// already uses, joined for the composite-field case.
+	var uce *crud.UniqueConstraintError
+	if errors.As(err, &uce) {
+		log.Printf("api: %s: %v", logContext, err)
+		locale := localeFromRequest(w, r)
+		labels := make([]string, len(uce.Fields))
+		for i, f := range uce.Fields {
+			labels[i] = h.catalog.TOrDefault(locale, "field."+uce.EntityType+"."+f, f)
+		}
+		msg := strings.ReplaceAll(h.catalog.T(locale, "crud.error.unique_constraint_violation"), "{fields}", strings.Join(labels, ", "))
+		httpx.WriteError(w, http.StatusBadRequest, msg)
+		return
+	}
 	// entity.ValidationError (uc-infra#96): every current create/update
 	// call site pre-validates via entity.ValidateRecord before ever
 	// reaching crud.Engine, so this is defense in depth for a future or
