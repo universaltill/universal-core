@@ -50,20 +50,20 @@ type Client struct {
 }
 
 // defaultTimeout is generous, not stingy: this platform's own reference
-// deployment (homelab-k8s's ollama app) deliberately runs a small model
-// (llama3.2:3b) on 2-node Raspberry-Pi-class hardware specifically so it
-// stays cheap to run — a cold or under-load response can genuinely take
-// tens of seconds. A caller with a tighter budget can still pass a
-// shorter-deadlined context; this is only the ceiling.
+// self-hosted deployment deliberately runs a small model on modest
+// hardware specifically so it stays cheap to run — a cold or under-load
+// response can genuinely take tens of seconds. A caller with a tighter
+// budget can still pass a shorter-deadlined context; this is only the
+// ceiling.
 const defaultTimeout = 90 * time.Second
 
-// NewClient builds a Client for baseURL (e.g.
-// "http://ollama.ollama.svc.cluster.local" in-cluster, or an ingress
-// URL) and model (e.g. "llama3.2:3b"). baseURL == "" deliberately
-// returns nil, not a Client with an empty URL — see Enabled's doc
-// comment for why every caller can then treat "AI not configured" and
-// "got back a nil *Client" as the exact same case, with no separate
-// "is this even set up" check needed anywhere else in the kernel.
+// NewClient builds a Client for baseURL (e.g. "http://ollama.internal:11434"
+// in-cluster, or an external ingress URL) and model (e.g. "llama3.2:3b").
+// baseURL == "" deliberately returns nil, not a Client with an empty URL
+// — see Enabled's doc comment for why every caller can then treat
+// "AI not configured" and "got back a nil *Client" as the exact same
+// case, with no separate "is this even set up" check needed anywhere
+// else in the kernel.
 func NewClient(baseURL, model string) *Client {
 	if baseURL == "" {
 		return nil
@@ -102,10 +102,10 @@ type generateResponse struct {
 
 // GenerateJSON sends prompt to the model with schema as Ollama's
 // "format" constraint (a JSON Schema object — Ollama itself enforces
-// the model's output matches it; confirmed against the live
-// homelab-k8s Ollama, server version 0.32.0, which supports schema-
-// constrained structured output, not just the older bare "format":
-// "json"), then unmarshals the model's response text into out.
+// the model's output matches it; confirmed against a live Ollama
+// instance new enough to support schema-constrained structured output,
+// not just the older bare "format": "json"), then unmarshals the
+// model's response text into out.
 //
 // Deliberately returns a plain error rather than panicking or retrying
 // — network failure, context deadline, and a schema-violating response
