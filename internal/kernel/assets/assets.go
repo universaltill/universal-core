@@ -43,12 +43,14 @@ import "github.com/universaltill/universal-core/internal/kernel/entity"
 func FixedAsset() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "FixedAsset",
-		// Version 2 (board #20): gained the maintenance related list
-		// below. The registry is append-only, so this is a new published
-		// version rather than an edit to v1 — moduleseed publishes it
-		// alongside the old one and GetPublished takes the highest, which
-		// is the designed upgrade path for a module that ships again.
-		Version:        2,
+		// Version 3 (uc-infra#80): cost, salvage_value and
+		// useful_life_months gained Min:0 bounds. Version 2 (board #20)
+		// gained the maintenance related list below. The registry is
+		// append-only, so each is a new published version rather than an
+		// edit to the last — moduleseed publishes it alongside the old
+		// ones and GetPublished takes the highest, which is the designed
+		// upgrade path for a module that ships again.
+		Version:        3,
 		Module:         "assets",
 		StatusTypeCode: "fixed_asset_status",
 		Fields: []entity.Field{
@@ -57,13 +59,13 @@ func FixedAsset() *entity.Definition {
 			{Name: "asset_number", Type: entity.FieldString, Required: true},
 			{Name: "name", Type: entity.FieldI18nText, Required: true},
 			{Name: "acquisition_date", Type: entity.FieldDate, Required: true},
-			{Name: "cost", Type: entity.FieldNumber, Required: true},
-			{Name: "salvage_value", Type: entity.FieldNumber, Default: float64(0)},
+			{Name: "cost", Type: entity.FieldNumber, Required: true, Min: entity.Float64Ptr(0)},
+			{Name: "salvage_value", Type: entity.FieldNumber, Default: float64(0), Min: entity.Float64Ptr(0)},
 			// Useful life in MONTHS, not years: depreciation is charged
 			// monthly, and storing years would force every consumer to
 			// re-derive months and disagree about how to handle a
 			// part-year life.
-			{Name: "useful_life_months", Type: entity.FieldNumber, Required: true},
+			{Name: "useful_life_months", Type: entity.FieldNumber, Required: true, Min: entity.Float64Ptr(0)},
 			{Name: "depreciation_method", Type: entity.FieldEnum, Required: true,
 				// Only the method depreciation.Build actually implements
 				// is offered — an enum value with no implementation
@@ -111,16 +113,19 @@ func FixedAsset() *entity.Definition {
 func DepreciationSchedule() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "DepreciationSchedule",
-		Version:    1,
-		Module:     "assets",
+		// Version 2 (uc-infra#80): depreciation_amount and book_value
+		// gained Min:0 bounds. sequence is left unbounded — it is a
+		// display/ordering hint, not a quantity or money value.
+		Version: 2,
+		Module:  "assets",
 		Fields: []entity.Field{
 			{Name: "fixed_asset_id", Type: entity.FieldReference, Required: true, Target: "FixedAsset"},
 			{Name: "sequence", Type: entity.FieldNumber, Required: true},
 			// period_end is the last day of the month this row covers —
 			// the date a posting for it carries.
 			{Name: "period_end", Type: entity.FieldDate, Required: true},
-			{Name: "depreciation_amount", Type: entity.FieldNumber, Required: true},
-			{Name: "book_value", Type: entity.FieldNumber, Required: true},
+			{Name: "depreciation_amount", Type: entity.FieldNumber, Required: true, Min: entity.Float64Ptr(0)},
+			{Name: "book_value", Type: entity.FieldNumber, Required: true, Min: entity.Float64Ptr(0)},
 			// posted_at stays empty until a ledger posting run (follow-up
 			// work) claims the row. Present from the start so that run
 			// doesn't need a version-bump migration to become
@@ -152,8 +157,9 @@ func DepreciationSchedule() *entity.Definition {
 // free text.
 func MaintenanceOrder() *entity.Definition {
 	return &entity.Definition{
-		EntityType:     "MaintenanceOrder",
-		Version:        1,
+		EntityType: "MaintenanceOrder",
+		// Version 2 (uc-infra#80): cost gained a Min:0 bound.
+		Version:        2,
 		Module:         "assets",
 		StatusTypeCode: "maintenance_order_status",
 		Fields: []entity.Field{
@@ -166,7 +172,7 @@ func MaintenanceOrder() *entity.Definition {
 			{Name: "scheduled_date", Type: entity.FieldDate, Required: true},
 			{Name: "completed_date", Type: entity.FieldDate},
 			{Name: "vendor_id", Type: entity.FieldReference, Target: "Party"},
-			{Name: "cost", Type: entity.FieldNumber, Default: float64(0)},
+			{Name: "cost", Type: entity.FieldNumber, Default: float64(0), Min: entity.Float64Ptr(0)},
 			{Name: "currency_id", Type: entity.FieldReference, Target: "Currency"},
 			{Name: "status_id", Type: entity.FieldReference, Required: true, Target: "Status"},
 		},

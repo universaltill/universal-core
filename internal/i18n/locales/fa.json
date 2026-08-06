@@ -822,5 +822,7 @@
   "entity.validation.enum_invalid": "{field} یک گزینه معتبر نیست.",
   "entity.validation.i18n_text_invalid": "{field} مقدار نامعتبری دارد.",
   "entity.validation.not_before": "{field} نمی‌تواند قبل از {other_field} باشد.",
+  "entity.validation.below_minimum": "{field} از حداقل مجاز کمتر است.",
+  "entity.validation.above_maximum": "{field} از حداکثر مجاز بیشتر است.",
   "entity.validation.invalid": "{field} نامعتبر است."
 }

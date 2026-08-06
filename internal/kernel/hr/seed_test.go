@@ -436,6 +436,16 @@ func TestLeaveRequest_RejectsReversedDates(t *testing.T) {
 	}, actor); err == nil {
 		t.Fatal("leave ending before it starts must be rejected")
 	}
+	// days is bounded to Min:0 (uc-infra#80) — -99 no longer saves.
+	// No Max: how many days a request can span is tenant policy
+	// (ADR-0018 §Consequences), not a kernel-invariant ceiling.
+	if _, err := engine.Create(ctx, publishedDef(t, tenantDB, "LeaveRequest"), map[string]any{
+		"request_number": "LV-NEG", "employee_id": emp.ID, "leave_type": "annual",
+		"start_date": "2026-05-01", "end_date": "2026-05-05", "days": -99.0,
+		"status_id": draft,
+	}, actor); err == nil {
+		t.Fatal("a negative days must be rejected")
+	}
 }
 
 // Publishing statuses before foundation is a real operator ordering
@@ -622,11 +632,79 @@ func TestAttendanceRecord_BelongsToTheEmployment(t *testing.T) {
 		t.Fatalf("current employment's attendance: err=%v n=%d", err, len(onCurrent))
 	}
 
-	// The source enum is enforced; the hours value is not bounded (#80).
+	// The source enum is enforced.
 	if _, err := engine.Create(ctx, attDef, map[string]any{
 		"employee_id": current.ID, "entry_date": "2026-07-29",
 		"hours_worked": 8.0, "source": "telepathy",
 	}, actor); err == nil {
 		t.Error("an undeclared attendance source must be rejected by the enum")
+	}
+}
+
+// hours_worked is bounded to [0, 24] (uc-infra#80) — a negative or
+// 30-hour day no longer saves cleanly. Reversion check performed by hand
+// against the pre-fix code (git stash of validate.go's Min/Max branch):
+// both cases below passed with no error before the fix.
+func TestAttendanceRecord_HoursWorkedBounded(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+	for _, step := range []struct {
+		name string
+		fn   func(context.Context, *sql.DB, audit.Actor) error
+	}{
+		{"foundation", foundation.Publish},
+		{"hr", Publish},
+		{"hr statuses", PublishStatuses},
+	} {
+		if err := step.fn(ctx, tenantDB, actor); err != nil {
+			t.Fatalf("publish %s: %v", step.name, err)
+		}
+	}
+	engine := crud.NewEngine(tenantDB)
+	types, _ := engine.ListByField(ctx, publishedDef(t, tenantDB, "StatusType"), "code", "employee_status")
+	rows, _ := engine.ListByField(ctx, publishedDef(t, tenantDB, "Status"), "status_type_id", types[0].ID)
+	var active string
+	for _, r := range rows {
+		if c, _ := r.Data["code"].(string); c == "active" {
+			active = r.ID
+		}
+	}
+	person, _ := engine.Create(ctx, publishedDef(t, tenantDB, "Party"), map[string]any{
+		"party_type": "person", "name": "Demo Employee", "status": "active",
+	}, actor)
+	emp, err := engine.Create(ctx, publishedDef(t, tenantDB, "Employee"), map[string]any{
+		"employee_number": "EMP-HRS", "party_id": person.ID, "hire_date": "2026-01-01",
+		"status_id": active,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create Employee: %v", err)
+	}
+	attDef := publishedDef(t, tenantDB, "AttendanceRecord")
+
+	if _, err := engine.Create(ctx, attDef, map[string]any{
+		"employee_id": emp.ID, "entry_date": "2026-07-28",
+		"hours_worked": -1.0, "source": "manual",
+	}, actor); err == nil {
+		t.Error("a negative hours_worked must be rejected")
+	}
+	if _, err := engine.Create(ctx, attDef, map[string]any{
+		"employee_id": emp.ID, "entry_date": "2026-07-28",
+		"hours_worked": 30.0, "source": "manual",
+	}, actor); err == nil {
+		t.Error("a 30-hour day must be rejected")
+	}
+	// The bound is inclusive: exactly 0 and exactly 24 both save.
+	if _, err := engine.Create(ctx, attDef, map[string]any{
+		"employee_id": emp.ID, "entry_date": "2026-07-28",
+		"hours_worked": 0.0, "source": "manual",
+	}, actor); err != nil {
+		t.Errorf("hours_worked of exactly 0 (the inclusive minimum) should save: %v", err)
+	}
+	if _, err := engine.Create(ctx, attDef, map[string]any{
+		"employee_id": emp.ID, "entry_date": "2026-07-29",
+		"hours_worked": 24.0, "source": "manual",
+	}, actor); err != nil {
+		t.Errorf("hours_worked of exactly 24 (the inclusive maximum) should save: %v", err)
 	}
 }

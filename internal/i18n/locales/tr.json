@@ -822,5 +822,7 @@
   "entity.validation.enum_invalid": "{field} geçerli bir seçenek değil.",
   "entity.validation.i18n_text_invalid": "{field} geçersiz bir değere sahip.",
   "entity.validation.not_before": "{field}, {other_field} tarihinden önce olamaz.",
+  "entity.validation.below_minimum": "{field} izin verilen en düşük değerin altında.",
+  "entity.validation.above_maximum": "{field} izin verilen en yüksek değerin üstünde.",
   "entity.validation.invalid": "{field} geçersiz."
 }

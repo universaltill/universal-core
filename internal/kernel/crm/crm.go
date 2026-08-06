@@ -84,8 +84,6 @@
 //     one lead rather than two (#81).
 //
 // Opportunity:
-//   - that probability is a percentage. -400 and 10000 both save
-//     (#80), as does an amount of -1.
 //   - that expected_close_date is in the future, or after the
 //     Lead it came from was created.
 //   - any coherence between lead_id and the rest of the record: the
@@ -95,13 +93,14 @@
 //     above, and the same #78.
 //
 // Campaign:
-//   - that budget is non-negative (#80);
 //   - name uniqueness, on any of the three (#81).
 //
 // What IS enforced: every enum, the four status graphs seeded below
-// (three added here plus Case's), the status_id checks noted above, and
-// the two NotBefore date orderings (Case.sla_due_at after opened_date,
-// Campaign.end_date after start_date) — on update as well as create.
+// (three added here plus Case's), the status_id checks noted above, the
+// two NotBefore date orderings (Case.sla_due_at after opened_date,
+// Campaign.end_date after start_date) — on update as well as create —
+// and (uc-infra#80) Opportunity.probability's [0, 100] bound,
+// Opportunity.amount's Min:0, and Campaign.budget's Min:0.
 package crm
 
 import "github.com/universaltill/universal-core/internal/kernel/entity"
@@ -164,15 +163,16 @@ func Case() *entity.Definition {
 // something to start diverging on in a CRM card.
 func Campaign() *entity.Definition {
 	return &entity.Definition{
-		EntityType:     "Campaign",
-		Version:        1,
+		EntityType: "Campaign",
+		// Version 2 (uc-infra#80): budget gained a Min:0 bound.
+		Version:        2,
 		Module:         "crm",
 		StatusTypeCode: "campaign_status",
 		Fields: []entity.Field{
 			{Name: "name", Type: entity.FieldString, Required: true},
 			{Name: "channel", Type: entity.FieldEnum, Required: true,
 				EnumValues: []string{"email", "event", "web", "social", "print", "phone", "partner"}},
-			{Name: "budget", Type: entity.FieldNumber, Default: float64(0)},
+			{Name: "budget", Type: entity.FieldNumber, Default: float64(0), Min: entity.Float64Ptr(0)},
 			{Name: "currency_id", Type: entity.FieldReference, Target: "Currency"},
 			{Name: "start_date", Type: entity.FieldDate, Required: true},
 			{Name: "end_date", Type: entity.FieldDate, NotBefore: "start_date"},
@@ -262,8 +262,13 @@ func Lead() *entity.Definition {
 // than the gap.
 func Opportunity() *entity.Definition {
 	return &entity.Definition{
-		EntityType:     "Opportunity",
-		Version:        1,
+		EntityType: "Opportunity",
+		// Version 2 (uc-infra#80): amount gained a Min:0 bound;
+		// probability gained a [0, 100] bound (ADR-0018 §Consequences:
+		// "a percentage within 0-100") — it is entered as a whole
+		// percentage point, e.g. 25.0 for 25%, same convention as
+		// finance.TaxCode.rate.
+		Version:        2,
 		Module:         "crm",
 		StatusTypeCode: "opportunity_stage",
 		Fields: []entity.Field{
@@ -273,9 +278,9 @@ func Opportunity() *entity.Definition {
 			// rather than anything sales-side.
 			{Name: "customer_id", Type: entity.FieldReference, Required: true, Target: "Party"},
 			{Name: "lead_id", Type: entity.FieldReference, Target: "Lead"},
-			{Name: "amount", Type: entity.FieldNumber, Default: float64(0)},
+			{Name: "amount", Type: entity.FieldNumber, Default: float64(0), Min: entity.Float64Ptr(0)},
 			{Name: "currency_id", Type: entity.FieldReference, Target: "Currency"},
-			{Name: "probability", Type: entity.FieldNumber, Default: float64(0)},
+			{Name: "probability", Type: entity.FieldNumber, Default: float64(0), Min: entity.Float64Ptr(0), Max: entity.Float64Ptr(100)},
 			{Name: "expected_close_date", Type: entity.FieldDate, Required: true},
 			{Name: "owner_id", Type: entity.FieldReference, Target: "Party"},
 			{Name: "description", Type: entity.FieldString},

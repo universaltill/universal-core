@@ -735,3 +735,42 @@ func (r *RecordRepo) CountMissingField(ctx context.Context, entityType, fieldNam
 	}
 	return n, nil
 }
+
+// CountOutOfRangeField is CountMissingField's counterpart for a
+// FieldNumber's declared entity.Field.Min/Max (uc-infra#80, ADR-0018 §4):
+// a version bump that adds or tightens a numeric bound can invalidate
+// existing records the exact same way a newly-Required field does — see
+// cmd/sync-tenant-modules' numericBoundWarnings, which is what calls
+// this. min/max are *float64 and passed through as-is: a nil bound
+// becomes a SQL NULL, and the driver-level "IS NOT NULL" check below is
+// what turns "no lower bound" into "never reject on the low side" rather
+// than every row failing a `< NULL` comparison (which is neither true
+// nor false in SQL, and would silently match nothing instead of erroring
+// — the same care CountMissingField's own coalesce takes for a missing
+// field).
+//
+// jsonb_typeof guards the cast: a record predating this field's
+// existence, or one written with a non-numeric value before
+// entity.ValidateRecord could catch it, must not fail the whole query
+// with a Postgres cast error — such a row simply isn't counted as
+// "out of range", the same "not this warning's problem" scope
+// CountMissingField's Required check keeps for values it doesn't
+// recognize as present.
+func (r *RecordRepo) CountOutOfRangeField(ctx context.Context, entityType, fieldName string, min, max *float64) (int, error) {
+	var n int
+	err := r.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM records
+		 WHERE entity_type = $1
+		   AND deleted_at IS NULL
+		   AND jsonb_typeof(data->$2) = 'number'
+		   AND (
+		     ($3::float8 IS NOT NULL AND (data->>$2)::float8 < $3::float8)
+		     OR ($4::float8 IS NOT NULL AND (data->>$2)::float8 > $4::float8)
+		   )`,
+		entityType, fieldName, min, max,
+	).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count %s records out of range on %s: %w", entityType, fieldName, err)
+	}
+	return n, nil
+}

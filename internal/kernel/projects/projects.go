@@ -99,8 +99,9 @@ import "github.com/universaltill/universal-core/internal/kernel/entity"
 // PartyRole, exactly as SalesOrder.customer_id does.
 func Project() *entity.Definition {
 	return &entity.Definition{
-		EntityType:     "Project",
-		Version:        1,
+		EntityType: "Project",
+		// Version 2 (uc-infra#80): budget gained a Min:0 bound.
+		Version:        2,
 		Module:         "projects",
 		StatusTypeCode: "project_status",
 		Fields: []entity.Field{
@@ -114,7 +115,7 @@ func Project() *entity.Definition {
 			// asset's completed_date, which legitimately can precede its
 			// schedule, this is a span rather than a plan-versus-actual.
 			{Name: "end_date", Type: entity.FieldDate, NotBefore: "start_date"},
-			{Name: "budget", Type: entity.FieldNumber, Default: float64(0)},
+			{Name: "budget", Type: entity.FieldNumber, Default: float64(0), Min: entity.Float64Ptr(0)},
 			{Name: "currency_id", Type: entity.FieldReference, Target: "Currency"},
 			{Name: "status_id", Type: entity.FieldReference, Required: true, Target: "Status"},
 		},
@@ -161,8 +162,9 @@ func Project() *entity.Definition {
 // once), but a pure vendor/customer Party no longer does.
 func Task() *entity.Definition {
 	return &entity.Definition{
-		EntityType:     "Task",
-		Version:        2,
+		EntityType: "Task",
+		// Version 3 (uc-infra#80): estimated_hours gained a Min:0 bound.
+		Version:        3,
 		Module:         "projects",
 		StatusTypeCode: "task_status",
 		Fields: []entity.Field{
@@ -172,7 +174,7 @@ func Task() *entity.Definition {
 			{Name: "assignee_id", Type: entity.FieldReference, Target: "Party", TargetFilter: []entity.TargetFilterCondition{
 				{Entity: "PartyRole", EntityField: "party_id", Field: "role_type", Value: "employee"},
 			}},
-			{Name: "estimated_hours", Type: entity.FieldNumber, Default: float64(0)},
+			{Name: "estimated_hours", Type: entity.FieldNumber, Default: float64(0), Min: entity.Float64Ptr(0)},
 			{Name: "due_date", Type: entity.FieldDate},
 			{Name: "status_id", Type: entity.FieldReference, Required: true, Target: "Status"},
 		},
@@ -197,11 +199,15 @@ func Task() *entity.Definition {
 // hours is a plain FieldNumber rather than minutes-as-integer: unlike
 // money, a fractional hour has no exactness requirement that float
 // storage threatens, and everyone who enters time thinks in "1.5".
+//
+// Bounded to [0, 24] (uc-infra#80, ADR-0018 §Consequences: "hours within
+// a day") — one logged entry cannot exceed a calendar day.
 func TimeEntry() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "TimeEntry",
-		Version:    2,
-		Module:     "projects",
+		// Version 3 (uc-infra#80): hours gained a [0, 24] bound.
+		Version: 3,
+		Module:  "projects",
 		Fields: []entity.Field{
 			{Name: "task_id", Type: entity.FieldReference, Required: true, Target: "Task"},
 			// The person who did the work: a Party holding the employee
@@ -213,7 +219,7 @@ func TimeEntry() *entity.Definition {
 				{Entity: "PartyRole", EntityField: "party_id", Field: "role_type", Value: "employee"},
 			}},
 			{Name: "entry_date", Type: entity.FieldDate, Required: true},
-			{Name: "hours", Type: entity.FieldNumber, Required: true},
+			{Name: "hours", Type: entity.FieldNumber, Required: true, Min: entity.Float64Ptr(0), Max: entity.Float64Ptr(24)},
 			// billable is the flag project billing will read; whether an
 			// hour becomes an invoice line is a Sales decision, not this
 			// entity's.

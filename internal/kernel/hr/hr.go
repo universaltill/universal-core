@@ -42,10 +42,11 @@
 //     uniqueness; "natural key" below is a convention, not a
 //     guarantee);
 //
-//   - `days` being positive, or agreeing with the start/end span: -99
-//     days and 500 days over a two-day span both save cleanly. The
-//     same is true of AttendanceRecord.hours_worked — a negative or
-//     30-hour day saves. entity.Field has no Min/Max (#80);
+//   - `days` agreeing with the start/end span: 500 days over a
+//     two-day span still saves cleanly (a negative `days` no longer
+//     does — uc-infra#80 gave entity.Field a Min bound, but "agrees
+//     with a sibling date span" needs a cross-field concept this
+//     kernel doesn't have yet, ADR-0018 §2's still-open half);
 //
 //   - leave falling inside its employment's hire/end window: leave
 //     dated 2030 against an employment that ended in 2020 saves;
@@ -63,9 +64,11 @@
 //
 //   - entry_date not being in the future.
 //
-// What IS enforced: the leave_type and attendance source enums, and
-// both NotBefore date chains (an employment ending before it started,
-// or leave ending before it starts, are rejected).
+// What IS enforced: the leave_type and attendance source enums, both
+// NotBefore date chains (an employment ending before it started, or
+// leave ending before it starts, are rejected), and (uc-infra#80)
+// LeaveRequest.days' Min:0 and AttendanceRecord.hours_worked's [0, 24]
+// bound.
 //
 // AttendanceRecord is deliberately NOT surfaced as a related list on
 // Employee, unlike LeaveRequest. Adding one would change Employee's
@@ -151,8 +154,12 @@ func Employee() *entity.Definition {
 // has two separate leave histories, which is correct.
 func LeaveRequest() *entity.Definition {
 	return &entity.Definition{
-		EntityType:     "LeaveRequest",
-		Version:        1,
+		EntityType: "LeaveRequest",
+		// Version 2 (uc-infra#80): days gained a Min:0 bound — a negative
+		// leave request has no meaning. No Max: how many days a leave
+		// request can span is tenant policy (a maximum entitlement), not a
+		// kernel-invariant ceiling — ADR-0018 §Consequences.
+		Version:        2,
 		Module:         "hr",
 		StatusTypeCode: "leave_request_status",
 		Fields: []entity.Field{
@@ -171,7 +178,7 @@ func LeaveRequest() *entity.Definition {
 			// and non-working days make "end minus start" wrong in every
 			// jurisdiction, and the correct calculation is exactly the
 			// per-country policy this module doesn't own.
-			{Name: "days", Type: entity.FieldNumber, Required: true},
+			{Name: "days", Type: entity.FieldNumber, Required: true, Min: entity.Float64Ptr(0)},
 			{Name: "reason", Type: entity.FieldString},
 			{Name: "status_id", Type: entity.FieldReference, Required: true, Target: "Status"},
 		},
@@ -198,14 +205,16 @@ func LeaveRequest() *entity.Definition {
 // does not have (FieldDate is a date), and faking it with strings
 // would be worse than leaving it out.
 //
-// hours_worked has no upper or lower bound: entity.Field cannot
-// express one yet (#80), so a negative or 30-hour day saves cleanly.
-// Listed in this package's "Not enforced" comment with the rest.
+// hours_worked is bounded to [0, 24] (uc-infra#80, ADR-0018
+// §Consequences: "hours within a day") — a negative or 30-hour day no
+// longer saves. No longer listed in this package's "Not enforced"
+// comment with the rest.
 func AttendanceRecord() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "AttendanceRecord",
-		Version:    1,
-		Module:     "hr",
+		// Version 2 (uc-infra#80): hours_worked gained a [0, 24] bound.
+		Version: 2,
+		Module:  "hr",
 		// Like Employee, this has no name — ADR-0013's closing rule says
 		// such an entity must declare its own label rather than fall
 		// back to a raw id. Nothing references AttendanceRecord today,
@@ -215,7 +224,7 @@ func AttendanceRecord() *entity.Definition {
 		Fields: []entity.Field{
 			{Name: "employee_id", Type: entity.FieldReference, Required: true, Target: "Employee"},
 			{Name: "entry_date", Type: entity.FieldDate, Required: true},
-			{Name: "hours_worked", Type: entity.FieldNumber, Required: true},
+			{Name: "hours_worked", Type: entity.FieldNumber, Required: true, Min: entity.Float64Ptr(0), Max: entity.Float64Ptr(24)},
 			{Name: "source", Type: entity.FieldEnum, Required: true,
 				EnumValues: []string{"clock", "timesheet", "manual"},
 				Default:    "timesheet"},

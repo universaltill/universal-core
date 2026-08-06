@@ -285,6 +285,7 @@ func syncTenant(
 		defFor := func(t string) (*entity.Definition, bool) { d, ok := want[t]; return d, ok }
 		warnings := requiredFieldWarnings(ctx, tenantDB, name, changes, defFor)
 		warnings = append(warnings, targetConstraintWarnings(ctx, tenantDB, entityDefs, name, changes, defFor)...)
+		warnings = append(warnings, numericBoundWarnings(ctx, tenantDB, entityDefs, name, changes, defFor)...)
 		return warnings, outcomeSynced
 	}
 
@@ -350,6 +351,7 @@ func syncTenant(
 	}
 	warnings := requiredFieldWarnings(ctx, tenantDB, name, changes, defFor)
 	warnings = append(warnings, targetConstraintWarnings(ctx, tenantDB, entityDefs, name, changes, defFor)...)
+	warnings = append(warnings, numericBoundWarnings(ctx, tenantDB, entityDefs, name, changes, defFor)...)
 	return warnings, result
 }
 
@@ -700,4 +702,79 @@ func targetConstraintChanged(oldDef *entity.Definition, newField entity.Field) b
 		return true
 	}
 	return !reflect.DeepEqual(oldField.TargetFilter, newField.TargetFilter)
+}
+
+// numericBoundWarnings is requiredFieldWarnings/targetConstraintWarnings'
+// counterpart for a FieldNumber's declared entity.Field.Min/Max
+// (uc-infra#80, ADR-0018 §4 and §Consequences): "a row already outside
+// the bound will fail its next edit, so the sync's data-migration
+// warning is the right place to notice" — this is that warning. Same
+// shape as targetConstraintWarnings: only a newly-added-or-tightened
+// bound is checked (numericBoundChanged), a brand-new-to-the-registry
+// type is NOT skipped for the same "rolled-back records are still
+// there" reason, and the count lives in data.RecordRepo because raw SQL
+// stays in internal/data (CLAUDE.md).
+func numericBoundWarnings(
+	ctx context.Context,
+	tenantDB *sql.DB,
+	entityDefs *data.EntityDefinitionRepo,
+	tenantName string,
+	changes []change,
+	defFor func(entityType string) (*entity.Definition, bool),
+) []string {
+	records := data.NewRecordRepo(tenantDB)
+	var out []string
+	for _, c := range changes {
+		newDef, ok := defFor(c.entityType)
+		if !ok {
+			continue
+		}
+		var oldDef *entity.Definition
+		if c.from > 0 {
+			v, err := entityDefs.GetVersion(ctx, c.entityType, c.from)
+			if err == nil {
+				var d entity.Definition
+				if json.Unmarshal(v.Definition, &d) == nil {
+					oldDef = &d
+				}
+			}
+		}
+		for _, f := range newDef.Fields {
+			if f.Type != entity.FieldNumber || (f.Min == nil && f.Max == nil) {
+				continue
+			}
+			if oldDef != nil && !numericBoundChanged(oldDef, f) {
+				continue
+			}
+			n, err := records.CountOutOfRangeField(ctx, c.entityType, f.Name, f.Min, f.Max)
+			if err != nil || n == 0 {
+				continue
+			}
+			out = append(out, fmt.Sprintf(
+				"%s: %s — %d record(s) are outside the new bound on %q and will fail validation on next edit",
+				tenantName, c.entityType, n, f.Name))
+		}
+	}
+	return out
+}
+
+// numericBoundChanged reports whether newField's declared Min/Max is
+// new, or tighter, than the same-named field on oldDef. "Tighter" — not
+// merely "different" — matters here in a way it didn't for
+// targetConstraintChanged: a Min that moved DOWN (or a Max that moved
+// UP) can only ever admit more values, never strand a record that
+// satisfied the old bound, so re-warning on a loosened bound would be
+// noise, not signal.
+func numericBoundChanged(oldDef *entity.Definition, newField entity.Field) bool {
+	oldField, ok := oldDef.FieldByName(newField.Name)
+	if !ok {
+		return true // the field itself is new
+	}
+	if newField.Min != nil && (oldField.Min == nil || *newField.Min > *oldField.Min) {
+		return true
+	}
+	if newField.Max != nil && (oldField.Max == nil || *newField.Max < *oldField.Max) {
+		return true
+	}
+	return false
 }

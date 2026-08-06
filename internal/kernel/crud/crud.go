@@ -145,7 +145,8 @@ func (e *Engine) Create(ctx context.Context, def *entity.Definition, fields map[
 // instead, its own doc comment explains why) — this is only for the
 // narrower case of a hook enforcing a real business-rule input
 // constraint the generic entity/crud engine has no field-level mechanism
-// for yet (Min/Max, cross-field inequality — #80).
+// for (cross-field inequality — entity.Field's Min/Max, uc-infra#80,
+// covers single-field bounds but not "field A must differ from field B").
 var ErrHookRejected = errors.New("hook rejected the write")
 
 // ErrReferenceCycle is returned by Update when a self-referencing

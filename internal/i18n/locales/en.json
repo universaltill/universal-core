@@ -822,5 +822,7 @@
   "entity.validation.enum_invalid": "{field} is not a valid choice.",
   "entity.validation.i18n_text_invalid": "{field} has an invalid value.",
   "entity.validation.not_before": "{field} must not be before {other_field}.",
+  "entity.validation.below_minimum": "{field} is below the allowed minimum.",
+  "entity.validation.above_maximum": "{field} is above the allowed maximum.",
   "entity.validation.invalid": "{field} is invalid."
 }

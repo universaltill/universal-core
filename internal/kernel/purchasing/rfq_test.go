@@ -242,6 +242,14 @@ func TestRequestForQuotationForm_HasCompareQuotesNavigateAction(t *testing.T) {
 // function but isn't in All() is invisible to Publish (seed.go) and
 // never reaches a real tenant.
 func TestRequestForQuotationEntitiesAreInAll(t *testing.T) {
+	// RequestForQuotationLine and RequestForQuotationQuoteLine moved to
+	// Version 2 (uc-infra#80: qty and unit_price each gained a Min:0
+	// bound) — the other two never declared a bounded number field, so
+	// they stayed at the original Version 1.
+	wantVersion := map[string]int{
+		"RequestForQuotation": 1, "RequestForQuotationLine": 2,
+		"RequestForQuotationVendor": 1, "RequestForQuotationQuoteLine": 2,
+	}
 	want := map[string]bool{
 		"RequestForQuotation": false, "RequestForQuotationLine": false,
 		"RequestForQuotationVendor": false, "RequestForQuotationQuoteLine": false,
@@ -249,8 +257,8 @@ func TestRequestForQuotationEntitiesAreInAll(t *testing.T) {
 	for _, def := range All() {
 		if _, ok := want[def.EntityType]; ok {
 			want[def.EntityType] = true
-			if def.Version != 1 {
-				t.Errorf("%s: expected Version 1 (new entity), got %d", def.EntityType, def.Version)
+			if def.Version != wantVersion[def.EntityType] {
+				t.Errorf("%s: expected Version %d, got %d", def.EntityType, wantVersion[def.EntityType], def.Version)
 			}
 		}
 	}

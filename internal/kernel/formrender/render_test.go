@@ -606,6 +606,53 @@ func TestRender_UntranslatedFieldLabelFallsBackToDeclaredLabel(t *testing.T) {
 	}
 }
 
+// TestRender_NumberFieldMinMaxAttributes (uc-infra#80, ADR-0018 §4): a
+// FieldNumber's declared Min/Max renders as the input's min/max HTML
+// attributes — the same client-side mirror Required's own attribute
+// already gets, so a browser blocks an out-of-bounds submission before it
+// ever reaches ValidateRecord, not just after.
+func TestRender_NumberFieldMinMaxAttributes(t *testing.T) {
+	r := testRenderer(t)
+	minVal, maxVal := 0.0, 24.0
+	ent := &entity.Definition{
+		EntityType: "TimeEntry",
+		Fields: []entity.Field{
+			{Name: "hours", Type: entity.FieldNumber, Required: true, Min: &minVal, Max: &maxVal},
+			{Name: "estimated_hours", Type: entity.FieldNumber, Min: &minVal},
+			{Name: "widget_count", Type: entity.FieldNumber},
+		},
+	}
+	def := &form.Definition{
+		EntityType: "TimeEntry",
+		Sections: []form.Section{{
+			Title: "Header", Component: form.ComponentFields,
+			Fields: []form.FormField{
+				{Name: "hours", Label: "Hours"},
+				{Name: "estimated_hours", Label: "Estimated Hours"},
+				{Name: "widget_count", Label: "Widget Count"},
+			},
+		}},
+	}
+	data := Data{Record: map[string]any{"hours": 3.5, "estimated_hours": 2.0, "widget_count": float64(9)}}
+	var buf strings.Builder
+	if err := r.Render(&buf, def, ent, data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, `<input type="number" id="hours" name="hours" value="3.5" min="0" max="24" required>`) {
+		t.Fatalf("expected both min and max attributes (in Min,Max order) before required, got:\n%s", out)
+	}
+	if !strings.Contains(out, `<input type="number" id="estimated_hours" name="estimated_hours" value="2" min="0">`) {
+		t.Fatalf("expected a Min-only field to render min but no max attribute, got:\n%s", out)
+	}
+	if !strings.Contains(out, `<input type="number" id="widget_count" name="widget_count" value="9">`) {
+		t.Fatalf("expected an unbounded number field to render neither min nor max, got:\n%s", out)
+	}
+	if strings.Contains(out, `widget_count" value="9" min`) {
+		t.Fatalf("an unbounded field must not render a min/max attribute at all:\n%s", out)
+	}
+}
+
 // TestRender_ReferenceFieldWithNoOptionsStillRendersCombobox confirms a
 // reference field with no pre-loaded current-value label (a new/unset
 // field, or a target whose label lookup degraded to no entry rather than

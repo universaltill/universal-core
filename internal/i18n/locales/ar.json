@@ -822,5 +822,7 @@
   "entity.validation.enum_invalid": "{field} ليس خيارًا صالحًا.",
   "entity.validation.i18n_text_invalid": "{field} يحتوي على قيمة غير صالحة.",
   "entity.validation.not_before": "لا يمكن أن يكون {field} قبل {other_field}.",
+  "entity.validation.below_minimum": "{field} أقل من الحد الأدنى المسموح به.",
+  "entity.validation.above_maximum": "{field} أكبر من الحد الأقصى المسموح به.",
   "entity.validation.invalid": "{field} غير صالح."
 }

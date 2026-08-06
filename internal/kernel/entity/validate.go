@@ -3,6 +3,7 @@ package entity
 import (
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"time"
 )
@@ -36,6 +37,19 @@ const (
 	// KindNotBefore: a FieldDate value is chronologically before the
 	// nearest present predecessor named by Field.NotBefore.
 	KindNotBefore ValidationErrorKind = "not_before"
+	// KindBelowMinimum/KindAboveMaximum: a FieldNumber value violates the
+	// Field.Min/Field.Max bound declared on it (uc-infra#80).
+	//
+	// Their catalog messages deliberately do NOT name the bound itself
+	// ("is below the allowed minimum", not "must be at least 0"): this
+	// error's translation layer substitutes {field} and, for
+	// KindNotBefore only, {other_field} — there is no mechanism for
+	// interpolating a numeric parameter, and inventing one belongs in its
+	// own change rather than in the merge that first brought Min/Max and
+	// the translation layer together. The untranslated Detail still
+	// carries the exact bound for logs and API callers.
+	KindBelowMinimum ValidationErrorKind = "below_minimum"
+	KindAboveMaximum ValidationErrorKind = "above_maximum"
 	// KindInvalid is the defensive catch-all for a field whose Type
 	// isn't one ValidateRecord knows how to check at all. Definition.
 	// Validate rejects an unknown FieldType at publish time, so this
@@ -66,6 +80,8 @@ func AllValidationErrorKinds() []ValidationErrorKind {
 		KindEnumInvalid,
 		KindI18nTextInvalid,
 		KindNotBefore,
+		KindBelowMinimum,
+		KindAboveMaximum,
 		KindInvalid,
 	}
 }
@@ -260,10 +276,33 @@ func validateFieldValue(entityType string, f Field, v any) *ValidationError {
 			return newErr(KindTypeMismatch, fmt.Sprintf("expected string, got %T", v))
 		}
 	case FieldNumber:
-		switch v.(type) {
-		case float64, int, int64:
+		var num float64
+		switch n := v.(type) {
+		case float64:
+			num = n
+		case int:
+			num = float64(n)
+		case int64:
+			num = float64(n)
 		default:
 			return newErr(KindTypeMismatch, fmt.Sprintf("expected number, got %T", v))
+		}
+		// A bound can't be enforced on a value ordering can't compare:
+		// NaN < min and NaN > max are both false, so without this check a
+		// NaN would silently sail past any declared Min/Max. Rejected
+		// unconditionally, not just when a bound is declared — "not a real
+		// number" is never a valid FieldNumber value, bound or no bound,
+		// and this is the one place in the kernel that decides that
+		// (depreciation.go's MinorUnits has had to guard against exactly
+		// this reaching it from an unbounded field).
+		if math.IsNaN(num) || math.IsInf(num, 0) {
+			return newErr(KindTypeMismatch, fmt.Sprintf("value %v is not a finite number", v))
+		}
+		if f.Min != nil && num < *f.Min {
+			return newErr(KindBelowMinimum, fmt.Sprintf("value %v is below the minimum %v", num, *f.Min))
+		}
+		if f.Max != nil && num > *f.Max {
+			return newErr(KindAboveMaximum, fmt.Sprintf("value %v is above the maximum %v", num, *f.Max))
 		}
 	case FieldBool:
 		if _, ok := v.(bool); !ok {

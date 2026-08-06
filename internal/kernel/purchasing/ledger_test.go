@@ -1004,9 +1004,20 @@ func TestValidateStockTransfer_ZeroQty_RollsBackTheWholeWrite(t *testing.T) {
 // StockTransfer created legitimately could be edited — through the
 // ordinary PUT /api/records/StockTransfer/{id} route every entity has,
 // and through the edit form a saved create form becomes — into exactly
-// the same-facility, negative-quantity record the create path refuses.
+// the same-facility record the create path refuses.
 // Reverting the hook to a create-only gate fails this test with the
 // stored record holding from == to.
+//
+// qty stays valid (10) throughout: qty gained a Min:0 bound of its own
+// (uc-infra#80), enforced by entity.ValidateRecord — which crud.Engine.
+// Update runs BEFORE any hook (crud.go:290) — so a negative qty here
+// would be rejected at that earlier layer instead, with a plain
+// validation error rather than one wrapping crud.ErrHookRejected. This
+// test's job is specifically the hook's same-facility check surviving an
+// UPDATE, not a re-test of the bound; TestValidateStockTransfer_
+// NegativeQty_Rejected below already covers the hook's own qty<=0 logic
+// directly, and TestValidateRecord_MinMax (internal/kernel/entity) covers
+// the Min:0 bound itself.
 func TestValidateStockTransfer_UpdateToSameFacility_RollsBackTheWholeWrite(t *testing.T) {
 	fx := setUpStockTransferFixture(t)
 	fx.engine.SetHook("StockTransfer", ValidateStockTransfer)
@@ -1024,10 +1035,13 @@ func TestValidateStockTransfer_UpdateToSameFacility_RollsBackTheWholeWrite(t *te
 	version := rec.Version
 	_, err = fx.engine.Update(ctx, def, rec.ID, map[string]any{
 		"item_id": fx.itemID, "from_facility_id": fx.facilityAID, "to_facility_id": fx.facilityAID,
-		"qty": float64(-5), "transfer_date": "2026-08-01", "status_id": fx.draftStatusID,
+		// A different (but still valid, Min:0-satisfying) qty than the
+		// create above, so the rollback assertion on qty below still
+		// distinguishes "rolled back" from "coincidentally the same".
+		"qty": float64(20), "transfer_date": "2026-08-01", "status_id": fx.draftStatusID,
 	}, &version, humanActor())
 	if err == nil {
-		t.Fatal("expected an update to from == to (and qty < 0) to be rejected, not silently stored")
+		t.Fatal("expected an update to from == to to be rejected, not silently stored")
 	}
 	if !errors.Is(err, crud.ErrHookRejected) {
 		t.Errorf("expected error to wrap crud.ErrHookRejected through the real Update path, got: %v", err)
