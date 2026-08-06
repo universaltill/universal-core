@@ -74,6 +74,24 @@ in parallel produces a real, intermittent cross-package race. The SAF-T
 XSD validation tests need `xmllint` (`libxml2-utils` on Debian/Ubuntu)
 installed, or they skip. A PR with a red suite won't be reviewed.
 
+### `cmd/migrate` is not a setup step for the server or other binaries
+
+The snippet above runs `cmd/migrate` with its default `-target=legacy` —
+the original shared-database schema most of the integration suite runs
+against. That's a separate, non-chained path from `cmd/provision-tenant`,
+`cmd/install-module`, and `cmd/universal-core` itself: all three apply
+their own control-plane migration set internally (see
+[`cmd/migrate/main.go`](cmd/migrate/main.go)'s doc comment) and need
+nothing run before them.
+
+If you go on to run any of those three with the same `DATABASE_URL` you
+just exported for the snippet above, you'll hit a deliberate guard: "a
+database object it creates already exists — this database most likely
+already has a different migration set applied to it". That's the legacy
+and control-plane schemas colliding, not a bug — point whichever of
+`cmd/provision-tenant`/`cmd/install-module`/`cmd/universal-core` you're
+running at its own, separate database instead.
+
 ## License of contributions
 
 By contributing, you agree that your contributions are licensed under the
