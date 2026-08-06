@@ -827,6 +827,526 @@ func TestQueue_ReclaimStale_OriginalStaleWorkerCannotUndoTheReclaim(t *testing.T
 	}
 }
 
+// escalatingApprovalWorkflow is poApprovalWorkflow's counterpart with an
+// escalation tier (uc-infra#64): unapproved past escalateAfterHours, "vp"
+// gains approval eligibility alongside the original "cfo" role.
+func escalatingApprovalWorkflow(escalateAfterHours float64) *Definition {
+	return &Definition{
+		Name:    "po_approval_escalating",
+		Version: 1,
+		Trigger: Trigger{Type: TriggerOnCreate, EntityType: "PurchaseOrder"},
+		Steps: []Step{
+			{Kind: StepRequireApproval, Params: map[string]any{
+				"role": "cfo", "escalate_after_hours": escalateAfterHours, "escalate_role": "vp",
+			}},
+			{Kind: StepNotify, Params: map[string]any{"channel": "finance"}},
+		},
+	}
+}
+
+// forceWaitingSince backdates a waiting_approval job's updated_at, the
+// same "entered waiting_approval at" clock MarkWaitingApproval itself
+// sets — simulating a job that has genuinely sat for elapsed duration,
+// the same technique TestQueue_ReclaimStale_RequeuesOrphanedRunningJob
+// uses for 'running' jobs.
+func forceWaitingSince(t *testing.T, db *sql.DB, jobID string, elapsed time.Duration) {
+	t.Helper()
+	if _, err := db.Exec(
+		`UPDATE workflow_jobs SET updated_at = now() - ($2::float8 * interval '1 second') WHERE id = $1`,
+		jobID, elapsed.Seconds(),
+	); err != nil {
+		t.Fatalf("backdate updated_at for job %s: %v", jobID, err)
+	}
+}
+
+func TestQueue_EscalateOverdueApprovals_EscalatesPastThreshold(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	def := escalatingApprovalWorkflow(1) // 1 hour
+	q, err := NewQueue(db, nil)
+	if err != nil {
+		t.Fatalf("NewQueue: %v", err)
+	}
+	recordID := "11111111-1111-1111-1111-111111111111"
+	job, err := q.Enqueue(ctx, def, "PurchaseOrder", recordID, humanActor())
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := q.ProcessOne(ctx, lookupFor(def)); err != nil {
+		t.Fatalf("ProcessOne (halt at approval): %v", err)
+	}
+	forceWaitingSince(t, db, job.ID, 2*time.Hour)
+
+	escalated, err := q.EscalateOverdueApprovals(ctx, time.Now(), lookupFor(def), systemActor())
+	if err != nil {
+		t.Fatalf("EscalateOverdueApprovals: %v", err)
+	}
+	if len(escalated) != 1 || escalated[0] != job.ID {
+		t.Fatalf("expected exactly job %s to be escalated, got %v", job.ID, escalated)
+	}
+
+	repo := data.NewWorkflowJobRepo(db)
+	got, err := repo.Get(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !got.Escalated {
+		t.Fatal("expected job to be marked escalated")
+	}
+	if got.Status != "waiting_approval" {
+		t.Fatalf("escalating must not change status, got %q", got.Status)
+	}
+
+	// Audit row written in the same transaction as the escalation
+	// (CLAUDE.md: audit written from the same transaction as the
+	// mutation) — attributed to ActorSystem, the same clock-driven-firing
+	// identity Scheduler.FireDue uses, never a human or an AI agent since
+	// nobody clicked anything and no model produced anything.
+	var count int
+	var actorType, action string
+	if err := db.QueryRowContext(ctx,
+		`SELECT count(*) FROM audit_log WHERE record_id = $1 AND action = 'update'`, recordID,
+	).Scan(&count); err != nil {
+		t.Fatalf("count audit rows: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly one audit row for the escalation, got %d", count)
+	}
+	if err := db.QueryRowContext(ctx,
+		`SELECT actor_type, action FROM audit_log WHERE record_id = $1`, recordID,
+	).Scan(&actorType, &action); err != nil {
+		t.Fatalf("read audit row: %v", err)
+	}
+	if actorType != "system" {
+		t.Fatalf("expected actor_type 'system', got %q", actorType)
+	}
+}
+
+func TestQueue_EscalateOverdueApprovals_LeavesJobBeforeThresholdAlone(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	def := escalatingApprovalWorkflow(24) // 24 hours
+	q, err := NewQueue(db, nil)
+	if err != nil {
+		t.Fatalf("NewQueue: %v", err)
+	}
+	job, err := q.Enqueue(ctx, def, "PurchaseOrder", "22222222-2222-2222-2222-222222222222", humanActor())
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := q.ProcessOne(ctx, lookupFor(def)); err != nil {
+		t.Fatalf("ProcessOne (halt at approval): %v", err)
+	}
+	// Freshly entered waiting_approval — nowhere near the 24h threshold.
+
+	escalated, err := q.EscalateOverdueApprovals(ctx, time.Now(), lookupFor(def), systemActor())
+	if err != nil {
+		t.Fatalf("EscalateOverdueApprovals: %v", err)
+	}
+	if len(escalated) != 0 {
+		t.Fatalf("expected no job escalated before its threshold, got %v", escalated)
+	}
+
+	repo := data.NewWorkflowJobRepo(db)
+	got, err := repo.Get(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Escalated {
+		t.Fatal("job must not be escalated before its threshold elapses")
+	}
+}
+
+func TestQueue_EscalateOverdueApprovals_IgnoresStepsWithNoEscalation(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	def := poApprovalWorkflow() // no escalate_after_hours at all
+	q, err := NewQueue(db, nil)
+	if err != nil {
+		t.Fatalf("NewQueue: %v", err)
+	}
+	job, err := q.Enqueue(ctx, def, "PurchaseOrder", "33333333-3333-3333-3333-333333333333", humanActor())
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := q.ProcessOne(ctx, lookupFor(def)); err != nil {
+		t.Fatalf("ProcessOne (halt at approval): %v", err)
+	}
+	forceWaitingSince(t, db, job.ID, 999*time.Hour)
+
+	escalated, err := q.EscalateOverdueApprovals(ctx, time.Now(), lookupFor(def), systemActor())
+	if err != nil {
+		t.Fatalf("EscalateOverdueApprovals: %v", err)
+	}
+	if len(escalated) != 0 {
+		t.Fatalf("a step with no escalate_after_hours must never escalate, however long it waits: got %v", escalated)
+	}
+}
+
+func TestQueue_EscalateOverdueApprovals_IgnoresNonWaitingApprovalJobs(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	def := &Definition{
+		Name: "notify_only_escalation_test", Version: 1,
+		Trigger: Trigger{Type: TriggerManual},
+		Steps:   []Step{{Kind: StepNotify}},
+	}
+	q, err := NewQueue(db, nil)
+	if err != nil {
+		t.Fatalf("NewQueue: %v", err)
+	}
+	// A queued (never halted) job.
+	if _, err := q.Enqueue(ctx, def, "PurchaseOrder", "44444444-4444-4444-4444-444444444444", humanActor()); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	escalated, err := q.EscalateOverdueApprovals(ctx, time.Now(), lookupFor(def), systemActor())
+	if err != nil {
+		t.Fatalf("EscalateOverdueApprovals: %v", err)
+	}
+	if len(escalated) != 0 {
+		t.Fatalf("a job that never reached waiting_approval must never be escalated, got %v", escalated)
+	}
+}
+
+func TestQueue_EscalateOverdueApprovals_IsIdempotent(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	def := escalatingApprovalWorkflow(1)
+	q, err := NewQueue(db, nil)
+	if err != nil {
+		t.Fatalf("NewQueue: %v", err)
+	}
+	recordID := "55555555-5555-5555-5555-555555555555"
+	job, err := q.Enqueue(ctx, def, "PurchaseOrder", recordID, humanActor())
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := q.ProcessOne(ctx, lookupFor(def)); err != nil {
+		t.Fatalf("ProcessOne (halt at approval): %v", err)
+	}
+	forceWaitingSince(t, db, job.ID, 2*time.Hour)
+
+	first, err := q.EscalateOverdueApprovals(ctx, time.Now(), lookupFor(def), systemActor())
+	if err != nil {
+		t.Fatalf("EscalateOverdueApprovals (1st): %v", err)
+	}
+	if len(first) != 1 {
+		t.Fatalf("expected the job escalated once, got %v", first)
+	}
+
+	second, err := q.EscalateOverdueApprovals(ctx, time.Now(), lookupFor(def), systemActor())
+	if err != nil {
+		t.Fatalf("EscalateOverdueApprovals (2nd): %v", err)
+	}
+	if len(second) != 0 {
+		t.Fatalf("expected a second sweep to find no new candidates (already escalated), got %v", second)
+	}
+
+	var auditCount int
+	if err := db.QueryRowContext(ctx,
+		`SELECT count(*) FROM audit_log WHERE record_id = $1 AND action = 'update'`, recordID,
+	).Scan(&auditCount); err != nil {
+		t.Fatalf("count audit rows: %v", err)
+	}
+	if auditCount != 1 {
+		t.Fatalf("expected exactly one audit row across both sweeps, got %d", auditCount)
+	}
+}
+
+// TestQueue_ResumeAfterApproval_ClearsEscalatedForTheNextStep is the
+// regression test for a real fail-open bug an independent review caught:
+// ResumeAfterApproval advanced step_index and flipped status back to
+// 'queued' but left `escalated` untouched, so a MULTI-step
+// require_approval workflow (a "manager, then CFO" chain — a canonical
+// shape workflow.Definition.Validate fully permits) would have its
+// SECOND require_approval step born pre-escalated the instant the FIRST
+// one escalated, regardless of whether the second step's own
+// escalate_after_hours had elapsed at all. `userMayApprove` would then
+// wave a mere escalate_role holder for step 1 straight through with zero
+// elapsed time — a real fail-open in an approval gate, not a
+// hypothetical one.
+func TestQueue_ResumeAfterApproval_ClearsEscalatedForTheNextStep(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	def := &Definition{
+		Name: "two_tier_approval", Version: 1,
+		Trigger: Trigger{Type: TriggerOnCreate, EntityType: "PurchaseOrder"},
+		Steps: []Step{
+			{Kind: StepRequireApproval, Params: map[string]any{
+				"role": "manager", "escalate_after_hours": 1.0, "escalate_role": "vp",
+			}},
+			{Kind: StepRequireApproval, Params: map[string]any{
+				"role": "cfo", "escalate_after_hours": 100.0, "escalate_role": "coo",
+			}},
+		},
+	}
+	q, err := NewQueue(db, nil)
+	if err != nil {
+		t.Fatalf("NewQueue: %v", err)
+	}
+	job, err := q.Enqueue(ctx, def, "PurchaseOrder", "aaaaaaaa-1111-1111-1111-111111111111", humanActor())
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	// Halt at step 0, force it overdue, escalate it.
+	if _, err := q.ProcessOne(ctx, lookupFor(def)); err != nil {
+		t.Fatalf("ProcessOne (halt at step 0): %v", err)
+	}
+	forceWaitingSince(t, db, job.ID, 2*time.Hour)
+	escalated, err := q.EscalateOverdueApprovals(ctx, time.Now(), lookupFor(def), systemActor())
+	if err != nil {
+		t.Fatalf("EscalateOverdueApprovals: %v", err)
+	}
+	if len(escalated) != 1 {
+		t.Fatalf("expected step 0's job escalated, got %v", escalated)
+	}
+
+	// Approve step 0 (the original manager, say) and resume — the durable
+	// counterpart of a human clicking Approve.
+	if err := q.ResumeAfterApproval(ctx, job.ID); err != nil {
+		t.Fatalf("ResumeAfterApproval: %v", err)
+	}
+	if _, err := q.ProcessOne(ctx, lookupFor(def)); err != nil {
+		t.Fatalf("ProcessOne (halt at step 1): %v", err)
+	}
+
+	repo := data.NewWorkflowJobRepo(db)
+	got, err := repo.Get(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status != "waiting_approval" || got.StepIndex != 1 {
+		t.Fatalf("expected the job halted at step 1 waiting_approval, got status=%q step_index=%d", got.Status, got.StepIndex)
+	}
+	if got.Escalated {
+		t.Fatal("step 1 must start fresh (Escalated=false) — escalation state must not leak across require_approval steps")
+	}
+
+	// Confirm the sweep still considers step 1 (ListWaitingApproval
+	// filters escalated=false — a leaked true would make step 1
+	// permanently invisible to future escalation too).
+	stillEscalated, err := q.EscalateOverdueApprovals(ctx, time.Now(), lookupFor(def), systemActor())
+	if err != nil {
+		t.Fatalf("EscalateOverdueApprovals (step 1, not yet overdue): %v", err)
+	}
+	if len(stillEscalated) != 0 {
+		t.Fatalf("step 1 has not been waiting anywhere near its own 100h threshold, must not escalate: got %v", stillEscalated)
+	}
+}
+
+func TestQueue_EscalateOverdueApprovals_TenantIsolation(t *testing.T) {
+	ctx := context.Background()
+	dbA := freshTenantDB(t)
+	dbB := freshTenantDB(t)
+	def := escalatingApprovalWorkflow(1)
+	qA, err := NewQueue(dbA, nil)
+	if err != nil {
+		t.Fatalf("NewQueue (tenant A): %v", err)
+	}
+	qB, err := NewQueue(dbB, nil)
+	if err != nil {
+		t.Fatalf("NewQueue (tenant B): %v", err)
+	}
+
+	jobA, err := qA.Enqueue(ctx, def, "PurchaseOrder", "66666666-6666-6666-6666-666666666666", humanActor())
+	if err != nil {
+		t.Fatalf("Enqueue (tenant A): %v", err)
+	}
+	if _, err := qA.ProcessOne(ctx, lookupFor(def)); err != nil {
+		t.Fatalf("ProcessOne (tenant A): %v", err)
+	}
+	forceWaitingSince(t, dbA, jobA.ID, 2*time.Hour)
+
+	// Tenant B's sweep must not touch tenant A's overdue job — there is
+	// no row belonging to tenant A in tenant B's database at all.
+	escalatedB, err := qB.EscalateOverdueApprovals(ctx, time.Now(), lookupFor(def), systemActor())
+	if err != nil {
+		t.Fatalf("EscalateOverdueApprovals (tenant B): %v", err)
+	}
+	if len(escalatedB) != 0 {
+		t.Fatalf("tenant B's sweep must not escalate any job, got %v", escalatedB)
+	}
+
+	repoA := data.NewWorkflowJobRepo(dbA)
+	got, err := repoA.Get(ctx, jobA.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Escalated {
+		t.Fatal("tenant A's job must not be escalated by tenant B's sweep")
+	}
+
+	// Tenant A's own sweep still works.
+	escalatedA, err := qA.EscalateOverdueApprovals(ctx, time.Now(), lookupFor(def), systemActor())
+	if err != nil {
+		t.Fatalf("EscalateOverdueApprovals (tenant A): %v", err)
+	}
+	if len(escalatedA) != 1 || escalatedA[0] != jobA.ID {
+		t.Fatalf("expected tenant A's own sweep to escalate its job, got %v", escalatedA)
+	}
+}
+
+// TestQueue_EscalateOverdueApprovals_MalformedEscalateAfterHoursNeverEscalates
+// is EscalateOverdueApprovals' sibling to TestQueue_ProcessOne_
+// MalformedApprovalRoleNeverReachesWaitingApproval: the same "defense in
+// depth, not defense in one place" case, for the escalation sweep's own
+// defensive re-check of a value workflow.Definition.Validate already
+// guarantees at publish time (a lookup can still return something
+// Validate would have refused, e.g. a corrupted/rolled-back registry
+// row).
+func TestQueue_EscalateOverdueApprovals_MalformedEscalateAfterHoursNeverEscalates(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	def := &Definition{
+		Name: "malformed_escalate_hours", Version: 1,
+		Trigger: Trigger{Type: TriggerOnCreate, EntityType: "PurchaseOrder"},
+		Steps:   []Step{{Kind: StepRequireApproval, Params: map[string]any{"role": "cfo"}}}, // valid at Enqueue time
+	}
+	q, err := NewQueue(db, nil)
+	if err != nil {
+		t.Fatalf("NewQueue: %v", err)
+	}
+	job, err := q.Enqueue(ctx, def, "PurchaseOrder", "99999999-8888-8888-8888-888888888888", humanActor())
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := q.ProcessOne(ctx, lookupFor(def)); err != nil {
+		t.Fatalf("ProcessOne (halt at approval): %v", err)
+	}
+	forceWaitingSince(t, db, job.ID, 999*time.Hour)
+
+	// Simulates a lookup returning a definition whose escalate_after_hours
+	// is malformed (e.g. written out-of-band, bypassing Enqueue's check) —
+	// same premise as TestQueue_ProcessOne_
+	// MalformedApprovalRoleNeverReachesWaitingApproval.
+	malformedLookup := func(ctx context.Context, name string, version int) (*Definition, error) {
+		return &Definition{
+			Name: name, Version: version, Trigger: Trigger{Type: TriggerOnCreate, EntityType: "PurchaseOrder"},
+			Steps: []Step{{Kind: StepRequireApproval, Params: map[string]any{
+				"role": "cfo", "escalate_after_hours": "not-a-number", "escalate_role": "vp",
+			}}},
+		}, nil
+	}
+
+	escalated, err := q.EscalateOverdueApprovals(ctx, time.Now(), malformedLookup, systemActor())
+	if err != nil {
+		t.Fatalf("EscalateOverdueApprovals must tolerate a malformed escalate_after_hours, not error: %v", err)
+	}
+	if len(escalated) != 0 {
+		t.Fatalf("a malformed escalate_after_hours must never escalate, however long the job waits: got %v", escalated)
+	}
+}
+
+// TestQueue_EscalateOverdueApprovals_OverflowingEscalateAfterHoursNeverEscalatesImmediately
+// is the sweep-level regression test for the same overflow bug
+// TestDefinitionValidate_EscalateAfterHoursMustBePositiveNumber's "huge"
+// case guards at the Validate layer — defense in depth, since a lookup
+// can still return something Validate would have refused (the same
+// premise TestQueue_EscalateOverdueApprovals_
+// MalformedEscalateAfterHoursNeverEscalates already established for a
+// non-numeric value).
+func TestQueue_EscalateOverdueApprovals_OverflowingEscalateAfterHoursNeverEscalatesImmediately(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	def := &Definition{
+		Name: "overflowing_escalate_hours", Version: 1,
+		Trigger: Trigger{Type: TriggerOnCreate, EntityType: "PurchaseOrder"},
+		Steps:   []Step{{Kind: StepRequireApproval, Params: map[string]any{"role": "cfo"}}}, // valid at Enqueue time
+	}
+	q, err := NewQueue(db, nil)
+	if err != nil {
+		t.Fatalf("NewQueue: %v", err)
+	}
+	if _, err := q.Enqueue(ctx, def, "PurchaseOrder", "77777777-6666-6666-6666-666666666666", humanActor()); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := q.ProcessOne(ctx, lookupFor(def)); err != nil {
+		t.Fatalf("ProcessOne (halt at approval): %v", err)
+	}
+	// A job that JUST entered waiting_approval — if the overflow bug were
+	// present, it would escalate immediately regardless of how little
+	// time has actually elapsed.
+
+	overflowLookup := func(ctx context.Context, name string, version int) (*Definition, error) {
+		return &Definition{
+			Name: name, Version: version, Trigger: Trigger{Type: TriggerOnCreate, EntityType: "PurchaseOrder"},
+			Steps: []Step{{Kind: StepRequireApproval, Params: map[string]any{
+				"role": "cfo", "escalate_after_hours": 1e9, "escalate_role": "vp",
+			}}},
+		}, nil
+	}
+
+	escalated, err := q.EscalateOverdueApprovals(ctx, time.Now(), overflowLookup, systemActor())
+	if err != nil {
+		t.Fatalf("EscalateOverdueApprovals must tolerate an overflowing escalate_after_hours, not error: %v", err)
+	}
+	if len(escalated) != 0 {
+		t.Fatalf("an overflowing escalate_after_hours must never escalate immediately: got %v", escalated)
+	}
+}
+
+func TestQueue_EscalateOverdueApprovals_SkipsUnresolvableJobWithoutAbortingSweep(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	badDef := &Definition{
+		Name: "will_be_unresolvable", Version: 1,
+		Trigger: Trigger{Type: TriggerOnCreate, EntityType: "PurchaseOrder"},
+		Steps: []Step{
+			{Kind: StepRequireApproval, Params: map[string]any{
+				"role": "cfo", "escalate_after_hours": 1.0, "escalate_role": "vp",
+			}},
+		},
+	}
+	goodDef := escalatingApprovalWorkflow(1)
+	q, err := NewQueue(db, nil)
+	if err != nil {
+		t.Fatalf("NewQueue: %v", err)
+	}
+
+	badJob, err := q.Enqueue(ctx, badDef, "PurchaseOrder", "77777777-7777-7777-7777-777777777777", humanActor())
+	if err != nil {
+		t.Fatalf("Enqueue (bad): %v", err)
+	}
+	if _, err := q.ProcessOne(ctx, lookupFor(badDef)); err != nil {
+		t.Fatalf("ProcessOne (bad): %v", err)
+	}
+	forceWaitingSince(t, db, badJob.ID, 2*time.Hour)
+
+	goodJob, err := q.Enqueue(ctx, goodDef, "PurchaseOrder", "88888888-8888-8888-8888-888888888888", humanActor())
+	if err != nil {
+		t.Fatalf("Enqueue (good): %v", err)
+	}
+	if _, err := q.ProcessOne(ctx, lookupFor(goodDef)); err != nil {
+		t.Fatalf("ProcessOne (good): %v", err)
+	}
+	forceWaitingSince(t, db, goodJob.ID, 2*time.Hour)
+
+	// A lookup that only resolves the good definition — simulating
+	// badDef's own definition having since been deleted/corrupted in the
+	// registry, exactly the "dangling workflow_name+version" case the
+	// method's doc comment describes.
+	partialLookup := lookupFor(goodDef)
+
+	escalated, err := q.EscalateOverdueApprovals(ctx, time.Now(), partialLookup, systemActor())
+	if err != nil {
+		t.Fatalf("EscalateOverdueApprovals must tolerate one bad job, not abort the sweep: %v", err)
+	}
+	if len(escalated) != 1 || escalated[0] != goodJob.ID {
+		t.Fatalf("expected only the resolvable job escalated, got %v", escalated)
+	}
+
+	repo := data.NewWorkflowJobRepo(db)
+	badGot, err := repo.Get(ctx, badJob.ID)
+	if err != nil {
+		t.Fatalf("Get (bad): %v", err)
+	}
+	if badGot.Escalated {
+		t.Fatal("the unresolvable job must not have been escalated")
+	}
+}
+
 func TestQueue_ProcessOne_PanicInHandlerIsRecoveredAndRetried(t *testing.T) {
 	db := freshTenantDB(t)
 	ctx := context.Background()

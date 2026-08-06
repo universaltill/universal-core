@@ -199,11 +199,7 @@ var errApprovalRoleDenied = errors.New("caller does not hold the role required t
 // eligible row per view rather than once per real approval (independent
 // review caught the first draft doing exactly that).
 func requireApprovalRole(ctx context.Context, ts tenantScope, job data.WorkflowJob, userID string) error {
-	req, err := approvalRoleFor(ctx, ts, job, nil)
-	if err != nil {
-		return err
-	}
-	ok, viaDelegator, err := userMeetsApproval(ctx, ts, job, req, userID, newApprovalMemo())
+	req, ok, viaDelegator, err := userMayApprove(ctx, ts, job, nil, userID, newApprovalMemo())
 	if err != nil {
 		return err
 	}
@@ -402,6 +398,64 @@ func recordDepartmentID(ctx context.Context, ts tenantScope, job data.WorkflowJo
 // definitions, so without it the page is an N+1 of identical registry
 // reads; approveWorkflowJob handles exactly one job and passes nil.
 func approvalRoleFor(ctx context.Context, ts tenantScope, job data.WorkflowJob, defCache map[string]*cachedWorkflowDef) (approvalRequirement, error) {
+	step, err := requireApprovalStepFor(ctx, ts, job, defCache)
+	if err != nil {
+		return approvalRequirement{}, err
+	}
+	raw, present := step.Params["role"]
+	if !present {
+		return approvalRequirement{}, nil
+	}
+	// workflow.Definition.Validate (run by Unmarshal above) already
+	// rejects a non-string/empty "role" param at publish time, so this
+	// can't actually be false for a definition that made it this far —
+	// checked explicitly anyway rather than discarding it (a silently
+	// ignored malformed value here would mean "no restriction", which is
+	// exactly the fail-open bug this whole check exists to prevent).
+	requiredRole, ok := raw.(string)
+	if !ok || requiredRole == "" {
+		return approvalRequirement{}, fmt.Errorf("workflow job %s: step %d's role param is %#v, not a valid Role code", job.ID, job.StepIndex, raw)
+	}
+	// department is optional and already validated at publish time; a
+	// blank/absent one leaves DepartmentField "" = tenant-wide check.
+	deptField, _ := step.Params["department"].(string)
+	return approvalRequirement{Role: requiredRole, DepartmentField: deptField}, nil
+}
+
+// escalationRoleFor is approvalRoleFor's counterpart for the escalate_role/
+// escalate_department pair a require_approval step may name (uc-infra#64).
+// An empty approvalRequirement{} (never an error) means the step set no
+// escalate_role — there is nothing to widen eligibility with, which is a
+// perfectly ordinary step shape, not a data problem. Shares defCache with
+// approvalRoleFor: both resolve the exact same Definition/step for the
+// same job, so callers that already have a warm cache from one get it for
+// the other for free.
+func escalationRoleFor(ctx context.Context, ts tenantScope, job data.WorkflowJob, defCache map[string]*cachedWorkflowDef) (approvalRequirement, error) {
+	step, err := requireApprovalStepFor(ctx, ts, job, defCache)
+	if err != nil {
+		return approvalRequirement{}, err
+	}
+	raw, present := step.Params["escalate_role"]
+	if !present {
+		return approvalRequirement{}, nil
+	}
+	// Same publish-time-guaranteed shape as approvalRoleFor's role check —
+	// see workflow.Definition.Validate's escalate_role validation.
+	requiredRole, ok := raw.(string)
+	if !ok || requiredRole == "" {
+		return approvalRequirement{}, fmt.Errorf("workflow job %s: step %d's escalate_role param is %#v, not a valid Role code", job.ID, job.StepIndex, raw)
+	}
+	deptField, _ := step.Params["escalate_department"].(string)
+	return approvalRequirement{Role: requiredRole, DepartmentField: deptField}, nil
+}
+
+// requireApprovalStepFor resolves the workflow.Step a job is currently
+// halted at, validating it's actually a require_approval step — the
+// shared definition-lookup/cache/bounds-check core approvalRoleFor and
+// escalationRoleFor both need, factored out so the two param pairs they
+// read (role/department vs. escalate_role/escalate_department) don't
+// duplicate the lookup itself.
+func requireApprovalStepFor(ctx context.Context, ts tenantScope, job data.WorkflowJob, defCache map[string]*cachedWorkflowDef) (workflow.Step, error) {
 	cacheKey := fmt.Sprintf("%s@%d", job.WorkflowName, job.WorkflowVersion)
 	var def *workflow.Definition
 	entry, cached := (*cachedWorkflowDef)(nil), false
@@ -410,7 +464,7 @@ func approvalRoleFor(ctx context.Context, ts tenantScope, job data.WorkflowJob, 
 	}
 	if cached {
 		if entry.err != nil {
-			return approvalRequirement{}, entry.err
+			return workflow.Step{}, entry.err
 		}
 		def = entry.def
 	} else {
@@ -434,35 +488,71 @@ func approvalRoleFor(ctx context.Context, ts tenantScope, job data.WorkflowJob, 
 			defCache[cacheKey] = &cachedWorkflowDef{def: resolved, err: err}
 		}
 		if err != nil {
-			return approvalRequirement{}, err
+			return workflow.Step{}, err
 		}
 		def = resolved
 	}
 	if job.StepIndex < 0 || job.StepIndex >= len(def.Steps) {
-		return approvalRequirement{}, fmt.Errorf("workflow job %s: step index %d out of range for %s v%d (%d steps)", job.ID, job.StepIndex, job.WorkflowName, job.WorkflowVersion, len(def.Steps))
+		return workflow.Step{}, fmt.Errorf("workflow job %s: step index %d out of range for %s v%d (%d steps)", job.ID, job.StepIndex, job.WorkflowName, job.WorkflowVersion, len(def.Steps))
 	}
 	step := def.Steps[job.StepIndex]
 	if step.Kind != workflow.StepRequireApproval {
-		return approvalRequirement{}, fmt.Errorf("workflow job %s: step %d is a %q step, not require_approval — nothing should have halted it waiting for approval", job.ID, job.StepIndex, step.Kind)
+		return workflow.Step{}, fmt.Errorf("workflow job %s: step %d is a %q step, not require_approval — nothing should have halted it waiting for approval", job.ID, job.StepIndex, step.Kind)
 	}
-	raw, present := step.Params["role"]
-	if !present {
-		return approvalRequirement{}, nil
+	return step, nil
+}
+
+// userMayApprove is the ONE place that decides whether userID may approve
+// job, combining the primary role/department requirement with the
+// escalation one once a job has escalated (uc-infra#64) — used by the
+// enforcement gate, the HTML inbox, and the JSON API so none of the three
+// can disagree. Escalation is additive, never a replacement: a user who
+// meets the ORIGINAL requirement may always still approve, even after
+// escalation widened who else may too — see workflow.go's Validate and
+// this package's own escalationRoleFor for why (nothing about escalating
+// a job revokes the original approver's standing).
+//
+// req is the primary approvalRequirement (still returned so callers that
+// display "what role is required" — the JSON list endpoint — keep doing
+// so unchanged; escalation eligibility is not surfaced there, matching
+// this task's "no UI changes beyond eligibility" scope).
+func userMayApprove(ctx context.Context, ts tenantScope, job data.WorkflowJob, defCache map[string]*cachedWorkflowDef, userID string, memo *approvalMemo) (req approvalRequirement, meets bool, viaDelegator string, err error) {
+	req, err = approvalRoleFor(ctx, ts, job, defCache)
+	if err != nil {
+		return approvalRequirement{}, false, "", err
 	}
-	// workflow.Definition.Validate (run by Unmarshal above) already
-	// rejects a non-string/empty "role" param at publish time, so this
-	// can't actually be false for a definition that made it this far —
-	// checked explicitly anyway rather than discarding it (a silently
-	// ignored malformed value here would mean "no restriction", which is
-	// exactly the fail-open bug this whole check exists to prevent).
-	requiredRole, ok := raw.(string)
-	if !ok || requiredRole == "" {
-		return approvalRequirement{}, fmt.Errorf("workflow job %s: step %d's role param is %#v, not a valid Role code", job.ID, job.StepIndex, raw)
+	meets, viaDelegator, err = userMeetsApproval(ctx, ts, job, req, userID, memo)
+	if err != nil {
+		return req, false, "", err
 	}
-	// department is optional and already validated at publish time; a
-	// blank/absent one leaves DepartmentField "" = tenant-wide check.
-	deptField, _ := step.Params["department"].(string)
-	return approvalRequirement{Role: requiredRole, DepartmentField: deptField}, nil
+	if meets || !job.Escalated {
+		return req, meets, viaDelegator, nil
+	}
+	escalationReq, err := escalationRoleFor(ctx, ts, job, defCache)
+	if err != nil {
+		return req, false, "", err
+	}
+	if escalationReq.Role == "" {
+		// Defensive: a job can only be marked Escalated by
+		// Queue.EscalateOverdueApprovals, which only ever does so for a
+		// step that set escalate_role (workflow.Validate requires one
+		// alongside escalate_after_hours). An empty Role here would mean
+		// the Definition drifted since escalation — userMeetsApproval
+		// treats Role == "" as "anyone may approve", which would be a
+		// fail-open bug if reached with an escalation requirement, so
+		// this never falls through to that call.
+		return req, false, "", nil
+	}
+	meets, viaDelegator, err = userMeetsApproval(ctx, ts, job, escalationReq, userID, memo)
+	if err != nil {
+		// Explicit rather than returning the (already-false-on-every-
+		// error-path-today) meets/viaDelegator as-is — that relied on an
+		// invariant of userMeetsApproval's own error handling instead of
+		// this function's own contract, the fragile shape an independent
+		// review flagged.
+		return req, false, "", err
+	}
+	return req, meets, viaDelegator, nil
 }
 
 // workflowJobResponse is the JSON shape for one row of listWorkflowJobs —
@@ -590,7 +680,7 @@ func (h *Handler) listWorkflowJobs(w http.ResponseWriter, r *http.Request) {
 		}
 		// Same function the approve endpoint and the HTML inbox use, so all
 		// three surfaces cannot disagree about what a step requires.
-		req, err := approvalRoleFor(r.Context(), ts, j, defCache)
+		req, ok, _, err := userMayApprove(r.Context(), ts, j, defCache, rc.Actor.ID, memo)
 		if err != nil {
 			// A job whose definition or step index will not resolve is a data
 			// problem, not this caller's fault. Report the job with BOTH
@@ -598,11 +688,6 @@ func (h *Handler) listWorkflowJobs(w http.ResponseWriter, r *http.Request) {
 			// wire's "no verdict", distinct from an explicit false, so a
 			// client is never told it may act when the server could not
 			// decide — nor told it may not, which would be equally untrue.
-			log.Printf("api: list workflow jobs: resolve required role for job %s: %v", j.ID, err)
-			continue
-		}
-		ok, _, err := userMeetsApproval(r.Context(), ts, j, req, rc.Actor.ID, memo)
-		if err != nil {
 			log.Printf("api: list workflow jobs: resolve approvability for job %s: %v", j.ID, err)
 			continue
 		}
@@ -675,11 +760,7 @@ func (h *Handler) renderWorkflowInbox(w http.ResponseWriter, r *http.Request) {
 		// Resolved through the SAME function approveWorkflowJob's own gate
 		// uses, so what the inbox offers and what the API will accept
 		// cannot disagree.
-		req, err := approvalRoleFor(r.Context(), ts, j, defCache)
-		var meets bool
-		if err == nil {
-			meets, _, err = userMeetsApproval(r.Context(), ts, j, req, rc.Actor.ID, memo)
-		}
+		req, meets, _, err := userMayApprove(r.Context(), ts, j, defCache, rc.Actor.ID, memo)
 		switch {
 		case err != nil:
 			// A job whose definition/step/record can't be resolved is a
