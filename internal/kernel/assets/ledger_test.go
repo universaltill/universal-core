@@ -1,0 +1,762 @@
+package assets
+
+import (
+	"context"
+	"database/sql"
+	"strings"
+	"testing"
+
+	"github.com/universaltill/universal-core/internal/data"
+	"github.com/universaltill/universal-core/internal/kernel/audit"
+	"github.com/universaltill/universal-core/internal/kernel/crud"
+	"github.com/universaltill/universal-core/internal/kernel/finance"
+	"github.com/universaltill/universal-core/internal/kernel/foundation"
+)
+
+// depreciationFixture is a tenant with Assets + Finance published, one
+// USD Currency, three GL accounts already synced (so ledger.PostTx can
+// resolve them), and every fixed_asset_status id resolved by code —
+// everything PostDueDepreciation's tests need to build a FixedAsset and
+// its DepreciationSchedule rows directly, the same way
+// TestFixedAsset_UsableEndToEnd (seed_test.go) already does for Publish
+// itself.
+type depreciationFixture struct {
+	tenantDB   *sql.DB
+	engine     *crud.Engine
+	currencyID string
+	assetAcct  string // asset_account_id — "1600"
+	expAcct    string // depreciation_expense_account_id — "6100"
+	accumAcct  string // accumulated_depreciation_account_id — "1601"
+	statusID   map[string]string
+}
+
+func setUpDepreciationFixture(t *testing.T) depreciationFixture {
+	t.Helper()
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	for _, step := range []struct {
+		name string
+		fn   func(context.Context, *sql.DB, audit.Actor) error
+	}{
+		{"foundation", foundation.Publish},
+		{"finance", finance.Publish},
+		{"assets", Publish},
+		{"assets forms", PublishForms},
+		{"assets statuses", PublishStatuses},
+	} {
+		if err := step.fn(ctx, tenantDB, actor); err != nil {
+			t.Fatalf("publish %s: %v", step.name, err)
+		}
+	}
+
+	engine := crud.NewEngine(tenantDB)
+
+	currency, err := engine.Create(ctx, publishedDef(t, tenantDB, "Currency"), map[string]any{
+		"code": "USD", "name": "US Dollar", "minor_unit": float64(2),
+	}, actor)
+	if err != nil {
+		t.Fatalf("create Currency: %v", err)
+	}
+
+	accountDef := publishedDef(t, tenantDB, "Account")
+	mustAccount := func(code, name, accountType string) string {
+		t.Helper()
+		rec, err := engine.Create(ctx, accountDef, map[string]any{
+			"code": code, "name": name, "type": accountType,
+			"currency_id": currency.ID, "is_active": true,
+		}, actor)
+		if err != nil {
+			t.Fatalf("create Account %s: %v", code, err)
+		}
+		return rec.ID
+	}
+	assetAcctID := mustAccount("1600", "Vehicles", "asset")
+	expAcctID := mustAccount("6100", "Depreciation Expense", "expense")
+	accumAcctID := mustAccount("1601", "Accumulated Depreciation - Vehicles", "asset")
+
+	if err := finance.SyncGLAccounts(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("SyncGLAccounts: %v", err)
+	}
+
+	statusTypes, err := engine.ListByField(ctx, publishedDef(t, tenantDB, "StatusType"), "code", "fixed_asset_status")
+	if err != nil || len(statusTypes) != 1 {
+		t.Fatalf("fixed_asset_status StatusType: err=%v n=%d", err, len(statusTypes))
+	}
+	statuses, err := engine.ListByField(ctx, publishedDef(t, tenantDB, "Status"), "status_type_id", statusTypes[0].ID)
+	if err != nil {
+		t.Fatalf("list Status: %v", err)
+	}
+	statusID := map[string]string{}
+	for _, s := range statuses {
+		if code, _ := s.Data["code"].(string); code != "" {
+			statusID[code] = s.ID
+		}
+	}
+	for _, code := range []string{"draft", "in_service", "disposed", "written_off", "fully_depreciated"} {
+		if statusID[code] == "" {
+			t.Fatalf("missing fixed_asset_status %q", code)
+		}
+	}
+
+	return depreciationFixture{
+		tenantDB: tenantDB, engine: engine, currencyID: currency.ID,
+		assetAcct: assetAcctID, expAcct: expAcctID, accumAcct: accumAcctID,
+		statusID: statusID,
+	}
+}
+
+// createAsset creates a FixedAsset with every account reference wired
+// (fx.assetAcct/expAcct/accumAcct) unless withMissingAccounts is true,
+// in which case depreciation_expense_account_id is left empty — the
+// "misconfigured asset" case PostDueDepreciation must skip, not fail on.
+// useful_life_months is always 3 — tests that need a schedule
+// deliberately entered for FEWER than the asset's full life (the
+// partial-schedule / "not actually finished" cases) create fewer than 3
+// DepreciationSchedule rows against this same 3-month life, rather than
+// varying the life itself.
+func (fx depreciationFixture) createAsset(t *testing.T, statusCode string, withMissingAccounts bool) string {
+	t.Helper()
+	return fx.createAssetNumbered(t, "FA-"+statusCode, statusCode, withMissingAccounts)
+}
+
+// createAssetNumbered is createAsset with an explicit asset_number, for
+// tests that create more than one asset in the same status (createAsset
+// alone would give them all the identical "FA-<statusCode>" number).
+func (fx depreciationFixture) createAssetNumbered(t *testing.T, assetNumber, statusCode string, withMissingAccounts bool) string {
+	t.Helper()
+	fields := map[string]any{
+		"asset_number": assetNumber, "name": map[string]any{"en": "Test Asset"},
+		"acquisition_date": "2020-01-01", "cost": 3000.0, "salvage_value": 0.0,
+		"useful_life_months": 3.0, "depreciation_method": "straight_line",
+		"currency_id":                         fx.currencyID,
+		"asset_account_id":                    fx.assetAcct,
+		"depreciation_expense_account_id":     fx.expAcct,
+		"accumulated_depreciation_account_id": fx.accumAcct,
+		"status_id":                           fx.statusID[statusCode],
+	}
+	if withMissingAccounts {
+		delete(fields, "depreciation_expense_account_id")
+	}
+	rec, err := fx.engine.Create(context.Background(), publishedDef(t, fx.tenantDB, "FixedAsset"), fields, humanActor())
+	if err != nil {
+		t.Fatalf("create FixedAsset: %v", err)
+	}
+	return rec.ID
+}
+
+// auditCount returns how many audit_log rows exist for entityType/id
+// matching action and actorType — same raw-query pattern
+// internal/kernel/ledger/ledger_test.go and
+// internal/kernel/purchasing/ledger_test.go already use to assert audit
+// rows directly rather than trust that a write "must have" produced one.
+func (fx depreciationFixture) auditCount(t *testing.T, entityType, id, action, actorType string) int {
+	t.Helper()
+	var n int
+	if err := fx.tenantDB.QueryRow(
+		`SELECT count(*) FROM audit_log WHERE entity_type = $1 AND record_id = $2 AND action = $3 AND actor_type = $4`,
+		entityType, id, action, actorType,
+	).Scan(&n); err != nil {
+		t.Fatalf("count audit_log for %s %s: %v", entityType, id, err)
+	}
+	return n
+}
+
+// createScheduleRow creates one DepreciationSchedule row directly (not
+// through depreciation.Build — these tests exercise PostDueDepreciation's
+// own branching, not the schedule arithmetic, which depreciation_test.go
+// already covers exhaustively). amount/bookValue are plain currency
+// units (2dp), matching how every other FieldNumber money value in this
+// kernel is stored.
+func (fx depreciationFixture) createScheduleRow(t *testing.T, assetID string, sequence int, periodEnd string, amount, bookValue float64) string {
+	t.Helper()
+	rec, err := fx.engine.Create(context.Background(), publishedDef(t, fx.tenantDB, "DepreciationSchedule"), map[string]any{
+		"fixed_asset_id": assetID, "sequence": float64(sequence),
+		"period_end": periodEnd, "depreciation_amount": amount, "book_value": bookValue,
+	}, humanActor())
+	if err != nil {
+		t.Fatalf("create DepreciationSchedule row %d: %v", sequence, err)
+	}
+	return rec.ID
+}
+
+func (fx depreciationFixture) statusCode(t *testing.T, entityType, id string) string {
+	t.Helper()
+	rec, err := fx.engine.Get(context.Background(), publishedDef(t, fx.tenantDB, entityType), id)
+	if err != nil {
+		t.Fatalf("Get %s %s: %v", entityType, id, err)
+	}
+	statusID, _ := rec.Data["status_id"].(string)
+	if statusID == "" {
+		t.Fatalf("%s %s has no status_id", entityType, id)
+	}
+	status, err := fx.engine.Get(context.Background(), publishedDef(t, fx.tenantDB, "Status"), statusID)
+	if err != nil {
+		t.Fatalf("Get Status %s: %v", statusID, err)
+	}
+	code, _ := status.Data["code"].(string)
+	return code
+}
+
+func TestPostDueDepreciation_PostsDueRowsAndLeavesFutureRowsUntouched(t *testing.T) {
+	fx := setUpDepreciationFixture(t)
+	ctx := context.Background()
+	assetID := fx.createAsset(t, "in_service", false)
+	dueID := fx.createScheduleRow(t, assetID, 1, "2020-01-31", 1000.00, 2000.00)
+	futureID := fx.createScheduleRow(t, assetID, 2, "2099-02-29", 1000.00, 1000.00)
+
+	posted, err := PostDueDepreciation(ctx, fx.tenantDB, SchedulerActor())
+	if err != nil {
+		t.Fatalf("PostDueDepreciation: %v", err)
+	}
+	if posted != 1 {
+		t.Fatalf("posted = %d, want 1", posted)
+	}
+
+	entries := data.NewJournalEntryRepo(fx.tenantDB)
+	list, err := entries.List(ctx)
+	if err != nil {
+		t.Fatalf("List journal entries: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected exactly 1 journal entry, got %d", len(list))
+	}
+	entry := list[0]
+	if entry.SourceType != "DepreciationSchedule" || entry.SourceID != dueID {
+		t.Fatalf("unexpected source: type=%s id=%s", entry.SourceType, entry.SourceID)
+	}
+	byCode := map[string]data.JournalLine{}
+	for _, l := range entry.Lines {
+		byCode[l.AccountCode] = l
+	}
+	wantMinor := int64(1000 * 100)
+	if exp := byCode["6100"]; exp.DebitMinor != wantMinor {
+		t.Errorf("expected expense (6100) debit %d, got %+v", wantMinor, exp)
+	}
+	if accum := byCode["1601"]; accum.CreditMinor != wantMinor {
+		t.Errorf("expected accumulated depreciation (1601) credit %d, got %+v", wantMinor, accum)
+	}
+
+	dueRow, err := fx.engine.Get(ctx, publishedDef(t, fx.tenantDB, "DepreciationSchedule"), dueID)
+	if err != nil {
+		t.Fatalf("Get due row: %v", err)
+	}
+	if postedAt, _ := dueRow.Data["posted_at"].(string); postedAt != "2020-01-31" {
+		t.Errorf("due row posted_at = %q, want 2020-01-31", postedAt)
+	}
+	futureRow, err := fx.engine.Get(ctx, publishedDef(t, fx.tenantDB, "DepreciationSchedule"), futureID)
+	if err != nil {
+		t.Fatalf("Get future row: %v", err)
+	}
+	if postedAt, _ := futureRow.Data["posted_at"].(string); postedAt != "" {
+		t.Errorf("future row posted_at = %q, want empty (not due yet)", postedAt)
+	}
+
+	// Schedule not exhausted (one row still unposted) — asset must stay
+	// in_service.
+	if code := fx.statusCode(t, "FixedAsset", assetID); code != "in_service" {
+		t.Errorf("asset status = %q, want in_service (schedule not exhausted)", code)
+	}
+}
+
+func TestPostDueDepreciation_Idempotent_RerunDoesNotDoublePost(t *testing.T) {
+	fx := setUpDepreciationFixture(t)
+	ctx := context.Background()
+	assetID := fx.createAsset(t, "in_service", false)
+	fx.createScheduleRow(t, assetID, 1, "2020-01-31", 1000.00, 2000.00)
+
+	if _, err := PostDueDepreciation(ctx, fx.tenantDB, SchedulerActor()); err != nil {
+		t.Fatalf("first PostDueDepreciation: %v", err)
+	}
+	posted, err := PostDueDepreciation(ctx, fx.tenantDB, SchedulerActor())
+	if err != nil {
+		t.Fatalf("second PostDueDepreciation: %v", err)
+	}
+	if posted != 0 {
+		t.Errorf("second run posted = %d, want 0 (already posted)", posted)
+	}
+
+	entries := data.NewJournalEntryRepo(fx.tenantDB)
+	list, err := entries.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected exactly 1 journal entry after two runs, got %d", len(list))
+	}
+}
+
+func TestPostDueDepreciation_SkipsAssetNotInService(t *testing.T) {
+	fx := setUpDepreciationFixture(t)
+	ctx := context.Background()
+	for _, statusCode := range []string{"draft", "disposed", "written_off"} {
+		assetID := fx.createAsset(t, statusCode, false)
+		fx.createScheduleRow(t, assetID, 1, "2020-01-31", 1000.00, 2000.00)
+
+		posted, err := PostDueDepreciation(ctx, fx.tenantDB, SchedulerActor())
+		if err != nil {
+			t.Fatalf("PostDueDepreciation (asset status %s): %v", statusCode, err)
+		}
+		if posted != 0 {
+			t.Errorf("asset in status %q: posted = %d, want 0", statusCode, posted)
+		}
+	}
+	entries := data.NewJournalEntryRepo(fx.tenantDB)
+	list, err := entries.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(list) != 0 {
+		t.Fatalf("expected no journal entries for non-in_service assets, got %d", len(list))
+	}
+}
+
+// TestPostDueDepreciation_MissingAccountRefs_SkipsThatAssetOnly is the
+// per-asset failure-isolation guarantee: one misconfigured asset must
+// not prevent every OTHER asset's due depreciation from posting in the
+// same run.
+func TestPostDueDepreciation_MissingAccountRefs_SkipsThatAssetOnly(t *testing.T) {
+	fx := setUpDepreciationFixture(t)
+	ctx := context.Background()
+
+	badAssetID := fx.createAssetNumbered(t, "FA-bad", "in_service", true)
+	fx.createScheduleRow(t, badAssetID, 1, "2020-01-31", 1000.00, 2000.00)
+
+	goodAssetID := fx.createAssetNumbered(t, "FA-good", "in_service", false)
+	goodRowID := fx.createScheduleRow(t, goodAssetID, 1, "2020-01-31", 500.00, 1000.00)
+
+	posted, err := PostDueDepreciation(ctx, fx.tenantDB, SchedulerActor())
+	if err != nil {
+		t.Fatalf("PostDueDepreciation: %v", err)
+	}
+	if posted != 1 {
+		t.Fatalf("posted = %d, want 1 (only the well-configured asset)", posted)
+	}
+
+	entries := data.NewJournalEntryRepo(fx.tenantDB)
+	list, err := entries.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(list) != 1 || list[0].SourceID != goodRowID {
+		t.Fatalf("expected exactly 1 journal entry for the good asset's row, got %+v", list)
+	}
+
+	badRow, err := fx.engine.Get(ctx, publishedDef(t, fx.tenantDB, "DepreciationSchedule"),
+		func() string {
+			rows, err := fx.engine.ListByField(ctx, publishedDef(t, fx.tenantDB, "DepreciationSchedule"), "fixed_asset_id", badAssetID)
+			if err != nil || len(rows) != 1 {
+				t.Fatalf("list bad asset's schedule rows: err=%v n=%d", err, len(rows))
+			}
+			return rows[0].ID
+		}(),
+	)
+	if err != nil {
+		t.Fatalf("Get bad asset's row: %v", err)
+	}
+	if postedAt, _ := badRow.Data["posted_at"].(string); postedAt != "" {
+		t.Errorf("bad asset's row posted_at = %q, want empty (never posted)", postedAt)
+	}
+}
+
+// TestPostDueDepreciation_LastRowPosted_TransitionsToFullyDepreciated is
+// the schedule-exhaustion case: once every schedule row an asset has is
+// posted, the asset itself must advance out of in_service so it stops
+// reading as "still depreciating."
+func TestPostDueDepreciation_LastRowPosted_TransitionsToFullyDepreciated(t *testing.T) {
+	fx := setUpDepreciationFixture(t)
+	ctx := context.Background()
+	assetID := fx.createAsset(t, "in_service", false)
+	fx.createScheduleRow(t, assetID, 1, "2020-01-31", 1000.00, 2000.00)
+	fx.createScheduleRow(t, assetID, 2, "2020-02-29", 1000.00, 1000.00)
+	fx.createScheduleRow(t, assetID, 3, "2020-03-31", 1000.00, 0.00)
+
+	posted, err := PostDueDepreciation(ctx, fx.tenantDB, SchedulerActor())
+	if err != nil {
+		t.Fatalf("PostDueDepreciation: %v", err)
+	}
+	if posted != 3 {
+		t.Fatalf("posted = %d, want 3", posted)
+	}
+
+	entries := data.NewJournalEntryRepo(fx.tenantDB)
+	list, err := entries.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(list) != 3 {
+		t.Fatalf("expected 3 journal entries, got %d", len(list))
+	}
+
+	if code := fx.statusCode(t, "FixedAsset", assetID); code != "fully_depreciated" {
+		t.Errorf("asset status = %q, want fully_depreciated once every row is posted", code)
+	}
+
+	// Rerun must be a true no-op: nothing left due, nothing left to
+	// transition (already fully_depreciated, so even a due row appearing
+	// later — e.g. a data fix — would correctly be skipped as
+	// not-in_service rather than silently reactivating the asset).
+	posted, err = PostDueDepreciation(ctx, fx.tenantDB, SchedulerActor())
+	if err != nil {
+		t.Fatalf("rerun PostDueDepreciation: %v", err)
+	}
+	if posted != 0 {
+		t.Errorf("rerun posted = %d, want 0", posted)
+	}
+}
+
+// TestPostDueDepreciation_NoSchedules_ReturnsZeroNoError is the
+// unlicensed-tenant path: a tenant that never published Assets (or one
+// that did but has no schedules yet) must not error — records.List
+// returning an empty slice for an entity type nothing ever wrote is the
+// ordinary case, not a fault.
+func TestPostDueDepreciation_NoSchedules_ReturnsZeroNoError(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	if err := foundation.Publish(ctx, tenantDB, humanActor()); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	// Deliberately NOT publishing assets — the "module not licensed"
+	// case.
+	posted, err := PostDueDepreciation(ctx, tenantDB, SchedulerActor())
+	if err != nil {
+		t.Fatalf("PostDueDepreciation on a tenant without Assets published: %v", err)
+	}
+	if posted != 0 {
+		t.Errorf("posted = %d, want 0", posted)
+	}
+}
+
+// TestPostDueDepreciation_ZeroAmountRow_MarksPostedWithoutAJournalEntry
+// guards the defensive zero-amount branch the same way
+// PostCustomerInvoiceToLedger's own zero-total test guards its — even
+// though depreciation.Build's own invariants mean a real schedule should
+// never produce one.
+func TestPostDueDepreciation_ZeroAmountRow_MarksPostedWithoutAJournalEntry(t *testing.T) {
+	fx := setUpDepreciationFixture(t)
+	ctx := context.Background()
+	assetID := fx.createAsset(t, "in_service", false)
+	zeroID := fx.createScheduleRow(t, assetID, 1, "2020-01-31", 0.00, 3000.00)
+
+	posted, err := PostDueDepreciation(ctx, fx.tenantDB, SchedulerActor())
+	if err != nil {
+		t.Fatalf("PostDueDepreciation: %v", err)
+	}
+	if posted != 1 {
+		t.Fatalf("posted = %d, want 1 (marked posted even though nothing was journaled)", posted)
+	}
+	entries := data.NewJournalEntryRepo(fx.tenantDB)
+	list, err := entries.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(list) != 0 {
+		t.Fatalf("expected no journal entry for a zero-amount row, got %d", len(list))
+	}
+	row, err := fx.engine.Get(ctx, publishedDef(t, fx.tenantDB, "DepreciationSchedule"), zeroID)
+	if err != nil {
+		t.Fatalf("Get row: %v", err)
+	}
+	if postedAt, _ := row.Data["posted_at"].(string); postedAt != "2020-01-31" {
+		t.Errorf("posted_at = %q, want 2020-01-31 (still marked posted)", postedAt)
+	}
+}
+
+// TestPostDueDepreciation_PartialSchedule_DoesNotTransitionUntilUsefulLifeIsFullyPosted
+// is the direct regression test for independent review's finding: a
+// FixedAsset with useful_life_months=3 but only ONE DepreciationSchedule
+// row actually entered so far — exactly cmd/seed-demo-data's own
+// deliberate pattern (it seeds only the first 12 of a 60-period
+// schedule "to avoid burying the rest of the demo data"). Posting that
+// one due row must NOT read "no unposted rows currently exist" as "this
+// asset's life is complete": the asset must stay in_service, with 2
+// periods of life still un-entered, not flip to fully_depreciated with
+// 2/3 of its cost never depreciated and no way back (the status graph
+// has no fully_depreciated -> in_service edge).
+func TestPostDueDepreciation_PartialSchedule_DoesNotTransitionUntilUsefulLifeIsFullyPosted(t *testing.T) {
+	fx := setUpDepreciationFixture(t)
+	ctx := context.Background()
+	assetID := fx.createAsset(t, "in_service", false) // useful_life_months: 3
+	fx.createScheduleRow(t, assetID, 1, "2020-01-31", 1000.00, 2000.00)
+	// Deliberately NOT creating periods 2 and 3 yet — the partial-schedule
+	// state.
+
+	posted, err := PostDueDepreciation(ctx, fx.tenantDB, SchedulerActor())
+	if err != nil {
+		t.Fatalf("PostDueDepreciation: %v", err)
+	}
+	if posted != 1 {
+		t.Fatalf("posted = %d, want 1", posted)
+	}
+	if code := fx.statusCode(t, "FixedAsset", assetID); code != "in_service" {
+		t.Fatalf("asset status = %q, want in_service — only 1 of 3 useful_life_months periods has ever been entered, let alone posted", code)
+	}
+
+	// Entering and posting the remaining two periods must still complete
+	// it correctly.
+	fx.createScheduleRow(t, assetID, 2, "2020-02-29", 1000.00, 1000.00)
+	fx.createScheduleRow(t, assetID, 3, "2020-03-31", 1000.00, 0.00)
+	if _, err := PostDueDepreciation(ctx, fx.tenantDB, SchedulerActor()); err != nil {
+		t.Fatalf("second PostDueDepreciation: %v", err)
+	}
+	if code := fx.statusCode(t, "FixedAsset", assetID); code != "fully_depreciated" {
+		t.Errorf("asset status = %q, want fully_depreciated once all 3 periods are entered and posted", code)
+	}
+}
+
+// TestPostDueDepreciation_AlreadyFullyPostedButNotTransitioned_HealsOnNextRun
+// is the direct regression test for independent review's other blocker:
+// the completion check must not be gated on "did THIS call post the
+// exhausting row" — a fire-once-or-never condition means an asset that
+// somehow ends up with every row posted but the status transition
+// itself never happened (a crashed process between the last row's
+// commit and the transition, a version conflict, an overlapping second
+// poller) is stuck in_service forever, since no LATER run would ever
+// see posted > 0 again for it. Simulating that stuck state directly
+// (marking every row posted without ever calling PostDueDepreciation, so
+// this test doesn't depend on how such a state could arise) and
+// confirming a run that posts NOTHING new still transitions it proves
+// the check is retry-safe, not merely a repeat of the exhaustion test
+// above.
+func TestPostDueDepreciation_AlreadyFullyPostedButNotTransitioned_HealsOnNextRun(t *testing.T) {
+	fx := setUpDepreciationFixture(t)
+	ctx := context.Background()
+	assetID := fx.createAsset(t, "in_service", false) // useful_life_months: 3
+	scheduleDef := publishedDef(t, fx.tenantDB, "DepreciationSchedule")
+	for seq, periodEnd := range map[int]string{1: "2020-01-31", 2: "2020-02-29", 3: "2020-03-31"} {
+		id := fx.createScheduleRow(t, assetID, seq, periodEnd, 1000.00, 0.00)
+		rec, err := fx.engine.Get(ctx, scheduleDef, id)
+		if err != nil {
+			t.Fatalf("Get row %d: %v", seq, err)
+		}
+		fields := map[string]any{}
+		for k, v := range rec.Data {
+			fields[k] = v
+		}
+		fields["posted_at"] = periodEnd
+		version := rec.Version
+		if _, err := fx.engine.Update(ctx, scheduleDef, id, fields, &version, humanActor()); err != nil {
+			t.Fatalf("directly mark row %d posted: %v", seq, err)
+		}
+	}
+	if code := fx.statusCode(t, "FixedAsset", assetID); code != "in_service" {
+		t.Fatalf("setup: asset should still be in_service (never ran PostDueDepreciation), got %q", code)
+	}
+
+	posted, err := PostDueDepreciation(ctx, fx.tenantDB, SchedulerActor())
+	if err != nil {
+		t.Fatalf("PostDueDepreciation: %v", err)
+	}
+	if posted != 0 {
+		t.Fatalf("posted = %d, want 0 — every row was already marked posted before this call", posted)
+	}
+	if code := fx.statusCode(t, "FixedAsset", assetID); code != "fully_depreciated" {
+		t.Errorf("asset status = %q, want fully_depreciated — a call that posts nothing new must still complete the transition once the schedule is actually exhausted", code)
+	}
+}
+
+// TestPostDueDepreciation_IdempotentRerun_AssetStaysInService is
+// TestPostDueDepreciation_Idempotent_RerunDoesNotDoublePost's sibling,
+// but scoped so the asset does NOT reach fully_depreciated on the first
+// run (2 of 3 useful_life_months periods entered) — independent review's
+// finding that the original idempotent-rerun test's asset always
+// transitioned on the first run, so its rerun short-circuited at the
+// !inService check and never actually reached either the posted_at
+// pre-filter or the ExistsForSource guard inside postDepreciationRow.
+// This test's rerun does reach them.
+func TestPostDueDepreciation_IdempotentRerun_AssetStaysInService(t *testing.T) {
+	fx := setUpDepreciationFixture(t)
+	ctx := context.Background()
+	assetID := fx.createAsset(t, "in_service", false) // useful_life_months: 3
+	fx.createScheduleRow(t, assetID, 1, "2020-01-31", 1000.00, 2000.00)
+	fx.createScheduleRow(t, assetID, 2, "2020-02-29", 1000.00, 1000.00)
+	// period 3 deliberately not entered — asset must stay in_service.
+
+	first, err := PostDueDepreciation(ctx, fx.tenantDB, SchedulerActor())
+	if err != nil {
+		t.Fatalf("first PostDueDepreciation: %v", err)
+	}
+	if first != 2 {
+		t.Fatalf("first run posted = %d, want 2", first)
+	}
+	if code := fx.statusCode(t, "FixedAsset", assetID); code != "in_service" {
+		t.Fatalf("asset status = %q, want in_service (only 2 of 3 periods entered)", code)
+	}
+
+	second, err := PostDueDepreciation(ctx, fx.tenantDB, SchedulerActor())
+	if err != nil {
+		t.Fatalf("second PostDueDepreciation: %v", err)
+	}
+	if second != 0 {
+		t.Errorf("second run posted = %d, want 0 — both due rows were already posted, and the asset staying in_service means this run actually reached the idempotency guards instead of short-circuiting on status", second)
+	}
+	entries := data.NewJournalEntryRepo(fx.tenantDB)
+	list, err := entries.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("expected exactly 2 journal entries after two runs, got %d", len(list))
+	}
+}
+
+// TestPostDueDepreciation_WritesAuditRows confirms all three mutating
+// write paths (DepreciationSchedule.posted_at via a real posting,
+// DepreciationSchedule.posted_at via the zero-amount markPosted path,
+// and FixedAsset.status_id's transition) each write a real audit_log
+// row with the system actor (ADR-0008) — not just that the code that
+// builds and inserts them compiles and runs without erroring, which a
+// green suite with no audit assertion at all cannot distinguish from
+// "the insert silently no-ops."
+func TestPostDueDepreciation_WritesAuditRows(t *testing.T) {
+	fx := setUpDepreciationFixture(t)
+	ctx := context.Background()
+
+	// Real posting path.
+	postedAssetID := fx.createAssetNumbered(t, "FA-posted", "in_service", false)
+	postedRowID := fx.createScheduleRow(t, postedAssetID, 1, "2020-01-31", 1000.00, 2000.00)
+
+	// Zero-amount markPosted path.
+	zeroAssetID := fx.createAssetNumbered(t, "FA-zero", "in_service", false)
+	zeroRowID := fx.createScheduleRow(t, zeroAssetID, 1, "2020-01-31", 0.00, 3000.00)
+
+	// Full-life asset, to exercise the FixedAsset status-transition
+	// write too.
+	lifeAssetID := fx.createAssetNumbered(t, "FA-life", "in_service", false)
+	fx.createScheduleRow(t, lifeAssetID, 1, "2020-01-31", 1000.00, 2000.00)
+	fx.createScheduleRow(t, lifeAssetID, 2, "2020-02-29", 1000.00, 1000.00)
+	fx.createScheduleRow(t, lifeAssetID, 3, "2020-03-31", 1000.00, 0.00)
+
+	if _, err := PostDueDepreciation(ctx, fx.tenantDB, SchedulerActor()); err != nil {
+		t.Fatalf("PostDueDepreciation: %v", err)
+	}
+
+	if n := fx.auditCount(t, "DepreciationSchedule", postedRowID, "update", "system"); n != 1 {
+		t.Errorf("audit_log rows for the posted DepreciationSchedule row = %d, want 1", n)
+	}
+	if n := fx.auditCount(t, "DepreciationSchedule", zeroRowID, "update", "system"); n != 1 {
+		t.Errorf("audit_log rows for the zero-amount DepreciationSchedule row = %d, want 1", n)
+	}
+	if n := fx.auditCount(t, "FixedAsset", lifeAssetID, "update", "system"); n != 1 {
+		t.Errorf("audit_log rows for the FixedAsset status transition = %d, want 1", n)
+	}
+	if code := fx.statusCode(t, "FixedAsset", lifeAssetID); code != "fully_depreciated" {
+		t.Fatalf("setup check: expected lifeAssetID to have transitioned, got %q", code)
+	}
+}
+
+// TestPostDueDepreciation_MixedInServiceAndNotInService_OneRun proves
+// per-asset status gating holds when both kinds of asset have due rows
+// in the SAME tenant run, not just across separate runs the way
+// TestPostDueDepreciation_SkipsAssetNotInService exercises it.
+func TestPostDueDepreciation_MixedInServiceAndNotInService_OneRun(t *testing.T) {
+	fx := setUpDepreciationFixture(t)
+	ctx := context.Background()
+
+	liveID := fx.createAssetNumbered(t, "FA-live", "in_service", false)
+	liveRowID := fx.createScheduleRow(t, liveID, 1, "2020-01-31", 1000.00, 2000.00)
+
+	disposedID := fx.createAssetNumbered(t, "FA-disposed", "disposed", false)
+	fx.createScheduleRow(t, disposedID, 1, "2020-01-31", 1000.00, 2000.00)
+
+	posted, err := PostDueDepreciation(ctx, fx.tenantDB, SchedulerActor())
+	if err != nil {
+		t.Fatalf("PostDueDepreciation: %v", err)
+	}
+	if posted != 1 {
+		t.Fatalf("posted = %d, want 1 (only the in_service asset)", posted)
+	}
+	entries := data.NewJournalEntryRepo(fx.tenantDB)
+	list, err := entries.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(list) != 1 || list[0].SourceID != liveRowID {
+		t.Fatalf("expected exactly 1 journal entry, for the in_service asset's row, got %+v", list)
+	}
+}
+
+// TestCurrencyMinorUnit_ResolvesNonDefaultScale is the direct regression
+// test for independent review's finding that every other test's fixture
+// uses a Currency with minor_unit=2 — identical to
+// defaultCurrencyMinorUnit — so nothing distinguishes "currencyMinorUnit
+// resolved the real value" from "the fallback silently applied and got
+// lucky." This one uses 0 (JPY-style, no decimal places): a 1000.00
+// depreciation_amount must convert to 1000 minor units, not 100000 (what
+// the 2dp fallback would wrongly produce).
+func TestCurrencyMinorUnit_ResolvesNonDefaultScale(t *testing.T) {
+	fx := setUpDepreciationFixture(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	jpy, err := fx.engine.Create(ctx, publishedDef(t, fx.tenantDB, "Currency"), map[string]any{
+		"code": "JPY", "name": "Japanese Yen", "minor_unit": float64(0),
+	}, actor)
+	if err != nil {
+		t.Fatalf("create JPY Currency: %v", err)
+	}
+	fields := map[string]any{
+		"asset_number": "FA-jpy", "name": map[string]any{"en": "Test Asset (JPY)"},
+		"acquisition_date": "2020-01-01", "cost": 3000.0, "salvage_value": 0.0,
+		"useful_life_months": 3.0, "depreciation_method": "straight_line",
+		"currency_id":                         jpy.ID,
+		"asset_account_id":                    fx.assetAcct,
+		"depreciation_expense_account_id":     fx.expAcct,
+		"accumulated_depreciation_account_id": fx.accumAcct,
+		"status_id":                           fx.statusID["in_service"],
+	}
+	asset, err := fx.engine.Create(ctx, publishedDef(t, fx.tenantDB, "FixedAsset"), fields, actor)
+	if err != nil {
+		t.Fatalf("create FixedAsset: %v", err)
+	}
+	fx.createScheduleRow(t, asset.ID, 1, "2020-01-31", 1000.00, 2000.00)
+
+	if _, err := PostDueDepreciation(ctx, fx.tenantDB, SchedulerActor()); err != nil {
+		t.Fatalf("PostDueDepreciation: %v", err)
+	}
+	entries := data.NewJournalEntryRepo(fx.tenantDB)
+	list, err := entries.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected 1 journal entry, got %d", len(list))
+	}
+	for _, l := range list[0].Lines {
+		if l.DebitMinor != 0 && l.DebitMinor != 1000 {
+			t.Errorf("debit line = %d minor units, want 1000 (0dp JPY scale, not the 2dp fallback's 100000)", l.DebitMinor)
+		}
+		if l.CreditMinor != 0 && l.CreditMinor != 1000 {
+			t.Errorf("credit line = %d minor units, want 1000 (0dp JPY scale, not the 2dp fallback's 100000)", l.CreditMinor)
+		}
+	}
+}
+
+// TestStatusIDByCodeTx_NotSeeded is a direct unit test of the
+// not-seeded error path — reachable in practice when
+// assets.PublishStatuses hasn't run for a tenant (or ran against a
+// different status_type_id than the one passed in), not something the
+// guarded engine's Required-field validation would prevent the way an
+// empty status_id/fixed_asset_id/Account.code would (those three are
+// all Required at the Definition level, so they're unreachable through
+// the normal product write path and are left as documented,
+// intentionally-deferred defensive code rather than tested here).
+func TestStatusIDByCodeTx_NotSeeded(t *testing.T) {
+	fx := setUpDepreciationFixture(t)
+	ctx := context.Background()
+	tx, err := fx.tenantDB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // test cleanup
+
+	records := data.NewRecordRepo(fx.tenantDB)
+	_, err = statusIDByCodeTx(ctx, tx, records, "00000000-0000-0000-0000-000000000000", statusCodeFullyDepreciated)
+	if err == nil {
+		t.Fatal("expected an error for a status type nothing was ever seeded against")
+	}
+	if !strings.Contains(err.Error(), "not seeded") {
+		t.Errorf("error should say the status wasn't seeded, got: %v", err)
+	}
+}
