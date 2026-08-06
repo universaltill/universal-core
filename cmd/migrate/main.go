@@ -4,8 +4,11 @@
 // cmd/universal-core itself uses on boot — schema_migrations bookkeeping
 // included — rather than a second, untracked mechanism (e.g. applying
 // the .sql files directly with psql) that would drift from it. Running
-// this and then running cmd/universal-core against the same database is
-// a no-op the second time, by design.
+// this with -target=control and then running cmd/universal-core against
+// the same database is a no-op the second time, by design: both apply
+// the same control-plane set, and schema_migrations bookkeeping skips
+// what's already recorded. (This is NOT true of the default
+// -target=legacy — see below.)
 //
 // -target selects which migration set to apply (ADR-0003): "legacy"
 // (default) is the original shared-database set — still the live
@@ -18,16 +21,17 @@
 // tenant migration file lands (internal/tenantdb.Router.Create already
 // runs this automatically when provisioning a brand-new tenant).
 //
-// This command is NOT a prerequisite for cmd/provision-tenant:
-// provision-tenant applies its own control-plane migrations
-// (-target=control's set) internally and needs nothing run before it.
-// Running this command's default (-target=legacy) against what's
-// actually meant to be a control-plane database, then running
-// provision-tenant against that same database, applies two different,
-// incompatible migration sets to one database and fails (see
-// universaltill/uc-infra#84) — each -target is a genuinely different
-// schema for a genuinely different kind of database, not a step in one
-// shared setup sequence.
+// This command is NOT a prerequisite for cmd/provision-tenant,
+// cmd/install-module, or cmd/universal-core: all three apply their own
+// control-plane migrations (-target=control's set, via db.ApplyControl)
+// internally and need nothing run before them. Running this command's
+// default (-target=legacy) against what's actually meant to be a
+// control-plane database, then running any of those three against that
+// same database, applies two different, incompatible migration sets to
+// one database and fails (see universaltill/uc-infra#84) — each
+// -target/internal caller applies a genuinely different schema for a
+// genuinely different kind of database, not a step in one shared setup
+// sequence.
 package main
 
 import (
