@@ -859,3 +859,57 @@ func TestMembers_Remove_ForgedGrantID(t *testing.T) {
 		t.Fatal("the member's own grant should have been revoked via the server-side lookup")
 	}
 }
+
+// TestMembers_RevokeRole_UnknownRecord_ShowsActionError: revoking a
+// user_role_id that doesn't exist (a stale page, a race with another
+// admin) fails at the crud.Get lookup — not a system-of-record
+// refusal, so it takes membersActionError's generic banner path rather
+// than the localized crud-error one. Exercises membersActionError,
+// previously at 0% coverage (uc-infra#110).
+//
+// The "empty id" case is the negative control: it renders the exact
+// same members.error banner (via membersRevokeRole's own early return,
+// not membersActionError) but WITHOUT membersActionError's defining
+// behavior — the ErrDetail line. Asserting the detail line's presence
+// only in the "unknown id" case is what proves this test is actually
+// exercising membersActionError, rather than just matching a banner
+// that several unrelated failure paths in this file also produce.
+func TestMembers_RevokeRole_UnknownRecord_ShowsActionError(t *testing.T) {
+	m := newMembersHarness(t, true)
+	m.fake.seedMember("user-admin", "admin@example.com")
+
+	t.Run("empty id: generic banner, no detail (negative control)", func(t *testing.T) {
+		rec := m.post("user-admin", "/settings/members/roles/revoke", url.Values{
+			"user_role_id": {""},
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+		}
+		body := rec.Body.String()
+		if !strings.Contains(body, "The action failed.") {
+			t.Fatalf("expected the members.error banner text, got:\n%s", body)
+		}
+		if strings.Contains(body, "uc-members-banner-detail") {
+			t.Fatalf("empty id takes the early-return path, not membersActionError — should carry no detail line, got:\n%s", body)
+		}
+	})
+
+	t.Run("unknown id: membersActionError's banner, detail carries the cause", func(t *testing.T) {
+		rec := m.post("user-admin", "/settings/members/roles/revoke", url.Values{
+			"user_role_id": {"00000000-0000-0000-0000-000000000000"},
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 with a visible error banner, got %d: %s", rec.Code, rec.Body.String())
+		}
+		body := rec.Body.String()
+		if !strings.Contains(body, "The action failed.") {
+			t.Fatalf("expected the members.error banner text, got:\n%s", body)
+		}
+		if !strings.Contains(body, `class="uc-members-banner-detail"`) {
+			t.Fatalf("expected membersActionError's detail line (BA R5 no-silent-failure), got:\n%s", body)
+		}
+		if !strings.Contains(body, "data: record not found") {
+			t.Fatalf("expected the detail line to carry the underlying error text, got:\n%s", body)
+		}
+	})
+}
