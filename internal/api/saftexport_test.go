@@ -541,9 +541,16 @@ func TestSAFTExport_DuplicateOwnOrganizationRolesOnOneParty(t *testing.T) {
 // (independent review, uc-infra#63): PartyRole.party_id carries no
 // TargetFilter/MustMatchParentField, so crud's own reference-target check
 // skips it entirely (checkReferenceTargetConstraints returns early) and
-// entity.ValidateRecord only asserts "is a non-nil string" — a role row
-// whose party_id is blank or not UUID-shaped is therefore creatable
-// through the ordinary API by any actor with PartyRole write access.
+// entity.ValidateRecord only asserts the value's shape, not that it
+// resolves — a role row whose party_id is not UUID-shaped is therefore
+// creatable through the ordinary API by any actor with PartyRole write
+// access.
+//
+// The blank case is no longer creatable that way: uc-infra#86 made
+// Required reject an empty string over the JSON API. It is still
+// exercised here against a directly-seeded row, because that guard is
+// write-path only and rows predating it still exist — see the subtest's
+// own comment.
 // records.id is a uuid column, so a Get on such a value returns a raw
 // Postgres "invalid input syntax for type uuid" driver error rather than
 // data.ErrNotFound: without the shape guard, ONE junk role row 500s the
@@ -560,21 +567,48 @@ func TestSAFTExport_OwnOrganizationRoleWithUnresolvablePartyIDFallsBackToNA(t *t
 			testHandler(t, router).Routes(mux)
 			setupSAFTTenant(t, tenantID, db, mux)
 
-			req := newRequest("POST", "/api/records/PartyRole", tenantID, "farshid",
-				[]byte(`{"party_id":"`+partyID+`","role_type":"own_organization"}`))
-			req.Header.Set("Content-Type", "application/json")
-			rec := httptest.NewRecorder()
-			mux.ServeHTTP(rec, req)
-			if rec.Code != http.StatusCreated {
-				// Not a skip: if a future write-path guard starts rejecting
-				// this shape, that is a BETTER outcome, but this test must
-				// then be retired deliberately rather than silently passing.
-				t.Fatalf("POST PartyRole with party_id=%q: expected 201 (no write-path guard rejects this shape today), got %d: %s",
-					partyID, rec.Code, rec.Body.String())
+			if partyID == "" {
+				// The write-path guard this test's original comment
+				// anticipated now EXISTS: uc-infra#86 made Required reject
+				// an empty string over the JSON API, so this row is no
+				// longer creatable through POST /api/records/PartyRole
+				// (it 400s with "Party is required." — the better
+				// outcome that comment asked for). Retiring the API half
+				// of this case deliberately, as instructed, rather than
+				// letting it pass silently.
+				//
+				// The EXPORT half is not retired, because the data shape
+				// did not go away: #86 guards the write path only, and
+				// nothing migrated the rows written before it landed. A
+				// tenant provisioned earlier can still hold a blank
+				// party_id today, and one such row must still not 500 the
+				// whole statutory export. Seeded through the repository
+				// directly (no validation layer) precisely because that
+				// is how such a row got there — it predates the guard.
+				if _, err := data.NewRecordRepo(db).Create(context.Background(), "PartyRole", map[string]any{
+					"party_id": "", "role_type": "own_organization",
+				}); err != nil {
+					t.Fatalf("seed a legacy blank-party_id PartyRole directly: %v", err)
+				}
+			} else {
+				req := newRequest("POST", "/api/records/PartyRole", tenantID, "farshid",
+					[]byte(`{"party_id":"`+partyID+`","role_type":"own_organization"}`))
+				req.Header.Set("Content-Type", "application/json")
+				rec := httptest.NewRecorder()
+				mux.ServeHTTP(rec, req)
+				if rec.Code != http.StatusCreated {
+					// Still not a skip: a non-UUID-but-non-empty party_id
+					// remains creatable through the ordinary API (#86
+					// rejects "" only), so if THIS shape ever starts being
+					// rejected, retire it deliberately the same way the
+					// empty case above was.
+					t.Fatalf("POST PartyRole with party_id=%q: expected 201 (no write-path guard rejects this shape today), got %d: %s",
+						partyID, rec.Code, rec.Body.String())
+				}
 			}
 
-			req = newRequest("GET", "/export/saft?from=2026-01-01&to=2026-12-31", tenantID, "farshid", nil)
-			rec = httptest.NewRecorder()
+			req := newRequest("GET", "/export/saft?from=2026-01-01&to=2026-12-31", tenantID, "farshid", nil)
+			rec := httptest.NewRecorder()
 			mux.ServeHTTP(rec, req)
 			if rec.Code != http.StatusOK {
 				t.Fatalf("expected 200 (unresolvable party_id should degrade, not error), got %d: %s", rec.Code, rec.Body.String())
