@@ -565,6 +565,117 @@ func TestGuardedEngine_ResolveReferenceFilter_DropsUnreadableEntityJoinCondition
 	}
 }
 
+// TestGuardedEngine_ResolveReferenceFilter_DropsEntityJoinConditionOnHiddenJoinField
+// (uc-infra#106): CanRead(cond.Entity) alone is not enough — a caller who
+// CAN read PartyRole in general but has a hidden=true FieldPermission on
+// the specific field the join condition names must still not have that
+// field used to narrow the picker's candidate set. Whether a given Party
+// id appears in the narrowed results is itself a same-class oracle as the
+// entity-level one uc-infra#78 already closed: it discloses, one
+// candidate at a time, which PartyRole rows carry a given (hidden)
+// party_id, exactly what the FieldPermission was meant to hide.
+//
+// Covers both fields a join condition names on the OTHER entity —
+// EntityField (the field expected to equal the candidate's own id) and
+// Field (the Definition-constant condition, e.g. role_type) — since
+// either one being hidden makes the same information leak through the
+// EXISTS narrowing; rejectHiddenSortFilter's own doc comment already
+// makes this "gate uniformly regardless of which shape produced the
+// condition" argument for the primary-entity case, so the join case
+// keeps the same discipline.
+func TestGuardedEngine_ResolveReferenceFilter_DropsEntityJoinConditionOnHiddenJoinField(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+
+	party := f.create("Party", map[string]any{
+		"party_type": "person", "name": "Some Employee", "status": "active",
+	})
+	f.create("PartyRole", map[string]any{"party_id": party.ID, "role_type": "employee"})
+
+	field := entity.Field{
+		Name: "employee_id", Type: entity.FieldReference, Target: "Party",
+		TargetFilter: []entity.TargetFilterCondition{
+			{Entity: "PartyRole", EntityField: "party_id", Field: "role_type", Value: "employee"},
+		},
+	}
+
+	// Caller CAN read PartyRole at the entity level, but PartyRole.party_id
+	// (the EntityField the join condition names) is hidden from every role
+	// they hold.
+	hiddenEntityField := f.role("hides-party-role-party-id")
+	f.permit(hiddenEntityField.ID, "Party", true, false)
+	f.permit(hiddenEntityField.ID, "PartyRole", true, false)
+	f.hide(hiddenEntityField.ID, "PartyRole", "party_id")
+	f.grant("user-hidden-entity-field", hiddenEntityField.ID)
+
+	g := Guard(f.engine, humanResolver(f, "user-hidden-entity-field"))
+	opts, err := g.ResolveReferenceFilter(ctx, field, "")
+	if err != nil {
+		t.Fatalf("ResolveReferenceFilter (hidden EntityField): %v", err)
+	}
+	if len(opts.JoinFilters) != 0 {
+		t.Fatalf("expected no JoinFilters narrowing when the join's EntityField is hidden, got %+v", opts.JoinFilters)
+	}
+
+	// Same shape, but this time PartyRole.role_type (the join condition's
+	// Field) is what's hidden instead of EntityField.
+	hiddenField := f.role("hides-party-role-role-type")
+	f.permit(hiddenField.ID, "Party", true, false)
+	f.permit(hiddenField.ID, "PartyRole", true, false)
+	f.hide(hiddenField.ID, "PartyRole", "role_type")
+	f.grant("user-hidden-field", hiddenField.ID)
+
+	g2 := Guard(f.engine, humanResolver(f, "user-hidden-field"))
+	opts2, err := g2.ResolveReferenceFilter(ctx, field, "")
+	if err != nil {
+		t.Fatalf("ResolveReferenceFilter (hidden Field): %v", err)
+	}
+	if len(opts2.JoinFilters) != 0 {
+		t.Fatalf("expected no JoinFilters narrowing when the join's Field is hidden, got %+v", opts2.JoinFilters)
+	}
+
+	// The same field, for a caller with no hidden FieldPermission at all on
+	// PartyRole, still narrows normally — confirms the drop above is
+	// field-permission-specific, not a blanket regression of the mechanism.
+	open := f.role("party-role-reader-no-hidden-fields")
+	f.permit(open.ID, "Party", true, false)
+	f.permit(open.ID, "PartyRole", true, false)
+	f.grant("user-open-fields", open.ID)
+	gOpen := Guard(f.engine, humanResolver(f, "user-open-fields"))
+	opts3, err := gOpen.ResolveReferenceFilter(ctx, field, "")
+	if err != nil {
+		t.Fatalf("ResolveReferenceFilter (no hidden fields): %v", err)
+	}
+	if len(opts3.JoinFilters) != 1 {
+		t.Fatalf("expected JoinFilters narrowing when neither join field is hidden, got %+v", opts3.JoinFilters)
+	}
+
+	// Independent-review follow-up: a field with MULTIPLE TargetFilter
+	// conditions — one entity-join (hidden), one direct-field (not) — must
+	// drop only the affected join condition, leaving its sibling intact.
+	// Proves the `continue` inside ResolveReferenceFilter's loop skips just
+	// the one condition rather than the whole field's narrowing collapsing
+	// to nothing whenever any single condition is hidden.
+	multiField := entity.Field{
+		Name: "employee_id", Type: entity.FieldReference, Target: "Party",
+		TargetFilter: []entity.TargetFilterCondition{
+			{Entity: "PartyRole", EntityField: "party_id", Field: "role_type", Value: "employee"},
+			{Field: "status", Value: "active"},
+		},
+	}
+	gMulti := Guard(f.engine, humanResolver(f, "user-hidden-entity-field"))
+	opts4, err := gMulti.ResolveReferenceFilter(ctx, multiField, "")
+	if err != nil {
+		t.Fatalf("ResolveReferenceFilter (multi-condition, hidden join field): %v", err)
+	}
+	if len(opts4.JoinFilters) != 0 {
+		t.Fatalf("expected the hidden join condition dropped, got JoinFilters %+v", opts4.JoinFilters)
+	}
+	if len(opts4.EqualsFilters) != 1 || opts4.EqualsFilters[0].Field != "status" {
+		t.Fatalf("expected the sibling direct-field condition to survive untouched, got EqualsFilters %+v", opts4.EqualsFilters)
+	}
+}
+
 // TestGuardedEngine_Create_TargetConstraintError_StripsJoinDetailWhenCallerCannotReadJoinEntity
 // is the regression test for independent review finding #5:
 // crud.Engine's write-time rejection ran unguarded against the full

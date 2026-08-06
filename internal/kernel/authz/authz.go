@@ -1036,6 +1036,57 @@ func (g *GuardedEngine) ValidateStatusTransition(ctx context.Context, def *entit
 // message when CanRead(JoinEntity) is false — see its own doc comment,
 // including the residual risk that fix does NOT close (the outcome-only
 // signal, message text aside).
+//
+// THIRD CORRECTION (uc-infra#106): CanRead(cond.Entity) alone is not
+// enough. It gates whether the caller may read the joined entity TYPE at
+// all, but says nothing about whether the specific FIELDS the condition
+// names on that entity — EntityField (the field expected to equal the
+// candidate's own id) and Field (the Definition-constant condition
+// alongside it) — are themselves RBAC-hidden via FieldPermission. A
+// caller who CAN read PartyRole in general but has a hidden=true
+// FieldPermission on PartyRole.party_id specifically must not have that
+// field used to narrow the candidate set regardless: the response body
+// never returns it, but whether a given candidate id is included or
+// excluded is still the same disclosure the hidden FieldPermission exists
+// to prevent, just reached through the join instead of a direct read.
+// Both EntityField and Field are checked, not only EntityField:
+// rejectHiddenSortFilter's own doc comment already makes the "gate
+// uniformly regardless of which shape produced the condition" argument
+// for the primary entity's EqualsFilters entries, and the same reasoning
+// applies here — a Field match hidden on the joined entity is just as
+// much a per-candidate oracle as EntityField would be, and there is no
+// cheaper, more special-cased way to tell them apart that's worth the
+// complexity. That borrowed reasoning covers only WHICH fields to check,
+// not the failure mode: a hidden direct-field condition (Entity == "")
+// still denies the whole ListPageFiltered/CountFiltered call via
+// rejectHiddenSortFilter, while a hidden join-field condition here is
+// silently DROPPED, narrowing less rather than refusing outright — the
+// same drop-don't-deny posture the CanRead(cond.Entity) check above
+// already established for an unreadable join entity, kept consistent
+// rather than introducing a third behavior. One visible consequence: the
+// picker can still offer a candidate this narrowing would otherwise have
+// excluded, whose subsequent Create/Update then 400s — see the note
+// below on why that write-time check is unaffected by this fix.
+//
+// This closes the READ path only (the picker's own narrowing) — the
+// same asymmetry the CORRECTION above already accepts for
+// CanRead(cond.Entity). checkReferenceTargetConstraints (crud package,
+// called from unguarded Create/Update) still evaluates the FULL
+// Definition regardless of whether a join field is hidden, deliberately:
+// the constraint itself must keep being enforced for that viewer, or a
+// hidden field would double as a way to bypass validation entirely.
+// sanitizeTargetConstraintError below only generalizes the error message
+// when CanRead(JoinEntity) is false, never on a hidden join field, and
+// crud.TargetConstraintError doesn't carry EntityField/Field to check
+// against in any case — so a caller with WRITE permission on the
+// referencing entity can still probe this join's condition one candidate
+// at a time via repeated create-and-reject attempts, same as the
+// outcome-only residual risk (400 vs. 201, no message-text leak per
+// handlers.go's generic per-field error) sanitizeTargetConstraintError's
+// own doc comment already discloses for the unreadable-entity case.
+// Narrowing this further needs TargetConstraintError to carry the join's
+// field names, not attempted here (uc-infra#106 follow-up, tracked
+// separately rather than expanding this fix's scope).
 func (g *GuardedEngine) ResolveReferenceFilter(ctx context.Context, f entity.Field, siblingValue string) (data.ListPageOptions, error) {
 	if len(f.TargetFilter) > 0 {
 		readable := make([]entity.TargetFilterCondition, 0, len(f.TargetFilter))
@@ -1046,6 +1097,13 @@ func (g *GuardedEngine) ResolveReferenceFilter(ctx context.Context, f entity.Fie
 					return data.ListPageOptions{}, err
 				}
 				if !ok {
+					continue
+				}
+				hidden, err := g.res.HiddenFields(ctx, cond.Entity)
+				if err != nil {
+					return data.ListPageOptions{}, err
+				}
+				if hidden[cond.EntityField] || hidden[cond.Field] {
 					continue
 				}
 			}
