@@ -85,6 +85,66 @@ func TestValidateRecord(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
+
+	// #86: a direct JSON call (unlike the form handler and CSV importer,
+	// which both convert a blank input to absent before validating) can
+	// submit a required field as "" rather than omitting it. Required
+	// must reject that the same as missing/nil, or every required
+	// FieldString/FieldReference/FieldDate is satisfiable with no value.
+	t.Run("required field submitted as empty string is rejected", func(t *testing.T) {
+		data := map[string]any{"name": ""}
+		if err := ValidateRecord(def, data); err == nil {
+			t.Fatal("expected error for required field 'name' submitted as \"\"")
+		}
+	})
+
+	t.Run("required FieldReference submitted as empty string is rejected", func(t *testing.T) {
+		refDef := &Definition{
+			EntityType: "InventoryMovement",
+			Version:    1,
+			Fields: []Field{
+				{Name: "facility_id", Type: FieldReference, Target: "Facility", Required: true},
+			},
+		}
+		if err := ValidateRecord(refDef, map[string]any{"facility_id": ""}); err == nil {
+			t.Fatal("expected error for required reference field submitted as \"\"")
+		}
+	})
+
+	t.Run("required bool false and required number zero are not treated as empty", func(t *testing.T) {
+		// A naive rewrite of the Required check (e.g. reflect.IsZero, or
+		// fmt.Sprint(v) == "") would wrongly reject these; only "" itself
+		// (a string) counts as empty.
+		zeroDef := &Definition{
+			EntityType: "Vendor",
+			Version:    1,
+			Fields: []Field{
+				{Name: "active", Type: FieldBool, Required: true},
+				{Name: "lead_time_days", Type: FieldNumber, Required: true},
+			},
+		}
+		data := map[string]any{"active": false, "lead_time_days": float64(0)}
+		if err := ValidateRecord(zeroDef, data); err != nil {
+			t.Fatalf("required bool=false / number=0 must validate as present, got: %v", err)
+		}
+	})
+
+	t.Run("optional string field submitted as empty string still passes", func(t *testing.T) {
+		// Only Required tightens on "" — an optional string field keeps
+		// accepting "" as a legitimate value, same as before this fix.
+		optDef := &Definition{
+			EntityType: "Vendor",
+			Version:    1,
+			Fields: []Field{
+				{Name: "name", Type: FieldString, Required: true},
+				{Name: "notes", Type: FieldString},
+			},
+		}
+		data := map[string]any{"name": "Acme", "notes": ""}
+		if err := ValidateRecord(optDef, data); err != nil {
+			t.Fatalf("unexpected error for optional string field left blank: %v", err)
+		}
+	})
 }
 
 // stagedDef is a minimal two-date chronology chain — the same shape

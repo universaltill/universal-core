@@ -25,12 +25,20 @@ import (
 //
 // A dry run must not write, so when the facility does not exist yet it
 // returns a synthetic all-zero id purely so the caller's preview
-// validates rows against a facility-shaped value. entity.ValidateRecord
-// treats a present, non-nil string as satisfying Required regardless of
-// content, so this placeholder is not load-bearing for validation — it
-// exists only so a dry-run log line can say which facility a row would
-// point at, and it is never written: callers must not invoke this with
-// dryRun and then persist the returned id.
+// validates rows against a facility-shaped value.
+//
+// This placeholder IS load-bearing, and became so with uc-infra#86:
+// entity.ValidateRecord used to treat any present, non-nil string as
+// satisfying Required regardless of content, but it now rejects an empty
+// string the same as an absent/nil value. InventoryItem.facility_id is
+// Required, so returning "" here would make every previewed row report
+// "skipped" in a dry run that a real run would actually migrate — a
+// preview that silently disagrees with the thing it is previewing. (This
+// comment said the opposite until #86 landed; the two changes were
+// developed in parallel and only met at merge.) The obviously-fake id
+// also makes the dry-run log say which facility rows *would* point at.
+// It can never be written: it is returned only under dryRun, and
+// recordmigrate.Run returns before engine.Update on the same flag.
 func GetOrCreateFacility(
 	ctx context.Context,
 	engine *crud.Engine,

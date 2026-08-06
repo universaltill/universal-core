@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -170,6 +171,34 @@ func TestEngine_Create_ValidationFailure_WritesNothing(t *testing.T) {
 		audit.Actor{Type: audit.ActorHuman, ID: "farshid"})
 	if err == nil {
 		t.Fatal("expected validation error")
+	}
+
+	var count int
+	if err := db.QueryRow(`SELECT count(*) FROM records`).Scan(&count); err != nil {
+		t.Fatalf("count records: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected no records written after validation failure, got %d", count)
+	}
+}
+
+// TestEngine_Create_RequiredFieldAsEmptyString_WritesNothing is the
+// integration-level pin for #86: a direct API call (unlike the form
+// handler and CSV importer, which both convert a blank input to absent
+// before this same engine ever sees it) can submit a required field as
+// "" rather than omitting it. Engine.Create must reject that the same as
+// missing/nil, through the real validate-then-write path against a real
+// tenant database — not just at the entity.ValidateRecord unit level.
+func TestEngine_Create_RequiredFieldAsEmptyString_WritesNothing(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	def := vendorDef()
+
+	_, err := engine.Create(ctx, def, map[string]any{"name": "", "lead_time_days": float64(10)},
+		audit.Actor{Type: audit.ActorHuman, ID: "farshid"})
+	if err == nil || !strings.Contains(err.Error(), "is required") {
+		t.Fatalf("expected a required-field error for \"name\" submitted as \"\", got: %v", err)
 	}
 
 	var count int

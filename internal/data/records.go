@@ -716,17 +716,11 @@ func (r *RecordRepo) DeleteTx(ctx context.Context, q querier, entityType, id str
 // so they stay readable and start failing on next edit — a silent state
 // this makes loud.
 //
-// Absent and JSON-null both fail entity.ValidateRecord's Required
-// check, which treats a key as satisfied only when present and
-// non-nil. **An empty string currently does not** — Required accepts
-// `""` over the JSON API today, which is #86. It is counted anyway, on
-// purpose: a row holding `"facility_id": ""` is stock at no location
-// whatever the validator currently tolerates, it is exactly the shape a
-// half-finished migration leaves behind, and when #86 tightens Required
-// it becomes a hard failure. So this over-reports by design against
-// today's validator and exactly matches it once #86 lands — the safe
-// direction for a warning whose cost is a human looking, and whose
-// alternative is a tenant broken silently.
+// Absent, JSON-null, and an empty string all fail entity.ValidateRecord's
+// Required check (#86) the same way, so this counts all three: a row
+// holding `"facility_id": ""` is stock at no location regardless of
+// which of the three shapes it's stored as, and it is exactly what a
+// half-finished migration leaves behind.
 func (r *RecordRepo) CountMissingField(ctx context.Context, entityType, fieldName string) (int, error) {
 	var n int
 	err := r.db.QueryRowContext(ctx,

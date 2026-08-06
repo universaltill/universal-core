@@ -105,15 +105,29 @@ func (e *ValidationError) Unwrap() error { return ErrValidation }
 func ValidateRecord(def *Definition, data map[string]any) error {
 	for _, f := range def.Fields {
 		v, present := data[f.Name]
-		if !present || v == nil {
-			if f.Required {
-				return &ValidationError{
-					Kind:       KindRequired,
-					EntityType: def.EntityType,
-					FieldName:  f.Name,
-					Detail:     fmt.Sprintf("field %q is required", f.Name),
-				}
+		absent := !present || v == nil
+		// Required additionally rejects an empty string (uc-infra#86):
+		// the form handler and CSV importer both convert a blank input to
+		// absent before it ever reaches here, but a direct JSON call can
+		// submit "" instead of omitting the key. `v == ""` only matches a
+		// `v` whose dynamic type is string, so a required bool `false` or
+		// number `0` is unaffected — this tightens Required only, never
+		// loosens the type check below for an optional field's `""`.
+		//
+		// Returns the same structured *ValidationError (KindRequired) the
+		// absent case has used since uc-infra#96's translation layer
+		// landed, NOT the bare fmt.Errorf this check originally shipped
+		// with — the two are the same failure to a user, so they must
+		// localize identically rather than one leaking raw English.
+		if f.Required && (absent || v == "") {
+			return &ValidationError{
+				Kind:       KindRequired,
+				EntityType: def.EntityType,
+				FieldName:  f.Name,
+				Detail:     fmt.Sprintf("field %q is required", f.Name),
 			}
+		}
+		if absent {
 			continue
 		}
 		if verr := validateFieldValue(def.EntityType, f, v); verr != nil {
