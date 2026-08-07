@@ -22,6 +22,7 @@ import (
 	"github.com/universaltill/universal-core/internal/httpx"
 	"github.com/universaltill/universal-core/internal/i18n"
 	"github.com/universaltill/universal-core/internal/kernel/aiassist"
+	"github.com/universaltill/universal-core/internal/kernel/blobstore"
 	"github.com/universaltill/universal-core/internal/kernel/purchasing"
 	"github.com/universaltill/universal-core/internal/kernel/sales"
 	"github.com/universaltill/universal-core/internal/kernel/secretcrypt"
@@ -62,6 +63,32 @@ func aiClientFromEnv() (client *aiassist.Client, url, model string) {
 func speechClientFromEnv() (client *speechassist.Client, url string) {
 	url = os.Getenv("WHISPER_URL")
 	return speechassist.NewClient(url), url
+}
+
+// defaultBlobStorageRoot is used when BLOB_STORAGE_ROOT is unset — a
+// relative path under the process's own working directory, so a
+// deployment gets a working attachment store with zero configuration
+// (ADR-0024's "self-hosted, no external credential" posture) rather than
+// the feature being silently off until someone sets an env var. A real
+// deployment mounting persistent storage should set BLOB_STORAGE_ROOT
+// explicitly to that mount, the same way it already must for Postgres
+// itself.
+const defaultBlobStorageRoot = "./data/attachments"
+
+// blobstoreFromEnv builds the filesystem-backed blob store from
+// BLOB_STORAGE_ROOT (ADR-0024). Unlike aiClientFromEnv/
+// speechClientFromEnv, there is no legitimate "disabled" state here —
+// blob storage needs no external credential — so this returns an error
+// (fatal at boot, same as a bad DATABASE_URL) rather than a nil-safe
+// client, and the resolved root is returned alongside purely for the
+// startup log line.
+func blobstoreFromEnv() (store *blobstore.FSStore, root string, err error) {
+	root = os.Getenv("BLOB_STORAGE_ROOT")
+	if root == "" {
+		root = defaultBlobStorageRoot
+	}
+	store, err = blobstore.NewFSStore(root)
+	return store, root, err
 }
 
 // secretCryptorFromEnv builds a secretcrypt.Cryptor from
@@ -261,6 +288,12 @@ func main() {
 		log.Printf("SECRET_ENCRYPTION_KEY not set — the AI-provider settings page will refuse to store a tenant API key")
 	}
 	handler := api.New(router, catalog, auth, svc, ai, speech, secretCryptor)
+	blobStore, blobRoot, err := blobstoreFromEnv()
+	if err != nil {
+		log.Fatalf("initialize blob storage (BLOB_STORAGE_ROOT=%q): %v", blobRoot, err)
+	}
+	handler.SetBlobstore(blobStore)
+	log.Printf("attachment storage: filesystem-backed at %s (ADR-0024)", blobRoot)
 	// Runtime member management (universal-core#3, ADR-0010): the
 	// /settings/members page's outbound Zitadel client. Issuer reuses
 	// OIDC_ISSUER_URL — one identity instance for login and management;

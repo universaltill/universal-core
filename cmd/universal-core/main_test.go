@@ -9,14 +9,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -840,5 +843,146 @@ func TestUniversalCore_AttendanceRecordUniqueConstraint_EnforcedByRealBinary(t *
 	}
 	if len(list.Data) != 1 {
 		t.Fatalf("expected exactly 1 AttendanceRecord after the rejected double-submit, got %d: %s", len(list.Data), listBody)
+	}
+}
+
+// TestUniversalCore_AttachmentUploadDownload_ServedByRealBinary is the
+// smoke layer for uc-infra#142 (ADR-0024): the real compiled binary,
+// wired to a real filesystem-backed blob store via BLOB_STORAGE_ROOT,
+// actually serves the generic attachment upload/download routes end to
+// end — proving main.go's wiring (blobstoreFromEnv + SetBlobstore), not
+// just internal/api's own in-process handler tests.
+func TestUniversalCore_AttachmentUploadDownload_ServedByRealBinary(t *testing.T) {
+	controlDSN := testexec.FreshDatabase(t, "uc_test_server_control")
+
+	control := testexec.Open(t, controlDSN)
+	ctx := context.Background()
+	if err := db.ApplyControl(ctx, control); err != nil {
+		t.Fatalf("ApplyControl: %v", err)
+	}
+	router, err := tenantdb.NewRouter(control, controlDSN)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+	defer router.Close()
+	tenantID, err := router.Create(ctx, "Attachment Smoke Test", "eu-west")
+	if err != nil {
+		t.Fatalf("router.Create: %v", err)
+	}
+	testexec.DropTenantDatabase(t, testexec.Open(t, controlDSN), tenantID)
+	tenantDB, err := router.Get(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("router.Get: %v", err)
+	}
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "smoke-test-setup"}
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	router.Close()
+	control.Close()
+
+	blobRoot := t.TempDir()
+	baseURL := startServer(t, controlDSN, "INSECURE_DEV_AUTH=true", "BLOB_STORAGE_ROOT="+blobRoot)
+
+	// foundation.Publish doesn't itself create any Party rows — create
+	// one directly through the real running server (the target record
+	// this attachment attaches to), the same way any other smoke test in
+	// this file drives record creation.
+	createPartyReq, err := http.NewRequest(http.MethodPost, baseURL+"/api/records/Party",
+		strings.NewReader(`{"party_type":"organization","name":"Attachment Smoke Test Org"}`))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	createPartyReq.Header.Set("X-Tenant-ID", tenantID)
+	createPartyReq.Header.Set("X-Actor-ID", "smoke-test")
+	createPartyReq.Header.Set("Content-Type", "application/json")
+	createPartyResp, err := http.DefaultClient.Do(createPartyReq)
+	if err != nil {
+		t.Fatalf("POST /api/records/Party: %v", err)
+	}
+	createPartyBody, _ := io.ReadAll(createPartyResp.Body)
+	createPartyResp.Body.Close()
+	if createPartyResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 creating the target Party, got %d: %s", createPartyResp.StatusCode, createPartyBody)
+	}
+	var createdParty struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(createPartyBody, &createdParty); err != nil {
+		t.Fatalf("unmarshal create-Party response: %v", err)
+	}
+
+	fileContent := []byte("real binary smoke test attachment contents")
+	var uploadBuf bytes.Buffer
+	mw := multipart.NewWriter(&uploadBuf)
+	fw, err := mw.CreateFormFile("file", "smoke.txt")
+	if err != nil {
+		t.Fatalf("create form file: %v", err)
+	}
+	if _, err := fw.Write(fileContent); err != nil {
+		t.Fatalf("write form file: %v", err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+	uploadReq, err := http.NewRequest(http.MethodPost, baseURL+"/api/attachments/Party/"+createdParty.Data.ID, &uploadBuf)
+	if err != nil {
+		t.Fatalf("build upload request: %v", err)
+	}
+	uploadReq.Header.Set("X-Tenant-ID", tenantID)
+	uploadReq.Header.Set("X-Actor-ID", "smoke-test")
+	uploadReq.Header.Set("Content-Type", mw.FormDataContentType())
+	uploadResp, err := http.DefaultClient.Do(uploadReq)
+	if err != nil {
+		t.Fatalf("POST /api/attachments/Party/%s: %v", createdParty.Data.ID, err)
+	}
+	uploadBody, _ := io.ReadAll(uploadResp.Body)
+	uploadResp.Body.Close()
+	if uploadResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 uploading an attachment, got %d: %s", uploadResp.StatusCode, uploadBody)
+	}
+	var uploaded struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(uploadBody, &uploaded); err != nil {
+		t.Fatalf("unmarshal upload response: %v", err)
+	}
+
+	downloadReq, err := http.NewRequest(http.MethodGet, baseURL+"/api/attachments/"+uploaded.Data.ID, nil)
+	if err != nil {
+		t.Fatalf("build download request: %v", err)
+	}
+	downloadReq.Header.Set("X-Tenant-ID", tenantID)
+	downloadReq.Header.Set("X-Actor-ID", "smoke-test")
+	downloadResp, err := http.DefaultClient.Do(downloadReq)
+	if err != nil {
+		t.Fatalf("GET /api/attachments/%s: %v", uploaded.Data.ID, err)
+	}
+	defer downloadResp.Body.Close()
+	downloadBody, _ := io.ReadAll(downloadResp.Body)
+	if downloadResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 downloading the attachment, got %d: %s", downloadResp.StatusCode, downloadBody)
+	}
+	if !bytes.Equal(downloadBody, fileContent) {
+		t.Fatalf("downloaded content mismatch: got %q, want %q", downloadBody, fileContent)
+	}
+
+	// The real binary actually wrote through to BLOB_STORAGE_ROOT on
+	// disk — not just returning bytes it happened to buffer in memory.
+	var foundOnDisk bool
+	if walkErr := filepath.Walk(blobRoot, func(_ string, info os.FileInfo, _ error) error {
+		if info != nil && !info.IsDir() {
+			foundOnDisk = true
+		}
+		return nil
+	}); walkErr != nil {
+		t.Fatalf("walk BLOB_STORAGE_ROOT: %v", walkErr)
+	}
+	if !foundOnDisk {
+		t.Fatalf("expected at least one file under BLOB_STORAGE_ROOT=%s after a successful upload", blobRoot)
 	}
 }

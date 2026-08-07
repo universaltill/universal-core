@@ -25,6 +25,7 @@ import (
 	"github.com/universaltill/universal-core/internal/i18n"
 	"github.com/universaltill/universal-core/internal/kernel/aiassist"
 	"github.com/universaltill/universal-core/internal/kernel/authz"
+	"github.com/universaltill/universal-core/internal/kernel/blobstore"
 	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/csvimport"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
@@ -91,6 +92,23 @@ type Handler struct {
 	// composition root via SetMemberMgmt.
 	members *zitadelmgmt.Client
 	tenants *data.TenantRepo
+	// blobstore is nil unless SetBlobstore was called. Unlike
+	// ai/speech/members, this has no legitimate "unconfigured" state in
+	// production (blobstore.FSStore needs no external credential — the
+	// real composition root always wires one, see ADR-0024) — it's still
+	// nil-checked defensively in attachment.go because existing tests
+	// build a Handler via New() without wiring one, and every other
+	// optional-integration field in this struct follows the same
+	// nil-safe-degrade-to-503 contract rather than panicking.
+	blobstore blobstore.Store
+}
+
+// SetBlobstore wires the blob storage backend (internal/kernel/
+// blobstore) — a post-construction setter for the same reason
+// SetMemberMgmt is one (New already has seven parameters; see its own
+// doc comment).
+func (h *Handler) SetBlobstore(store blobstore.Store) {
+	h.blobstore = store
 }
 
 // SetMemberMgmt wires the member-management client and the tenant
@@ -283,6 +301,11 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	mux.Handle("GET /api/records/{entityType}", auth(h.listRecords))
 	mux.Handle("POST /api/records/{entityType}", auth(h.createRecord))
 	mux.Handle("GET /api/records/{entityType}/{id}", auth(h.getRecord))
+	// Generic attachment upload/download (uc-infra#142, ADR-0024) — see
+	// attachment.go. Entity-agnostic, same as the /api/records/ routes
+	// above: no route here is specific to any one entityType.
+	mux.Handle("POST /api/attachments/{entityType}/{recordID}", auth(h.attachmentUpload))
+	mux.Handle("GET /api/attachments/{id}", auth(h.attachmentDownload))
 	// Searchable reference-field picker source (#24) — see reference_search.go.
 	mux.Handle("GET /api/references/{entityType}", auth(h.searchReferenceOptions))
 	// POST, not PUT: formrender's own <form> tag always submits via

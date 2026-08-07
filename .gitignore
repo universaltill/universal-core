@@ -3,6 +3,14 @@
 .DS_Store
 /coverage.out
 
+# Default BLOB_STORAGE_ROOT (ADR-0024) when the env var isn't set — a
+# developer running `go run ./cmd/universal-core` from the repo root and
+# uploading an attachment would otherwise land real user-supplied file
+# content as untracked files in a public repo's working tree (the same
+# class of near-miss the seed-demo-data binary note below already
+# documents; found by independent review, uc-infra#142).
+/data/
+
 # This repo is public. docs/ (ADRs, code-review records) and infra/
 # (Terraform) live in the private universaltill/uc-infra repo instead —
 # ignored here so an accidental `git add -A` can never re-introduce them.
