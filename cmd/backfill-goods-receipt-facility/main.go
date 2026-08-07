@@ -68,12 +68,46 @@ func main() {
 		log.Fatal("DATABASE_URL is required")
 	}
 	actorID := flag.String("actor-id", "", "audit actor id for every record this updates (required)")
+	// An unattended pipeline backfill run is an ai_agent actor, and
+	// ADR-0001 §14 makes that distinction first-class — hard-coding
+	// ActorHuman would write a falsified actor_type onto every record
+	// this command migrates (uc-infra#160, same shape as
+	// cmd/backfill-inventory-facility's fix for uc-infra#72/#123).
+	actorType := flag.String("actor-type", string(audit.ActorHuman), "audit actor type: human | ai_agent")
+	modelVersion := flag.String("model-version", "", "model version, required when -actor-type is ai_agent")
 	facilityCode := flag.String("facility-code", "MAIN", "code of the Facility to assign pre-existing receipts to; created if absent")
 	facilityName := flag.String("facility-name", "Main Warehouse", "name used only when the facility is created")
 	dryRun := flag.Bool("dry-run", false, "report what would change without writing anything")
 	flag.Parse()
 	if *actorID == "" {
 		log.Fatal("-actor-id is required")
+	}
+	// Resolved and checked before any database work: an operator who
+	// mistyped the actor should learn that immediately, not after the
+	// connection already ran (same discipline as cmd/provision-tenant).
+	actor := audit.Actor{Type: audit.ActorType(*actorType), ID: *actorID, ModelVersion: *modelVersion}
+	switch actor.Type {
+	case audit.ActorHuman, audit.ActorAgent:
+	default:
+		log.Fatalf("invalid actor: -actor-type must be %q or %q, got %q", audit.ActorHuman, audit.ActorAgent, *actorType)
+	}
+	// An ai_agent actor has no natural-language prompt of its own here —
+	// the resolved invocation is the closest analogue, and ADR-0001 §14
+	// requires input_hash for every ai_agent audit row, not just
+	// model_version (uc-infra#124).
+	if actor.Type == audit.ActorAgent {
+		actor.Input = audit.CLIInvocationInput(os.Args[1:])
+	}
+	// A human actor carrying a model version is the same class of
+	// falsified audit metadata this fix exists to prevent the other way
+	// around — Validate() alone only rejects an EMPTY ModelVersion on an
+	// agent, never a populated one on a human, so that half of the
+	// mistake needs its own check.
+	if actor.Type == audit.ActorHuman && *modelVersion != "" {
+		log.Fatalf("invalid actor: -model-version is only meaningful when -actor-type is %q", audit.ActorAgent)
+	}
+	if err := actor.Validate(); err != nil {
+		log.Fatalf("invalid actor: %v", err)
 	}
 
 	sqlDB, err := sql.Open("pgx", dbURL)
@@ -86,7 +120,6 @@ func main() {
 	}
 
 	ctx := context.Background()
-	actor := audit.Actor{Type: audit.ActorHuman, ID: *actorID}
 	entityDefs := data.NewEntityDefinitionRepo(sqlDB)
 	engine := crud.NewEngine(sqlDB)
 
