@@ -2423,6 +2423,167 @@ func seedEntityPermission(t *testing.T, db *sql.DB, roleCode, userID, entityType
 	return role.ID
 }
 
+// seedFieldPermission grants roleCode a field-level FieldPermission row
+// hiding fieldName on entityType (authz.Resolver.HiddenFields), creates
+// the role, and grants it to userID — the field-level analogue of
+// seedEntityPermission above. Deliberately does NOT also seed an
+// entity-level Permission row: HiddenFields' own "rulesExist" gate is
+// keyed per entity type off Permission rows specifically (see
+// authz.Resolver.resolve), so a role holding only a FieldPermission row
+// hides the one field without also opting the tenant into entity-level
+// RBAC for PurchaseOrder/POLine — unlike seedEntityPermission's own
+// call sites, this helper's callers don't need a matching can_read=true
+// grant just to keep seeing the rest of the form.
+func seedFieldPermission(t *testing.T, db *sql.DB, roleCode, userID, entityType, fieldName string) {
+	t.Helper()
+	ctx := context.Background()
+	engine := crud.NewEngine(db)
+	actor := humanActor()
+
+	role, err := engine.Create(ctx, foundation.Role(), map[string]any{"code": roleCode, "name": roleCode}, actor)
+	if err != nil {
+		t.Fatalf("create Role %s: %v", roleCode, err)
+	}
+	if _, err := engine.Create(ctx, foundation.UserRole(), map[string]any{"user_id": userID, "role_id": role.ID}, actor); err != nil {
+		t.Fatalf("grant %s to %s: %v", roleCode, userID, err)
+	}
+	if _, err := engine.Create(ctx, foundation.FieldPermission(), map[string]any{
+		"role_id": role.ID, "entity_type": entityType, "field_name": fieldName, "hidden": true,
+	}, actor); err != nil {
+		t.Fatalf("create FieldPermission hiding %s.%s for %s: %v", entityType, fieldName, roleCode, err)
+	}
+}
+
+// poLineWithNoteEntityDef/poLineWithNoteFormDef add a second POLine
+// field (beyond poLineEntityDef's line_total) so the two child-redaction
+// tests below can prove ONE column disappears while a SIBLING column
+// survives — poLineEntityDef alone has nothing to distinguish "redacted"
+// from "the whole table's gone".
+func poLineWithNoteEntityDef() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "POLine",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "purchase_order_id", Type: entity.FieldString, Required: true},
+			{Name: "line_total", Type: entity.FieldNumber, Required: true},
+			{Name: "note", Type: entity.FieldString},
+		},
+	}
+}
+
+func poLineWithNoteFormDef() *form.Definition {
+	return &form.Definition{
+		EntityType: "POLine",
+		Version:    1,
+		Sections: []form.Section{{
+			Title:     "Details",
+			Component: form.ComponentFields,
+			Fields: []form.FormField{
+				{Name: "line_total", Label: "Line Total"},
+				{Name: "note", Label: "Note"},
+			},
+		}},
+	}
+}
+
+// TestAPI_RenderRecordForm_MasterDetailChildRedactedFieldColumnAbsent
+// (uc-infra#127): the internal/api-layer counterpart to formrender's own
+// unit tests — a FieldPermission hiding POLine.note against REAL
+// Postgres/REAL RBAC (not a synthetic ChildRedactedFields map handed to
+// the renderer directly) must remove that column, header and cell, from
+// the rendered PurchaseOrder form's Lines section, while line_total
+// (unredacted) still shows. This is the path formrender's tests can't
+// reach: whether loadMasterDetailChildren actually resolves and wires
+// ts.crud.HiddenFields(section.Target) end to end.
+func TestAPI_RenderRecordForm_MasterDetailChildRedactedFieldColumnAbsent(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := foundation.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	publishEntityAndForm(t, db, purchaseOrderEntityDef(), purchaseOrderFormDef())
+	publishEntityAndForm(t, db, poLineWithNoteEntityDef(), poLineWithNoteFormDef())
+	seedFieldPermission(t, db, "line-viewer", "user-line-viewer", "POLine", "note")
+
+	engine := crud.NewEngine(db)
+	po, err := engine.Create(ctx, purchaseOrderEntityDef(), map[string]any{"vendor_id": "v1"}, humanActor())
+	if err != nil {
+		t.Fatalf("seed PurchaseOrder: %v", err)
+	}
+	if _, err := engine.Create(ctx, poLineWithNoteEntityDef(), map[string]any{
+		"purchase_order_id": po.ID, "line_total": 150.5, "note": "confidential margin note",
+	}, humanActor()); err != nil {
+		t.Fatalf("seed POLine: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	formReq := newRequest("GET", "/forms/PurchaseOrder/"+po.ID, tenantID, "user-line-viewer", nil)
+	formRec := httptest.NewRecorder()
+	mux.ServeHTTP(formRec, formReq)
+	if formRec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", formRec.Code, formRec.Body.String())
+	}
+	body := formRec.Body.String()
+	if strings.Contains(body, `data-field="note"`) {
+		t.Errorf("expected the redacted note column (header and cell) absent from the rendered form, got:\n%s", body)
+	}
+	if strings.Contains(body, "confidential margin note") {
+		t.Errorf("expected the redacted field's value not to reach the DOM, got:\n%s", body)
+	}
+	if !strings.Contains(body, `data-field="line_total"`) {
+		t.Errorf("expected the unredacted line_total column to still render, got:\n%s", body)
+	}
+}
+
+// TestAPI_RenderRecordForm_MasterDetailChildRedactedFieldColumnAbsentEvenWhenEmpty
+// (uc-infra#127): the zero-child-rows variant of the test above — the
+// scenario uc-infra#127's report specifically called out as newly
+// dangerous once uc-infra#103 made column headers render real text: a
+// redacted column's header must not appear even when the Lines section
+// has no rows to show yet, since childColumns derives the header from
+// the child Definition, not from row data.
+func TestAPI_RenderRecordForm_MasterDetailChildRedactedFieldColumnAbsentEvenWhenEmpty(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := foundation.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	publishEntityAndForm(t, db, purchaseOrderEntityDef(), purchaseOrderFormDef())
+	publishEntityAndForm(t, db, poLineWithNoteEntityDef(), poLineWithNoteFormDef())
+	seedFieldPermission(t, db, "line-viewer", "user-line-viewer", "POLine", "note")
+
+	engine := crud.NewEngine(db)
+	po, err := engine.Create(ctx, purchaseOrderEntityDef(), map[string]any{"vendor_id": "v1"}, humanActor())
+	if err != nil {
+		t.Fatalf("seed PurchaseOrder: %v", err)
+	}
+	// Deliberately no POLine created — this PurchaseOrder's Lines
+	// section has zero child rows.
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	formReq := newRequest("GET", "/forms/PurchaseOrder/"+po.ID, tenantID, "user-line-viewer", nil)
+	formRec := httptest.NewRecorder()
+	mux.ServeHTTP(formRec, formReq)
+	if formRec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", formRec.Code, formRec.Body.String())
+	}
+	body := formRec.Body.String()
+	if strings.Contains(body, `data-field="note"`) {
+		t.Errorf("expected the redacted note column's header absent even with zero child rows, got:\n%s", body)
+	}
+	if !strings.Contains(body, `data-field="line_total"`) {
+		t.Errorf("expected the unredacted line_total column's header to still render with zero rows, got:\n%s", body)
+	}
+}
+
 // TestAPI_RenderRecordForm_MasterDetailReferenceColumnResolvesToLabel
 // (uc-infra#85): the internal/api-layer counterpart to formrender's own
 // unit tests — a master_detail child row's FieldReference column

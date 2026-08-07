@@ -1228,7 +1228,7 @@ func (h *Handler) buildFormRenderData(ctx context.Context, ts tenantScope, entDe
 		renderData.Record = rec.Data
 		renderData.RecordLabel = h.recordLabel(entDef, rec, locale)
 
-		children, childDefs, childReferenceLabels, unavailableSections, err := h.loadMasterDetailChildren(ctx, ts, entDef, formDef, id, locale)
+		children, childDefs, childReferenceLabels, unavailableSections, childRedactedFields, err := h.loadMasterDetailChildren(ctx, ts, entDef, formDef, id, locale)
 		if err != nil {
 			return formrender.Data{}, fmt.Errorf("load master-detail children: %w", err)
 		}
@@ -1236,6 +1236,7 @@ func (h *Handler) buildFormRenderData(ctx context.Context, ts tenantScope, entDe
 		renderData.ChildDefs = childDefs
 		renderData.ChildReferenceLabels = childReferenceLabels
 		renderData.UnavailableSections = unavailableSections
+		renderData.ChildRedactedFields = childRedactedFields
 	} else {
 		// A not-yet-saved record has no children to fetch, but section
 		// AVAILABILITY is a Definition-level fact, not a record-level
@@ -1586,10 +1587,10 @@ func (h *Handler) pageReferenceLabels(ctx context.Context, ts tenantScope, def *
 // exist" — mistook it for exactly that, 404ing the whole parent form
 // even though the record plainly exists and only one of its related
 // child module types isn't licensed (uc-infra#132).
-func (h *Handler) loadMasterDetailChildren(ctx context.Context, ts tenantScope, entDef *entity.Definition, formDef *form.Definition, recordID, locale string) (map[string][]map[string]any, map[string]*entity.Definition, map[string]map[string]map[string]string, map[string]bool, error) {
+func (h *Handler) loadMasterDetailChildren(ctx context.Context, ts tenantScope, entDef *entity.Definition, formDef *form.Definition, recordID, locale string) (map[string][]map[string]any, map[string]*entity.Definition, map[string]map[string]map[string]string, map[string]bool, map[string]map[string]bool, error) {
 	availableChildDefs, unavailable, err := h.resolveMasterDetailSectionAvailability(ctx, ts, entDef, formDef)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 	children := make(map[string][]map[string]any)
 	// The child Definitions travel with the rows: the renderer needs
@@ -1597,6 +1598,15 @@ func (h *Handler) loadMasterDetailChildren(ctx context.Context, ts tenantScope, 
 	// viewer's locale (formrender.buildChildRows).
 	childDefs := make(map[string]*entity.Definition)
 	referenceLabels := make(map[string]map[string]map[string]string)
+	// childRedactedFields is RedactedFields' own resolution
+	// (ts.crud.HiddenFields), just keyed per section Target instead of
+	// once for the parent — see formrender.Data.ChildRedactedFields'
+	// doc comment for why a child entity type needs its own redaction
+	// set (uc-infra#127). Resolved per section rather than once for
+	// every child entity type this tenant has, since a form only ever
+	// declares master_detail/related_list sections for the child types
+	// it actually shows.
+	childRedactedFields := make(map[string]map[string]bool)
 	for _, section := range formDef.Sections {
 		// Both component kinds resolve their rows the same way — parent
 		// id matched against the child's ParentField. They differ in what
@@ -1629,7 +1639,7 @@ func (h *Handler) loadMasterDetailChildren(ctx context.Context, ts tenantScope, 
 		}
 		records, err := ts.crud.ListByField(ctx, childDef, rel.ParentField, recordID)
 		if err != nil {
-			return nil, nil, nil, nil, fmt.Errorf("list %s children: %w", section.Target, err)
+			return nil, nil, nil, nil, nil, fmt.Errorf("list %s children: %w", section.Target, err)
 		}
 		rows := make([]map[string]any, len(records))
 		for i, rec := range records {
@@ -1638,8 +1648,17 @@ func (h *Handler) loadMasterDetailChildren(ctx context.Context, ts tenantScope, 
 		children[section.Target] = rows
 		childDefs[section.Target] = childDef
 		referenceLabels[section.Target] = h.pageReferenceLabels(ctx, ts, childDef, records, locale)
+		// Resolved even for a section with zero rows: the redacted
+		// column must vanish from the header too (uc-infra#127's own
+		// acceptance criterion), and childColumns builds the header
+		// from the Definition, not from row data.
+		redacted, err := ts.crud.HiddenFields(ctx, section.Target)
+		if err != nil {
+			return nil, nil, nil, nil, nil, fmt.Errorf("resolve hidden fields for %s: %w", section.Target, err)
+		}
+		childRedactedFields[section.Target] = redacted
 	}
-	return children, childDefs, referenceLabels, unavailable, nil
+	return children, childDefs, referenceLabels, unavailable, childRedactedFields, nil
 }
 
 // resolveMasterDetailSectionAvailability resolves, for every

@@ -221,6 +221,24 @@ type Data struct {
 	// query failed", so it resolves this the same way it precomputes
 	// RedactedFields/ReferenceCreateLabels.
 	UnavailableSections map[string]bool
+	// ChildRedactedFields is RedactedFields' equivalent for a
+	// master_detail/related_list section's CHILD entity type, keyed the
+	// same way as Children/ChildDefs (by section Target), then by the
+	// child entity's field name. RedactedFields only ever governs the
+	// parent entity's own Fields sections and HiddenFields inputs; before
+	// this, a FieldPermission hiding a field on a child entity type had
+	// no effect at all on a related-list/master-detail table — the child
+	// Definition's full field order (childColumns) went straight into
+	// both the column headers and every row's cells, leaking a hidden
+	// field's name AND, once uc-infra#103 made column headers real text,
+	// its human-readable label too — visible even with zero child rows,
+	// since childColumns derives columns from the Definition, not the
+	// rows (uc-infra#127). A field named here is dropped from both the
+	// column set and every row's cells for that section — see
+	// childColumns/buildChildRows. Missing/nil is treated as "nothing
+	// redacted for this child type", same graceful-degrade convention as
+	// ChildDefs/ChildReferenceLabels.
+	ChildRedactedFields map[string]map[string]bool
 }
 
 // Render writes the HTML/HTMX form for def against ent's field shapes and
@@ -596,7 +614,7 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 			}
 
 		case form.ComponentMasterDetail:
-			sv.Children, sv.Columns = buildChildRows(data.Children[s.Target], data.ChildDefs[s.Target], data.ChildReferenceLabels[s.Target], r.i18n, locale)
+			sv.Children, sv.Columns = buildChildRows(data.Children[s.Target], data.ChildDefs[s.Target], data.ChildReferenceLabels[s.Target], data.ChildRedactedFields[s.Target], r.i18n, locale)
 			sv.AddHref = "/api/records/" + url.PathEscape(s.Target) + "/new"
 			if s.RollUp != "" {
 				// RollUpTarget names a field on the PARENT entity (ent,
@@ -620,7 +638,7 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 			// the endpoint: the rows are already here, and a lazy-load
 			// that fires on every form render is a request this page
 			// does not need (independent review, board #20).
-			sv.Children, sv.Columns = buildChildRows(data.Children[s.Target], data.ChildDefs[s.Target], data.ChildReferenceLabels[s.Target], r.i18n, locale)
+			sv.Children, sv.Columns = buildChildRows(data.Children[s.Target], data.ChildDefs[s.Target], data.ChildReferenceLabels[s.Target], data.ChildRedactedFields[s.Target], r.i18n, locale)
 		}
 
 		vm.Sections = append(vm.Sections, sv)
@@ -971,8 +989,15 @@ func (r *Renderer) buildFields(s form.Section, ent *entity.Definition, record ma
 // childDef may be nil (a Definition mismatch the caller already
 // tolerates); the per-row key fallback keeps such a section rendering
 // something rather than nothing.
-func buildChildRows(children []map[string]any, childDef *entity.Definition, referenceLabels map[string]map[string]string, catalog *i18n.Catalog, locale string) ([]childRowView, []columnView) {
-	names := childColumns(children, childDef)
+//
+// redacted names the child entity's fields this viewer may not see
+// (Data.ChildRedactedFields[section.Target]) — filtered out of names
+// before columns/rows are built, so a redacted field reaches neither
+// the header (column NAME or its resolved LABEL) nor any row's cell.
+// nil/empty means nothing is redacted for this child type, the same
+// graceful-degrade convention RedactedFields itself follows.
+func buildChildRows(children []map[string]any, childDef *entity.Definition, referenceLabels map[string]map[string]string, redacted map[string]bool, catalog *i18n.Catalog, locale string) ([]childRowView, []columnView) {
+	names := childColumns(children, childDef, redacted)
 	columns := make([]columnView, 0, len(names))
 	for _, name := range names {
 		label := name
@@ -1002,11 +1027,17 @@ func buildChildRows(children []map[string]any, childDef *entity.Definition, refe
 // childColumns is the child Definition's declared field order, falling
 // back to the union of the rows' own keys (sorted, so output stays
 // deterministic — Go map iteration is randomized) when no Definition is
-// available.
-func childColumns(children []map[string]any, childDef *entity.Definition) []string {
+// available. Either way, any name redacted (see buildChildRows' own
+// redacted param) is dropped before it's returned — this runs whether or
+// not there are any rows, which is what makes a redacted column disappear
+// even from an otherwise-empty related-list/master-detail table.
+func childColumns(children []map[string]any, childDef *entity.Definition, redacted map[string]bool) []string {
 	if childDef != nil && len(childDef.Fields) > 0 {
 		cols := make([]string, 0, len(childDef.Fields))
 		for _, f := range childDef.Fields {
+			if redacted[f.Name] {
+				continue
+			}
 			cols = append(cols, f.Name)
 		}
 		return cols
@@ -1015,7 +1046,7 @@ func childColumns(children []map[string]any, childDef *entity.Definition) []stri
 	var cols []string
 	for _, child := range children {
 		for k := range child {
-			if !seen[k] {
+			if !seen[k] && !redacted[k] {
 				seen[k] = true
 				cols = append(cols, k)
 			}
