@@ -776,7 +776,12 @@ func numericBoundWarnings(
 				continue
 			}
 			n, err := records.CountOutOfRangeField(ctx, c.entityType, f.Name, f.Min, f.Max)
-			if err != nil || n == 0 {
+			if err != nil {
+				log.Printf("WARNING: %s: %s — could not check existing records against the new bound on %q, this warning may be incomplete: %v",
+					tenantName, c.entityType, f.Name, err)
+				continue
+			}
+			if n == 0 {
 				continue
 			}
 			out = append(out, fmt.Sprintf(
@@ -843,7 +848,12 @@ func uniqueConstraintWarnings(
 		for _, set := range newlyAddedUniqueSets(ctx, entityDefs, c, newDef) {
 			name := entity.UniqueConstraintName(set)
 			n, err := crud.CountUniqueConstraintViolations(ctx, records, c.entityType, set)
-			if err != nil || n == 0 {
+			if err != nil {
+				log.Printf("WARNING: %s: %s — could not check existing records against the new unique constraint %q, this warning may be incomplete: %v",
+					tenantName, c.entityType, name, err)
+				continue
+			}
+			if n == 0 {
 				continue
 			}
 			out = append(out, fmt.Sprintf(

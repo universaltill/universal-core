@@ -1,13 +1,15 @@
-// Regression tests for uc-infra#116: requiredFieldWarnings and
-// targetConstraintWarnings each treated a genuine Count*/error from
-// their underlying repository call identically to "zero violations
-// found" (`if err != nil || n == 0 { continue }`), so a transient DB
-// error produced a false "all clear" instead of surfacing to the
-// operator. These exercise the error branch directly against a real
-// *sql.DB that has been Close()d — deterministic ("sql: database is
-// closed"), no live Postgres connection needed, and it reaches the
-// count call the exact same way a dropped connection or canceled query
-// would in production.
+// Regression tests for uc-infra#116 and its follow-up uc-infra#158: all
+// four of requiredFieldWarnings, targetConstraintWarnings,
+// numericBoundWarnings and uniqueConstraintWarnings each treated a
+// genuine Count*/error from their underlying repository call identically
+// to "zero violations found" (`if err != nil || n == 0 { continue }`),
+// so a transient DB error produced a false "all clear" instead of
+// surfacing to the operator. #116 fixed the first two; #158 closed the
+// same gap at the other two's own Count* call sites. These exercise the
+// error branch directly against a real *sql.DB that has been Close()d —
+// deterministic ("sql: database is closed"), no live Postgres connection
+// needed, and it reaches the count call the exact same way a dropped
+// connection or canceled query would in production.
 package main
 
 import (
@@ -184,6 +186,124 @@ func TestTargetConstraintWarnings_CountErrorIsSurfacedNotSwallowed(t *testing.T)
 		want := `could not check existing records against the new reference constraint on "` + field + `"`
 		if !strings.Contains(logged, want) {
 			t.Errorf("expected the WARNING for %q to contain %q, got: %q", field, want, logged)
+		}
+	}
+	for _, want := range []string{"WARNING", "Demo Organization"} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("expected the operator-facing WARNING to mention %q, got: %q", want, logged)
+		}
+	}
+	if !strings.Contains(logged, "database is closed") {
+		t.Errorf("expected the WARNING to carry the underlying error, got: %q", logged)
+	}
+}
+
+// Regression tests for uc-infra#158, the same swallowed-error bug shape
+// #116 fixed above (`if err != nil || n == 0 { continue }`), independently
+// present at numericBoundWarnings' and uniqueConstraintWarnings' own
+// Count* call sites — out of #116's scope, tracked separately, fixed here.
+
+func TestNumericBoundWarnings_CountErrorIsSurfacedNotSwallowed(t *testing.T) {
+	// Two bounded FieldNumber fields, not one — same "the loop must keep
+	// going past a transient error" reasoning as the tests above.
+	minVal := 0.0
+	maxVal := 100.0
+	def := &entity.Definition{
+		EntityType: "Gauge",
+		Fields: []entity.Field{
+			{Name: "reading", Type: entity.FieldNumber, Min: &minVal},
+			{Name: "capacity", Type: entity.FieldNumber, Max: &maxVal},
+		},
+	}
+	defFor := func(entityType string) (*entity.Definition, bool) {
+		if entityType != "Gauge" {
+			return nil, false
+		}
+		return def, true
+	}
+	// from: 0 (new-to-registry) so numericBoundWarnings treats every
+	// bounded field as newly-added without needing entityDefs to resolve
+	// an old version — entityDefs below is only ever passed through to
+	// GetVersion, never called for c.from == 0, so a closed DB behind it
+	// is fine: this test isn't exercising that lookup.
+	changes := []change{{entityType: "Gauge", from: 0, to: 1}}
+	entityDefs := data.NewEntityDefinitionRepo(closedDB(t))
+
+	var out []string
+	logged := captureLog(t, func() {
+		out = numericBoundWarnings(context.Background(), closedDB(t), entityDefs, "Demo Organization", changes, defFor)
+	})
+
+	if len(out) != 0 {
+		t.Errorf("numericBoundWarnings on a count error must not report a fabricated violation count, got %v", out)
+	}
+	// A distinctive fragment of the new wording, not just "Gauge"/the
+	// field name alone — CountOutOfRangeField's own wrapped error text
+	// ("count Gauge records out of range on reading: ...") already
+	// contains those in isolation, so asserting only on them would pass
+	// even if the new WARNING line dropped this function's own message
+	// entirely.
+	for _, field := range []string{"reading", "capacity"} {
+		want := `could not check existing records against the new bound on "` + field + `"`
+		if !strings.Contains(logged, want) {
+			t.Errorf("expected the WARNING for %q to contain %q, got: %q", field, want, logged)
+		}
+	}
+	for _, want := range []string{"WARNING", "Demo Organization"} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("expected the operator-facing WARNING to mention %q, got: %q", want, logged)
+		}
+	}
+	if !strings.Contains(logged, "database is closed") {
+		t.Errorf("expected the WARNING to carry the underlying error, got: %q", logged)
+	}
+}
+
+func TestUniqueConstraintWarnings_CountErrorIsSurfacedNotSwallowed(t *testing.T) {
+	// Two declared Unique sets, not one — same "the loop must keep going
+	// past a transient error" reasoning as the tests above.
+	def := &entity.Definition{
+		EntityType: "Voucher",
+		Unique: [][]string{
+			{"code"},
+			{"batch_id", "sequence"},
+		},
+	}
+	defFor := func(entityType string) (*entity.Definition, bool) {
+		if entityType != "Voucher" {
+			return nil, false
+		}
+		return def, true
+	}
+	// from: 0 (new-to-registry) so newlyAddedUniqueSets treats every
+	// declared set as newly-added without needing entityDefs to resolve
+	// an old version — entityDefs below is only ever passed through to
+	// GetVersion, never called for c.from == 0, so a closed DB behind it
+	// is fine: this test isn't exercising that lookup.
+	changes := []change{{entityType: "Voucher", from: 0, to: 1}}
+	entityDefs := data.NewEntityDefinitionRepo(closedDB(t))
+
+	var out []string
+	logged := captureLog(t, func() {
+		out = uniqueConstraintWarnings(context.Background(), closedDB(t), entityDefs, "Demo Organization", changes, defFor)
+	})
+
+	if len(out) != 0 {
+		t.Errorf("uniqueConstraintWarnings on a count error must not report a fabricated violation count, got %v", out)
+	}
+	// A distinctive fragment of the new wording, not just the constraint
+	// name alone — CountUniqueConstraintViolations' own wrapped error text
+	// ("count unique constraint violations for Voucher: ...") already
+	// contains the entity type in isolation, so asserting only on the
+	// constraint name would pass even if the new WARNING line dropped
+	// this function's own message entirely.
+	for _, name := range []string{
+		entity.UniqueConstraintName([]string{"code"}),
+		entity.UniqueConstraintName([]string{"batch_id", "sequence"}),
+	} {
+		want := `could not check existing records against the new unique constraint "` + name + `"`
+		if !strings.Contains(logged, want) {
+			t.Errorf("expected the WARNING for %q to contain %q, got: %q", name, want, logged)
 		}
 	}
 	for _, want := range []string{"WARNING", "Demo Organization"} {
