@@ -248,3 +248,81 @@ func TestActorTypeValidation(t *testing.T) {
 		t.Errorf("expected an unknown actor type to be rejected, got code %d: %s", code, stderr)
 	}
 }
+
+// TestInstall_ActorTypeAI_WritesRealAuditRows is the positive half
+// TestActorTypeValidation deliberately doesn't cover: every rejection
+// test above only proves the guardrail exists, never that a SUCCESSFUL
+// ai_agent install actually reaches the audit log with the right values
+// (same class of wiring mistake uc-infra#72's independent review found
+// elsewhere). Also covers uc-infra#124: an ai_agent actor's input_hash
+// must be populated, not just model_version — Actor.Validate() now
+// enforces this, but only a real run against a real database proves the
+// CLI actually supplies it end to end. Runs the real compiled binary and
+// reads the installed module's own audit_log rows directly.
+func TestInstall_ActorTypeAI_WritesRealAuditRows(t *testing.T) {
+	if os.Getenv("TEST_DATABASE_URL") == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping integration test")
+	}
+	controlDSN := testexec.FreshDatabase(t, "uc_test_installmod_ai_actor")
+	control := testexec.Open(t, controlDSN)
+	ctx := context.Background()
+	if err := db.ApplyControl(ctx, control); err != nil {
+		t.Fatalf("ApplyControl: %v", err)
+	}
+	router, err := tenantdb.NewRouter(control, controlDSN)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+	t.Cleanup(func() { router.Close() })
+	tenantID, err := router.Create(ctx, "Install Module AI Actor Smoke Test", "eu-west")
+	if err != nil {
+		t.Fatalf("router.Create: %v", err)
+	}
+	testexec.DropTenantDatabase(t, testexec.Open(t, controlDSN), tenantID)
+	tenantDB, err := router.Get(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("router.Get: %v", err)
+	}
+	if err := foundation.Publish(ctx, tenantDB, audit.Actor{Type: audit.ActorHuman, ID: "smoke-test-setup"}); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+
+	var watermark int64
+	if err := tenantDB.QueryRowContext(ctx,
+		`SELECT coalesce(max(id), 0) FROM audit_log`).Scan(&watermark); err != nil {
+		t.Fatalf("read audit_log watermark: %v", err)
+	}
+
+	stdout, stderr, code := run(t, []string{"DATABASE_URL=" + controlDSN},
+		"-bundle", fixturePath(t), "-tenant-id", tenantID,
+		"-actor-id", "pipeline", "-actor-type", "ai_agent", "-model-version", "claude-test-1")
+	if code != 0 {
+		t.Fatalf("install exited %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+
+	var total, wrongActor, missingInputHash int
+	if err := tenantDB.QueryRowContext(ctx,
+		`SELECT count(*) FROM audit_log WHERE id > $1`, watermark).Scan(&total); err != nil {
+		t.Fatalf("count audit_log: %v", err)
+	}
+	if total == 0 {
+		t.Fatal("expected the install to write at least one new audit_log row")
+	}
+	if err := tenantDB.QueryRowContext(ctx,
+		`SELECT count(*) FROM audit_log WHERE id > $1
+		 AND (actor_type != 'ai_agent' OR actor_id != 'pipeline' OR model_version IS DISTINCT FROM 'claude-test-1')`, watermark,
+	).Scan(&wrongActor); err != nil {
+		t.Fatalf("count wrong-actor audit_log rows: %v", err)
+	}
+	if wrongActor != 0 {
+		t.Errorf("expected every new audit_log row to carry actor_type=ai_agent, actor_id=pipeline, model_version=claude-test-1, got %d that don't", wrongActor)
+	}
+	if err := tenantDB.QueryRowContext(ctx,
+		`SELECT count(*) FROM audit_log WHERE id > $1 AND input_hash IS NULL`, watermark,
+	).Scan(&missingInputHash); err != nil {
+		t.Fatalf("count missing-input-hash audit_log rows: %v", err)
+	}
+	if missingInputHash != 0 {
+		t.Errorf("expected every new ai_agent audit_log row to carry a non-null input_hash, got %d that don't", missingInputHash)
+	}
+}

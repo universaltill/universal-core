@@ -432,6 +432,17 @@ func TestSync_ActorTypeAI_WritesRealAuditRows(t *testing.T) {
 	if wrongActor != 0 {
 		t.Errorf("expected every synced-definition audit_log row to carry actor_type=ai_agent, actor_id=pipeline, model_version=claude-test-1, got %d that don't", wrongActor)
 	}
+	// uc-infra#124: an ai_agent actor's input_hash must be populated too,
+	// not just model_version.
+	var missingInputHash int
+	if err := tenantDB.QueryRowContext(context.Background(),
+		`SELECT count(*) FROM audit_log WHERE id > $1 AND input_hash IS NULL`, watermark,
+	).Scan(&missingInputHash); err != nil {
+		t.Fatalf("count missing-input-hash audit_log rows: %v", err)
+	}
+	if missingInputHash != 0 {
+		t.Errorf("expected every synced-definition audit_log row to carry a non-null input_hash, got %d that don't", missingInputHash)
+	}
 }
 
 // TestSync_BringsAStaleTenantUpToDate is the core case: the drift

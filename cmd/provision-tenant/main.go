@@ -84,6 +84,13 @@ func main() {
 	default:
 		log.Fatalf("invalid actor: -actor-type must be %q or %q, got %q", audit.ActorHuman, audit.ActorAgent, *actorType)
 	}
+	// An ai_agent actor has no natural-language prompt of its own here —
+	// the resolved invocation is the closest analogue, and ADR-0001 §14
+	// requires input_hash for every ai_agent audit row, not just
+	// model_version (uc-infra#124).
+	if actor.Type == audit.ActorAgent {
+		actor.Input = audit.CLIInvocationInput(os.Args[1:])
+	}
 	// A human actor carrying a model version is the same class of
 	// falsified audit metadata this fix exists to prevent the other
 	// way around (uc-infra#72 independent review) — Validate() alone

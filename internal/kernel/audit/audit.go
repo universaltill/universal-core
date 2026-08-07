@@ -9,6 +9,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -77,6 +79,21 @@ var (
 
 // Validate checks that an Actor is well-formed before it's allowed to
 // author an audit entry.
+//
+// This deliberately does NOT require Input for an ActorAgent, even
+// though ADR-0001 §14 names input_hash a required part of an ai_agent
+// audit row alongside model_version: internal/kernel/entity (Definition
+// drafting), internal/kernel/csvimport, and internal/kernel/sqlsource
+// already construct valid ActorAgent actors with no Input today
+// (uc-infra#124's own investigation confirmed this at every one of
+// those call sites), and turning this into a hard Validate() failure
+// would break them, not just the CLI binaries this task actually
+// touches. uc-infra#124 populates Input for the 7 CLI binaries that
+// construct an ai_agent actor (see CLIInvocationInput below) without
+// making Validate() enforce it — flipping Validate() to require Input
+// for every ActorAgent is real, separate follow-up work (audit every
+// remaining ai_agent call site, give each a real Input, then enforce),
+// tracked as its own backlog item rather than done here.
 func (a Actor) Validate() error {
 	if a.ID == "" {
 		return ErrMissingActorID
@@ -95,6 +112,30 @@ func (a Actor) InputHash() string {
 	}
 	sum := sha256.Sum256([]byte(a.Input))
 	return hex.EncodeToString(sum[:])
+}
+
+// CLIInvocationInput returns a deterministic string representing a CLI
+// invocation, for use as Actor.Input when the actor is an ai_agent CLI
+// caller with no natural-language prompt of its own — a
+// provision-tenant/seed-demo-data/backfill-* run doesn't draft anything,
+// but the resolved argument list it was invoked with is the closest
+// analogue: it's the actual input that produced this run's changes, and
+// the same invocation always hashes the same way. Callers pass the
+// program's arguments (e.g. os.Args[1:] — excluding the program name
+// itself, which varies by how the binary was invoked and carries no
+// information about what it did).
+//
+// Each argument is quoted (%q) before joining, not just space-separated
+// — a plain strings.Join would hash ["-name", "a b"] and
+// ["-name", "a", "b"] identically (independent review, uc-infra#124),
+// which would silently collapse two different invocations onto the same
+// input_hash.
+func CLIInvocationInput(args []string) string {
+	quoted := make([]string, len(args))
+	for i, a := range args {
+		quoted[i] = strconv.Quote(a)
+	}
+	return strings.Join(quoted, " ")
 }
 
 // Entry is one audit_log row, ready to be persisted by a repository. This
