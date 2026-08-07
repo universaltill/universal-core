@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"context"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -126,6 +127,127 @@ func TestListFilter_RegionalNumber_RealBrowser(t *testing.T) {
 	}
 	if boxValue != "1.234.567,5" {
 		t.Errorf("filter box value = %q, want the raw typed text 1.234.567,5", boxValue)
+	}
+}
+
+// TestRegionPicker_RealBrowser_ClearsFilterAcrossRegionSwitch is
+// uc-infra#128 driven through a real browser: operate the actual
+// <select class="uc-nav-region"> the way a viewer does (not an httptest
+// request built by hand) while a FieldNumber filter is active, and
+// confirm the resulting page neither silently drops a matching row (the
+// raw text reinterpreted under the new region's rules) nor leaves the
+// filter box showing stale text from the region that's no longer active
+// — the live-DOM proof that listview_filter_regional_test.go's
+// TestRegionPicker_DropsFilterValueAcrossRegionSwitch can only show at
+// the rendered-HTML-string level.
+//
+// Two rows are seeded (not one): a single row can't distinguish "the
+// filter was truly cleared" from "the filter is still active and still
+// happens to match" (uc-infra#128's independent review, F5) — after the
+// switch, BOTH must be visible.
+//
+// The region is read out of the LIVE option element rather than
+// hardcoded (independent review, F4): chromedp.SetValue on a <select>
+// silently assigns "" if no option actually has the value given, so
+// asserting the option exists first is what proves the picker really
+// offers a stale-q-free en-IN link, not just that this test's hardcoded
+// guess happened to match. And the switch is confirmed with
+// chromedp.Location — not a WaitVisible/Text pair on an element that's
+// already visible in the pre-switch DOM — because that combination isn't
+// a navigation barrier and can read the OLD page's content, making a
+// "did it change" assertion pass vacuously (this repo's own established
+// pattern for exactly this, see rfq_compare_quotes_link_test.go,
+// module_menu_hub_test.go, tenant_picker_test.go).
+func TestRegionPicker_RealBrowser_ClearsFilterAcrossRegionSwitch(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, tenantDB := testServer(t)
+
+	shipDef, shipForm := filterShipmentDef("RegionSwitchShipment")
+	publishDef(t, tenantDB, shipDef, shipForm)
+	eng := crud.NewEngine(tenantDB)
+	if _, err := eng.Create(context.Background(), shipDef, map[string]any{
+		"name": "Container 1", "ship_date": "2026-04-03", "weight": 1234567.5,
+	}, humanActor()); err != nil {
+		t.Fatalf("seed RegionSwitchShipment: %v", err)
+	}
+	if _, err := eng.Create(context.Background(), shipDef, map[string]any{
+		"name": "Container 2", "ship_date": "2026-01-15", "weight": 42.0,
+	}, humanActor()); err != nil {
+		t.Fatalf("seed second RegionSwitchShipment: %v", err)
+	}
+
+	ctx := browserCtx(t, tenantID)
+
+	// British grouping ("en" is the language whose picker actually
+	// offers more than one region — most others don't — and en-GB vs.
+	// en-IN disagree on grouping, the same pair the httptest-level
+	// sibling test uses).
+	var listText string
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/records/RegionSwitchShipment?filter=weight&q="+url.QueryEscape("1,234,567.5")),
+		chromedp.WaitVisible(`table`, chromedp.ByQuery),
+		chromedp.Text(`table`, &listText, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("load British-grouped filter: %v", err)
+	}
+	if !strings.Contains(listText, "Container 1") || strings.Contains(listText, "Container 2") {
+		t.Fatalf("expected the British-grouped filter to match only Container 1, got:\n%s", listText)
+	}
+
+	// Read the picker's own live en-IN option value rather than assuming
+	// it — proves the offered link is really stale-q-free, and that this
+	// test's SetValue below actually lands on a real option.
+	var enINHref string
+	if err := chromedp.Run(ctx,
+		chromedp.Evaluate(`(function() {
+			var opts = document.querySelectorAll('select.uc-nav-region option');
+			for (var i = 0; i < opts.length; i++) {
+				var u = new URL(opts[i].value, window.location.href);
+				if (u.searchParams.get('region') === 'en-IN') return opts[i].value;
+			}
+			return '';
+		})()`, &enINHref),
+	); err != nil {
+		t.Fatalf("read region picker options: %v", err)
+	}
+	if enINHref == "" {
+		t.Fatal("no en-IN option found in the region picker")
+	}
+	if strings.Contains(enINHref, "q=") {
+		t.Fatalf("region picker's own en-IN option carries \"q=\" — following it would reinterpret the filter under en-IN's rules: %s", enINHref)
+	}
+
+	// Operate the picker the way a user does: select that real option and
+	// let the element's own change handler navigate. chromedp.Location
+	// alongside the WaitVisible/Text pair (this repo's own established
+	// idiom for "did the click really navigate", see
+	// rfq_compare_quotes_link_test.go) is what proves the browser landed
+	// on the new URL rather than reading the pre-switch page's DOM.
+	var landedURL string
+	if err := chromedp.Run(ctx,
+		chromedp.SetValue(`select.uc-nav-region`, enINHref, chromedp.ByQuery),
+		chromedp.Evaluate(`document.querySelector('select.uc-nav-region').dispatchEvent(new Event('change'))`, nil),
+		chromedp.WaitVisible(`table`, chromedp.ByQuery),
+		chromedp.Location(&landedURL),
+		chromedp.Text(`table`, &listText, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("operate region picker: %v", err)
+	}
+	if !strings.Contains(landedURL, "region=en-IN") || strings.Contains(landedURL, "q=") {
+		t.Fatalf("expected the switch to land on a region=en-IN URL with no q=, got: %s", landedURL)
+	}
+	if !strings.Contains(listText, "Container 1") || !strings.Contains(listText, "Container 2") {
+		t.Errorf("switching region should show every row (filter=weight with no q, matching nothing left inactive) — got:\n%s", listText)
+	}
+
+	var boxValue string
+	if err := chromedp.Run(ctx,
+		chromedp.Value(`input[name="q"]`, &boxValue, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("read filter box value: %v", err)
+	}
+	if boxValue != "" {
+		t.Errorf("filter box = %q after a region switch, want empty — showing the old region's text implies it still applies", boxValue)
 	}
 }
 
