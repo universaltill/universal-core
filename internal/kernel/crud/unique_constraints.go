@@ -99,7 +99,7 @@ func uniqueKeyValue(sortedFields []string, fields map[string]any) (value string,
 	return hex.EncodeToString(sum[:]), true, nil
 }
 
-// writeUniqueConstraintKeys inserts one record_unique_keys row per
+// WriteUniqueConstraintKeys inserts one record_unique_keys row per
 // declared Unique set that has every one of its fields present (and
 // non-empty) on the new record, inside tx — called from Engine.Create,
 // after data.RecordRepo.CreateTx so recordID is known, before commit.
@@ -112,6 +112,16 @@ func uniqueKeyValue(sortedFields []string, fields map[string]any) (value string,
 // data.ErrUniqueKeyConflict, translated below into a
 // *UniqueConstraintError instead of leaking a raw driver error.
 //
+// Exported (uc-infra#126) so a crud.Hook implementation — which by
+// contract (Hook's own doc comment) gets only a *sql.Tx, not an *Engine,
+// and so cannot route a write through Engine.Create/Update — can still
+// participate correctly in the SAME generic enforcement every ordinary
+// write goes through, instead of writing InventoryItem-shaped (or any
+// other entity-shaped) duplicate logic to do it by hand. Still entirely
+// generic: takes a Definition and a fields map, never an entity type
+// name to special-case, same kernel-boundary discipline as this
+// function's un-exported form always had.
+//
 // Known, deliberately deferred gap (uc-infra#107, tracked separately —
 // not specific to Unique): a FieldReference value that reaches here in a
 // non-canonical spelling (case, whitespace) of the same underlying id
@@ -120,7 +130,7 @@ func uniqueKeyValue(sortedFields []string, fields map[string]any) (value string,
 // collide. #107 already tracks id-spelling canonicalization as a
 // cross-cutting kernel gap; fixing it only here would leave every other
 // consumer of a FieldReference value inconsistent with this one.
-func writeUniqueConstraintKeys(ctx context.Context, tx queryable, keys *data.RecordUniqueKeyRepo, def *entity.Definition, recordID string, fields map[string]any) error {
+func WriteUniqueConstraintKeys(ctx context.Context, tx queryable, keys *data.RecordUniqueKeyRepo, def *entity.Definition, recordID string, fields map[string]any) error {
 	for _, set := range def.Unique {
 		sorted := canonicalSort(set)
 		name := entity.UniqueConstraintName(sorted)
@@ -141,7 +151,7 @@ func writeUniqueConstraintKeys(ctx context.Context, tx queryable, keys *data.Rec
 	return nil
 }
 
-// updateUniqueConstraintKeys re-derives each declared constraint's key
+// UpdateUniqueConstraintKeys re-derives each declared constraint's key
 // from the record's post-update field values and reconciles
 // record_unique_keys — called from Engine.Update, after
 // data.RecordRepo.UpdateTx, before commit:
@@ -154,8 +164,13 @@ func writeUniqueConstraintKeys(ctx context.Context, tx queryable, keys *data.Rec
 //   - applicable, existing row → update key_value in place.
 //
 // Every branch that touches the unique index can return
-// *UniqueConstraintError, same translation as writeUniqueConstraintKeys.
-func updateUniqueConstraintKeys(ctx context.Context, tx queryable, keys *data.RecordUniqueKeyRepo, def *entity.Definition, recordID string, fields map[string]any) error {
+// *UniqueConstraintError, same translation as WriteUniqueConstraintKeys.
+//
+// Exported alongside WriteUniqueConstraintKeys (uc-infra#126) — same
+// reasoning, a crud.Hook updating a record it looked up itself (not the
+// one Engine.Update is already writing) needs this same reconciliation,
+// not a hand-rolled duplicate of it.
+func UpdateUniqueConstraintKeys(ctx context.Context, tx queryable, keys *data.RecordUniqueKeyRepo, def *entity.Definition, recordID string, fields map[string]any) error {
 	for _, set := range def.Unique {
 		sorted := canonicalSort(set)
 		name := entity.UniqueConstraintName(sorted)
@@ -219,7 +234,7 @@ func canonicalSort(fields []string) []string {
 // data-migration warning path when a Definition version bump adds or
 // widens a Unique set on an entity type that may already hold
 // conflicting data (ADR-0018's Consequences section). Unlike
-// writeUniqueConstraintKeys/updateUniqueConstraintKeys, this never
+// WriteUniqueConstraintKeys/UpdateUniqueConstraintKeys, this never
 // writes record_unique_keys — it walks live records a page at a time and
 // counts key values seen more than once, entirely in Go, so it can be
 // run as a dry-run report before the constraint is ever enforced for

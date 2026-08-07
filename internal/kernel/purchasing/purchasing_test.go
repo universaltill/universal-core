@@ -659,8 +659,8 @@ func TestFacility_RejectsUnknownType(t *testing.T) {
 // merely that the field exists.
 func TestInventoryItem_IsKeyedByItemAndFacility(t *testing.T) {
 	def := InventoryItem()
-	if def.Version != 4 {
-		t.Errorf("InventoryItem is v%d, want v4 — the facility bump (v3) plus qty_on_hand's Min:0 bound (v4, uc-infra#80)", def.Version)
+	if def.Version != 5 {
+		t.Errorf("InventoryItem is v%d, want v5 — the facility bump (v3), qty_on_hand's Min:0 bound (v4, uc-infra#80), and the (item_id, facility_id) Unique constraint (v5, uc-infra#126)", def.Version)
 	}
 	f, ok := def.FieldByName("facility_id")
 	if !ok {
@@ -688,6 +688,35 @@ func TestInventoryItem_IsKeyedByItemAndFacility(t *testing.T) {
 	legacy["facility_id"] = "00000000-0000-0000-0000-000000000002"
 	if err := entity.ValidateRecord(def, legacy); err != nil {
 		t.Fatalf("the same record with a facility_id must validate: %v", err)
+	}
+}
+
+// TestInventoryItem_UniqueOnItemAndFacility confirms uc-infra#126's
+// Unique declaration: one live InventoryItem per (item_id, facility_id)
+// pair — the Definition-level half of creditInventoryOnReceipt's upsert
+// fix (ledger.go), which relies on crud.WriteUniqueConstraintKeys
+// rejecting a concurrent second CREATE for the same pair.
+func TestInventoryItem_UniqueOnItemAndFacility(t *testing.T) {
+	def := InventoryItem()
+	if len(def.Unique) != 1 {
+		t.Fatalf("InventoryItem.Unique = %v, want exactly one declared set", def.Unique)
+	}
+	got := append([]string(nil), def.Unique[0]...)
+	want := []string{"item_id", "facility_id"}
+	if len(got) != len(want) {
+		t.Fatalf("InventoryItem.Unique[0] = %v, want %v", got, want)
+	}
+	seen := map[string]bool{}
+	for _, f := range got {
+		seen[f] = true
+	}
+	for _, f := range want {
+		if !seen[f] {
+			t.Errorf("InventoryItem.Unique[0] = %v, missing %q", got, f)
+		}
+	}
+	if err := def.Validate(); err != nil {
+		t.Fatalf("InventoryItem must validate as a Definition: %v", err)
 	}
 }
 

@@ -792,6 +792,62 @@ func (s *seeder) seedFacilities() map[string]string {
 	return ids
 }
 
+// receivedQtyBySKU sums qty_received across every real GoodsReceiptLine
+// credited at facilityID, keyed by the receiving Item's own sku — the
+// source of truth seedInventory's reconcile (below) folds into its
+// declared baseline, instead of either blindly trusting whatever an
+// existing InventoryItem row already holds or permanently exempting
+// some fixed set of SKUs from convergence (independent review,
+// uc-infra#126 — see seedInventory's own comment on this function's
+// call for why). Returns an empty map, not an error, when
+// GoodsReceiptLine/GoodsReceipt aren't published for this tenant — no
+// receipt can exist without them, so the ordinary force-reconcile is
+// already correct with nothing to add.
+func (s *seeder) receivedQtyBySKU(items map[string]string, facilityID string) map[string]float64 {
+	out := map[string]float64{}
+	if !hasPublished(s.ctx, s.entityDefs, "GoodsReceiptLine") || !hasPublished(s.ctx, s.entityDefs, "GoodsReceipt") {
+		return out
+	}
+	skuByItemID := make(map[string]string, len(items))
+	for sku, id := range items {
+		skuByItemID[id] = sku
+	}
+
+	lineDef := s.def("GoodsReceiptLine")
+	lines, err := s.crud.List(s.ctx, lineDef)
+	if err != nil {
+		log.Fatalf("list GoodsReceiptLine: %v", err)
+	}
+	grDef := s.def("GoodsReceipt")
+	facilityByGR := map[string]string{}
+	for _, line := range lines {
+		itemID, _ := line.Data["item_id"].(string)
+		sku, ok := skuByItemID[itemID]
+		if !ok {
+			continue
+		}
+		grID, _ := line.Data["goods_receipt_id"].(string)
+		if grID == "" {
+			continue
+		}
+		fid, cached := facilityByGR[grID]
+		if !cached {
+			gr, err := s.crud.Get(s.ctx, grDef, grID)
+			if err != nil {
+				log.Fatalf("get GoodsReceipt %s: %v", grID, err)
+			}
+			fid, _ = gr.Data["facility_id"].(string)
+			facilityByGR[grID] = fid
+		}
+		if fid != facilityID {
+			continue
+		}
+		qty, _ := line.Data["qty_received"].(float64)
+		out[sku] += qty
+	}
+	return out
+}
+
 // seedInventory gives every stock Item an on-hand + available-to-promise
 // level — service items (no natural inventory concept) are deliberately
 // skipped, same as InventoryItem's own doc comment describes the
@@ -813,6 +869,20 @@ func (s *seeder) seedFacilities() map[string]string {
 func (s *seeder) seedInventory(items, facilities map[string]string) {
 	def := s.def("InventoryItem")
 	levels := inventoryLevels
+	receivingFacilityID := facilities[demoMainFacilityCode]
+	// receivedQtyBySKU is derived from the real GoodsReceiptLine data a
+	// prior run of seedGoodsReceipts already credited (uc-infra#126,
+	// independent review), not a hand-maintained list of "which SKUs
+	// receive" — that was this fix's first attempt, and it was wrong on
+	// two counts: it silently drifted from seedPurchaseOrders' own
+	// `orders` table (exactly the "second hardcoded list" seedGoodsReceipts'
+	// own doc comment already warns against), and it permanently exempted
+	// those SKUs' rows from convergence rather than converging them
+	// correctly — a later change to inventoryLevels for one of those SKUs
+	// would never reach an existing tenant. Folding the real received
+	// total into `desired` below keeps every SKU under the same
+	// convergence guarantee uniformly.
+	receivedQtyBySKU := s.receivedQtyBySKU(items, receivingFacilityID)
 	for sku, itemID := range items {
 		rows, ok := levels[sku]
 		if !ok {
@@ -860,7 +930,20 @@ func (s *seeder) seedInventory(items, facilities map[string]string) {
 			if facilityID == "" {
 				log.Fatalf("seedInventory: no facility seeded for code %q", row.facility)
 			}
-			desired = append(desired, want{facilityID, row.onHand, row.atp})
+			onHand, atp := row.onHand, row.atp
+			// Fold the real receipt total into the DECLARED target
+			// itself (uc-infra#126) rather than skipping reconcile for
+			// this row: seedGoodsReceipts only ever receives at
+			// receivingFacilityID, so a row's baseline at any OTHER
+			// declared facility (SKU-1003's STORE-01 row, say) is
+			// unaffected and still converges to the bare baseline.
+			if facilityID == receivingFacilityID {
+				if received := receivedQtyBySKU[sku]; received > 0 {
+					onHand += received
+					atp += received
+				}
+			}
+			desired = append(desired, want{facilityID, onHand, atp})
 			declared[facilityID] = true
 		}
 
@@ -910,25 +993,20 @@ func (s *seeder) seedInventory(items, facilities map[string]string) {
 		}
 		for _, extra := range loose {
 			fid, _ := extra.Data["facility_id"].(string)
-			// loose collects two genuinely different cases (independent
-			// review, uc-infra#54) and the message must not conflate
-			// them: a facility this SKU's declared levels never
-			// mention at all, versus a SECOND row at a facility that
-			// IS declared but whose one "declared" slot atFacility
-			// already gave to an earlier row — e.g. the row
-			// purchasing.PostGoodsReceiptLineToLedger's InventoryItem
-			// credit (ledger.go) inserted for a real receipt on top of
-			// this SKU's seedInventory baseline. That second case is
-			// not a data-hygiene problem to warn about the same way;
-			// it is this card's own insert-not-upsert design (see
-			// ledger.go's doc comment on that tradeoff) surfacing
-			// here, and it is expected, not a fixable drift.
-			if declared[fid] {
-				log.Printf("INFO: InventoryItem %s for %s is a second row at already-declared facility %q — left in place (likely a real GoodsReceipt credit on top of the declared baseline, not drift)",
-					extra.ID, sku, fid)
-				continue
-			}
-			log.Printf("WARNING: InventoryItem %s for %s sits at facility %q, which the demo data does not declare — left in place; it will skew stock totals",
+			// Every leftover row here is now genuine drift, full stop
+			// (uc-infra#126). Before #126, a SECOND row at an
+			// already-declared facility was tolerated as "probably a
+			// real GoodsReceipt credit on top of the declared baseline"
+			// (independent review, uc-infra#54) — a direct consequence
+			// of purchasing.creditInventoryOnReceipt's old insert-not-
+			// upsert design (ledger.go). Now that it upserts against
+			// InventoryItem's own (item_id, facility_id) Unique
+			// constraint (uc-infra#81), a real receipt lands on the
+			// SAME row seedInventory already reconciled — it can no
+			// longer produce a second one — so that allowance is gone:
+			// declared or not, a leftover loose row means something
+			// else wrote it, not a legitimate receipt.
+			log.Printf("WARNING: InventoryItem %s for %s sits at facility %q — left in place; it will skew stock totals",
 				extra.ID, sku, fid)
 		}
 	}

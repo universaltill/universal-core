@@ -349,6 +349,289 @@ func TestPostGoodsReceiptLineToLedger_PostsInventoryAndAP(t *testing.T) {
 	}
 }
 
+// TestPostGoodsReceiptLineToLedger_SecondReceiptUpsertsInventoryItem is
+// uc-infra#126's regression test: a second GoodsReceiptLine crediting
+// the SAME (item_id, facility_id) pair must increment the existing
+// InventoryItem row, not accumulate a second one. Before this fix,
+// creditInventoryOnReceipt always CreateTx'd a new row (ledger.go's own
+// former doc comment on that tradeoff) — this test fails against that
+// unfixed behavior (2 rows, first row's qty left at 4 instead of 10) and
+// passes once creditInventoryOnReceipt upserts.
+func TestPostGoodsReceiptLineToLedger_SecondReceiptUpsertsInventoryItem(t *testing.T) {
+	fx := setUpGoodsReceiptFixture(t, 12.50)
+	fx.engine.SetHook("GoodsReceiptLine", PostGoodsReceiptLineToLedger)
+	ctx := context.Background()
+	actor := humanActor()
+
+	gr, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceipt"), map[string]any{
+		"purchase_order_id": fx.poID, "received_date": "2026-01-10", "facility_id": fx.facilityID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create GoodsReceipt: %v", err)
+	}
+
+	_, err = fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"), map[string]any{
+		"goods_receipt_id": gr.ID, "po_line_id": fx.poLineID,
+		"item_id": fx.itemID, "qty_received": float64(4),
+	}, actor)
+	if err != nil {
+		t.Fatalf("create first GoodsReceiptLine: %v", err)
+	}
+	if _, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"), map[string]any{
+		"goods_receipt_id": gr.ID, "po_line_id": fx.poLineID,
+		"item_id": fx.itemID, "qty_received": float64(6),
+	}, actor); err != nil {
+		t.Fatalf("create second GoodsReceiptLine: %v", err)
+	}
+
+	invDef := defFor(t, fx.tenantDB, "InventoryItem")
+	invRecs, err := fx.engine.List(ctx, invDef)
+	if err != nil {
+		t.Fatalf("list InventoryItem: %v", err)
+	}
+	if len(invRecs) != 1 {
+		t.Fatalf("expected exactly 1 InventoryItem row after two receipts of the same (item, facility), got %d", len(invRecs))
+	}
+	inv := invRecs[0]
+	if got, _ := inv.Data["qty_on_hand"].(float64); got != 10 {
+		t.Errorf("InventoryItem.qty_on_hand = %v, want 10 (4 + 6, upserted)", got)
+	}
+	if got, _ := inv.Data["qty_available_to_promise"].(float64); got != 10 {
+		t.Errorf("InventoryItem.qty_available_to_promise = %v, want 10 (4 + 6, upserted)", got)
+	}
+	if inv.Version != 2 {
+		t.Errorf("InventoryItem.Version = %d, want 2 (one create + one update)", inv.Version)
+	}
+
+	// The second credit must have its own Update audit row — same
+	// atomicity discipline the Create path already has, not silently
+	// folded into (or skipped alongside) the first.
+	var updateAuditCount int
+	if err := fx.tenantDB.QueryRowContext(ctx,
+		`SELECT count(*) FROM audit_log WHERE entity_type = 'InventoryItem' AND record_id = $1 AND action = 'update'`,
+		inv.ID,
+	).Scan(&updateAuditCount); err != nil {
+		t.Fatalf("count InventoryItem update audit rows: %v", err)
+	}
+	if updateAuditCount != 1 {
+		t.Fatalf("expected exactly 1 update audit row for the upserted InventoryItem, got %d", updateAuditCount)
+	}
+
+	// The first GoodsReceiptLine's credit must still have its own create
+	// audit row — the fix must not remove or overwrite it.
+	var createAuditCount int
+	if err := fx.tenantDB.QueryRowContext(ctx,
+		`SELECT count(*) FROM audit_log WHERE entity_type = 'InventoryItem' AND record_id = $1 AND action = 'create'`,
+		inv.ID,
+	).Scan(&createAuditCount); err != nil {
+		t.Fatalf("count InventoryItem create audit rows: %v", err)
+	}
+	if createAuditCount != 1 {
+		t.Fatalf("expected exactly 1 create audit row for the InventoryItem, got %d", createAuditCount)
+	}
+}
+
+// TestPostGoodsReceiptLineToLedger_ThirdFacilityReceiptCreatesNewRow
+// confirms the upsert is scoped to (item_id, facility_id), not item_id
+// alone — a receipt at a DIFFERENT facility for the same item must still
+// create its own InventoryItem row, not merge into the first facility's.
+func TestPostGoodsReceiptLineToLedger_ThirdFacilityReceiptCreatesNewRow(t *testing.T) {
+	fx := setUpGoodsReceiptFixture(t, 12.50)
+	fx.engine.SetHook("GoodsReceiptLine", PostGoodsReceiptLineToLedger)
+	ctx := context.Background()
+	actor := humanActor()
+
+	otherFacility, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "Facility"), map[string]any{
+		"code": "SECOND", "name": "Second Warehouse", "facility_type": "warehouse", "is_active": true,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create second Facility: %v", err)
+	}
+
+	gr1, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceipt"), map[string]any{
+		"purchase_order_id": fx.poID, "received_date": "2026-01-10", "facility_id": fx.facilityID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create GoodsReceipt at first facility: %v", err)
+	}
+	if _, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"), map[string]any{
+		"goods_receipt_id": gr1.ID, "po_line_id": fx.poLineID,
+		"item_id": fx.itemID, "qty_received": float64(4),
+	}, actor); err != nil {
+		t.Fatalf("create GoodsReceiptLine at first facility: %v", err)
+	}
+
+	gr2, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceipt"), map[string]any{
+		"purchase_order_id": fx.poID, "received_date": "2026-01-11", "facility_id": otherFacility.ID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create GoodsReceipt at second facility: %v", err)
+	}
+	if _, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"), map[string]any{
+		"goods_receipt_id": gr2.ID, "po_line_id": fx.poLineID,
+		"item_id": fx.itemID, "qty_received": float64(6),
+	}, actor); err != nil {
+		t.Fatalf("create GoodsReceiptLine at second facility: %v", err)
+	}
+
+	invDef := defFor(t, fx.tenantDB, "InventoryItem")
+	invRecs, err := fx.engine.List(ctx, invDef)
+	if err != nil {
+		t.Fatalf("list InventoryItem: %v", err)
+	}
+	if len(invRecs) != 2 {
+		t.Fatalf("expected 2 InventoryItem rows (one per facility), got %d", len(invRecs))
+	}
+	byFacility := map[string]float64{}
+	for _, rec := range invRecs {
+		fid, _ := rec.Data["facility_id"].(string)
+		qty, _ := rec.Data["qty_on_hand"].(float64)
+		byFacility[fid] = qty
+	}
+	if byFacility[fx.facilityID] != 4 {
+		t.Errorf("first facility qty_on_hand = %v, want 4", byFacility[fx.facilityID])
+	}
+	if byFacility[otherFacility.ID] != 6 {
+		t.Errorf("second facility qty_on_hand = %v, want 6", byFacility[otherFacility.ID])
+	}
+}
+
+// TestPostGoodsReceiptLineToLedger_ConcurrentReceiptsConverge is the
+// adversarial case uc-infra#126 explicitly calls out: N GoodsReceiptLines
+// against the SAME (item, facility) posted from concurrent transactions
+// must still converge to exactly one InventoryItem row whose qty_on_hand
+// is the exact sum — covering both retry paths creditInventoryOnReceipt
+// needs (ErrVersionConflict on a losing UPDATE, and a losing CREATE
+// racing the very first row into existence, only closable now that
+// InventoryItem declares Unique on (item_id, facility_id), uc-infra#81).
+func TestPostGoodsReceiptLineToLedger_ConcurrentReceiptsConverge(t *testing.T) {
+	fx := setUpGoodsReceiptFixture(t, 1.00)
+	fx.engine.SetHook("GoodsReceiptLine", PostGoodsReceiptLineToLedger)
+	ctx := context.Background()
+	actor := humanActor()
+
+	gr, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceipt"), map[string]any{
+		"purchase_order_id": fx.poID, "received_date": "2026-01-10", "facility_id": fx.facilityID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create GoodsReceipt: %v", err)
+	}
+
+	const concurrency = 8
+	errs := make(chan error, concurrency)
+	for i := 0; i < concurrency; i++ {
+		go func() {
+			_, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"), map[string]any{
+				"goods_receipt_id": gr.ID, "po_line_id": fx.poLineID,
+				"item_id": fx.itemID, "qty_received": float64(1),
+			}, actor)
+			errs <- err
+		}()
+	}
+	for i := 0; i < concurrency; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent GoodsReceiptLine create: %v", err)
+		}
+	}
+
+	invDef := defFor(t, fx.tenantDB, "InventoryItem")
+	invRecs, err := fx.engine.List(ctx, invDef)
+	if err != nil {
+		t.Fatalf("list InventoryItem: %v", err)
+	}
+	if len(invRecs) != 1 {
+		t.Fatalf("expected exactly 1 InventoryItem row after %d concurrent receipts of the same (item, facility), got %d", concurrency, len(invRecs))
+	}
+	if got, _ := invRecs[0].Data["qty_on_hand"].(float64); got != float64(concurrency) {
+		t.Errorf("InventoryItem.qty_on_hand = %v, want %d (every concurrent receipt counted exactly once)", got, concurrency)
+	}
+}
+
+// TestPostGoodsReceiptLineToLedger_DuplicateLegacyRows_ReturnsDiagnosableError
+// covers creditInventoryOnReceipt's one deliberately-NOT-retried conflict
+// (independent review, uc-infra#126): a pre-#126 tenant carrying two live
+// InventoryItem rows for the same (item, facility), where only the newer
+// one has ever been reconciled into record_unique_keys. GetByFieldsQ
+// picks the older (unbackfilled) row; UpdateUniqueConstraintKeys' insert
+// for it collides with the newer row's already-claimed key. Retrying
+// would just pick the identical older row and hit the identical
+// conflict again — not a transient race — so this must surface a clear,
+// actionable error instead of looping or leaking an opaque wrapped one,
+// and must leave nothing partially written.
+func TestPostGoodsReceiptLineToLedger_DuplicateLegacyRows_ReturnsDiagnosableError(t *testing.T) {
+	fx := setUpGoodsReceiptFixture(t, 10)
+	fx.engine.SetHook("GoodsReceiptLine", PostGoodsReceiptLineToLedger)
+	ctx := context.Background()
+	actor := humanActor()
+
+	invDef := defFor(t, fx.tenantDB, "InventoryItem")
+	// The "backfilled" row: created normally through the engine, so it
+	// gets its own record_unique_keys row automatically.
+	newer, err := fx.engine.Create(ctx, invDef, map[string]any{
+		"item_id": fx.itemID, "facility_id": fx.facilityID,
+		"qty_on_hand": float64(5), "qty_available_to_promise": float64(5),
+	}, actor)
+	if err != nil {
+		t.Fatalf("create backfilled InventoryItem: %v", err)
+	}
+
+	// The "pre-#126 legacy duplicate": inserted directly, bypassing the
+	// engine (so no record_unique_keys row is ever written for it —
+	// exactly the un-backfilled state a real tenant's old insert-only-
+	// created duplicates would be in) and backdated so GetByFieldsQ's
+	// (created_at, id) ordering deterministically picks THIS one first.
+	var olderID string
+	if err := fx.tenantDB.QueryRowContext(ctx,
+		`INSERT INTO records (entity_type, data, created_at) VALUES (
+		   'InventoryItem',
+		   jsonb_build_object('item_id', $1::text, 'facility_id', $2::text, 'qty_on_hand', 3::numeric, 'qty_available_to_promise', 3::numeric),
+		   now() - interval '1 day'
+		 ) RETURNING id`,
+		fx.itemID, fx.facilityID,
+	).Scan(&olderID); err != nil {
+		t.Fatalf("insert legacy duplicate InventoryItem: %v", err)
+	}
+
+	gr, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceipt"), map[string]any{
+		"purchase_order_id": fx.poID, "received_date": "2026-01-10", "facility_id": fx.facilityID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create GoodsReceipt: %v", err)
+	}
+	_, err = fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"), map[string]any{
+		"goods_receipt_id": gr.ID, "po_line_id": fx.poLineID,
+		"item_id": fx.itemID, "qty_received": float64(4),
+	}, actor)
+	if err == nil {
+		t.Fatal("expected the receipt to fail against duplicate legacy InventoryItem rows, got nil error")
+	}
+	if !strings.Contains(err.Error(), "duplicate live InventoryItem rows") {
+		t.Fatalf("expected a diagnosable duplicate-rows error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), olderID) {
+		t.Fatalf("expected the error to name the conflicting row %s, got: %v", olderID, err)
+	}
+
+	// The whole write must have rolled back cleanly: the untouched
+	// (correctly-keyed) row is unchanged, and the GoodsReceiptLine that
+	// triggered this never landed either — same transaction, no partial
+	// credit anywhere.
+	unchanged, err := fx.engine.Get(ctx, invDef, newer.ID)
+	if err != nil {
+		t.Fatalf("get newer InventoryItem: %v", err)
+	}
+	if got, _ := unchanged.Data["qty_on_hand"].(float64); got != 5 {
+		t.Errorf("newer InventoryItem qty_on_hand = %v, want unchanged 5 (the failed credit must not have landed anywhere)", got)
+	}
+	lines, err := fx.engine.List(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"))
+	if err != nil {
+		t.Fatalf("list GoodsReceiptLine: %v", err)
+	}
+	if len(lines) != 0 {
+		t.Fatalf("expected the GoodsReceiptLine create to roll back entirely alongside the failed credit, got %d lines", len(lines))
+	}
+}
+
 // TestPostGoodsReceiptLineToLedger_ZeroValueLine_PostsNothing confirms a
 // zero-price/zero-qty line (this hook's own doc comment: samples, a
 // data-entry-in-progress POLine) is a legitimate no-op, not an error —
@@ -428,14 +711,16 @@ func TestPostGoodsReceiptLineToLedger_ZeroQty_NoInventoryCredit(t *testing.T) {
 	}
 }
 
-// TestPostGoodsReceiptLineToLedger_MultipleReceipts_InsertSeparateInventoryRows
-// (uc-infra#54) pins the "insert a new row, don't upsert" design decision
-// this hook's own doc comment explains: two GoodsReceiptLines crediting
-// the same item at the same facility must each produce their own
-// InventoryItem row, summing correctly through the reporting layer —
-// exactly the "(item, facility) uniqueness is NOT enforced... every
-// aggregate sums" convention ADR-0015 §2 established for this entity.
-func TestPostGoodsReceiptLineToLedger_MultipleReceipts_InsertSeparateInventoryRows(t *testing.T) {
+// TestPostGoodsReceiptLineToLedger_MultipleReceipts_UpsertsOneInventoryRow
+// (uc-infra#126, superseding #54's original "insert a new row, don't
+// upsert" pin) confirms two GoodsReceiptLines crediting the same item at
+// the same facility, via separate GoodsReceipts entirely — not just
+// separate lines on one receipt, which
+// TestPostGoodsReceiptLineToLedger_SecondReceiptUpsertsInventoryItem
+// already covers — converge onto the SAME InventoryItem row, and that
+// the reporting layer's aggregate still reports the correct total
+// against that single row.
+func TestPostGoodsReceiptLineToLedger_MultipleReceipts_UpsertsOneInventoryRow(t *testing.T) {
 	fx := setUpGoodsReceiptFixture(t, 10)
 	fx.engine.SetHook("GoodsReceiptLine", PostGoodsReceiptLineToLedger)
 	ctx := context.Background()
@@ -460,8 +745,8 @@ func TestPostGoodsReceiptLineToLedger_MultipleReceipts_InsertSeparateInventoryRo
 	if err != nil {
 		t.Fatalf("list InventoryItem: %v", err)
 	}
-	if len(invRecs) != 2 {
-		t.Fatalf("expected 2 separate InventoryItem rows (one per receipt), got %d", len(invRecs))
+	if len(invRecs) != 1 {
+		t.Fatalf("expected exactly 1 InventoryItem row (upserted across both receipts), got %d", len(invRecs))
 	}
 
 	reporting := data.NewReportingRepo(fx.tenantDB)
@@ -470,7 +755,7 @@ func TestPostGoodsReceiptLineToLedger_MultipleReceipts_InsertSeparateInventoryRo
 		t.Fatalf("OnHandQtyByItem: %v", err)
 	}
 	if got := onHand[fx.itemID]; got != 10 {
-		t.Fatalf("on-hand for item = %v, want 10 (4 + 6 summed across the two credited rows)", got)
+		t.Fatalf("on-hand for item = %v, want 10 (4 + 6 summed in place on the one upserted row)", got)
 	}
 }
 

@@ -246,13 +246,25 @@ func Facility() *entity.Definition {
 func InventoryItem() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "InventoryItem",
+		// Version 5 (uc-infra#126): declares Unique on (item_id,
+		// facility_id) — one live InventoryItem row per item-at-facility,
+		// not one per GoodsReceiptLine ever posted against it.
+		// purchasing.creditInventoryOnReceipt (ledger.go) now upserts
+		// against this constraint instead of always inserting; existing
+		// tenants with pre-existing duplicate (item_id, facility_id) rows
+		// are reported by cmd/sync-tenant-modules' generic
+		// uniqueConstraintWarnings, same as any other Definition version
+		// bump that adds/widens a Unique set (ADR-0018's Consequences
+		// section) — this Definition change does not itself touch or
+		// merge any existing tenant's data.
+		//
 		// Version 4 (uc-infra#80): qty_on_hand gained a Min:0 bound.
 		// qty_available_to_promise is left unbounded: unlike physical
 		// on-hand stock, ATP legitimately goes negative under real
 		// oversell/backorder conditions (demand outstrips on-hand plus
 		// incoming supply) — bounding it here would reject a real,
 		// meaningful inventory state, not a data-entry mistake.
-		Version: 4,
+		Version: 5,
 		Module:  "purchasing",
 		Fields: []entity.Field{
 			{Name: "item_id", Type: entity.FieldReference, Required: true, Target: "Item"},
@@ -260,6 +272,7 @@ func InventoryItem() *entity.Definition {
 			{Name: "qty_on_hand", Type: entity.FieldNumber, Required: true, Default: float64(0), Min: entity.Float64Ptr(0)},
 			{Name: "qty_available_to_promise", Type: entity.FieldNumber, Required: true, Default: float64(0)},
 		},
+		Unique: [][]string{{"item_id", "facility_id"}},
 	}
 }
 

@@ -633,6 +633,218 @@ func TestRecordRepo_ExistsByFieldsQ_HostileFieldNameIsInert(t *testing.T) {
 	}
 }
 
+func TestRecordRepo_GetByFieldsQ(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(db)
+
+	created, err := repo.Create(ctx, "PersonRole", map[string]any{"person_id": "p1", "role_type": "employee"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	rec, found, err := repo.GetByFieldsQ(ctx, db, "PersonRole", map[string]string{"person_id": "p1", "role_type": "employee"})
+	if err != nil {
+		t.Fatalf("GetByFieldsQ: %v", err)
+	}
+	if !found {
+		t.Fatal("expected a matching PersonRole to be found")
+	}
+	if rec.ID != created.ID {
+		t.Fatalf("GetByFieldsQ returned id %q, want %q", rec.ID, created.ID)
+	}
+	if rec.Version != created.Version {
+		t.Fatalf("GetByFieldsQ returned version %d, want %d", rec.Version, created.Version)
+	}
+	if rec.Data["role_type"] != "employee" {
+		t.Fatalf("GetByFieldsQ returned data %v, missing role_type", rec.Data)
+	}
+}
+
+// TestRecordRepo_GetByFieldsQ_NotFoundIsNotAnError confirms the "no
+// match" case surfaces as found=false, err=nil — not ErrNotFound — since
+// an upsert's existence check treats "nothing here yet" as the ordinary
+// create branch, not a failure to unwrap.
+func TestRecordRepo_GetByFieldsQ_NotFoundIsNotAnError(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(db)
+
+	rec, found, err := repo.GetByFieldsQ(ctx, db, "PersonRole", map[string]string{"person_id": "nobody", "role_type": "employee"})
+	if err != nil {
+		t.Fatalf("GetByFieldsQ: %v", err)
+	}
+	if found {
+		t.Fatalf("expected no match, got %+v", rec)
+	}
+	if rec.ID != "" {
+		t.Fatalf("expected a zero-value Record on no match, got id %q", rec.ID)
+	}
+}
+
+// TestRecordRepo_GetByFieldsQ_PartialMatchIsNotFound confirms every
+// named field/value pair must agree — matching on person_id alone while
+// role_type disagrees must not return the record.
+func TestRecordRepo_GetByFieldsQ_PartialMatchIsNotFound(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(db)
+
+	if _, err := repo.Create(ctx, "PersonRole", map[string]any{"person_id": "p1", "role_type": "employee"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	_, found, err := repo.GetByFieldsQ(ctx, db, "PersonRole", map[string]string{"person_id": "p1", "role_type": "vendor"})
+	if err != nil {
+		t.Fatalf("GetByFieldsQ: %v", err)
+	}
+	if found {
+		t.Fatal("expected no match when one of two fields disagrees")
+	}
+}
+
+// TestRecordRepo_GetByFieldsQ_ExcludesSoftDeleted confirms a soft-deleted
+// record (deleted_at set) is invisible, same as every other live-record
+// read in this file.
+func TestRecordRepo_GetByFieldsQ_ExcludesSoftDeleted(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(db)
+
+	created, err := repo.Create(ctx, "PersonRole", map[string]any{"person_id": "p1", "role_type": "employee"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := repo.Delete(ctx, "PersonRole", created.ID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	_, found, err := repo.GetByFieldsQ(ctx, db, "PersonRole", map[string]string{"person_id": "p1", "role_type": "employee"})
+	if err != nil {
+		t.Fatalf("GetByFieldsQ: %v", err)
+	}
+	if found {
+		t.Fatal("expected a soft-deleted record to be excluded")
+	}
+}
+
+// TestRecordRepo_GetByFieldsQ_MultipleMatchesReturnsOldest confirms the
+// deterministic "oldest wins" tie-break when more than one live record
+// matches — mirrors crud.BackfillUniqueConstraintKeys' own convention
+// for the same pre-existing-duplicate ambiguity.
+func TestRecordRepo_GetByFieldsQ_MultipleMatchesReturnsOldest(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(db)
+
+	first, err := repo.Create(ctx, "PersonRole", map[string]any{"person_id": "p1", "role_type": "employee"})
+	if err != nil {
+		t.Fatalf("create first: %v", err)
+	}
+	if _, err := repo.Create(ctx, "PersonRole", map[string]any{"person_id": "p1", "role_type": "employee"}); err != nil {
+		t.Fatalf("create second: %v", err)
+	}
+
+	rec, found, err := repo.GetByFieldsQ(ctx, db, "PersonRole", map[string]string{"person_id": "p1", "role_type": "employee"})
+	if err != nil {
+		t.Fatalf("GetByFieldsQ: %v", err)
+	}
+	if !found {
+		t.Fatal("expected a match")
+	}
+	if rec.ID != first.ID {
+		t.Fatalf("GetByFieldsQ returned id %q, want the oldest record %q", rec.ID, first.ID)
+	}
+}
+
+// TestRecordRepo_GetByFieldsQ_TiedCreatedAtIsStillDeterministic
+// (independent review, uc-infra#126) is the regression test for a bug
+// TestRecordRepo_GetByFieldsQ_MultipleMatchesReturnsOldest could not
+// catch: that test's two rows come from separate implicit transactions,
+// so their created_at values differ in practice even though nothing
+// guarantees it. Two rows created inside the SAME transaction get the
+// IDENTICAL created_at (Postgres' now() is transaction start time, not
+// per-statement) — an ORDER BY created_at alone would then pick between
+// them arbitrarily. This forces that exact tie and confirms the `id`
+// tiebreak still returns a single, stable row across repeated calls.
+func TestRecordRepo_GetByFieldsQ_TiedCreatedAtIsStillDeterministic(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(db)
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	first, err := repo.CreateTx(ctx, tx, "PersonRole", map[string]any{"person_id": "p1", "role_type": "employee"})
+	if err != nil {
+		t.Fatalf("create first: %v", err)
+	}
+	second, err := repo.CreateTx(ctx, tx, "PersonRole", map[string]any{"person_id": "p1", "role_type": "employee"})
+	if err != nil {
+		t.Fatalf("create second: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	var createdAtEqual bool
+	if err := db.QueryRowContext(ctx,
+		`SELECT (SELECT created_at FROM records WHERE id = $1) = (SELECT created_at FROM records WHERE id = $2)`,
+		first.ID, second.ID,
+	).Scan(&createdAtEqual); err != nil {
+		t.Fatalf("compare created_at: %v", err)
+	}
+	if !createdAtEqual {
+		t.Fatal("test setup assumption failed: the two rows' created_at values differ — this test no longer exercises the tie it's named for")
+	}
+
+	want := first.ID
+	if second.ID < first.ID {
+		want = second.ID
+	}
+	for i := 0; i < 5; i++ {
+		rec, found, err := repo.GetByFieldsQ(ctx, db, "PersonRole", map[string]string{"person_id": "p1", "role_type": "employee"})
+		if err != nil {
+			t.Fatalf("GetByFieldsQ: %v", err)
+		}
+		if !found {
+			t.Fatal("expected a match")
+		}
+		if rec.ID != want {
+			t.Fatalf("GetByFieldsQ returned id %q on tied created_at, want the lexicographically-lower id %q (deterministic id tiebreak)", rec.ID, want)
+		}
+	}
+}
+
+func TestRecordRepo_GetByFieldsQ_RequiresAtLeastOnePair(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(db)
+
+	if _, _, err := repo.GetByFieldsQ(ctx, db, "PersonRole", map[string]string{}); err == nil {
+		t.Fatal("expected an error for zero field/value pairs, not a query with no filter at all")
+	}
+}
+
+func TestRecordRepo_GetByFieldsQ_HostileFieldNameIsInert(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(db)
+
+	if _, err := repo.Create(ctx, "PersonRole", map[string]any{"person_id": "p1", "role_type": "employee"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	hostile := "role_type'); DROP TABLE records; --"
+	if _, _, err := repo.GetByFieldsQ(ctx, db, "PersonRole", map[string]string{hostile: "employee"}); err != nil {
+		t.Fatalf("hostile field name should be inert, not error: %v", err)
+	}
+	if _, err := repo.Create(ctx, "PersonRole", map[string]any{"person_id": "p2", "role_type": "employee"}); err != nil {
+		t.Fatalf("records table was harmed by a hostile field name: %v", err)
+	}
+}
+
 func TestRecordRepo_DistinctFieldValues(t *testing.T) {
 	db := freshTenantDB(t)
 	ctx := context.Background()

@@ -594,6 +594,62 @@ func (r *RecordRepo) ExistsByFieldsQ(ctx context.Context, q querier, entityType 
 	return exists, nil
 }
 
+// GetByFieldsQ is ExistsByFieldsQ's counterpart when the caller needs the
+// matching record itself (id, data, version), not just whether one
+// exists — first real caller: purchasing.creditInventoryOnReceipt
+// (uc-infra#126), which must find the live InventoryItem for a given
+// (item_id, facility_id) pair, inside the same transaction as the
+// GoodsReceiptLine write that triggered it, to upsert rather than always
+// inserting. found is false, err is nil, when no live record matches —
+// ErrNotFound is deliberately NOT used here the way Get/GetTx use it:
+// "no matching record" is the ordinary, expected outcome of an upsert's
+// existence check, not an error condition the caller must unwrap.
+//
+// Same SQL-injection discipline as ExistsByFieldsQ: every field name and
+// value is bound as a parameter to the ->> operator, never concatenated
+// into the query text. When multiple live records match (equals doesn't
+// name a Unique-declared field set, or the constraint predates this
+// call), the one with the lowest (created_at, id) is returned — same
+// "oldest wins" convention crud.BackfillUniqueConstraintKeys already
+// established for the same kind of pre-existing-duplicate ambiguity, so
+// the two mechanisms never disagree about which record is the canonical
+// one. The `id` tiebreak (not just created_at) is required, not
+// cosmetic (independent review, uc-infra#126): created_at defaults to
+// now(), which is the enclosing transaction's start time in Postgres, so
+// two records inserted in the SAME transaction (a bulk importer,
+// recordmigrate) tie exactly — ORDER BY created_at alone would pick
+// between them arbitrarily. ListPage and ListByField already order by
+// (created_at, id) for this identical reason; this matches them.
+func (r *RecordRepo) GetByFieldsQ(ctx context.Context, q querier, entityType string, equals map[string]string) (Record, bool, error) {
+	if len(equals) == 0 {
+		return Record{}, false, fmt.Errorf("get by fields on %s: at least one field/value pair is required", entityType)
+	}
+	args := []any{entityType}
+	where := "entity_type = $1 AND deleted_at IS NULL"
+	for field, value := range equals {
+		args = append(args, field, value)
+		where += fmt.Sprintf(" AND data->>$%d = $%d", len(args)-1, len(args))
+	}
+	var id string
+	var raw []byte
+	var version int
+	err := q.QueryRowContext(ctx,
+		fmt.Sprintf(`SELECT id, data, version FROM records WHERE %s ORDER BY created_at, id LIMIT 1`, where),
+		args...,
+	).Scan(&id, &raw, &version)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Record{}, false, nil
+	}
+	if err != nil {
+		return Record{}, false, fmt.Errorf("get by fields on %s: %w", entityType, err)
+	}
+	var data map[string]any
+	if err := json.Unmarshal(raw, &data); err != nil {
+		return Record{}, false, fmt.Errorf("unmarshal record data: %w", err)
+	}
+	return Record{ID: id, EntityType: entityType, Data: data, Version: version}, true, nil
+}
+
 // DistinctFieldValues returns the distinct, non-empty string values
 // resultField holds across every non-deleted record of entityType whose
 // data has matchField == matchValue — resolves a FieldReference's
