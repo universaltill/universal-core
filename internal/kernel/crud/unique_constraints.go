@@ -50,15 +50,21 @@ func (e *UniqueConstraintError) Unwrap() error { return ErrUniqueConstraintViola
 // uniqueKeyValue computes the deterministic key record_unique_keys
 // stores for one constraint's canonical (sorted) field set, from a
 // record's field values. applicable is false when any named field's
-// value is absent, nil, OR an empty string — mirroring both ordinary SQL
-// semantics (a NULL column never participates in a unique index) AND
-// #86/ADR-0018 §4's "Required treats "" as absent" convention, so a
-// Unique field's own emptiness rule agrees with Required's rather than
-// silently disagreeing with it (independent review, uc-infra#81
-// follow-up: the first version of this function let two records with
-// badge_number:"" collide, when the same two records with badge_number
-// omitted entirely did not — same logical input, different outcome by
-// which shape submitted it).
+// value is absent, nil, OR a blank string (empty or whitespace-only) —
+// mirroring both ordinary SQL semantics (a NULL column never
+// participates in a unique index) AND #86/ADR-0018 §4's "Required treats
+// a blank string as absent" convention (widened by uc-infra#105 to cover
+// whitespace-only, not just ""), so a Unique field's own emptiness rule
+// agrees with Required's rather than silently disagreeing with it
+// (independent review, uc-infra#81 follow-up: the first version of this
+// function let two records with badge_number:"" collide, when the same
+// two records with badge_number omitted entirely did not — same logical
+// input, different outcome by which shape submitted it; #105's own
+// independent review found the identical gap reopened for
+// badge_number:"   " when Required was widened here without this
+// function following along, so this now calls entity.IsBlankString
+// directly instead of keeping its own copy of the check in sync by
+// hand).
 //
 // The stored value is SHA-256 of the field values' JSON encoding, hex,
 // not the JSON itself — independent review, uc-infra#81 follow-up: a raw
@@ -86,7 +92,7 @@ func uniqueKeyValue(sortedFields []string, fields map[string]any) (value string,
 		if !ok || v == nil {
 			return "", false, nil
 		}
-		if s, isString := v.(string); isString && s == "" {
+		if entity.IsBlankString(v) {
 			return "", false, nil
 		}
 		ordered[i] = v

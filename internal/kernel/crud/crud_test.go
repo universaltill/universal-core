@@ -210,6 +210,33 @@ func TestEngine_Create_RequiredFieldAsEmptyString_WritesNothing(t *testing.T) {
 	}
 }
 
+// TestEngine_Create_RequiredFieldAsWhitespaceOnlyString_WritesNothing is
+// the integration-level pin for uc-infra#105, the same shape as the
+// empty-string test above: a direct API call can submit a required
+// field as "   " rather than "" or omitting it, and Engine.Create must
+// reject that through the real validate-then-write path too, not just
+// at the entity.ValidateRecord unit level.
+func TestEngine_Create_RequiredFieldAsWhitespaceOnlyString_WritesNothing(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	def := vendorDef()
+
+	_, err := engine.Create(ctx, def, map[string]any{"name": "   ", "lead_time_days": float64(10)},
+		audit.Actor{Type: audit.ActorHuman, ID: "farshid"})
+	if err == nil || !strings.Contains(err.Error(), "is required") {
+		t.Fatalf("expected a required-field error for \"name\" submitted as \"   \", got: %v", err)
+	}
+
+	var count int
+	if err := db.QueryRow(`SELECT count(*) FROM records`).Scan(&count); err != nil {
+		t.Fatalf("count records: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected no records written after validation failure, got %d", count)
+	}
+}
+
 func TestEngine_Update_ChangesDataAndAppendsAudit(t *testing.T) {
 	db := freshTenantDB(t)
 	ctx := context.Background()
