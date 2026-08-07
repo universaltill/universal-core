@@ -236,6 +236,24 @@ type Data struct {
 	// that code's own comment for why conflating the two silently
 	// corrupts a writable header field.
 	DegradedSections map[string]bool
+	// ChildRedactedFields is RedactedFields' equivalent for a
+	// master_detail/related_list section's CHILD entity type, keyed the
+	// same way as Children/ChildDefs (by section Target), then by the
+	// child entity's field name. RedactedFields only ever governs the
+	// parent entity's own Fields sections and HiddenFields inputs; before
+	// this, a FieldPermission hiding a field on a child entity type had
+	// no effect at all on a related-list/master-detail table — the child
+	// Definition's full field order (childColumns) went straight into
+	// both the column headers and every row's cells, leaking a hidden
+	// field's name AND, once uc-infra#103 made column headers real text,
+	// its human-readable label too — visible even with zero child rows,
+	// since childColumns derives columns from the Definition, not the
+	// rows (uc-infra#127). A field named here is dropped from both the
+	// column set and every row's cells for that section — see
+	// childColumns/buildChildRows. Missing/nil is treated as "nothing
+	// redacted for this child type", same graceful-degrade convention as
+	// ChildDefs/ChildReferenceLabels.
+	ChildRedactedFields map[string]map[string]bool
 }
 
 // Render writes the HTML/HTMX form for def against ent's field shapes and
@@ -546,6 +564,13 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 	effective := make(map[string]any, len(data.Record))
 	maps.Copy(effective, data.Record)
 	rollUpTotals := make(map[string]float64)
+	// rollUpComputed tracks which RollUpTarget fields actually got a
+	// fresh total this render, as opposed to being skipped below — see
+	// its use at the ComponentMasterDetail case, where sv.RollUpTotal
+	// must stay "" (not "0") for a skipped section, since
+	// rollUpTotals' own zero-value default is indistinguishable from a
+	// genuinely-computed total of zero.
+	rollUpComputed := make(map[string]bool)
 	for _, s := range def.Sections {
 		if s.Component != form.ComponentMasterDetail || s.RollUp == "" {
 			continue
@@ -586,11 +611,30 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 			}
 			continue
 		}
+		if data.ChildRedactedFields[s.Target][s.RollUp] {
+			// The roll-up SOURCE field itself is hidden from this viewer
+			// on the child entity. authz.GuardedEngine.ListByField has
+			// already stripped it from every child row before this ever
+			// runs, so computeRollUp would silently sum a pile of
+			// missing keys into 0 — and that 0 would then land in
+			// `effective[s.RollUpTarget]` below, which is exactly what
+			// feeds the PARENT's own visible field (e.g. PurchaseOrder.
+			// total) and what a subsequent Save actually persists. A
+			// viewer who can't see POLine.line_total would silently zero
+			// out a real, nonzero PurchaseOrder.total on save (uc-infra
+			// #127 independent review) — the same class of silent data
+			// loss the UnavailableSections case just above already
+			// guards against, just reached through redaction instead of
+			// licensing. Same fix: leave `effective` (and rollUpTotals)
+			// untouched, rollUpComputed stays false for this target.
+			continue
+		}
 		total, err := computeRollUp(data.Children[s.Target], s.RollUp)
 		if err != nil {
 			return viewModel{}, fmt.Errorf("section %q: %w", s.Title, err)
 		}
 		rollUpTotals[s.RollUpTarget] = total
+		rollUpComputed[s.RollUpTarget] = true
 		effective[s.RollUpTarget] = total
 	}
 
@@ -637,9 +681,17 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 			}
 
 		case form.ComponentMasterDetail:
-			sv.Children, sv.Columns = buildChildRows(data.Children[s.Target], data.ChildDefs[s.Target], data.ChildReferenceLabels[s.Target], r.i18n, locale)
+			sv.Children, sv.Columns = buildChildRows(data.Children[s.Target], data.ChildDefs[s.Target], data.ChildReferenceLabels[s.Target], data.ChildRedactedFields[s.Target], r.i18n, locale)
 			sv.AddHref = "/api/records/" + url.PathEscape(s.Target) + "/new"
-			if s.RollUp != "" {
+			// rollUpComputed guards this, not just s.RollUp != "": a
+			// skipped roll-up (UnavailableSections, or ChildRedactedFields
+			// hiding the RollUp source field itself, both above) must
+			// leave RollUpTotal at its zero value ("") so the template's
+			// {{if .RollUpTotal}} suppresses the line entirely — checking
+			// rollUpTotals[s.RollUpTarget] alone can't tell "skipped" from
+			// "computed and genuinely zero", since a Go map miss and a
+			// real 0.0 total are the same value.
+			if s.RollUp != "" && rollUpComputed[s.RollUpTarget] {
 				// RollUpTarget names a field on the PARENT entity (ent,
 				// not the child section's Target) — see form.Section.
 				// RollUp's doc comment: it sums into "a header field".
@@ -661,7 +713,7 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 			// the endpoint: the rows are already here, and a lazy-load
 			// that fires on every form render is a request this page
 			// does not need (independent review, board #20).
-			sv.Children, sv.Columns = buildChildRows(data.Children[s.Target], data.ChildDefs[s.Target], data.ChildReferenceLabels[s.Target], r.i18n, locale)
+			sv.Children, sv.Columns = buildChildRows(data.Children[s.Target], data.ChildDefs[s.Target], data.ChildReferenceLabels[s.Target], data.ChildRedactedFields[s.Target], r.i18n, locale)
 		}
 
 		vm.Sections = append(vm.Sections, sv)
@@ -1012,8 +1064,15 @@ func (r *Renderer) buildFields(s form.Section, ent *entity.Definition, record ma
 // childDef may be nil (a Definition mismatch the caller already
 // tolerates); the per-row key fallback keeps such a section rendering
 // something rather than nothing.
-func buildChildRows(children []map[string]any, childDef *entity.Definition, referenceLabels map[string]map[string]string, catalog *i18n.Catalog, locale string) ([]childRowView, []columnView) {
-	names := childColumns(children, childDef)
+//
+// redacted names the child entity's fields this viewer may not see
+// (Data.ChildRedactedFields[section.Target]) — filtered out of names
+// before columns/rows are built, so a redacted field reaches neither
+// the header (column NAME or its resolved LABEL) nor any row's cell.
+// nil/empty means nothing is redacted for this child type, the same
+// graceful-degrade convention RedactedFields itself follows.
+func buildChildRows(children []map[string]any, childDef *entity.Definition, referenceLabels map[string]map[string]string, redacted map[string]bool, catalog *i18n.Catalog, locale string) ([]childRowView, []columnView) {
+	names := childColumns(children, childDef, redacted)
 	columns := make([]columnView, 0, len(names))
 	for _, name := range names {
 		label := name
@@ -1025,6 +1084,18 @@ func buildChildRows(children []map[string]any, childDef *entity.Definition, refe
 			label = catalog.TOrDefault(locale, "field."+childDef.EntityType+"."+name, name)
 		}
 		columns = append(columns, columnView{Field: name, Label: label})
+	}
+	if len(names) == 0 {
+		// Nothing to show per row either — without this, a child type
+		// whose every field got redacted (or that genuinely has zero
+		// declared fields) still emitted one content-free <tr>/
+		// <div class="uc-related-row"> per child record: visually
+		// broken, AND it discloses exactly how many child records exist
+		// to a viewer permitted to see none of their fields (uc-infra#127
+		// independent review). Falling through to the section's own
+		// {{if not .Children}} empty-state message instead — the same
+		// outcome a genuinely childless section already gets.
+		return nil, columns
 	}
 	rows := make([]childRowView, 0, len(children))
 	for _, child := range children {
@@ -1043,11 +1114,17 @@ func buildChildRows(children []map[string]any, childDef *entity.Definition, refe
 // childColumns is the child Definition's declared field order, falling
 // back to the union of the rows' own keys (sorted, so output stays
 // deterministic — Go map iteration is randomized) when no Definition is
-// available.
-func childColumns(children []map[string]any, childDef *entity.Definition) []string {
+// available. Either way, any name redacted (see buildChildRows' own
+// redacted param) is dropped before it's returned — this runs whether or
+// not there are any rows, which is what makes a redacted column disappear
+// even from an otherwise-empty related-list/master-detail table.
+func childColumns(children []map[string]any, childDef *entity.Definition, redacted map[string]bool) []string {
 	if childDef != nil && len(childDef.Fields) > 0 {
 		cols := make([]string, 0, len(childDef.Fields))
 		for _, f := range childDef.Fields {
+			if redacted[f.Name] {
+				continue
+			}
 			cols = append(cols, f.Name)
 		}
 		return cols
@@ -1056,7 +1133,7 @@ func childColumns(children []map[string]any, childDef *entity.Definition) []stri
 	var cols []string
 	for _, child := range children {
 		for k := range child {
-			if !seen[k] {
+			if !seen[k] && !redacted[k] {
 				seen[k] = true
 				cols = append(cols, k)
 			}

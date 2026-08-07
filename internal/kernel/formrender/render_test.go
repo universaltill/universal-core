@@ -898,6 +898,54 @@ func TestRender_MasterDetailRollUp(t *testing.T) {
 	}
 }
 
+// TestRender_MasterDetailRollUpSkipsRecomputeWhenSourceFieldRedacted
+// (uc-infra#127 independent review): a FieldPermission hiding the
+// section's own RollUp SOURCE field (POLine.line_total) must NOT
+// recompute — and must not silently zero — the parent's stored
+// RollUpTarget (PurchaseOrder.total). Before this,
+// authz.GuardedEngine.ListByField already strips a redacted field from
+// every returned row before the renderer ever sees it, so
+// computeRollUp summed a pile of missing keys into 0, and that 0 then
+// overwrote the parent's real, nonzero stored total in `effective` —
+// which a subsequent Save would actually persist. Mirrors the existing
+// UnavailableSections precedent ("preserve, don't silently wipe") just
+// reached through redaction instead of licensing.
+func TestRender_MasterDetailRollUpSkipsRecomputeWhenSourceFieldRedacted(t *testing.T) {
+	r := testRenderer(t)
+	data := Data{
+		RecordID: "po-1",
+		// The real stored total — must survive untouched.
+		Record: map[string]any{"payment_method": "Wire", "total": 1234.5},
+		Children: map[string][]map[string]any{
+			// No "line_total" key at all: this is exactly the shape
+			// GuardedEngine.ListByField produces once the field is
+			// hidden — it deletes the key, it doesn't zero it.
+			"POLine": {{}, {}},
+		},
+		ChildRedactedFields: map[string]map[string]bool{"POLine": {"line_total": true}},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, `id="total" name="total" value="1234.5"`) {
+		t.Fatalf("expected the stored total (1234.5) preserved untouched, got:\n%s", out)
+	}
+	// Scoped to the total field specifically — a bare `value="0"` check
+	// would also match this render's unrelated "_version" hidden input.
+	if strings.Contains(out, `name="total" value="0"`) {
+		t.Fatalf("roll-up recomputed to 0 and overwrote the stored total — this is the data-loss bug, got:\n%s", out)
+	}
+	// RollUpTotal must stay unset (not "0") so the template's
+	// {{if .RollUpTotal}} suppresses the misleading line entirely — a
+	// skipped roll-up and a genuinely-computed total of zero must not
+	// look the same.
+	if strings.Contains(out, `class="uc-rollup"`) {
+		t.Fatalf("expected no roll-up line at all when its source field is redacted, got:\n%s", out)
+	}
+}
+
 // TestRender_MasterDetailColumnsAndRollUpLabelResolveThroughCatalog (#99):
 // master-detail column headers and the roll-up label previously rendered
 // the raw snake_case field name verbatim in every locale — the one
@@ -1024,6 +1072,202 @@ func TestRender_MasterDetailEnumCellIsLocalized(t *testing.T) {
 	}
 	if strings.Contains(out, `>labour<`) {
 		t.Errorf("raw untranslated enum value leaked into a Turkish-locale cell, got:\n%s", out)
+	}
+}
+
+// TestRender_MasterDetailChildRedactedFieldColumnAndCellAbsent
+// (uc-infra#127): a FieldPermission hiding a field on a master_detail
+// section's TARGET entity must remove that field's column (both header
+// AND every row's cell), the same way RedactedFields already does for
+// the parent's own Fields sections. Before ChildRedactedFields existed,
+// a redacted child field's raw name — and, once uc-infra#103 rendered
+// real header text, its resolved label too — reached the DOM regardless
+// of permission.
+func TestRender_MasterDetailChildRedactedFieldColumnAndCellAbsent(t *testing.T) {
+	r := testRenderer(t)
+	childDef := &entity.Definition{
+		EntityType: "POLine", Version: 1,
+		Fields: []entity.Field{
+			{Name: "qty", Type: entity.FieldNumber},
+			{Name: "reason", Type: entity.FieldString},
+		},
+	}
+	data := Data{
+		RecordID: "po-1",
+		Record:   map[string]any{"payment_method": "Wire"},
+		Children: map[string][]map[string]any{
+			"POLine": {{"qty": 5.0, "reason": "confidential note"}},
+		},
+		ChildDefs:           map[string]*entity.Definition{"POLine": childDef},
+		ChildRedactedFields: map[string]map[string]bool{"POLine": {"reason": true}},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if strings.Contains(out, `data-field="reason"`) {
+		t.Errorf("redacted child column rendered a header or cell, got:\n%s", out)
+	}
+	if strings.Contains(out, "confidential note") {
+		t.Errorf("redacted child field's value reached the DOM, got:\n%s", out)
+	}
+	if !strings.Contains(out, `data-field="qty"`) {
+		t.Errorf("unredacted sibling column missing after redacting another, got:\n%s", out)
+	}
+}
+
+// TestRender_MasterDetailChildRedactedFieldColumnAbsentEvenWhenEmpty
+// (uc-infra#127): childColumns derives the header from the child
+// Definition, not from row data (uc-infra#103), so a redacted column
+// must disappear from the header even with zero child rows — otherwise
+// a viewer without permission learns the hidden field's name/translated
+// label from an otherwise-empty table, which is the exact scenario
+// uc-infra#127's report caught.
+func TestRender_MasterDetailChildRedactedFieldColumnAbsentEvenWhenEmpty(t *testing.T) {
+	r := testRenderer(t)
+	childDef := &entity.Definition{
+		EntityType: "POLine", Version: 1,
+		Fields: []entity.Field{
+			{Name: "qty", Type: entity.FieldNumber},
+			{Name: "reason", Type: entity.FieldString},
+		},
+	}
+	data := Data{
+		RecordID:            "po-1",
+		Record:              map[string]any{"payment_method": "Wire"},
+		Children:            map[string][]map[string]any{"POLine": {}},
+		ChildDefs:           map[string]*entity.Definition{"POLine": childDef},
+		ChildRedactedFields: map[string]map[string]bool{"POLine": {"reason": true}},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if strings.Contains(out, `data-field="reason"`) {
+		t.Errorf("redacted child column's header rendered even with zero rows, got:\n%s", out)
+	}
+	if !strings.Contains(out, `data-field="qty"`) {
+		t.Errorf("unredacted sibling column header missing even with zero rows, got:\n%s", out)
+	}
+}
+
+// Nothing redacted on the child side -> byte-identical to before
+// ChildRedactedFields existed. Mirrors
+// TestRender_NoRedactionMatchesUnfilteredRender's own guarantee for the
+// parent's RedactedFields.
+func TestRender_NoChildRedactionMatchesUnfilteredRender(t *testing.T) {
+	r := testRenderer(t)
+	childDef := &entity.Definition{
+		EntityType: "POLine", Version: 1,
+		Fields: []entity.Field{{Name: "qty", Type: entity.FieldNumber}},
+	}
+	base := func(redacted map[string]map[string]bool) string {
+		t.Helper()
+		var buf strings.Builder
+		err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), Data{
+			RecordID: "po-1",
+			Record:   map[string]any{"payment_method": "Wire"},
+			Children: map[string][]map[string]any{
+				"POLine": {{"qty": 5.0}},
+			},
+			ChildDefs:           map[string]*entity.Definition{"POLine": childDef},
+			ChildRedactedFields: redacted,
+		}, "en")
+		if err != nil {
+			t.Fatalf("render: %v", err)
+		}
+		return buf.String()
+	}
+	if got, want := base(map[string]map[string]bool{}), base(nil); got != want {
+		t.Fatalf("empty ChildRedactedFields changed the render:\n%s\n---\n%s", got, want)
+	}
+}
+
+// TestRender_MasterDetailChildRedactedFieldColumnAbsentWithoutChildDef
+// (uc-infra#127 independent review): childColumns' NO-CHILD-DEFINITION
+// fallback branch (union of the rows' own keys) has its own
+// `!redacted[k]` guard, separate from the ChildDefs-present branch
+// exercised by every other redaction test in this file — a Definition
+// mismatch is exactly the case where the caller can least afford to
+// assume redaction was already applied elsewhere. This test only passes
+// with that guard present; deleting it (verified during review) leaves
+// every other test in this file green, since none of them reach this
+// branch with a non-empty redacted set.
+func TestRender_MasterDetailChildRedactedFieldColumnAbsentWithoutChildDef(t *testing.T) {
+	r := testRenderer(t)
+	data := Data{
+		RecordID: "po-1",
+		Record:   map[string]any{"payment_method": "Wire"},
+		Children: map[string][]map[string]any{
+			// No ChildDefs entry for POLine at all: childColumns falls
+			// back to the union of these rows' own keys.
+			"POLine": {{"qty": 5.0, "reason": "confidential note"}},
+		},
+		ChildRedactedFields: map[string]map[string]bool{"POLine": {"reason": true}},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if strings.Contains(out, `data-field="reason"`) {
+		t.Errorf("redacted column survived the no-ChildDef fallback branch, got:\n%s", out)
+	}
+	if strings.Contains(out, "confidential note") {
+		t.Errorf("redacted field's value survived the no-ChildDef fallback branch, got:\n%s", out)
+	}
+	if !strings.Contains(out, `data-field="qty"`) {
+		t.Errorf("unredacted sibling column missing from the no-ChildDef fallback branch, got:\n%s", out)
+	}
+}
+
+// TestRender_MasterDetailAllChildColumnsRedactedShowsEmptyStateNotBlankRows
+// (uc-infra#127 independent review): redacting EVERY field on a child
+// entity type must degrade to the section's normal empty-state message,
+// not one content-free <tr></tr> per child record — before this,
+// buildChildRows still emitted one row per record with zero cells
+// (visually broken), and the row COUNT itself disclosed exactly how
+// many child records exist to a viewer permitted to see none of their
+// fields.
+func TestRender_MasterDetailAllChildColumnsRedactedShowsEmptyStateNotBlankRows(t *testing.T) {
+	r := testRenderer(t)
+	childDef := &entity.Definition{
+		EntityType: "POLine", Version: 1,
+		Fields: []entity.Field{{Name: "qty", Type: entity.FieldNumber}},
+	}
+	data := Data{
+		RecordID: "po-1",
+		Record:   map[string]any{"payment_method": "Wire"},
+		Children: map[string][]map[string]any{
+			"POLine": {{"qty": 5.0}, {"qty": 7.0}, {"qty": 9.0}},
+		},
+		ChildDefs: map[string]*entity.Definition{"POLine": childDef},
+		// Also redact line_total (purchaseOrderForm's own RollUp source,
+		// a field this childDef doesn't even declare): unrelated to this
+		// test's own point, but without it the section's RollUp would
+		// still legitimately compute a fresh (zero) total from these
+		// rows and render its own "Total: 0" line — noise this test
+		// doesn't want to have to explain.
+		ChildRedactedFields: map[string]map[string]bool{"POLine": {"qty": true, "line_total": true}},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	// <td> only ever appears inside a body row's cells (the header uses
+	// <th>), so this is scoped to "no content-free body rows" without
+	// also tripping on the header's own pre-existing <thead><tr></tr>
+	// (unavoidable even when Columns is empty — see
+	// TestRender_MasterDetailChildRedactedFieldColumnAbsentEvenWhenEmpty,
+	// not this test's concern).
+	if strings.Contains(out, "<td") {
+		t.Errorf("expected no content-free body rows once every column is redacted, got:\n%s", out)
+	}
+	if !strings.Contains(out, `<p class="uc-empty">`) {
+		t.Errorf("expected the section's empty-state message once every column is redacted, got:\n%s", out)
 	}
 }
 
@@ -1327,6 +1571,41 @@ func TestRender_RelatedListHeaderRendersEvenWhenEmpty(t *testing.T) {
 	}
 	if !strings.Contains(out, "No related records.") {
 		t.Errorf("expected the empty-state message to still render alongside the header, got:\n%s", out)
+	}
+}
+
+// TestRender_RelatedListChildRedactedFieldColumnAndCellAbsent
+// (uc-infra#127): the same fix, for a related_list section — the two
+// component kinds share buildChildRows/childColumns, so this pins the
+// second caller doesn't regress independently of the master_detail
+// coverage above.
+func TestRender_RelatedListChildRedactedFieldColumnAndCellAbsent(t *testing.T) {
+	r := testRenderer(t)
+	childDef := &entity.Definition{
+		EntityType: "PurchaseOrder", Version: 1,
+		Fields: []entity.Field{
+			{Name: "status", Type: entity.FieldString},
+			{Name: "internal_note", Type: entity.FieldString},
+		},
+	}
+	data := Data{
+		Record: map[string]any{"payment_method": "Wire"},
+		Children: map[string][]map[string]any{
+			"PurchaseOrder": {{"status": "closed", "internal_note": "do not share"}},
+		},
+		ChildDefs:           map[string]*entity.Definition{"PurchaseOrder": childDef},
+		ChildRedactedFields: map[string]map[string]bool{"PurchaseOrder": {"internal_note": true}},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if strings.Contains(out, `data-field="internal_note"`) || strings.Contains(out, "do not share") {
+		t.Errorf("redacted related-list column/value reached the DOM, got:\n%s", out)
+	}
+	if !strings.Contains(out, `data-field="status"`) {
+		t.Errorf("unredacted sibling column missing after redacting another, got:\n%s", out)
 	}
 }
 

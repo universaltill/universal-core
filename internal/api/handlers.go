@@ -1228,15 +1228,16 @@ func (h *Handler) buildFormRenderData(ctx context.Context, ts tenantScope, entDe
 		renderData.Record = rec.Data
 		renderData.RecordLabel = h.recordLabel(entDef, rec, locale)
 
-		children, childDefs, childReferenceLabels, unavailableSections, degradedSections, err := h.loadMasterDetailChildren(ctx, ts, entDef, formDef, id, locale)
+		mdc, err := h.loadMasterDetailChildren(ctx, ts, entDef, formDef, id, locale)
 		if err != nil {
 			return formrender.Data{}, fmt.Errorf("load master-detail children: %w", err)
 		}
-		renderData.Children = children
-		renderData.ChildDefs = childDefs
-		renderData.ChildReferenceLabels = childReferenceLabels
-		renderData.UnavailableSections = unavailableSections
-		renderData.DegradedSections = degradedSections
+		renderData.Children = mdc.rows
+		renderData.ChildDefs = mdc.defs
+		renderData.ChildReferenceLabels = mdc.referenceLabels
+		renderData.UnavailableSections = mdc.unavailable
+		renderData.DegradedSections = mdc.degraded
+		renderData.ChildRedactedFields = mdc.redacted
 	} else {
 		// A not-yet-saved record has no children to fetch, but section
 		// AVAILABILITY is a Definition-level fact, not a record-level
@@ -1603,41 +1604,63 @@ func (h *Handler) pageReferenceLabels(ctx context.Context, ts tenantScope, def *
 // nothing populated a label map for it at all (uc-infra#85).
 //
 // A section whose Target has no published Definition in this tenant
-// (module not licensed) is reported back via the fourth return value
-// (unavailable, distinct from the fifth's degraded — see above)
-// instead of failing the whole lookup: this is the exact same
-// "licensing gap, not a data problem" case internal/api's own
-// referenceIDsMatching already degrades gracefully for, on the same
-// data.ErrNotFound signal. Before this, that error propagated up through
-// buildFormRenderData unchanged and renderForm's own errors.Is(err,
-// data.ErrNotFound) check — written to mean "the record itself doesn't
-// exist" — mistook it for exactly that, 404ing the whole parent form
-// even though the record plainly exists and only one of its related
-// child module types isn't licensed (uc-infra#132).
-func (h *Handler) loadMasterDetailChildren(ctx context.Context, ts tenantScope, entDef *entity.Definition, formDef *form.Definition, recordID, locale string) (map[string][]map[string]any, map[string]*entity.Definition, map[string]map[string]map[string]string, map[string]bool, map[string]bool, error) {
+// A section whose Target has no published Definition in this tenant
+// (module not licensed) is reported back via unavailable instead of
+// failing the whole lookup: this is the exact same "licensing gap, not
+// a data problem" case internal/api's own referenceIDsMatching already
+// degrades gracefully for, on the same data.ErrNotFound signal. Before
+// this, that error propagated up through buildFormRenderData unchanged
+// and renderForm's own errors.Is(err, data.ErrNotFound) check — written
+// to mean "the record itself doesn't exist" — mistook it for exactly
+// that, 404ing the whole parent form even though the record plainly
+// exists and only one of its related child module types isn't licensed
+// (uc-infra#132).
+//
+// degraded names every section skipped specifically because the viewer
+// lacks read access to its child entity type (authz.ErrDenied from
+// ListByField below), as opposed to a section skipped for the unrelated
+// "no matching Relationship" reason a few lines down, or for the
+// unrelated "unlicensed" reason resolveMasterDetailSectionAvailability
+// already filtered out of availableChildDefs above.
+// formrender.Data.DegradedSections needs this distinction: a section
+// with genuinely zero child rows should still roll up to 0, but a
+// section we simply couldn't READ must not (uc-infra#131 independent
+// review finding #1 — recomputing "zero" here for an unreadable section
+// fed straight into a writable header field and would silently persist
+// a wrong total on the next save). The viewer can still read the parent
+// record, so a child section they lack read access to must not turn the
+// entire form into a 403 — this mirrors loadCurrentReferenceLabels' own
+// ErrDenied degrade below. Any OTHER error from ListByField (a real
+// DB/lookup failure, not a permission denial) still hard-fails.
+//
+// redacted is RedactedFields' own resolution (ts.crud.HiddenFields),
+// just keyed per section Target instead of once for the parent — see
+// formrender.Data.ChildRedactedFields' doc comment for why a child
+// entity type needs its own redaction set (uc-infra#127). Resolved per
+// section rather than once for every child entity type this tenant has,
+// since a form only ever declares master_detail/related_list sections
+// for the child types it actually shows.
+//
+// Returned as a struct, not six more positional values alongside err:
+// three of the six are already map[string]... shapes distinguishable
+// only by position, and a seventh would make that worse (independent
+// review, uc-infra#127).
+func (h *Handler) loadMasterDetailChildren(ctx context.Context, ts tenantScope, entDef *entity.Definition, formDef *form.Definition, recordID, locale string) (masterDetailChildren, error) {
 	availableChildDefs, unavailable, err := h.resolveMasterDetailSectionAvailability(ctx, ts, entDef, formDef)
 	if err != nil {
-		return nil, nil, nil, nil, nil, err
+		return masterDetailChildren{}, err
 	}
-	children := make(map[string][]map[string]any)
-	// The child Definitions travel with the rows: the renderer needs
-	// them for column order and to resolve i18n_text cells to the
-	// viewer's locale (formrender.buildChildRows).
-	childDefs := make(map[string]*entity.Definition)
-	referenceLabels := make(map[string]map[string]map[string]string)
-	// degraded names every section skipped specifically because the
-	// viewer lacks read access to its child entity type (below), as
-	// opposed to a section skipped for the unrelated "no matching
-	// Relationship" reason a few lines down, or for the unrelated
-	// "unlicensed" reason resolveMasterDetailSectionAvailability already
-	// filtered out of availableChildDefs above. formrender.Data.
-	// DegradedSections needs this distinction: a section with
-	// genuinely zero child rows should still roll up to 0, but a
-	// section we simply couldn't READ must not (uc-infra#131
-	// independent review finding #1 — recomputing "zero" here for an
-	// unreadable section fed straight into a writable header field
-	// and would silently persist a wrong total on the next save).
-	degraded := make(map[string]bool)
+	result := masterDetailChildren{
+		rows: make(map[string][]map[string]any),
+		// The child Definitions travel with the rows: the renderer needs
+		// them for column order and to resolve i18n_text cells to the
+		// viewer's locale (formrender.buildChildRows).
+		defs:            make(map[string]*entity.Definition),
+		referenceLabels: make(map[string]map[string]map[string]string),
+		unavailable:     unavailable,
+		degraded:        make(map[string]bool),
+		redacted:        make(map[string]map[string]bool),
+	}
 	for _, section := range formDef.Sections {
 		// Both component kinds resolve their rows the same way — parent
 		// id matched against the child's ParentField. They differ in what
@@ -1672,20 +1695,41 @@ func (h *Handler) loadMasterDetailChildren(ctx context.Context, ts tenantScope, 
 		if err != nil {
 			if errors.Is(err, authz.ErrDenied) {
 				log.Printf("api: list %s children for %s(%s) (master-detail/related-list section, viewer lacks read access): %v", section.Target, entDef.EntityType, recordID, err)
-				degraded[section.Target] = true
+				result.degraded[section.Target] = true
 				continue
 			}
-			return nil, nil, nil, nil, nil, fmt.Errorf("list %s children: %w", section.Target, err)
+			return masterDetailChildren{}, fmt.Errorf("list %s children: %w", section.Target, err)
 		}
 		rows := make([]map[string]any, len(records))
 		for i, rec := range records {
 			rows[i] = rec.Data
 		}
-		children[section.Target] = rows
-		childDefs[section.Target] = childDef
-		referenceLabels[section.Target] = h.pageReferenceLabels(ctx, ts, childDef, records, locale)
+		result.rows[section.Target] = rows
+		result.defs[section.Target] = childDef
+		result.referenceLabels[section.Target] = h.pageReferenceLabels(ctx, ts, childDef, records, locale)
+		// Resolved even for a section with zero rows: the redacted
+		// column must vanish from the header too (uc-infra#127's own
+		// acceptance criterion), and childColumns builds the header
+		// from the Definition, not from row data.
+		redacted, err := ts.crud.HiddenFields(ctx, section.Target)
+		if err != nil {
+			return masterDetailChildren{}, fmt.Errorf("resolve hidden fields for %s: %w", section.Target, err)
+		}
+		result.redacted[section.Target] = redacted
 	}
-	return children, childDefs, referenceLabels, unavailable, degraded, nil
+	return result, nil
+}
+
+// masterDetailChildren is loadMasterDetailChildren's return shape — see
+// that function's own doc comment for what each field means and why
+// this is a struct rather than more positional returns.
+type masterDetailChildren struct {
+	rows            map[string][]map[string]any
+	defs            map[string]*entity.Definition
+	referenceLabels map[string]map[string]map[string]string
+	unavailable     map[string]bool
+	degraded        map[string]bool
+	redacted        map[string]map[string]bool
 }
 
 // resolveMasterDetailSectionAvailability resolves, for every

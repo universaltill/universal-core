@@ -139,6 +139,105 @@ func TestFieldPermission_HiddenFieldAbsentFromLiveDOM(t *testing.T) {
 	}
 }
 
+// TestFieldPermission_MasterDetailChildColumnAbsentFromLiveDOM
+// (uc-infra#127): the real-browser layer for ChildRedactedFields — a
+// FieldPermission hiding POLine.unit_price from the logged-in user's
+// role must remove that column (header AND cell) from the PurchaseOrder
+// form's Lines master_detail table, exactly as
+// TestFieldPermission_HiddenFieldAbsentFromLiveDOM already proves for a
+// redacted field on the FORM'S OWN entity. A rendered-HTML-string test
+// (formrender's/internal/api's own unit and integration tests for this
+// fix) can't prove no element named unit_price exists in the live DOM —
+// only a real browser settles that.
+func TestFieldPermission_MasterDetailChildColumnAbsentFromLiveDOM(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, tenantDB := testServer(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	// Hide POLine.unit_price from the browser's own actor.
+	seedFieldPermission(t, tenantDB, "e2e_line_viewer", "POLine", "unit_price")
+
+	if err := purchasing.PublishStatuses(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("PublishStatuses: %v", err)
+	}
+	engine := crud.NewEngine(tenantDB)
+	vendor, err := engine.Create(ctx, foundation.Party(), map[string]any{
+		"name": "Redaction Test Vendor", "party_type": "organization", "status": "active",
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed vendor: %v", err)
+	}
+	if _, err := engine.Create(ctx, foundation.PartyRole(), map[string]any{
+		"party_id": vendor.ID, "role_type": "vendor",
+	}, actor); err != nil {
+		t.Fatalf("seed vendor PartyRole: %v", err)
+	}
+	statusID := publishedStatusID(t, tenantDB, "purchase_order_status", "approved")
+	po, err := engine.Create(ctx, purchasing.PurchaseOrder(), map[string]any{
+		"po_number": "PO-REDACT-1", "vendor_id": vendor.ID, "order_date": "2026-08-01", "status_id": statusID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed PurchaseOrder: %v", err)
+	}
+	item, err := engine.Create(ctx, purchasing.Item(), map[string]any{
+		"sku": "SKU-REDACT-1", "name": "Redaction Test Widget", "item_type": "stock",
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed Item: %v", err)
+	}
+	if _, err := engine.Create(ctx, purchasing.POLine(), map[string]any{
+		"purchase_order_id": po.ID, "item_id": item.ID, "qty": 3, "unit_price": 42.5,
+	}, actor); err != nil {
+		t.Fatalf("seed POLine: %v", err)
+	}
+
+	bctx := browserCtx(t, tenantID)
+	if err := chromedp.Run(bctx,
+		chromedp.Navigate(srv.URL+"/forms/PurchaseOrder/"+po.ID),
+		chromedp.WaitVisible(`form.uc-form`, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("navigate to the PurchaseOrder form: %v", err)
+	}
+
+	// Neither the column header nor any row cell for the redacted child
+	// field may exist in the live DOM.
+	var unitPriceNodeCount int
+	if err := chromedp.Run(bctx, chromedp.EvaluateAsDevTools(
+		`document.querySelectorAll('[data-field="unit_price"]').length`, &unitPriceNodeCount,
+	)); err != nil {
+		t.Fatalf("count unit_price nodes: %v", err)
+	}
+	if unitPriceNodeCount != 0 {
+		t.Fatalf("redacted child column is present in the live DOM (%d node(s) for unit_price)", unitPriceNodeCount)
+	}
+	// Belt-and-braces: authz.GuardedEngine.ListByField already strips a
+	// hidden field's VALUE from every row before it ever reaches this
+	// handler, so this check alone would still pass with the fix
+	// reverted — the column identity (asserted above, via
+	// data-field="unit_price") was the actual leak uc-infra#127 closes.
+	var leaks bool
+	if err := chromedp.Run(bctx, chromedp.EvaluateAsDevTools(
+		`document.documentElement.outerHTML.includes("42.5")`, &leaks,
+	)); err != nil {
+		t.Fatalf("scan document for the redacted value: %v", err)
+	}
+	if leaks {
+		t.Fatal("redacted child field's value reached the browser somewhere in the document")
+	}
+
+	// The sibling qty column is unaffected — redaction is surgical.
+	var qtyNodeCount int
+	if err := chromedp.Run(bctx, chromedp.EvaluateAsDevTools(
+		`document.querySelectorAll('[data-field="qty"]').length`, &qtyNodeCount,
+	)); err != nil {
+		t.Fatalf("count qty nodes: %v", err)
+	}
+	if qtyNodeCount == 0 {
+		t.Fatal("redacting unit_price removed the qty column too — the Lines table lost an unrelated column")
+	}
+}
+
 // TestAccessDeniedPage_IsStyledAndLocalized is the counterpart to
 // issue_report_test.go's styling regression: a 403 page is one of the
 // few pages a user reaches without meaning to, so it has to look like

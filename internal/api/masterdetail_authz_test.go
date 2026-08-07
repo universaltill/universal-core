@@ -453,21 +453,21 @@ func TestLoadMasterDetailChildren_DegradesOnErrDeniedNotOtherErrors(t *testing.T
 		t.Fatalf("build tenantScope: %v", err)
 	}
 
-	children, childDefs, refLabels, _, degraded, err := h.loadMasterDetailChildren(ctx, deniedScope, purchaseOrderEntityDef(), purchaseOrderFormDef(), po.ID, "en")
+	mdc, err := h.loadMasterDetailChildren(ctx, deniedScope, purchaseOrderEntityDef(), purchaseOrderFormDef(), po.ID, "en")
 	if err != nil {
 		t.Fatalf("expected the POLine section (ErrDenied) to degrade, not hard-fail the whole call: %v", err)
 	}
-	if _, ok := children["POLine"]; ok {
-		t.Fatalf("expected the POLine section omitted from children when the viewer can't read it, got: %v", children)
+	if _, ok := mdc.rows["POLine"]; ok {
+		t.Fatalf("expected the POLine section omitted from children when the viewer can't read it, got: %v", mdc.rows)
 	}
-	if _, ok := childDefs["POLine"]; ok {
-		t.Fatalf("expected the POLine section omitted from childDefs when the viewer can't read it, got: %v", childDefs)
+	if _, ok := mdc.defs["POLine"]; ok {
+		t.Fatalf("expected the POLine section omitted from childDefs when the viewer can't read it, got: %v", mdc.defs)
 	}
-	if _, ok := refLabels["POLine"]; ok {
-		t.Fatalf("expected the POLine section omitted from referenceLabels when the viewer can't read it, got: %v", refLabels)
+	if _, ok := mdc.referenceLabels["POLine"]; ok {
+		t.Fatalf("expected the POLine section omitted from referenceLabels when the viewer can't read it, got: %v", mdc.referenceLabels)
 	}
-	if !degraded["POLine"] {
-		t.Fatalf("expected degraded[\"POLine\"] to be true — formrender's roll-up fix depends on this to distinguish \"couldn't load\" from \"genuinely zero rows\", got: %v", degraded)
+	if !mdc.degraded["POLine"] {
+		t.Fatalf("expected degraded[\"POLine\"] to be true — formrender's roll-up fix depends on this to distinguish \"couldn't load\" from \"genuinely zero rows\", got: %v", mdc.degraded)
 	}
 
 	// A genuine (non-authz) failure from ListByField itself must still
@@ -503,7 +503,7 @@ func TestLoadMasterDetailChildren_DegradesOnErrDeniedNotOtherErrors(t *testing.T
 	// tenant combination succeeds normally — otherwise a failure below
 	// could just as easily mean "this actor is denied too" as "a
 	// genuine error propagates," which would prove nothing.
-	if _, _, _, _, _, err := h.loadMasterDetailChildren(ctx, failScope, purchaseOrderEntityDef(), purchaseOrderFormDef(), failPO.ID, "en"); err != nil {
+	if _, err := h.loadMasterDetailChildren(ctx, failScope, purchaseOrderEntityDef(), purchaseOrderFormDef(), failPO.ID, "en"); err != nil {
 		t.Fatalf("sanity check: fail tenant should succeed before the table is dropped: %v", err)
 	}
 	// CASCADE: record_unique_keys (0006_record_unique_keys.sql) holds a
@@ -513,7 +513,7 @@ func TestLoadMasterDetailChildren_DegradesOnErrDeniedNotOtherErrors(t *testing.T
 	if _, err := failDB.ExecContext(ctx, "DROP TABLE records CASCADE"); err != nil {
 		t.Fatalf("drop records table: %v", err)
 	}
-	_, _, _, _, _, err = h.loadMasterDetailChildren(ctx, failScope, purchaseOrderEntityDef(), purchaseOrderFormDef(), failPO.ID, "en")
+	_, err = h.loadMasterDetailChildren(ctx, failScope, purchaseOrderEntityDef(), purchaseOrderFormDef(), failPO.ID, "en")
 	if err == nil {
 		t.Fatalf("expected a genuine (non-ErrDenied) ListByField failure to still propagate as an error, got nil")
 	}
