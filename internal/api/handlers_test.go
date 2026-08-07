@@ -2554,6 +2554,110 @@ func TestAPI_RenderRecordForm_MasterDetailReferenceColumnFallsBackToRawIDWhenTar
 	}
 }
 
+// TestAPI_RenderRecordForm_UnlicensedMasterDetailChildOmitsSectionNot404
+// (uc-infra#132): PurchaseOrder is published, and a real PurchaseOrder
+// record exists — but POLine (the "Lines" master-detail section's
+// Target) has no published Definition in this tenant at all, the same
+// "module not licensed here" configuration referenceIDsMatching's own
+// data.ErrNotFound-degrades-to-no-matches branch already handles for a
+// list-page filter. Before this fix, loadMasterDetailChildren's
+// unwrapped data.ErrNotFound from looking up POLine's Definition
+// propagated straight through buildFormRenderData to renderForm's own
+// errors.Is(err, data.ErrNotFound) check — written to mean "the record
+// itself doesn't exist" — producing a lying 404
+// ({"error":"PurchaseOrder \"...\" not found"}) for a PurchaseOrder that
+// plainly exists. The form must render 200 with the Lines section simply
+// absent, exactly like a viewer who can't see one field gets a form
+// missing that field rather than no form at all.
+func TestAPI_RenderRecordForm_UnlicensedMasterDetailChildOmitsSectionNot404(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := foundation.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	// PurchaseOrder is published; POLine deliberately is NOT — the exact
+	// "child module not licensed in this tenant" shape the issue reports.
+	publishEntityAndForm(t, db, purchaseOrderEntityDef(), purchaseOrderFormDef())
+
+	engine := crud.NewEngine(db)
+	po, err := engine.Create(ctx, purchaseOrderEntityDef(), map[string]any{"vendor_id": "v1"}, humanActor())
+	if err != nil {
+		t.Fatalf("seed PurchaseOrder: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	formReq := newRequest("GET", "/forms/PurchaseOrder/"+po.ID, tenantID, "farshid", nil)
+	formRec := httptest.NewRecorder()
+	mux.ServeHTTP(formRec, formReq)
+
+	if formRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 (the PurchaseOrder record plainly exists; only its POLine child module isn't licensed), got %d: %s", formRec.Code, formRec.Body.String())
+	}
+	body := formRec.Body.String()
+	if strings.Contains(body, "not found") {
+		t.Errorf("expected no \"not found\" text anywhere in a successful render, got:\n%s", body)
+	}
+	if strings.Contains(body, "Lines") {
+		t.Errorf("expected the unlicensed POLine section to be omitted from the rendered form entirely, got:\n%s", body)
+	}
+	if !strings.Contains(body, "Header") {
+		t.Errorf("expected the PurchaseOrder form's other section to still render normally, got:\n%s", body)
+	}
+}
+
+// TestAPI_RenderNewForm_UnlicensedMasterDetailChildOmitsSection
+// (uc-infra#132, independent review): the NOT-YET-SAVED-record sibling
+// of TestAPI_RenderRecordForm_UnlicensedMasterDetailChildOmitsSectionNot404.
+// buildFormRenderData only calls loadMasterDetailChildren inside its
+// `if id != ""` branch — id == "" (a "new record" form,
+// renderNewForm/GET /forms/{entityType}/new) never reached that call at
+// all, fix or no fix, so it never had the 404 bug this card fixes. But
+// it DID (and without this test would still) render the unlicensed
+// section anyway: an empty "Lines" table plus an "add" link pointing at
+// /api/records/POLine/new, a type this tenant has no Definition for —
+// then have that same section silently disappear the moment the record
+// is actually saved and the edit-form path (now fixed) takes over.
+// Same tenant, same entity, same form Definition, two different answers
+// about whether the section exists depending only on id == "". This
+// pins resolveMasterDetailSectionAvailability's fix: the "Lines" section
+// must be omitted on the NEW form too, not just the edit one.
+func TestAPI_RenderNewForm_UnlicensedMasterDetailChildOmitsSection(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := foundation.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	// PurchaseOrder is published; POLine deliberately is NOT.
+	publishEntityAndForm(t, db, purchaseOrderEntityDef(), purchaseOrderFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	formReq := newRequest("GET", "/forms/PurchaseOrder/new", tenantID, "farshid", nil)
+	formRec := httptest.NewRecorder()
+	mux.ServeHTTP(formRec, formReq)
+
+	if formRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for a new-record form, got %d: %s", formRec.Code, formRec.Body.String())
+	}
+	body := formRec.Body.String()
+	if strings.Contains(body, "Lines") {
+		t.Errorf("expected the unlicensed POLine section to be omitted from the NEW-record form too, got:\n%s", body)
+	}
+	if strings.Contains(body, "/api/records/POLine/new") {
+		t.Errorf("expected no add-child link for a target this tenant has no Definition for, got:\n%s", body)
+	}
+	if !strings.Contains(body, "Header") {
+		t.Errorf("expected the PurchaseOrder form's other section to still render normally, got:\n%s", body)
+	}
+}
+
 // TestAPI_ServesHTMXScript_Unauthenticated confirms /static/htmx.min.js
 // is reachable without dev-auth headers — it has to be, since the page
 // requesting it (a real browser navigating to a route DevAuth would
