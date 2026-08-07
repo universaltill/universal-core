@@ -256,7 +256,7 @@ func main() {
 		// configured (DevAuth is a no-op fallback behind Guard once it is).
 		log.Printf("WARNING: INSECURE_DEV_AUTH=true — /api and /forms routes trust X-Tenant-ID/X-Actor-ID headers with ZERO verification. Do not set this on a publicly reachable deployment.")
 	} else {
-		log.Printf("no auth backend configured — /api and /forms routes will 401 every request (see QUEUE.md)")
+		log.Printf("no auth backend configured — /api and /forms routes will 401 every request")
 	}
 	svcCfg := svcauthConfigFromEnv()
 	svc, err := svcauth.New(context.Background(), svcCfg, data.NewTenantRepo(controlDB))
