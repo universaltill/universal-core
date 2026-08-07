@@ -636,3 +636,32 @@ th a.uc-sort:hover { text-decoration: underline; }
   color: var(--uc-muted, #666); font-weight: 600;
 }
 .uc-i18n-row input { flex: 1 1 auto; }
+
+/* In-product help affordance (ADR-0023, uc-infra#143): a "?" on every
+   generated form/list page, linking to its derived help topic once
+   content exists (internal/help.HasContent), inert until then. Always
+   in the tab order (tabindex="0" set in the template regardless of
+   state) — an <a> with no href drops out of the default tab order,
+   which the disabled state deliberately overrides rather than accepts,
+   per ADR-0023's "stay focusable even while inert" decision.
+
+   .uc-form-toolbar wraps the affordance on form pages only (list pages
+   put it inline inside the existing .uc-list-toolbar's <h1> instead,
+   see the <h1> rule this file already has) — right-aligned rather than
+   the block element's default left-aligned full-width row, which
+   independent review found left the "?" sitting alone above the first
+   field with nothing to anchor it to. */
+.uc-form-toolbar { display: flex; justify-content: flex-end; margin: 0 0 0.5rem; }
+.uc-help-affordance {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 1.4rem; height: 1.4rem; margin-inline-start: 0.5rem;
+  border: 1px solid var(--uc-border); border-radius: 50%;
+  font-size: 0.8rem; font-weight: 600; line-height: 1;
+  text-decoration: none; color: var(--uc-accent, #1c7ed6);
+  vertical-align: middle;
+}
+.uc-help-affordance:hover { background: var(--uc-bg); }
+.uc-help-affordance[aria-disabled="true"] {
+  color: var(--uc-muted); cursor: default; opacity: 0.5;
+}
+.uc-help-affordance[aria-disabled="true"]:hover { background: none; }

@@ -2926,6 +2926,87 @@ func TestAPI_RecordList_EmptyShowsEmptyMessage(t *testing.T) {
 	}
 }
 
+// TestBuildHelpView_NoContent/TestBuildHelpView_ContentExists (ADR-0023,
+// uc-infra#143) unit-test listview.go's own buildHelpView directly, the
+// listview analog of formrender's identically-shaped test — see that
+// package's own test for why the "content exists" branch needs a direct
+// unit test rather than only an end-to-end one: help.HasContent is real
+// and false for every topic today, so no full HTTP request could ever
+// exercise the enabled branch.
+func TestBuildHelpView_NoContent(t *testing.T) {
+	cat, err := i18n.Load("en")
+	if err != nil {
+		t.Fatalf("load i18n catalog: %v", err)
+	}
+	h := &Handler{catalog: cat}
+	hv := h.buildHelpView("en", "entity/PurchaseOrder", false)
+	if hv.TopicID != "entity/PurchaseOrder" {
+		t.Errorf("TopicID = %q, want %q", hv.TopicID, "entity/PurchaseOrder")
+	}
+	if hv.Href != "" {
+		t.Errorf("Href = %q, want empty when content doesn't exist", hv.Href)
+	}
+	if !hv.Disabled {
+		t.Error("Disabled = false, want true when content doesn't exist")
+	}
+	if hv.Label != "Help" {
+		t.Errorf("Label = %q, want %q", hv.Label, "Help")
+	}
+}
+
+func TestBuildHelpView_ContentExists(t *testing.T) {
+	cat, err := i18n.Load("en")
+	if err != nil {
+		t.Fatalf("load i18n catalog: %v", err)
+	}
+	h := &Handler{catalog: cat}
+	hv := h.buildHelpView("en", "entity/PurchaseOrder", true)
+	if hv.TopicID != "entity/PurchaseOrder" {
+		t.Errorf("TopicID = %q, want %q", hv.TopicID, "entity/PurchaseOrder")
+	}
+	if hv.Href != "/help/entity/PurchaseOrder" {
+		t.Errorf("Href = %q, want %q", hv.Href, "/help/entity/PurchaseOrder")
+	}
+	if hv.Disabled {
+		t.Error("Disabled = true, want false when content exists")
+	}
+}
+
+// TestAPI_RecordList_HelpAffordanceRendersDisabledWhenNoContent
+// (ADR-0023, uc-infra#143) is the honest end-to-end confirmation of this
+// slice's actual shipped state, mirroring formrender's own test of the
+// same name/shape for form pages: no help content exists yet, so a real
+// list page's "?" must render disabled — present and focusable, no href.
+func TestAPI_RecordList_HelpAffordanceRendersDisabledWhenNoContent(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	req := newRequest("GET", "/records/Vendor", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	// data-help-topic="entity/Vendor" proves renderRecordList's real call
+	// site passed the actual entityType ("Vendor") into help.TopicID —
+	// independent review found this wiring was otherwise unobservable by
+	// any test, since Href (the only other TopicID-derived output) is
+	// empty in every test today (no help content ships in this slice).
+	if !strings.Contains(body, `<a class="uc-help-affordance" role="link" data-help-topic="entity/Vendor" aria-disabled="true" tabindex="0" aria-label="Help">?</a>`) {
+		t.Fatalf("expected a disabled, focusable, hrefless help affordance for topic entity/Vendor, got:\n%s", body)
+	}
+	if strings.Contains(body, `uc-help-affordance" href=`) {
+		t.Fatal("help affordance must not carry an href when its topic has no content yet")
+	}
+}
+
 func TestAPI_RecordList_UnknownEntityTypeIs404(t *testing.T) {
 	router := newTestRouter(t)
 	withDevAuthEnabled(t)

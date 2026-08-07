@@ -380,6 +380,7 @@
   "action.cancel": "لغو",
   "toast.error_fallback": "مشکلی پیش آمد. لطفاً دوباره تلاش کنید.",
   "toast.network_error": "امکان دسترسی به سرور نبود. اتصال خود را بررسی کرده و دوباره تلاش کنید.",
+  "help.affordance.label": "راهنما",
   "field.Permission.role_id": "نقش",
   "field.Permission.entity_type": "نوع موجودیت",
   "field.Permission.can_read": "امکان خواندن",

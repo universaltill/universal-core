@@ -1870,6 +1870,91 @@ func TestRender_SectionTitleWithoutCatalogKeyFallsBackToLiteral(t *testing.T) {
 // button's Label goes through the global form.action.save key exactly
 // like section titles go through their per-entity key — proven the same
 // non-English way, for the same tautology-avoidance reason.
+// TestBuildHelpView_NoContent and TestBuildHelpView_ContentExists
+// (ADR-0023, uc-infra#143) unit-test buildHelpView's two branches
+// directly, rather than only through Render() — Render() always calls
+// the real help.HasContent, which is false for every topic id as of
+// this slice (no content ships yet), so a full end-to-end test alone
+// could never exercise the "content exists" branch at all.
+func TestBuildHelpView_NoContent(t *testing.T) {
+	cat, err := i18n.Load("en")
+	if err != nil {
+		t.Fatalf("load i18n catalog: %v", err)
+	}
+	hv := buildHelpView(cat, "en", "entity/PurchaseOrder", false)
+	if hv.TopicID != "entity/PurchaseOrder" {
+		t.Errorf("TopicID = %q, want %q", hv.TopicID, "entity/PurchaseOrder")
+	}
+	if hv.Href != "" {
+		t.Errorf("Href = %q, want empty when content doesn't exist", hv.Href)
+	}
+	if !hv.Disabled {
+		t.Error("Disabled = false, want true when content doesn't exist")
+	}
+	if hv.Label != "Help" {
+		t.Errorf("Label = %q, want %q", hv.Label, "Help")
+	}
+}
+
+func TestBuildHelpView_ContentExists(t *testing.T) {
+	cat, err := i18n.Load("en")
+	if err != nil {
+		t.Fatalf("load i18n catalog: %v", err)
+	}
+	hv := buildHelpView(cat, "en", "entity/PurchaseOrder", true)
+	if hv.TopicID != "entity/PurchaseOrder" {
+		t.Errorf("TopicID = %q, want %q", hv.TopicID, "entity/PurchaseOrder")
+	}
+	if hv.Href != "/help/entity/PurchaseOrder" {
+		t.Errorf("Href = %q, want %q", hv.Href, "/help/entity/PurchaseOrder")
+	}
+	if hv.Disabled {
+		t.Error("Disabled = true, want false when content exists")
+	}
+}
+
+func TestBuildHelpView_LabelTranslated(t *testing.T) {
+	cat, err := i18n.Load("en")
+	if err != nil {
+		t.Fatalf("load i18n catalog: %v", err)
+	}
+	hv := buildHelpView(cat, "ar", "entity/PurchaseOrder", false)
+	if hv.Label != "مساعدة" {
+		t.Errorf("Label = %q, want the Arabic translation %q", hv.Label, "مساعدة")
+	}
+}
+
+// TestRender_HelpAffordanceRendersDisabledWhenNoContent (ADR-0023,
+// uc-infra#143) is the honest end-to-end confirmation of this slice's
+// actual shipped state: no help content exists yet (see
+// internal/help/content/README.md), so every rendered form's "?" must
+// come out disabled — present, focusable (tabindex="0"), but with no
+// href — never a link to a 404.
+func TestRender_HelpAffordanceRendersDisabledWhenNoContent(t *testing.T) {
+	r := testRenderer(t)
+	data := Data{Record: map[string]any{"payment_method": "Wire"}, Children: map[string][]map[string]any{}}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	got := buf.String()
+	// data-help-topic="entity/PurchaseOrder" is the load-bearing
+	// assertion independent review asked for: it proves buildViewModel's
+	// real call site actually passed def.EntityType ("PurchaseOrder")
+	// into help.TopicID, not merely that buildHelpView's own unit tests
+	// handle a hand-supplied topic id correctly. Before this attribute
+	// existed, nothing in this suite could tell a correct call site from
+	// a wrong one (e.g. a typo'd def.Name) — Href, the only other
+	// TopicID-derived output, is empty in every test today because no
+	// help content ships in this slice.
+	if !strings.Contains(got, `<a class="uc-help-affordance" role="link" data-help-topic="entity/PurchaseOrder" aria-disabled="true" tabindex="0" aria-label="Help">?</a>`) {
+		t.Errorf("expected a disabled, focusable, hrefless help affordance for topic entity/PurchaseOrder, got:\n%s", got)
+	}
+	if strings.Contains(got, `uc-help-affordance" href=`) {
+		t.Error("help affordance must not carry an href when its topic has no content yet")
+	}
+}
+
 func TestRender_SaveActionLabelResolvesThroughCatalog(t *testing.T) {
 	r := testRenderer(t)
 	data := Data{Record: map[string]any{"payment_method": "Wire"}, Children: map[string][]map[string]any{}}

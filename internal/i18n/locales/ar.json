@@ -380,6 +380,7 @@
   "action.cancel": "إلغاء",
   "toast.error_fallback": "حدث خطأ ما. يرجى المحاولة مرة أخرى.",
   "toast.network_error": "تعذر الوصول إلى الخادم. تحقق من اتصالك وحاول مرة أخرى.",
+  "help.affordance.label": "مساعدة",
   "field.Permission.role_id": "الدور",
   "field.Permission.entity_type": "نوع الكيان",
   "field.Permission.can_read": "يمكنه القراءة",

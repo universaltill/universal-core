@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/universaltill/universal-core/internal/help"
 	"github.com/universaltill/universal-core/internal/i18n"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/form"
@@ -52,6 +53,24 @@ func New(catalog *i18n.Catalog) *Renderer {
 // needs one. Exported so i18n_coverage_test.go's external test package
 // can enforce every locale actually translates it.
 const SaveActionCatalogKey = "form.action.save"
+
+// HelpAffordanceCatalogKey is the single global i18n key for the "?"
+// help affordance every generated form page carries (ADR-0023 in
+// uc-infra, uc-infra#143), the same "one global key, not per-entity"
+// reasoning as SaveActionCatalogKey above: the affordance's aria-label/
+// tooltip text is identical across every entity type, so there is
+// nothing to key per-entity on. Exported so i18n_coverage_test.go's
+// external test package can enforce every locale actually translates
+// it.
+const HelpAffordanceCatalogKey = "help.affordance.label"
+
+// HelpAffordanceDefaultLabel is the TOrDefault fallback for
+// HelpAffordanceCatalogKey — exported so internal/api's listview.go
+// (which builds an independent, identically-shaped helpView for list
+// pages, see that file's own doc comment) uses this literal rather than
+// its own copy that could silently drift from this one (found by
+// independent review, uc-infra#143).
+const HelpAffordanceDefaultLabel = "Help"
 
 // sectionSlugRe turns a Section.Title into the slug half of
 // sectionCatalogKey's key. Any run of characters outside [a-z0-9]
@@ -246,6 +265,63 @@ type viewModel struct {
 	// already-valid JSON text round-trips losslessly in the browser, but
 	// only because the JSON itself was built correctly first.
 	WorkflowStartVals string
+	// Help is the page-level "?" affordance (ADR-0023, uc-infra#143) —
+	// one per page, since a form page documents exactly one topic
+	// (def.EntityType's), not one per section.
+	Help helpView
+}
+
+// helpView is the "?" affordance's render data. NOT shared with
+// internal/api's recordListView — that package declares its own,
+// independently, for the same reason columnView/recordRowView aren't
+// shared either (see listview.go's own helpView doc comment); this
+// comment previously claimed otherwise, which independent review
+// flagged as a real hazard in a codebase where doc comments are the
+// design record — someone editing this type or buildHelpView below
+// could reasonably believe they'd fixed listview.go's copy too.
+type helpView struct {
+	// TopicID is the derived help.TopicID/RouteTopicID this affordance
+	// points at, rendered unconditionally as a data-help-topic attribute
+	// regardless of Disabled — independent review found that without
+	// this, the actual entityType->TopicID wiring at this package's own
+	// buildViewModel call site was unobservable by any test in this
+	// slice: Href (below) only renders once HasContent is true, which is
+	// false for every topic today, so a wrong call (e.g. a typo'd field)
+	// would have shipped with every test still green.
+	TopicID string
+	// Label is the affordance's aria-label/tooltip text, resolved via
+	// HelpAffordanceCatalogKey.
+	Label string
+	// Href is the topic's URL once it has content, "" otherwise. The
+	// template renders no href attribute at all when this is "" — an
+	// <a> without href is not a link and not in the tab order by
+	// default, which is why the template also always sets tabindex="0"
+	// regardless of this field (ADR-0023's "stay focusable even while
+	// inert" decision).
+	Href string
+	// Disabled is true whenever Href == "" — kept as its own field
+	// rather than the template testing Href directly so the template's
+	// {{if .Help.Disabled}} reads as intent ("render the inert state"),
+	// not as an accidental empty-string check.
+	Disabled bool
+}
+
+// buildHelpView computes a page's help affordance. Split out from
+// buildViewModel as a small, pure function taking hasContent as an
+// explicit bool (rather than calling help.HasContent itself) so both of
+// this function's branches — content exists vs. doesn't yet — are
+// directly unit-testable without needing real embedded help content to
+// exist for the "content exists" branch to mean anything (ADR-0023).
+func buildHelpView(catalog *i18n.Catalog, locale, topicID string, hasContent bool) helpView {
+	hv := helpView{
+		TopicID:  topicID,
+		Label:    catalog.TOrDefault(locale, HelpAffordanceCatalogKey, HelpAffordanceDefaultLabel),
+		Disabled: !hasContent,
+	}
+	if hasContent {
+		hv.Href = help.Href(topicID)
+	}
+	return hv
 }
 
 type sectionView struct {
@@ -427,6 +503,8 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 		RefSearchPlaceholder: r.i18n.T(locale, "form.reference.search"),
 		WorkflowStartVals:    string(valsJSON),
 	}
+	helpTopicID := help.TopicID(def.EntityType)
+	vm.Help = buildHelpView(r.i18n, locale, helpTopicID, help.HasContent(locale, helpTopicID))
 
 	// Roll-ups are computed in a first pass, before any fields section is
 	// built, because form.Section's RollUp/RollUpTarget sums a
@@ -1021,6 +1099,7 @@ func childCellValue(child map[string]any, name string, childDef *entity.Definiti
 }
 
 const tmplSrc = `<form class="uc-form" data-entity-type="{{.EntityType}}"{{if .RecordID}} data-record-id="{{.RecordID}}" data-record-label="{{.RecordLabel}}"{{end}} hx-post="{{.PostHref}}" hx-target="this" hx-swap="outerHTML">
+<div class="uc-form-toolbar"><a class="uc-help-affordance" role="link" data-help-topic="{{.Help.TopicID}}"{{if .Help.Href}} href="{{.Help.Href}}"{{end}}{{if .Help.Disabled}} aria-disabled="true"{{end}} tabindex="0" aria-label="{{.Help.Label}}">?</a></div>
 {{if .VersionKnown}}<input type="hidden" name="_version" value="{{.Version}}">
 {{end}}
 {{range .HiddenFields}}<input type="hidden" name="{{.Name}}" value="{{.Value}}">

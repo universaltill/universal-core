@@ -380,6 +380,7 @@
   "action.cancel": "İptal",
   "toast.error_fallback": "Bir şeyler ters gitti. Lütfen tekrar deneyin.",
   "toast.network_error": "Sunucuya ulaşılamadı. Bağlantınızı kontrol edip tekrar deneyin.",
+  "help.affordance.label": "Yardım",
   "field.Permission.role_id": "Rol",
   "field.Permission.entity_type": "Varlık türü",
   "field.Permission.can_read": "Okuyabilir",
