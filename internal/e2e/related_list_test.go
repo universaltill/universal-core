@@ -292,4 +292,23 @@ func TestRelatedList_ColumnHeadersAreLocalized_RealBrowser(t *testing.T) {
 	if !strings.Contains(rowText, "LV-9002") {
 		t.Errorf("expected the leave request's own row to still render alongside its header:\n%s", rowText)
 	}
+
+	// start_date's CELL text, regionally formatted: until uc-infra#133's
+	// childCellValue fix, a related_list FieldDate cell rendered the raw
+	// stored ISO value regardless of locale — only the top-level list
+	// page's cellText applied loc.FormatDate. Real production screen
+	// (same "not just formrender's own synthetic unit tests" reasoning
+	// as the leave_type assertion above), Turkish's default region (TR:
+	// day-first, dot-separated — see internal/kernel/locale's
+	// regionRules) applied to the seeded "2026-08-10".
+	var startDateCellText string
+	if err := chromedp.Run(browser, chromedp.Text(`.uc-related-cell[data-field="start_date"]`, &startDateCellText, chromedp.ByQuery)); err != nil {
+		t.Fatalf("read start_date cell text: %v", err)
+	}
+	if got := strings.TrimSpace(startDateCellText); got != "10.08.2026" {
+		t.Errorf("expected the Turkish-formatted start_date (10.08.2026) in the cell, got %q", got)
+	}
+	if strings.Contains(rowText, "2026-08-10") {
+		t.Errorf("raw ISO start_date leaked into the related_list row, got:\n%s", rowText)
+	}
 }

@@ -24,6 +24,7 @@ import (
 	"github.com/universaltill/universal-core/internal/i18n"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/form"
+	uclocale "github.com/universaltill/universal-core/internal/kernel/locale"
 	"github.com/universaltill/universal-core/internal/kernel/money"
 )
 
@@ -221,6 +222,36 @@ type Data struct {
 	// query failed", so it resolves this the same way it precomputes
 	// RedactedFields/ReferenceCreateLabels.
 	UnavailableSections map[string]bool
+	// RegionalLocale is the viewer's resolved regional-formatting
+	// preference (internal/api's regionalLocale — language plus region
+	// plus calendar, not just the bare language tag Render's own locale
+	// parameter carries), used by a master_detail/related_list child
+	// cell's FieldDate/FieldNumber formatting (see childCellValue) to
+	// match internal/api/listview.go's cellText behaviour for the exact
+	// same field types on the top-level list page (uc-infra#133).
+	//
+	// Precomputed by the caller, same reasoning as ChildReferenceLabels/
+	// RedactedFields above: resolving a region needs the incoming HTTP
+	// request (a "?region=" query param, a cookie) that this generic
+	// kernel package deliberately has no access to. internal/kernel/
+	// locale's own regionRules table is very much per-country (GB/US/
+	// TR/IR/...), not jurisdiction-invariant — CLAUDE.md's kernel/
+	// deterministic-core rule isn't about jurisdiction-invariance, it's
+	// about no ENTITY-TYPE-specific business logic in the generic
+	// engine. Depending on locale.Locale here doesn't cross that line:
+	// the package is metadata/request-agnostic and doesn't branch on
+	// entity type, same as entity/form/money/i18n, the other peer
+	// kernel-tier packages this file already imports. Only resolving a
+	// Locale FROM a request is genuinely internal/api's concern, which
+	// is why the VALUE still has to come from the caller.
+	//
+	// The zero value (Locale{}) is not a usable preference — see that
+	// type's own doc comment — so an unset RegionalLocale (most of this
+	// package's own unit tests, or any future caller with no
+	// request-scoped region to resolve) falls back to
+	// uclocale.Default(locale) in buildViewModel rather than formatting
+	// against a broken zero Locale.
+	RegionalLocale uclocale.Locale
 }
 
 // Render writes the HTML/HTMX form for def against ent's field shapes and
@@ -492,6 +523,21 @@ type actionView struct {
 }
 
 func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, data Data, locale string) (viewModel, error) {
+	// See Data.RegionalLocale's doc comment: a caller that never resolved
+	// one (this package's own unit tests, mostly) gets the plain
+	// language default rather than formatting child-cell dates/numbers
+	// against a useless zero Locale. Usable(), not a bare Language == ""
+	// check: a hand-built Locale{Language: "..."} literal that never
+	// went through Parse/Default/build would pass a Language check but
+	// still carry zero formatting rules, silently corrupting output
+	// (independent review, uc-infra#133 — e.g. FormatNumber(1234.5, -1)
+	// on an unusable Locale drops the decimal separator entirely,
+	// printing "12345").
+	regionalLoc := data.RegionalLocale
+	if !regionalLoc.Usable() {
+		regionalLoc = uclocale.Default(locale)
+	}
+
 	valsJSON, err := json.Marshal(map[string]string{
 		"entity_type": def.EntityType,
 		"record_id":   data.RecordID,
@@ -596,7 +642,7 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 			}
 
 		case form.ComponentMasterDetail:
-			sv.Children, sv.Columns = buildChildRows(data.Children[s.Target], data.ChildDefs[s.Target], data.ChildReferenceLabels[s.Target], r.i18n, locale)
+			sv.Children, sv.Columns = buildChildRows(data.Children[s.Target], data.ChildDefs[s.Target], data.ChildReferenceLabels[s.Target], r.i18n, locale, regionalLoc)
 			sv.AddHref = "/api/records/" + url.PathEscape(s.Target) + "/new"
 			if s.RollUp != "" {
 				// RollUpTarget names a field on the PARENT entity (ent,
@@ -608,7 +654,18 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 				// belong to the entity Definition, not the form one.
 				sv.RollUpField = s.RollUpTarget
 				sv.RollUpLabel = r.i18n.TOrDefault(locale, "field."+ent.EntityType+"."+s.RollUpTarget, s.RollUpTarget)
-				sv.RollUpTotal = strconv.FormatFloat(rollUpTotals[s.RollUpTarget], 'f', -1, 64)
+				// Regionally formatted (uc-infra#133, independent review):
+				// the child rows summed into this total now render their
+				// own line_total/qty cells through regionalLoc — leaving
+				// the total on raw strconv.FormatFloat would show a
+				// grouped/Jalali-digit line item one row above an
+				// ungrouped Latin-digit total that doesn't visually agree
+				// with what it's the sum of, the same mismatch this
+				// package's own history already flagged in the opposite
+				// direction (childCellValue's doc comment, "a line_total
+				// column could show 1e+06 one row above a roll-up total
+				// reading 1000000").
+				sv.RollUpTotal = regionalLoc.FormatNumber(rollUpTotals[s.RollUpTarget], -1)
 			}
 
 		case form.ComponentRelatedList:
@@ -620,7 +677,7 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 			// the endpoint: the rows are already here, and a lazy-load
 			// that fires on every form render is a request this page
 			// does not need (independent review, board #20).
-			sv.Children, sv.Columns = buildChildRows(data.Children[s.Target], data.ChildDefs[s.Target], data.ChildReferenceLabels[s.Target], r.i18n, locale)
+			sv.Children, sv.Columns = buildChildRows(data.Children[s.Target], data.ChildDefs[s.Target], data.ChildReferenceLabels[s.Target], r.i18n, locale, regionalLoc)
 		}
 
 		vm.Sections = append(vm.Sections, sv)
@@ -971,7 +1028,7 @@ func (r *Renderer) buildFields(s form.Section, ent *entity.Definition, record ma
 // childDef may be nil (a Definition mismatch the caller already
 // tolerates); the per-row key fallback keeps such a section rendering
 // something rather than nothing.
-func buildChildRows(children []map[string]any, childDef *entity.Definition, referenceLabels map[string]map[string]string, catalog *i18n.Catalog, locale string) ([]childRowView, []columnView) {
+func buildChildRows(children []map[string]any, childDef *entity.Definition, referenceLabels map[string]map[string]string, catalog *i18n.Catalog, locale string, loc uclocale.Locale) ([]childRowView, []columnView) {
 	names := childColumns(children, childDef)
 	columns := make([]columnView, 0, len(names))
 	for _, name := range names {
@@ -991,7 +1048,7 @@ func buildChildRows(children []map[string]any, childDef *entity.Definition, refe
 		for _, name := range names {
 			row.Cells = append(row.Cells, cellView{
 				Field: name,
-				Value: childCellValue(child, name, childDef, referenceLabels, catalog, locale),
+				Value: childCellValue(child, name, childDef, referenceLabels, catalog, locale, loc),
 			})
 		}
 		rows = append(rows, row)
@@ -1040,16 +1097,16 @@ func childColumns(children []map[string]any, childDef *entity.Definition) []stri
 // row above a roll-up total reading "1000000" (independent review,
 // uc-infra#85 follow-up).
 //
-// This does NOT give a child cell the regional locale formatting
-// (loc.FormatDate's Jalali calendar, loc.FormatNumber's digit
-// grouping) cellText's own FieldDate/FieldNumber cases apply — that
-// needs a uclocale.Locale, which is internal/api's concern, not
-// something this generic kernel package has access to (or should:
-// regional formatting is presentation policy, not the record data this
-// package renders). Filed as a separate gap rather than folded in here
-// (uc-infra#133) — different fix, different blast radius, not this
-// task's scope.
-func childCellValue(child map[string]any, name string, childDef *entity.Definition, referenceLabels map[string]map[string]string, catalog *i18n.Catalog, locale string) any {
+// This DOES give a child cell the regional locale formatting
+// (loc.FormatDate's Jalali calendar, loc.FormatNumber's digit grouping)
+// cellText's own FieldDate/FieldNumber cases apply — loc is a
+// pre-resolved uclocale.Locale, threaded down from Data.RegionalLocale
+// via buildViewModel/buildChildRows exactly the way referenceLabels
+// itself is precomputed by the caller (uc-infra#133; this function
+// previously fell back to FormatFieldValue's raw, locale-agnostic
+// formatting for both types, unlike cellText's identical top-level list
+// cell).
+func childCellValue(child map[string]any, name string, childDef *entity.Definition, referenceLabels map[string]map[string]string, catalog *i18n.Catalog, locale string, loc uclocale.Locale) any {
 	v, present := child[name]
 	if !present {
 		return nil
@@ -1070,6 +1127,29 @@ func childCellValue(child map[string]any, name string, childDef *entity.Definiti
 		// map — a missing translation is not something to show as Go
 		// syntax.
 		return nil
+	case entity.FieldDate:
+		// Same regional formatting cellText's FieldDate case applies to
+		// a top-level list column (Jalali calendar for a Farsi loc,
+		// otherwise Gregorian with the region's own field order/
+		// separator) — the stored value is always ISO 8601, display
+		// only, same "the form INPUT keeps the raw ISO value" scope
+		// boundary cellText's own comment documents (this function has
+		// no form-input path to worry about; every child cell here is
+		// read-only table text).
+		if s, ok := v.(string); ok && s != "" {
+			return loc.FormatDate(s)
+		}
+		return FormatFieldValue(v)
+	case entity.FieldNumber:
+		// Same reasoning as cellText's FieldNumber case: locale-aware
+		// grouping/decimal separator and digit shapes, precision left at
+		// -1 (this column has no currency context to fix a scale from —
+		// a FieldMoney child cell is its own case below, and still
+		// doesn't get this treatment; see that case's own comment).
+		if n, ok := v.(float64); ok {
+			return loc.FormatNumber(n, -1)
+		}
+		return FormatFieldValue(v)
 	case entity.FieldMoney:
 		// Same fix as buildFields'/buildHiddenFields' own FieldMoney
 		// cases (uc-infra#68): the stored value is minor units (1050),
@@ -1079,6 +1159,12 @@ func childCellValue(child map[string]any, name string, childDef *entity.Definiti
 		// value (absent, fractional-legacy pre-backfill) falls through
 		// to nil — same "blank rather than garbage" choice as the
 		// i18n_text case above.
+		//
+		// m.String() is NOT regionally grouped the way cellText's own
+		// FieldMoney case (loc.FormatNumber(m.Major(), money.Decimals))
+		// is on the top-level list page — a real, separate gap from this
+		// case's FieldDate/FieldNumber fix above, filed rather than
+		// folded in here (out of uc-infra#133's stated scope).
 		if m, err := money.FromAny(v); err == nil {
 			return m.String()
 		}

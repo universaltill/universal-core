@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -96,6 +97,132 @@ func TestListPage_RegionalDateAndNumberFormatting(t *testing.T) {
 			// never ran.
 			if tc.wantDate != "2026-04-03" && strings.Contains(body, ">2026-04-03<") {
 				t.Errorf("raw ISO date leaked into a cell for %s", name)
+			}
+		})
+	}
+}
+
+// regionalParentEntityDef/regionalChildEntityDef are a dedicated
+// master-detail fixture for TestMasterDetailChildCells_
+// RegionalDateAndNumberFormatting below, rather than extending
+// purchaseOrderEntityDef/poLineEntityDef (handlers_test.go): those are
+// shared by several other tests already, and this file's own
+// regionalEntityDef (used by the top-level list tests above) has no
+// composition relationship to hang a child section off of. Same "own
+// fixture, not a shared one" reasoning handlers_test.go's own
+// itemEntityDef/poLineWithItemRefEntityDef comment documents.
+func regionalParentEntityDef() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "Shipment", Version: 1, Module: "foundation",
+		Fields: []entity.Field{
+			{Name: "name", Type: entity.FieldString, Required: true},
+		},
+		Relationships: []entity.Relationship{
+			{Name: "legs", Kind: entity.RelationComposition, Target: "ShipmentLeg", ParentField: "shipment_id"},
+		},
+	}
+}
+
+func regionalParentFormDef() *form.Definition {
+	return &form.Definition{
+		EntityType: "Shipment", Version: 1,
+		Sections: []form.Section{
+			{Title: "Header", Component: form.ComponentFields, Fields: []form.FormField{{Name: "name", Label: "Name"}}},
+			{Title: "Legs", Component: form.ComponentMasterDetail, Target: "ShipmentLeg"},
+		},
+	}
+}
+
+func regionalChildEntityDef() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "ShipmentLeg", Version: 1,
+		Fields: []entity.Field{
+			{Name: "shipment_id", Type: entity.FieldString, Required: true},
+			{Name: "depart_date", Type: entity.FieldDate},
+			{Name: "distance_km", Type: entity.FieldNumber},
+		},
+	}
+}
+
+func regionalChildFormDef() *form.Definition {
+	return &form.Definition{
+		EntityType: "ShipmentLeg", Version: 1,
+		Sections: []form.Section{{
+			Title: "Details", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "depart_date", Label: "Depart Date"}, {Name: "distance_km", Label: "Distance"}},
+		}},
+	}
+}
+
+// TestMasterDetailChildCells_RegionalDateAndNumberFormatting (uc-infra
+// #133) is the internal/api-layer counterpart to
+// TestListPage_RegionalDateAndNumberFormatting above, but for a
+// master_detail child cell instead of a top-level list column: the same
+// stored record, the same regional query params, against real Postgres
+// and the real form-rendering HTTP path (loadMasterDetailChildren →
+// buildFormRenderData → formrender.Render), not a synthetic
+// formrender.Data handed to the renderer directly the way
+// formrender's own unit tests exercise this (see
+// TestRender_MasterDetailDateAndNumberCellsAreRegionallyFormatted for
+// that half). Same worked date/number pair and expected outputs as the
+// sibling list-page test, so a mismatch here would mean the two render
+// paths actually disagree.
+func TestMasterDetailChildCells_RegionalDateAndNumberFormatting(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, regionalParentEntityDef(), regionalParentFormDef())
+	publishEntityAndForm(t, db, regionalChildEntityDef(), regionalChildFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	shipReq := newRequest("POST", "/api/records/Shipment", tenantID, "farshid", []byte(`{"name":"Container 1"}`))
+	shipRec := httptest.NewRecorder()
+	mux.ServeHTTP(shipRec, shipReq)
+	var ship struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(shipRec.Body.Bytes(), &ship); err != nil {
+		t.Fatalf("unmarshal Shipment: %v", err)
+	}
+
+	legBody := []byte(`{"shipment_id":"` + ship.Data.ID + `","depart_date":"2026-04-03","distance_km":1234567.5}`)
+	legReq := newRequest("POST", "/api/records/ShipmentLeg", tenantID, "farshid", legBody)
+	legRec := httptest.NewRecorder()
+	mux.ServeHTTP(legRec, legReq)
+	if legRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 creating ShipmentLeg, got %d: %s", legRec.Code, legRec.Body.String())
+	}
+
+	for name, tc := range map[string]struct {
+		query    string
+		wantDate string
+		wantNum  string
+	}{
+		"british default": {"", "03/04/2026", "1,234,567.5"},
+		"american":        {"?region=en-US", "04/03/2026", "1,234,567.5"},
+		"turkish":         {"?lang=tr&region=tr-TR", "03.04.2026", "1.234.567,5"},
+		"farsi jalali":    {"?lang=fa&region=fa-IR", "۱۴۰۵/۰۱/۱۴", "۱٬۲۳۴٬۵۶۷٫۵"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := newRequest("GET", "/forms/Shipment/"+ship.Data.ID+tc.query, tenantID, "farshid", nil)
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("GET /forms/Shipment/%s%s: expected 200, got %d: %s", ship.Data.ID, tc.query, rec.Code, rec.Body.String())
+			}
+			body := rec.Body.String()
+			if !strings.Contains(body, `<td data-field="depart_date">`+tc.wantDate+`</td>`) {
+				t.Errorf("expected regionally formatted date %q in the depart_date child cell\n%s", tc.wantDate, excerpt(body))
+			}
+			if !strings.Contains(body, `<td data-field="distance_km">`+tc.wantNum+`</td>`) {
+				t.Errorf("expected regionally formatted number %q in the distance_km child cell\n%s", tc.wantNum, excerpt(body))
+			}
+			if strings.Contains(body, `>2026-04-03<`) {
+				t.Errorf("raw ISO date leaked into a %s-locale child cell\n%s", name, excerpt(body))
 			}
 		})
 	}

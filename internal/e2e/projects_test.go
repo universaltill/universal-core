@@ -84,9 +84,15 @@ func TestProjects_TaskTableRendersLocalizedAndAligned(t *testing.T) {
 		t.Fatalf("create Project: %v", err)
 	}
 	taskDef := defs("Task")
+	// estimated_hours is deliberately not a round 2-digit number like
+	// 40 — 4000.5 renders identically in en/tr only if grouping actually
+	// applied (4,000.5 vs 4.000,5), which the assertion below checks
+	// (uc-infra#133: a master_detail FieldNumber cell previously ignored
+	// regional grouping entirely, same underlying childCellValue gap the
+	// related_list assertion in related_list_test.go pins).
 	parent, err := engine.Create(ctx, taskDef, map[string]any{
 		"project_id": project.ID, "title": map[string]any{"en": "Discovery", "tr": "Keşif"},
-		"estimated_hours": 40.0, "status_id": status("task_status", "in_progress"),
+		"estimated_hours": 4000.5, "status_id": status("task_status", "in_progress"),
 	}, actor)
 	if err != nil {
 		t.Fatalf("create parent Task: %v", err)
@@ -117,6 +123,15 @@ func TestProjects_TaskTableRendersLocalizedAndAligned(t *testing.T) {
 	}
 	if !strings.Contains(tableText, "Discovery") || !strings.Contains(tableText, "Interviews") {
 		t.Errorf("task titles missing from the table:\n%s", tableText)
+	}
+	// estimated_hours (FieldNumber) regionally grouped (uc-infra#133):
+	// en-GB (this page's default region) groups by thousands with a
+	// comma, same as en-US.
+	if !strings.Contains(tableText, "4,000.5") {
+		t.Errorf("expected the regionally grouped estimated_hours (4,000.5) in the task table:\n%s", tableText)
+	}
+	if strings.Contains(tableText, "4000.5") {
+		t.Errorf("raw ungrouped estimated_hours leaked into the task table:\n%s", tableText)
 	}
 
 	// Every row has the same number of cells as the header — the
@@ -152,6 +167,15 @@ func TestProjects_TaskTableRendersLocalizedAndAligned(t *testing.T) {
 	}
 	if !strings.Contains(turkish, "Keşif") {
 		t.Errorf("Turkish viewer did not get the Turkish task title:\n%s", turkish)
+	}
+	// Same estimated_hours value, Turkish grouping/decimal separators
+	// (dot for thousands, comma for decimal) — proves the master_detail
+	// cell actually re-formats per region, not just per translated word.
+	if !strings.Contains(turkish, "4.000,5") {
+		t.Errorf("expected the Turkish-grouped estimated_hours (4.000,5) in the task table:\n%s", turkish)
+	}
+	if strings.Contains(turkish, "4000.5") {
+		t.Errorf("raw ungrouped estimated_hours leaked into the Turkish task table:\n%s", turkish)
 	}
 }
 
@@ -252,8 +276,17 @@ func TestProjects_BudgetLinesTableRendersLocalizedWithNoRollUp(t *testing.T) {
 	if got := strings.TrimSpace(categoryCell); got != "İşçilik" {
 		t.Errorf("expected the Turkish translation of category=labour in the cell, got %q", got)
 	}
-	if got := strings.TrimSpace(amountCell); got != "45000" {
-		t.Errorf("expected the planned_amount cell to show 45000, got %q", got)
+	// Regionally formatted, not the raw "45000" this test asserted
+	// before uc-infra#133: Turkish's default region (TR) groups
+	// thousands with a dot — same fix as the category cell's
+	// translation above, different field type (uc-infra#135 flagged
+	// this exact pinned assertion as needing this update once #133
+	// landed).
+	if got := strings.TrimSpace(amountCell); got != "45.000" {
+		t.Errorf("expected the regionally grouped planned_amount cell to show 45.000, got %q", got)
+	}
+	if strings.Contains(amountCell, "45000") {
+		t.Errorf("raw ungrouped planned_amount leaked into the Turkish-locale cell, got %q", amountCell)
 	}
 
 	// No roll-up element for this section at all — the deliberate

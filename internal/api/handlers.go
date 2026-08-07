@@ -30,6 +30,7 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/form"
 	"github.com/universaltill/universal-core/internal/kernel/formrender"
+	uclocale "github.com/universaltill/universal-core/internal/kernel/locale"
 	"github.com/universaltill/universal-core/internal/kernel/secretcrypt"
 	"github.com/universaltill/universal-core/internal/kernel/speechassist"
 	"github.com/universaltill/universal-core/internal/kernel/workflow"
@@ -1040,7 +1041,7 @@ func (h *Handler) writeRecordFormFragment(w http.ResponseWriter, r *http.Request
 		return
 	}
 	locale := localeFromRequest(w, r)
-	renderData, err := h.buildFormRenderData(r.Context(), ts, entDef, formDef, id, locale)
+	renderData, err := h.buildFormRenderData(r.Context(), ts, entDef, formDef, id, locale, regionalLocale(r, locale))
 	if err != nil {
 		writeCrudError(w, fmt.Sprintf("build %s form render data (id=%q)", entityType, id), err)
 		return
@@ -1139,7 +1140,7 @@ func (h *Handler) renderForm(w http.ResponseWriter, r *http.Request, id string) 
 		return
 	}
 
-	renderData, err := h.buildFormRenderData(r.Context(), ts, entDef, formDef, id, locale)
+	renderData, err := h.buildFormRenderData(r.Context(), ts, entDef, formDef, id, locale, regionalLocale(r, locale))
 	if errors.Is(err, data.ErrNotFound) {
 		httpx.WriteError(w, http.StatusNotFound, fmt.Sprintf("%s %q not found", entityType, id))
 		return
@@ -1208,7 +1209,18 @@ func (h *Handler) renderForm(w http.ResponseWriter, r *http.Request, id string) 
 // both build the exact same data shape the same way, rather than two
 // copies that could silently drift (e.g. one remembering to populate
 // master-detail children, the other not).
-func (h *Handler) buildFormRenderData(ctx context.Context, ts tenantScope, entDef *entity.Definition, formDef *form.Definition, id, locale string) (formrender.Data, error) {
+//
+// loc is the caller's already-resolved regionalLocale(r, locale) —
+// threaded straight into formrender.Data.RegionalLocale so a
+// master_detail/related_list child cell's FieldDate/FieldNumber columns
+// format the same regional way the top-level list page's cells already
+// do (uc-infra#133). Taken as a plain uclocale.Locale rather than
+// *http.Request so this function stays about assembling render data, not
+// about the request itself — the two callers already have to resolve
+// locale (the bare language string) from r before calling this, so
+// resolving the region here too is one more line at each call site, not
+// a new concern for either.
+func (h *Handler) buildFormRenderData(ctx context.Context, ts tenantScope, entDef *entity.Definition, formDef *form.Definition, id, locale string, loc uclocale.Locale) (formrender.Data, error) {
 	// Resolved before anything else: a field this viewer may not see must
 	// be absent from the form whether or not there's a record to load,
 	// since a blank "new" form leaks a hidden field's NAME just as
@@ -1217,7 +1229,7 @@ func (h *Handler) buildFormRenderData(ctx context.Context, ts tenantScope, entDe
 	if err != nil {
 		return formrender.Data{}, fmt.Errorf("resolve hidden fields for %s: %w", entDef.EntityType, err)
 	}
-	renderData := formrender.Data{RedactedFields: redacted}
+	renderData := formrender.Data{RedactedFields: redacted, RegionalLocale: loc}
 	if id != "" {
 		rec, err := ts.crud.Get(ctx, entDef, id)
 		if err != nil {
