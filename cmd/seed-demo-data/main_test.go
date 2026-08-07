@@ -1066,11 +1066,14 @@ func TestSeedDemoData_PipelineModelsTheContactShape(t *testing.T) {
 // PostGoodsReceiptLineToLedger's InventoryItem-crediting wiring credits
 // for real, the same as it would for a live tenant: PO-2026-0001 (40,
 // SKU-1002) + PO-2026-0004 (60 + 30, SKU-1005/1006) + PO-2026-0005
-// (3000 + 5000, SKU-1004/1009) = 8130. 1930 + 8130 = 10060. Before this
-// wiring existed, receiving was a no-op on stock, so this constant only
-// ever needed the hand-declared baseline; now it is the baseline plus
-// what the demo data genuinely receives, same as any other tenant's
-// stock would be.
+// (3000 + 5000, SKU-1002/1003 — see seedPurchaseOrders' own comment on
+// that PO for why it's those two SKUs and deliberately not SKU-1004/
+// SKU-1009) = 8130. 1930 + 8130 = 10060. Before this wiring existed,
+// receiving was a no-op on stock, so this constant only ever needed the
+// hand-declared baseline; now it is the baseline plus what the demo
+// data genuinely receives, same as any other tenant's stock would be.
+// cmd/seed-demo-data's own receivingItemSKUs keeps this same SKU set in
+// sync on the production side (uc-infra#126).
 const wantTotalOnHand = 10060.0
 
 func totalOnHand(t *testing.T, tenantDB *sql.DB) float64 {

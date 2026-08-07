@@ -462,7 +462,7 @@ func TestSync_BringsAStaleTenantUpToDate(t *testing.T) {
 
 	// The per-tenant progress line names exactly what moved, and the
 	// module set it inferred (ADR-0017 §1).
-	want := fmt.Sprintf("Sync Smoke Test (%s): Facility v1 (new), InventoryItem v2->v4 [foundation, purchasing]", id)
+	want := fmt.Sprintf("Sync Smoke Test (%s): Facility v1 (new), InventoryItem v2->v5 [foundation, purchasing]", id)
 	if !strings.Contains(stderr, want) {
 		t.Fatalf("expected progress line %q, got stderr: %q", want, stderr)
 	}
@@ -471,8 +471,8 @@ func TestSync_BringsAStaleTenantUpToDate(t *testing.T) {
 	if v, ok := versions["Facility"]; !ok || v != 1 {
 		t.Fatalf("expected Facility v1 published after sync, got v%d (present=%v)", v, ok)
 	}
-	if v := versions["InventoryItem"]; v != 4 {
-		t.Fatalf("expected InventoryItem v4 after sync, got v%d", v)
+	if v := versions["InventoryItem"]; v != 5 {
+		t.Fatalf("expected InventoryItem v5 after sync, got v%d", v)
 	}
 	// No records exist, so nothing was invalidated — the data-migration
 	// section must stay silent rather than cry wolf.
@@ -563,7 +563,7 @@ func TestSync_DryRunReportsWithoutWriting(t *testing.T) {
 	// Exactly the changes the real run makes in
 	// TestSync_BringsAStaleTenantUpToDate — a dry run whose report
 	// differs from the run it predicts is worthless as a drift report.
-	want := fmt.Sprintf("DRY RUN: Sync Smoke Test (%s): Facility v1 (new), InventoryItem v2->v4 [foundation, purchasing]", id)
+	want := fmt.Sprintf("DRY RUN: Sync Smoke Test (%s): Facility v1 (new), InventoryItem v2->v5 [foundation, purchasing]", id)
 	if !strings.Contains(stderr, want) {
 		t.Fatalf("expected planned-change line %q, got stderr: %q", want, stderr)
 	}
@@ -953,8 +953,8 @@ func TestSync_TenantIDTargetsOneTenant(t *testing.T) {
 	if v, ok := versions["Facility"]; !ok || v != 1 {
 		t.Fatalf("targeted tenant: expected Facility v1, got v%d (present=%v)", v, ok)
 	}
-	if v := versions["InventoryItem"]; v != 4 {
-		t.Fatalf("targeted tenant: expected InventoryItem v4, got v%d", v)
+	if v := versions["InventoryItem"]; v != 5 {
+		t.Fatalf("targeted tenant: expected InventoryItem v5, got v%d", v)
 	}
 	assertStale(t, bystander, "untargeted tenant")
 }

@@ -75,31 +75,30 @@ const (
 // overwrites), so both effects live in this one function rather than as
 // separate hooks — there is nowhere else to put the second one.
 //
-// **Inserts a NEW InventoryItem row rather than upserting an existing
-// (item_id, facility_id) one, on purpose but with a real, disclosed
-// cost.** InventoryItem's own doc comment and ADR-0015 §2 establish that
-// duplicate (item, facility) rows are TOLERATED — every aggregate sums
-// rather than picking a winner — but that tolerance exists as a
-// consequence of #81's missing uniqueness constraint, not as licence to
-// make duplication the normal write path. This function does exactly
-// that anyway, for one reason: an INSERT needs no read-modify-write, so
-// two GoodsReceiptLines crediting the same (item, facility) concurrently
-// can never lose an update the way an UPSERT without its own retry loop
-// would. That upside is real, but so is the downside independent review
-// surfaced: a tenant that receives the same item at the same facility
-// repeatedly accumulates one InventoryItem row per receipt forever
-// (unbounded growth every report in internal/data/reporting.go scans),
-// and the entity is also a first-class generic-CRUD screen — a user who
-// opens "the" InventoryItem row for an item now edits one arbitrary
-// sliver of a balance with no indication the rest exists. Upserting
-// with an optimistic-locking retry loop (the expectedVersion pattern
-// MatchVendorInvoiceOnUpdate already uses below) would close both gaps
-// at the cost of a first-create race that #81's still-missing
-// constraint can't fully close either way — deliberately NOT attempted
-// in this commit; tracked as a follow-up rather than expanded into here.
-// Idempotency-against-re-edits is handled the same way this function's
-// ledger side already handles it: the action != Create guard, since
-// GoodsReceiptLine has no update path today.
+// **Upserts the (item_id, facility_id) InventoryItem row (uc-infra#126)
+// rather than always inserting a new one** — the original insert-only
+// design (kept here for the reasoning, since the tradeoff it accepted is
+// still worth understanding) chose an INSERT specifically because it
+// needs no read-modify-write, so two GoodsReceiptLines crediting the
+// same (item, facility) concurrently could never lose an update the way
+// an upsert without its own retry loop would. That upside was real, but
+// so was the cost independent review surfaced: a tenant receiving the
+// same item at the same facility repeatedly accumulated one
+// InventoryItem row per receipt forever (unbounded growth every report
+// in internal/data/reporting.go scans), and the entity is also a
+// first-class generic-CRUD screen — a user opening "the" InventoryItem
+// row for an item edited one arbitrary sliver of a balance with no
+// indication the rest existed.
+//
+// Now that InventoryItem declares Unique on (item_id, facility_id)
+// (uc-infra#81), creditInventoryOnReceipt (below) closes both gaps with
+// an upsert retry loop: find-and-UpdateTx with expectedVersion on a
+// concurrent ErrVersionConflict, and — for the first-ever row at a given
+// (item, facility) — a losing CreateTx (a concurrent receipt won the
+// same Unique key first) retried as a find-and-update against the
+// winner's row instead of failing outright. Idempotency-against-re-edits
+// is unchanged: the action != Create guard below, since GoodsReceiptLine
+// has no update path today.
 //
 // Runs inside tx, the same transaction the GoodsReceiptLine write
 // itself is in (crud.Hook's own contract) — a posting failure rolls back
@@ -208,10 +207,20 @@ func PostGoodsReceiptLineToLedger(ctx context.Context, tx *sql.Tx, _ *entity.Def
 	return nil
 }
 
+// creditInventoryOnReceiptMaxRetries bounds creditInventoryOnReceipt's
+// upsert retry loop — a defensive ceiling against a pathological
+// scenario (a much larger concurrent burst than this kernel's own
+// adversarial test exercises) livelocking forever, not a number expected
+// to matter in practice: each retry only happens after losing a real
+// race to another concurrently-committing transaction, so a long streak
+// of consecutive losses is already an extremely unlikely tail, and this
+// exists only so that tail fails loudly instead of hanging.
+const creditInventoryOnReceiptMaxRetries = 20
+
 // creditInventoryOnReceipt is PostGoodsReceiptLineToLedger's InventoryItem
 // side, split out only for readability — see that function's own doc
-// comment for why this inserts a new row instead of upserting. Called
-// only when qty > 0 (that gate lives in the caller, not here — a
+// comment for the upsert-vs-insert tradeoff this implements. Called only
+// when qty > 0 (that gate lives in the caller, not here — a
 // zero-or-negative qty_received has nothing to credit), and independent
 // of whether the ledger posting below it fires at all.
 //
@@ -223,43 +232,171 @@ func PostGoodsReceiptLineToLedger(ctx context.Context, tx *sql.Tx, _ *entity.Def
 // model, if one lands later, changes this — not a reason to invent one
 // here.
 //
-// Validates against the compiled-in InventoryItem() Definition, not the
-// tenant's own published one (contrast every write in
+// Retry loop, not a single find-then-write: two GoodsReceiptLines
+// crediting the same (item, facility) from concurrent transactions can
+// both find "no existing row" (first-create race, closed by
+// InventoryItem's Unique(item_id, facility_id) — uc-infra#81 — rejecting
+// the loser's record_unique_keys insert) or both read the same existing
+// row's version (find-then-update race, closed by expectedVersion
+// rejecting the loser's UpdateTx with data.ErrVersionConflict). Either
+// loss means "someone else just changed the fact this decision was based
+// on" — re-reading and retrying is correct, not a bug being papered
+// over, the same reasoning any optimistic-concurrency retry loop rests
+// on. Bounded by creditInventoryOnReceiptMaxRetries so a pathological
+// run fails loudly instead of hanging.
+//
+// One conflict this retry loop deliberately does NOT retry (independent
+// review, uc-infra#126): a tenant carrying pre-#126 duplicate
+// InventoryItem rows for the same (item, facility), created back when
+// creditInventoryOnReceipt always inserted. If those duplicates predate
+// the Unique constraint's record_unique_keys backfill, the row
+// GetByFieldsQ picks (oldest) can lose UpdateUniqueConstraintKeys to a
+// DIFFERENT still-live duplicate that already holds the key — retrying
+// would just pick the same row and hit the same conflict again, since
+// nothing about this transaction changes what GetByFieldsQ sees. That
+// branch returns a clear, actionable error instead of looping.
+//
+// Still validates against the compiled-in InventoryItem() Definition,
+// not the tenant's own published one (contrast every write in
 // internal/kernel/crud.Engine, which always validates against
 // data.EntityDefinitionRepo.GetPublished) — a real, disclosed gap, not
-// an oversight: crud.Hook's signature hands this function a *sql.Tx and
-// nothing else, and EntityDefinitionRepo has no Tx-taking read method to
-// fetch the published Definition consistently within the same
-// transaction (see data.EntityDefinitionRepo — every method takes only
-// *sql.DB). Given #70 (existing tenants don't auto-adopt new
-// Definitions), a tenant whose published InventoryItem Definition hasn't
-// caught up, or one with a genuinely customized Definition, would have
-// this credit validate against a shape that isn't what that tenant's own
-// registry declares. Fixing this properly means either a Tx-capable
-// GetPublished or threading the published Definition through crud.Hook's
-// own signature — both real, separable changes, not attempted here.
+// an oversight, and NOT fixed by this function's upsert change:
+// crud.Hook's signature hands this function a *sql.Tx and nothing else,
+// and EntityDefinitionRepo has no Tx-taking read method to fetch the
+// published Definition consistently within the same transaction (see
+// data.EntityDefinitionRepo — every method takes only *sql.DB). Given
+// #70 (existing tenants don't auto-adopt new Definitions), a tenant
+// whose published InventoryItem Definition hasn't caught up, or one with
+// a genuinely customized Definition, would have this credit validate
+// against a shape that isn't what that tenant's own registry declares.
+// Fixing this properly means either a Tx-capable GetPublished or
+// threading the published Definition through crud.Hook's own signature
+// — both real, separable changes, split out as uc-infra#165 rather than
+// folded into this upsert fix.
 func creditInventoryOnReceipt(ctx context.Context, tx *sql.Tx, records *data.RecordRepo, itemID, facilityID string, qty float64, goodsReceiptLineID string, actor audit.Actor) error {
-	fields := map[string]any{
-		"item_id":                  itemID,
-		"facility_id":              facilityID,
-		"qty_on_hand":              qty,
-		"qty_available_to_promise": qty,
+	def := InventoryItem()
+	keys := data.NewRecordUniqueKeyRepo(nil)
+	equals := map[string]string{"item_id": itemID, "facility_id": facilityID}
+
+	for attempt := 0; ; attempt++ {
+		existing, found, err := records.GetByFieldsQ(ctx, tx, "InventoryItem", equals)
+		if err != nil {
+			return fmt.Errorf("find existing InventoryItem for GoodsReceiptLine %s: %w", goodsReceiptLineID, err)
+		}
+
+		if found {
+			existingOnHand, _ := numberFieldValue(existing.Data["qty_on_hand"])
+			existingATP, _ := numberFieldValue(existing.Data["qty_available_to_promise"])
+			fields := map[string]any{
+				"item_id":                  itemID,
+				"facility_id":              facilityID,
+				"qty_on_hand":              existingOnHand + qty,
+				"qty_available_to_promise": existingATP + qty,
+			}
+			if err := entity.ValidateRecord(def, fields); err != nil {
+				return fmt.Errorf("build InventoryItem credit for GoodsReceiptLine %s: %w", goodsReceiptLineID, err)
+			}
+			expectedVersion := existing.Version
+			if _, err := records.UpdateTx(ctx, tx, "InventoryItem", existing.ID, fields, &expectedVersion); err != nil {
+				if errors.Is(err, data.ErrVersionConflict) {
+					if attempt >= creditInventoryOnReceiptMaxRetries {
+						return fmt.Errorf("credit InventoryItem for GoodsReceiptLine %s: exceeded %d retries on version conflict", goodsReceiptLineID, creditInventoryOnReceiptMaxRetries)
+					}
+					continue
+				}
+				return fmt.Errorf("credit InventoryItem for GoodsReceiptLine %s: %w", goodsReceiptLineID, err)
+			}
+			if err := crud.UpdateUniqueConstraintKeys(ctx, tx, keys, def, existing.ID, fields); err != nil {
+				var uce *crud.UniqueConstraintError
+				if errors.As(err, &uce) {
+					// GetByFieldsQ picked `existing` as the oldest live
+					// row for this (item, facility), but ANOTHER live
+					// row already holds this pair's record_unique_keys
+					// entry — only possible on a tenant carrying
+					// pre-#126 duplicate InventoryItem rows that predate
+					// the Unique(item_id, facility_id) constraint (v5)
+					// and haven't been backfilled/merged yet (see
+					// cmd/sync-tenant-modules' uniqueConstraintWarnings/
+					// BackfillUniqueConstraintKeys for the operator-side
+					// remediation). Not a transient race — retrying
+					// would pick the same `existing` row and hit the
+					// same conflict again — so this returns a clear,
+					// actionable error instead of looping or leaking
+					// UpdateUniqueConstraintKeys' own opaque wrapping.
+					return fmt.Errorf("credit InventoryItem for GoodsReceiptLine %s: %s has duplicate live InventoryItem rows for (item_id, facility_id) — run cmd/sync-tenant-modules' backfill before this can upsert safely: %w", goodsReceiptLineID, existing.ID, err)
+				}
+				return fmt.Errorf("reconcile InventoryItem %s unique keys: %w", existing.ID, err)
+			}
+			auditEntry, err := audit.New("InventoryItem", existing.ID, audit.ActionUpdate, actor, fields)
+			if err != nil {
+				return fmt.Errorf("build audit entry for InventoryItem %s: %w", existing.ID, err)
+			}
+			if err := data.NewAuditRepo(nil).Insert(ctx, tx, auditEntry); err != nil {
+				return fmt.Errorf("write audit entry for InventoryItem %s: %w", existing.ID, err)
+			}
+			return nil
+		}
+
+		fields := map[string]any{
+			"item_id":                  itemID,
+			"facility_id":              facilityID,
+			"qty_on_hand":              qty,
+			"qty_available_to_promise": qty,
+		}
+		if err := entity.ValidateRecord(def, fields); err != nil {
+			return fmt.Errorf("build InventoryItem credit for GoodsReceiptLine %s: %w", goodsReceiptLineID, err)
+		}
+		// SAVEPOINT around the create + unique-key write: a Postgres
+		// UNIQUE index violation (the concurrent-create race
+		// WriteUniqueConstraintKeys' own doc comment describes) aborts
+		// the ENTIRE surrounding transaction at the SQL level, not just
+		// the one failing statement — any further statement on this same
+		// tx (including an attempt to soft-delete the losing row we just
+		// inserted) would fail with "current transaction is aborted"
+		// until the abort is cleared. ROLLBACK TO SAVEPOINT clears it
+		// without discarding the rest of the transaction (the
+		// GoodsReceiptLine write and its ledger posting), so this
+		// function can retry in the SAME transaction instead of failing
+		// the whole GoodsReceiptLine create over a benign, expected race.
+		if _, err := tx.ExecContext(ctx, "SAVEPOINT credit_inventory_on_receipt"); err != nil {
+			return fmt.Errorf("savepoint before InventoryItem create for GoodsReceiptLine %s: %w", goodsReceiptLineID, err)
+		}
+		invRec, err := records.CreateTx(ctx, tx, "InventoryItem", fields)
+		if err != nil {
+			return fmt.Errorf("credit InventoryItem for GoodsReceiptLine %s: %w", goodsReceiptLineID, err)
+		}
+		if err := crud.WriteUniqueConstraintKeys(ctx, tx, keys, def, invRec.ID, fields); err != nil {
+			var uce *crud.UniqueConstraintError
+			if errors.As(err, &uce) {
+				// A concurrent transaction already committed the winning
+				// row for this (item, facility) between our GetByFieldsQ
+				// above and this insert. Roll back to the savepoint —
+				// undoing our own now-unwanted row AND clearing the
+				// transaction-level abort the conflict caused — then
+				// retry: the next loop iteration's GetByFieldsQ will see
+				// the winner (now committed) and upsert into it instead.
+				if _, spErr := tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT credit_inventory_on_receipt"); spErr != nil {
+					return fmt.Errorf("roll back losing InventoryItem create for GoodsReceiptLine %s: %w", goodsReceiptLineID, spErr)
+				}
+				if attempt >= creditInventoryOnReceiptMaxRetries {
+					return fmt.Errorf("credit InventoryItem for GoodsReceiptLine %s: exceeded %d retries on create race", goodsReceiptLineID, creditInventoryOnReceiptMaxRetries)
+				}
+				continue
+			}
+			return fmt.Errorf("write InventoryItem %s unique keys: %w", invRec.ID, err)
+		}
+		if _, err := tx.ExecContext(ctx, "RELEASE SAVEPOINT credit_inventory_on_receipt"); err != nil {
+			return fmt.Errorf("release savepoint after InventoryItem create for GoodsReceiptLine %s: %w", goodsReceiptLineID, err)
+		}
+		auditEntry, err := audit.New("InventoryItem", invRec.ID, audit.ActionCreate, actor, fields)
+		if err != nil {
+			return fmt.Errorf("build audit entry for InventoryItem %s: %w", invRec.ID, err)
+		}
+		if err := data.NewAuditRepo(nil).Insert(ctx, tx, auditEntry); err != nil {
+			return fmt.Errorf("write audit entry for InventoryItem %s: %w", invRec.ID, err)
+		}
+		return nil
 	}
-	if err := entity.ValidateRecord(InventoryItem(), fields); err != nil {
-		return fmt.Errorf("build InventoryItem credit for GoodsReceiptLine %s: %w", goodsReceiptLineID, err)
-	}
-	invRec, err := records.CreateTx(ctx, tx, "InventoryItem", fields)
-	if err != nil {
-		return fmt.Errorf("credit InventoryItem for GoodsReceiptLine %s: %w", goodsReceiptLineID, err)
-	}
-	auditEntry, err := audit.New("InventoryItem", invRec.ID, audit.ActionCreate, actor, fields)
-	if err != nil {
-		return fmt.Errorf("build audit entry for InventoryItem %s: %w", invRec.ID, err)
-	}
-	if err := data.NewAuditRepo(nil).Insert(ctx, tx, auditEntry); err != nil {
-		return fmt.Errorf("write audit entry for InventoryItem %s: %w", invRec.ID, err)
-	}
-	return nil
 }
 
 // qtyNetEpsilonAbs/qtyNetEpsilonRel tolerate float64 rounding noise when

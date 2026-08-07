@@ -109,7 +109,7 @@ func (e *Engine) Create(ctx context.Context, def *entity.Definition, fields map[
 		return data.Record{}, fmt.Errorf("create record: %w", err)
 	}
 
-	if err := writeUniqueConstraintKeys(ctx, tx, e.keys, def, rec.ID, fields); err != nil {
+	if err := WriteUniqueConstraintKeys(ctx, tx, e.keys, def, rec.ID, fields); err != nil {
 		return data.Record{}, err
 	}
 
@@ -347,7 +347,7 @@ func (e *Engine) Update(ctx context.Context, def *entity.Definition, id string, 
 		return 0, fmt.Errorf("update record: %w", err)
 	}
 
-	if err := updateUniqueConstraintKeys(ctx, tx, e.keys, def, id, fields); err != nil {
+	if err := UpdateUniqueConstraintKeys(ctx, tx, e.keys, def, id, fields); err != nil {
 		return 0, err
 	}
 
