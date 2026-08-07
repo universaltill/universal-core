@@ -265,10 +265,10 @@ func TestBackfill_ActorTypeAI_WritesRealAuditRow(t *testing.T) {
 	}
 
 	var actorType, actorID string
-	var modelVersion sql.NullString
+	var modelVersion, inputHash sql.NullString
 	if err := tenantDB.QueryRowContext(context.Background(),
-		`SELECT actor_type, actor_id, model_version FROM audit_log WHERE record_id = $1 ORDER BY id DESC LIMIT 1`, id,
-	).Scan(&actorType, &actorID, &modelVersion); err != nil {
+		`SELECT actor_type, actor_id, model_version, input_hash FROM audit_log WHERE record_id = $1 ORDER BY id DESC LIMIT 1`, id,
+	).Scan(&actorType, &actorID, &modelVersion, &inputHash); err != nil {
 		t.Fatalf("read audit_log row for %s: %v", id, err)
 	}
 	if actorType != "ai_agent" || actorID != "pipeline" {
@@ -276,6 +276,11 @@ func TestBackfill_ActorTypeAI_WritesRealAuditRow(t *testing.T) {
 	}
 	if !modelVersion.Valid || modelVersion.String != "claude-test-1" {
 		t.Errorf("expected model_version=claude-test-1, got %+v", modelVersion)
+	}
+	// uc-infra#124: an ai_agent actor's input_hash must be populated too,
+	// not just model_version.
+	if !inputHash.Valid || inputHash.String == "" {
+		t.Errorf("expected a non-null input_hash for the ai_agent actor, got %+v", inputHash)
 	}
 }
 

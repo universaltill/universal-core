@@ -11,14 +11,24 @@ func TestActorValidate(t *testing.T) {
 		{"human ok", Actor{Type: ActorHuman, ID: "farshid"}, nil},
 		{
 			"ai agent ok",
-			Actor{Type: ActorAgent, ID: "kernel-agent", ModelVersion: "claude-fable-5"},
+			Actor{Type: ActorAgent, ID: "kernel-agent", ModelVersion: "claude-fable-5", Input: "add a field"},
 			nil,
 		},
 		{"missing id", Actor{Type: ActorHuman, ID: ""}, ErrMissingActorID},
 		{
 			"ai agent missing model version",
-			Actor{Type: ActorAgent, ID: "kernel-agent"},
+			Actor{Type: ActorAgent, ID: "kernel-agent", Input: "add a field"},
 			ErrMissingModelVersion,
+		},
+		{
+			// Deliberately still valid: internal/kernel/entity, csvimport,
+			// and sqlsource all construct a real ActorAgent with no Input
+			// today (uc-infra#124) — Validate() must keep accepting that
+			// until every one of those call sites is given a real Input to
+			// hash, not just the 7 CLI binaries this task touches.
+			"ai agent with no input is still valid",
+			Actor{Type: ActorAgent, ID: "kernel-agent", ModelVersion: "claude-fable-5"},
+			nil,
 		},
 	}
 	for _, tc := range cases {
@@ -66,5 +76,34 @@ func TestNew_Succeeds(t *testing.T) {
 	}
 	if e.EntityType != "Vendor" || e.Action != ActionCreate {
 		t.Fatalf("unexpected entry: %+v", e)
+	}
+}
+
+func TestCLIInvocationInput(t *testing.T) {
+	a := CLIInvocationInput([]string{"-actor-type=ai_agent", "-model-version=claude-fable-5", "-tenant-id=t1"})
+	b := CLIInvocationInput([]string{"-actor-type=ai_agent", "-model-version=claude-fable-5", "-tenant-id=t1"})
+	if a == "" {
+		t.Fatal("expected non-empty input for a non-empty argument list")
+	}
+	if a != b {
+		t.Fatalf("expected the same argument list to produce the same input, got %q vs %q", a, b)
+	}
+
+	c := CLIInvocationInput([]string{"-actor-type=ai_agent", "-model-version=claude-fable-5", "-tenant-id=t2"})
+	if c == a {
+		t.Fatal("expected a different argument list to produce a different input")
+	}
+
+	if got := CLIInvocationInput(nil); got != "" {
+		t.Fatalf("expected empty input for no arguments, got %q", got)
+	}
+
+	// A plain space-join would hash these two differently-shaped
+	// invocations identically (independent review, uc-infra#124) —
+	// quoting each argument must keep them distinguishable.
+	merged := CLIInvocationInput([]string{"-name", "a b"})
+	split := CLIInvocationInput([]string{"-name", "a", "b"})
+	if merged == split {
+		t.Fatalf("expected a single two-word argument to hash differently than two separate arguments, got identical input %q", merged)
 	}
 }
