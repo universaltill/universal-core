@@ -86,6 +86,36 @@ func TestDefault(t *testing.T) {
 	}
 }
 
+// TestUsable (uc-infra#133, independent review): every value Parse/
+// Default/build can actually produce is Usable(); the zero value and a
+// hand-built struct literal that only sets the exported fields — the
+// exact shape a caller outside this package (formrender.Data.
+// RegionalLocale) could construct without ever going through Parse/
+// Default — are not. A Locale that looks non-empty but isn't Usable()
+// must format wrong rather than silently: this test exists so nobody
+// "fixes" the guard back to a bare Language != "" check, which
+// FormatNumber(1234.5, -1)-on-a-ruleless-Locale would silently corrupt
+// (drops the decimal separator entirely — a 10x reporting error, not a
+// cosmetic one) without any test catching it.
+func TestUsable(t *testing.T) {
+	if (Locale{}).Usable() {
+		t.Error("the zero Locale must not be Usable")
+	}
+	if (Locale{Language: "tr", Region: "TR", Calendar: CalendarGregorian}).Usable() {
+		t.Error("a hand-built literal with no rules must not be Usable, even with non-empty Language/Region/Calendar")
+	}
+	if got := Default("en"); !got.Usable() {
+		t.Errorf("Default(en) = %+v, want Usable", got)
+	}
+	l, err := Parse("fa-IR")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if !l.Usable() {
+		t.Errorf("Parse(fa-IR) = %+v, want Usable", l)
+	}
+}
+
 func TestFormatDate(t *testing.T) {
 	for name, tc := range map[string]struct {
 		tag, iso, want string

@@ -11,6 +11,7 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/form"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
+	uclocale "github.com/universaltill/universal-core/internal/kernel/locale"
 )
 
 // purchaseOrderEntity/purchaseOrderForm are the same worked example as
@@ -1268,6 +1269,226 @@ func TestRender_MasterDetailAllChildColumnsRedactedShowsEmptyStateNotBlankRows(t
 	}
 	if !strings.Contains(out, `<p class="uc-empty">`) {
 		t.Errorf("expected the section's empty-state message once every column is redacted, got:\n%s", out)
+	}
+}
+
+// TestRender_MasterDetailDateAndNumberCellsAreRegionallyFormatted
+// (uc-infra#133): a FieldDate/FieldNumber master-detail child cell now
+// gets the same regional formatting (Jalali calendar, digit grouping)
+// internal/api/listview.go's cellText already applies to the identical
+// field types on the top-level list page — before this fix,
+// childCellValue fell all the way through to FormatFieldValue's
+// locale-agnostic formatting for both. Uses the same worked date/number
+// pair (2026-04-03, 1234567.5) and expected en-US/fa-IR outputs
+// internal/api's TestListPage_RegionalDateAndNumberFormatting already
+// pins for the top-level list, so a mismatch here would mean the two
+// surfaces actually disagree, not just that this test's own math is
+// wrong.
+func TestRender_MasterDetailDateAndNumberCellsAreRegionallyFormatted(t *testing.T) {
+	r := testRenderer(t)
+	childDef := &entity.Definition{
+		EntityType: "POLine", Version: 1,
+		Fields: []entity.Field{
+			{Name: "ship_date", Type: entity.FieldDate},
+			{Name: "qty", Type: entity.FieldNumber},
+		},
+	}
+	baseData := Data{
+		RecordID: "po-1",
+		Record:   map[string]any{"payment_method": "Wire"},
+		Children: map[string][]map[string]any{
+			"POLine": {{"ship_date": "2026-04-03", "qty": 1234567.5}},
+		},
+		ChildDefs: map[string]*entity.Definition{"POLine": childDef},
+	}
+
+	for name, tc := range map[string]struct {
+		regionTag string
+		wantDate  string
+		wantNum   string
+	}{
+		"american":     {"en-US", "04/03/2026", "1,234,567.5"},
+		"farsi jalali": {"fa-IR", "۱۴۰۵/۰۱/۱۴", "۱٬۲۳۴٬۵۶۷٫۵"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			loc, err := uclocale.Parse(tc.regionTag)
+			if err != nil {
+				t.Fatalf("uclocale.Parse(%q): %v", tc.regionTag, err)
+			}
+			data := baseData
+			data.RegionalLocale = loc
+			var buf strings.Builder
+			if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
+				t.Fatalf("render: %v", err)
+			}
+			out := buf.String()
+			if !strings.Contains(out, `<td data-field="ship_date">`+tc.wantDate+`</td>`) {
+				t.Errorf("expected regionally formatted date %q in the ship_date cell, got:\n%s", tc.wantDate, out)
+			}
+			if !strings.Contains(out, `<td data-field="qty">`+tc.wantNum+`</td>`) {
+				t.Errorf("expected regionally formatted number %q in the qty cell, got:\n%s", tc.wantNum, out)
+			}
+			if strings.Contains(out, `>2026-04-03<`) {
+				t.Errorf("raw ISO date leaked into a %s-locale child cell, got:\n%s", name, out)
+			}
+		})
+	}
+}
+
+// TestRender_MasterDetailDateAndNumberCellsFallBackWhenRegionalLocaleUnset
+// (uc-infra#133): Data.RegionalLocale's own doc comment promises a
+// caller that never resolved one — every other test in this file, and
+// any future caller with no request-scoped region to resolve — still
+// gets sensible formatting keyed off Render's own locale string, not a
+// panic or garbage output from a zero-valued uclocale.Locale.
+func TestRender_MasterDetailDateAndNumberCellsFallBackWhenRegionalLocaleUnset(t *testing.T) {
+	r := testRenderer(t)
+	childDef := &entity.Definition{
+		EntityType: "POLine", Version: 1,
+		Fields: []entity.Field{
+			{Name: "ship_date", Type: entity.FieldDate},
+			{Name: "qty", Type: entity.FieldNumber},
+		},
+	}
+	data := Data{
+		RecordID: "po-1",
+		Record:   map[string]any{"payment_method": "Wire"},
+		Children: map[string][]map[string]any{
+			"POLine": {{"ship_date": "2026-04-03", "qty": 1234567.5}},
+		},
+		ChildDefs: map[string]*entity.Definition{"POLine": childDef},
+		// RegionalLocale deliberately left unset (zero value).
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	// en's language default region is GB (day-first, comma grouping) —
+	// see internal/kernel/locale's languageDefaults.
+	if !strings.Contains(out, `<td data-field="ship_date">03/04/2026</td>`) {
+		t.Errorf("expected the en-language-default (GB) date format, got:\n%s", out)
+	}
+	if !strings.Contains(out, `<td data-field="qty">1,234,567.5</td>`) {
+		t.Errorf("expected the en-language-default number grouping, got:\n%s", out)
+	}
+}
+
+// TestRender_MasterDetailDateAndNumberCellsFallBackForNonConformingValues
+// (uc-infra#133, independent review): the happy-path test above only
+// exercises a present, correctly-typed value for each field. A real
+// child row can carry a null/absent date or number (e.g. a not-yet-set
+// due_date on a Task row, a rendered column on the real Project form) or
+// a stored value that isn't the type the field claims (pre-Definition
+// data drift) — childCellValue's FieldDate/FieldNumber cases both fall
+// through to FormatFieldValue(v) for those, and until this test neither
+// branch had any coverage at all.
+func TestRender_MasterDetailDateAndNumberCellsFallBackForNonConformingValues(t *testing.T) {
+	r := testRenderer(t)
+	childDef := &entity.Definition{
+		EntityType: "POLine", Version: 1,
+		Fields: []entity.Field{
+			{Name: "ship_date", Type: entity.FieldDate},
+			{Name: "qty", Type: entity.FieldNumber},
+			{Name: "eta", Type: entity.FieldDate},
+		},
+	}
+	loc, err := uclocale.Parse("fa-IR")
+	if err != nil {
+		t.Fatalf("uclocale.Parse: %v", err)
+	}
+	data := Data{
+		RecordID: "po-1",
+		Record:   map[string]any{"payment_method": "Wire"},
+		Children: map[string][]map[string]any{
+			// A null date/number (present key, nil value) must render
+			// blank, not "<nil>" or a Jalali-mangled zero date.
+			// eta is a non-ISO string ("TBD") — FormatDate's own
+			// contract returns a non-parseable value unchanged rather
+			// than erroring or mangling it.
+			"POLine": {{"ship_date": nil, "qty": nil, "eta": "TBD"}},
+		},
+		ChildDefs:      map[string]*entity.Definition{"POLine": childDef},
+		RegionalLocale: loc,
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, `<td data-field="ship_date"></td>`) {
+		t.Errorf("expected a null ship_date to render as an empty cell, got:\n%s", out)
+	}
+	if !strings.Contains(out, `<td data-field="qty"></td>`) {
+		t.Errorf("expected a null qty to render as an empty cell, got:\n%s", out)
+	}
+	if !strings.Contains(out, `<td data-field="eta">TBD</td>`) {
+		t.Errorf("expected a non-ISO eta to render as its raw text, got:\n%s", out)
+	}
+	if strings.Contains(out, "<nil>") {
+		t.Errorf("a nil value leaked Go's own formatting into a cell, got:\n%s", out)
+	}
+}
+
+// TestRender_MasterDetailRollUpTotalMatchesItsOwnRegionallyFormattedCells
+// (uc-infra#133, independent review): before this fix, a master-detail
+// section's roll-up total (sv.RollUpTotal) stayed on raw
+// strconv.FormatFloat while the very cells it sums went through
+// regionalLoc — a Turkish/Farsi viewer would see grouped/Jalali-digit
+// line items summing to an ungrouped Latin-digit total that visually
+// disagrees with its own addends, the same class of bug this package's
+// history already fixed once in the opposite direction (childCellValue's
+// own doc comment on the FieldMoney/scientific-notation fix).
+func TestRender_MasterDetailRollUpTotalMatchesItsOwnRegionallyFormattedCells(t *testing.T) {
+	r := testRenderer(t)
+	childDef := &entity.Definition{
+		EntityType: "POLine", Version: 1,
+		Fields: []entity.Field{{Name: "line_total", Type: entity.FieldNumber}},
+	}
+	loc, err := uclocale.Parse("tr-TR")
+	if err != nil {
+		t.Fatalf("uclocale.Parse: %v", err)
+	}
+	data := Data{
+		RecordID: "po-1",
+		Record:   map[string]any{"payment_method": "Wire"},
+		Children: map[string][]map[string]any{
+			"POLine": {{"line_total": 1500.5}, {"line_total": 2500.25}},
+		},
+		ChildDefs:      map[string]*entity.Definition{"POLine": childDef},
+		RegionalLocale: loc,
+	}
+	var buf strings.Builder
+	// Turkish LANGUAGE (translates the "Toplam" roll-up label) and
+	// Turkish REGION (RegionalLocale above, grouping/decimal separators)
+	// happen to be the same tag here, but they're independent axes —
+	// see TestRender_MasterDetailColumnsAndRollUpLabelResolveThroughCatalog
+	// for the label side in isolation.
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "tr"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	// Turkish groups thousands with a dot, decimals with a comma:
+	// 1500.5 -> "1.500,5", 2500.25 -> "2.500,25", their sum 4000.75 ->
+	// "4.000,75".
+	if !strings.Contains(out, `<td data-field="line_total">1.500,5</td>`) {
+		t.Errorf("expected the first regionally formatted line_total cell, got:\n%s", out)
+	}
+	if !strings.Contains(out, `<td data-field="line_total">2.500,25</td>`) {
+		t.Errorf("expected the second regionally formatted line_total cell, got:\n%s", out)
+	}
+	if !strings.Contains(out, `Toplam: 4.000,75`) {
+		t.Errorf("expected the roll-up total regionally formatted (4.000,75), matching its own cells, got:\n%s", out)
+	}
+	if strings.Contains(out, "Toplam: 4000.75") {
+		t.Errorf("roll-up total disagrees with its own regionally formatted cells (still raw), got:\n%s", out)
+	}
+	// The parent's own <input> for the roll-up target field must stay
+	// raw — it round-trips through csvimport.Coerce on submit, same
+	// scope boundary FormatDate's own doc comment documents for a date
+	// input.
+	if !strings.Contains(out, `id="total" name="total" value="4000.75"`) {
+		t.Errorf("expected the roll-up TARGET FIELD input to keep the raw, unformatted value, got:\n%s", out)
 	}
 }
 

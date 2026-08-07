@@ -227,6 +227,23 @@ func build(lang, region string, calendar Calendar) Locale {
 	return Locale{Language: lang, Region: region, Calendar: calendar, rules: rules}
 }
 
+// Usable reports whether l actually carries formatting rules — true for
+// anything Parse or Default returned, false for the zero value AND for
+// a hand-built Locale{Language: "..."} literal that only set the
+// exported fields (rules is unexported specifically so a caller outside
+// this package cannot populate it, but a struct literal can still leave
+// it zero while setting Language/Region/Calendar to something
+// non-empty-looking). Checking Language alone is not enough: Parse
+// never returns Language == "" on success, but that does not mean every
+// non-empty-Language value came from Parse/Default/build — see this
+// method's own callers, e.g. formrender.Data.RegionalLocale's fallback,
+// for why formatting against an unusable Locale is a real, silent
+// wrong-number risk (independent review, uc-infra#133) rather than a
+// theoretical one worth skipping.
+func (l Locale) Usable() bool {
+	return l.Language != "" && l.rules.dateSep != ""
+}
+
 // Tag renders the Locale back into the same string form Parse accepts —
 // the value persisted in the preference cookie. The calendar extension
 // is emitted only when it differs from the language's default, keeping
