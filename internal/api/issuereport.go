@@ -1,18 +1,14 @@
-// The in-app issue logger — Farshid's ask: "capture a voice record and
-// screen record and the logs... text the voice with ai as well and open
-// an issue for us maybe in the github issue." This is the first slice:
-// voice capture + transcription (internal/kernel/speechassist, a
-// self-hosted Whisper ASR instance — confirmed live end-to-end against
-// the real homelab deployment before this was written) plus typed
-// context, stored as a real IssueReport record (foundation.go) via the
-// same generic entity/crud/audit machinery every other entity in this
-// kernel uses.
+// The in-app issue logger captures a voice recording and an optional
+// screen recording alongside typed context, transcribes the voice note
+// (internal/kernel/speechassist, a self-hosted Whisper ASR instance —
+// verified end-to-end against the platform's reference deployment
+// before this was written), and stores it as a real IssueReport record
+// (foundation.go) via the same generic entity/crud/audit machinery
+// every other entity in this kernel uses, with any screen recording
+// stored separately as a linked Attachment (attachScreenRecording
+// below) rather than on the IssueReport record itself.
 //
 // Deliberately NOT in this slice, each for its own reason:
-//   - Screen recording: a materially bigger feature (video capture,
-//     encoding, much larger uploads) — voice-only ships a real, useful
-//     first version rather than blocking on everything the original ask
-//     named. Fast-follow, not forgotten (see QUEUE.md).
 //   - Automatic GitHub issue filing: needs a GitHub credential with
 //     issue-write access to the target repo, which per this kernel's
 //     secret-creation-needs-explicit-authorization discipline has to be
@@ -21,10 +17,11 @@
 //     filing to GitHub later is a step that reads from here, not a
 //     replacement for storing reports here.
 //   - Redaction/consent review before anything leaves the browser: the
-//     capture page shows the full description+transcript for editing
-//     before Submit is ever clickable, so nothing captured is sent
-//     anywhere the human submitting it hasn't already read — but there's
-//     no separate confirmation step beyond that yet.
+//     capture page shows the full description+transcript, and a video
+//     preview for any screen recording, for review before Submit is
+//     ever clickable, so nothing captured is sent anywhere the human
+//     submitting it hasn't already read or watched — but there's no
+//     separate confirmation step beyond that yet.
 package api
 
 import (

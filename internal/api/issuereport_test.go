@@ -200,12 +200,12 @@ func TestIssueReport_Transcribe_ReturnsTranscript(t *testing.T) {
 }
 
 // TestIssueReport_Transcribe_ForwardsCurrentUILocaleAsLanguageHint is the
-// real-server-request-shape proof for the bug Farshid reported ("it
-// works but only in english"): the page's own current UI locale
-// (Arabic, here) must actually reach speechassist as a language hint,
-// not be silently dropped — see speechassist.Client.Transcribe's own
-// doc comment on why leaving this to the Whisper server's auto-detect
-// was unreliable for a short recording.
+// real-server-request-shape proof for the reported bug where transcription
+// only worked in English: the page's own current UI locale (Arabic, here)
+// must actually reach speechassist as a language hint, not be silently
+// dropped — see speechassist.Client.Transcribe's own doc comment on why
+// leaving this to the Whisper server's auto-detect was unreliable for a
+// short recording.
 func TestIssueReport_Transcribe_ForwardsCurrentUILocaleAsLanguageHint(t *testing.T) {
 	router := newTestRouter(t)
 	withDevAuthEnabled(t)

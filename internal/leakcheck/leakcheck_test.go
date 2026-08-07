@@ -5,19 +5,22 @@
 // public history before (uc-infra#138 — hostnames, hardware detail,
 // Key Vault secret *names*, and a verbatim owner quote; uc-infra#153 —
 // the same class of leak in 4 more files found during #138's
-// independent review; no credential values in either case). This is a
-// narrow, source-text regression test scoped to the exact files
-// #138/#153 fixed — it is not a general secret scanner, and it does not
-// catch the same pattern reappearing in a file it doesn't watch (e.g.
-// via copy-paste) or a file that already had the pattern before this
-// test existed. Widening this to a repo-wide check is proposed in
-// uc-infra#153's own follow-up notes.
+// independent review; uc-infra#155 — the same class of leak in two
+// more files, missed by both earlier sweeps; no credential values in
+// any case). This is a narrow, source-text regression test scoped to the
+// exact files #138/#153/#155 fixed — it is not a general secret
+// scanner, and it does not catch the same pattern reappearing in a
+// file it doesn't watch (e.g. via copy-paste) or a file that already
+// had the pattern before this test existed. Widening this to a
+// repo-wide check is proposed in uc-infra#153's own follow-up notes.
 //
 // PR#119 (uc-infra#138) and PR#121 (uc-infra#153) both added a file at
 // this exact path/package/function name, each with a disjoint
 // bannedInFile map — merged here into one map covering all 8 files
 // (both sides taken together) rather than picking either side, so
 // neither PR's guard coverage was silently dropped by the merge.
+// uc-infra#155 added a 9th and 10th file (internal/api/issuereport.go
+// and internal/api/issuereport_test.go) on top of that merged map.
 package leakcheck
 
 import (
@@ -50,6 +53,7 @@ var bannedInFile = map[string][]string{
 		"kubernetes/apps",
 		"member-mgmt-zitadel-pat",
 		"zitadel-project-id",
+		"queue.md",
 	},
 	"internal/api/import.go": {
 		"homelab-k8s",
@@ -79,6 +83,16 @@ var bannedInFile = map[string][]string{
 	"internal/api/import_test.go": {
 		"homelab",
 	},
+	"internal/api/issuereport.go": {
+		"farshid's ask",
+		"open an issue for us maybe in the github issue",
+		"homelab",
+		"queue.md",
+	},
+	"internal/api/issuereport_test.go": {
+		"farshid reported",
+		"it works but only in english",
+	},
 }
 
 func TestNoLeakedInfraDetailInDocComments(t *testing.T) {
@@ -100,7 +114,7 @@ func TestNoLeakedInfraDetailInDocComments(t *testing.T) {
 			content := strings.ToLower(string(data))
 			for _, s := range banned {
 				if strings.Contains(content, strings.ToLower(s)) {
-					t.Errorf("%s: reintroduced leaked detail %q (see uc-infra#138/#153) — describe the deployment generically instead of naming the cluster/hardware/DNS/secret name/private-repo path, or quoting private planning context verbatim", relPath, s)
+					t.Errorf("%s: reintroduced leaked detail %q (see uc-infra#138/#153/#155) — describe the deployment generically instead of naming the cluster/hardware/DNS/secret name/private-repo path, or quoting private planning context verbatim", relPath, s)
 				}
 			}
 		})
