@@ -1228,13 +1228,14 @@ func (h *Handler) buildFormRenderData(ctx context.Context, ts tenantScope, entDe
 		renderData.Record = rec.Data
 		renderData.RecordLabel = h.recordLabel(entDef, rec, locale)
 
-		children, childDefs, childReferenceLabels, err := h.loadMasterDetailChildren(ctx, ts, entDef, formDef, id, locale)
+		children, childDefs, childReferenceLabels, degradedSections, err := h.loadMasterDetailChildren(ctx, ts, entDef, formDef, id, locale)
 		if err != nil {
 			return formrender.Data{}, fmt.Errorf("load master-detail children: %w", err)
 		}
 		renderData.Children = children
 		renderData.ChildDefs = childDefs
 		renderData.ChildReferenceLabels = childReferenceLabels
+		renderData.DegradedSections = degradedSections
 	}
 	// Resolved AFTER the record is loaded, because it depends on the
 	// record's current values: the combobox (#24) only needs each
@@ -1549,6 +1550,28 @@ func (h *Handler) pageReferenceLabels(ctx context.Context, ts tenantScope, def *
 // — a Definition mismatch here is a data-modeling bug to fix in the
 // Definition, not something that should 500 every form render for it.
 //
+// A section the viewer can read the RELATIONSHIP for but not the CHILD
+// entity TYPE itself degrades the same way: ts.crud.ListByField wraps
+// authz.ErrDenied when checkRead(childDef) fails, and that section is
+// skipped (omitted from the first three returned maps) rather than
+// failing the whole render — the viewer can still read the parent
+// record, so a child section they lack read access to must not turn the
+// entire form into a 403 (uc-infra#131). This mirrors loadCurrentReferenceLabels'
+// own ErrDenied degrade below: a target this viewer legitimately can't
+// see resolves to "nothing here," logged, not a page-wide failure. Any
+// OTHER error from ListByField (a real DB/lookup failure, not a
+// permission denial) still hard-fails the render — only the specific
+// "viewer isn't allowed to see this" case degrades.
+//
+// The fourth returned map (degraded) names exactly the sections that
+// hit that ErrDenied branch, keyed by section.Target. This is NOT
+// redundant with "absent from children": a section with genuinely zero
+// child rows is ALSO absent from children, but its roll-up must still
+// sum to 0, while a degraded section's roll-up must NOT (it isn't
+// "zero", it's "unknown" — see formrender.Data.DegradedSections and
+// render.go's roll-up loop for why conflating the two silently
+// corrupted a writable header field, independent review finding #1).
+//
 // It also resolves each section's own reference-typed columns to labels
 // (formrender.Data.ChildReferenceLabels), reusing pageReferenceLabels —
 // the same field->id->label lookup the top-level list view already does
@@ -1560,13 +1583,24 @@ func (h *Handler) pageReferenceLabels(ctx context.Context, ts tenantScope, def *
 // this, a related-list/master-detail FieldReference column (e.g.
 // Lead.campaign_id, Lead.status_id) rendered the raw stored id, because
 // nothing populated a label map for it at all (uc-infra#85).
-func (h *Handler) loadMasterDetailChildren(ctx context.Context, ts tenantScope, entDef *entity.Definition, formDef *form.Definition, recordID, locale string) (map[string][]map[string]any, map[string]*entity.Definition, map[string]map[string]map[string]string, error) {
+func (h *Handler) loadMasterDetailChildren(ctx context.Context, ts tenantScope, entDef *entity.Definition, formDef *form.Definition, recordID, locale string) (map[string][]map[string]any, map[string]*entity.Definition, map[string]map[string]map[string]string, map[string]bool, error) {
 	children := make(map[string][]map[string]any)
 	// The child Definitions travel with the rows: the renderer needs
 	// them for column order and to resolve i18n_text cells to the
 	// viewer's locale (formrender.buildChildRows).
 	childDefs := make(map[string]*entity.Definition)
 	referenceLabels := make(map[string]map[string]map[string]string)
+	// degraded names every section skipped specifically because the
+	// viewer lacks read access to its child entity type (below), as
+	// opposed to a section skipped for the unrelated "no matching
+	// Relationship" reason a few lines down. formrender.Data.
+	// DegradedSections needs this distinction: a section with
+	// genuinely zero child rows should still roll up to 0, but a
+	// section we simply couldn't READ must not (uc-infra#131
+	// independent review finding #1 — recomputing "zero" here for an
+	// unreadable section fed straight into a writable header field
+	// and would silently persist a wrong total on the next save).
+	degraded := make(map[string]bool)
 	for _, section := range formDef.Sections {
 		// Both component kinds resolve their rows the same way — parent
 		// id matched against the child's ParentField. They differ in what
@@ -1593,11 +1627,16 @@ func (h *Handler) loadMasterDetailChildren(ctx context.Context, ts tenantScope, 
 		}
 		childDef, err := ts.entityDef(ctx, section.Target)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("look up %s definition for master-detail section: %w", section.Target, err)
+			return nil, nil, nil, nil, fmt.Errorf("look up %s definition for master-detail section: %w", section.Target, err)
 		}
 		records, err := ts.crud.ListByField(ctx, childDef, rel.ParentField, recordID)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("list %s children: %w", section.Target, err)
+			if errors.Is(err, authz.ErrDenied) {
+				log.Printf("api: list %s children for %s(%s) (master-detail/related-list section, viewer lacks read access): %v", section.Target, entDef.EntityType, recordID, err)
+				degraded[section.Target] = true
+				continue
+			}
+			return nil, nil, nil, nil, fmt.Errorf("list %s children: %w", section.Target, err)
 		}
 		rows := make([]map[string]any, len(records))
 		for i, rec := range records {
@@ -1607,7 +1646,7 @@ func (h *Handler) loadMasterDetailChildren(ctx context.Context, ts tenantScope, 
 		childDefs[section.Target] = childDef
 		referenceLabels[section.Target] = h.pageReferenceLabels(ctx, ts, childDef, records, locale)
 	}
-	return children, childDefs, referenceLabels, nil
+	return children, childDefs, referenceLabels, degraded, nil
 }
 
 func writeDefinitionLookupError(w http.ResponseWriter, entityType string, err error) {

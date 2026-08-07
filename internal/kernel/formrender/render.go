@@ -186,6 +186,19 @@ type Data struct {
 	// the RBAC engine and the entity-display-name/i18n lookups needed to
 	// build this text, so it is precomputed the same way CurrentLabel is.
 	ReferenceCreateLabels map[string]string
+	// DegradedSections names every master-detail/related-list section
+	// (keyed by section.Target, same key space as Children) whose child
+	// rows could NOT be loaded because the viewer lacks read access to
+	// the child entity type (internal/api's loadMasterDetailChildren
+	// degrading authz.ErrDenied rather than failing the whole render —
+	// uc-infra#131). Distinct from a section simply having zero real
+	// children: that case is absent from DegradedSections but still has
+	// an empty (or missing) Children entry, and IS meant to roll up to
+	// 0. A section IN this set must not be treated as "zero children"
+	// by the roll-up computation below — see that code's own comment
+	// for why conflating the two silently corrupts a writable header
+	// field.
+	DegradedSections map[string]bool
 }
 
 // Render writes the HTML/HTMX form for def against ent's field shapes and
@@ -439,6 +452,33 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 	rollUpTotals := make(map[string]float64)
 	for _, s := range def.Sections {
 		if s.Component != form.ComponentMasterDetail || s.RollUp == "" {
+			continue
+		}
+		if data.DegradedSections[s.Target] {
+			// The viewer can't read this section's children at all, so
+			// there is no real total to compute — Children[s.Target]
+			// being empty/absent here means "couldn't load," not "zero
+			// rows," and summing it would silently produce 0.
+			// RollUpTarget is an ordinary writable field on the parent
+			// (e.g. PurchaseOrder.total, edited like any other header
+			// field), not a read-only computed one, so a wrong 0 here
+			// doesn't just mis-render — saving this form persists it
+			// over the real total (independent review, uc-infra#131:
+			// found live-corrupting internal/kernel/purchasing/
+			// ledger.go's GL posting, which reads the stored total
+			// directly). Leave effective[s.RollUpTarget] exactly as
+			// maps.Copy already set it above (the record's last stored
+			// value) and surface that same number as the displayed
+			// total below, rather than a total this render cannot
+			// actually verify. That value can itself be stale by
+			// whatever changed since it was last saved — an accepted,
+			// bounded gap: a viewer denied read on the child type
+			// structurally cannot verify a live total either way, and
+			// "possibly stale" is a materially smaller failure than
+			// "silently zeroed."
+			if n, ok := effective[s.RollUpTarget].(float64); ok {
+				rollUpTotals[s.RollUpTarget] = n
+			}
 			continue
 		}
 		total, err := computeRollUp(data.Children[s.Target], s.RollUp)
