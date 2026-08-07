@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/textproto"
 	"strings"
 	"testing"
 
@@ -367,5 +369,359 @@ func TestIssueReport_Submit_MissingRequiredFieldIs400(t *testing.T) {
 	// that it actually translates).
 	if want := `title is required.`; !strings.Contains(rec.Body.String(), want) {
 		t.Fatalf("expected the translated envelope message %q, got: %s", want, rec.Body.String())
+	}
+}
+
+// newIssueReportSubmitRequest builds a multipart/form-data
+// /issue-report/submit request — the shape issueReportTmpl's form now
+// always posts as (uc-infra#92), text fields plus an optional
+// screen_recording file part. recording == nil omits the file part
+// entirely (the common case: no screen recording captured).
+func newIssueReportSubmitRequest(t *testing.T, target, tenantID, actorID string, fields map[string]string, recording []byte) *http.Request {
+	t.Helper()
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	for k, v := range fields {
+		if err := mw.WriteField(k, v); err != nil {
+			t.Fatalf("write field %s: %v", k, err)
+		}
+	}
+	if recording != nil {
+		// Not mw.CreateFormFile: that hardcodes Content-Type:
+		// application/octet-stream, but a real browser sends the
+		// captured File's own .type ("video/webm" — see issueReportTmpl's
+		// `new File([blob], ..., { type: "video/webm" })`) as this part's
+		// Content-Type. CreatePart with an explicit header is what
+		// actually reproduces that.
+		header := make(textproto.MIMEHeader)
+		header.Set("Content-Disposition", `form-data; name="`+screenRecordingFormField+`"; filename="screen-recording.webm"`)
+		header.Set("Content-Type", "video/webm")
+		fw, err := mw.CreatePart(header)
+		if err != nil {
+			t.Fatalf("create screen_recording form part: %v", err)
+		}
+		if _, err := fw.Write(recording); err != nil {
+			t.Fatalf("write screen_recording content: %v", err)
+		}
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+	r := httptest.NewRequest("POST", target, &buf)
+	r.Header.Set("Content-Type", mw.FormDataContentType())
+	if tenantID != "" {
+		r.Header.Set("X-Tenant-ID", tenantID)
+	}
+	if actorID != "" {
+		r.Header.Set("X-Actor-ID", actorID)
+	}
+	return r
+}
+
+// TestIssueReport_NewPage_ShowsScreenRecordButtonWhenAttachmentsEnabled
+// confirms issueReportNewPage's AttachmentsEnabled gate (uc-infra#92):
+// with a blobstore wired, the screen-record control renders.
+func TestIssueReport_NewPage_ShowsScreenRecordButtonWhenAttachmentsEnabled(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, _ := newTestTenant(t, router)
+
+	h := testHandler(t, router)
+	h.SetBlobstore(newFSStoreAt(t, t.TempDir()))
+	mux := http.NewServeMux()
+	h.Routes(mux)
+
+	req := newRequest("GET", "/issue-report/new", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `id="uc-issue-screenrecord-btn"`) {
+		t.Fatalf("expected the screen-record button when a blobstore is configured, got:\n%s", body)
+	}
+	if !strings.Contains(body, `enctype="multipart/form-data"`) {
+		t.Fatalf("expected the capture form to post multipart/form-data, got:\n%s", body)
+	}
+}
+
+// TestIssueReport_NewPage_HidesScreenRecordButtonWhenAttachmentsDisabled
+// is the other half of the same gate: no blobstore configured (the
+// default testHandler, matching a deployment that never called
+// SetBlobstore) means the control is never rendered at all — never a
+// dead, always-failing button (uc-infra#92 design note: this is the
+// primary defense against attachScreenRecording's rare fallback path
+// ever being reachable through the real UI).
+func TestIssueReport_NewPage_HidesScreenRecordButtonWhenAttachmentsDisabled(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, _ := newTestTenant(t, router)
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux) // no blobstore wired
+
+	req := newRequest("GET", "/issue-report/new", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if body := rec.Body.String(); strings.Contains(body, `id="uc-issue-screenrecord-btn"`) {
+		t.Fatalf("expected no screen-record button with no blobstore configured, got:\n%s", body)
+	}
+}
+
+// TestIssueReport_Submit_MultipartWithoutRecording_StillCreatesRecord
+// confirms issueReportTmpl's move to enctype="multipart/form-data" for
+// EVERY submission (not just ones carrying a recording) didn't break the
+// ordinary text-only path — ParseMultipartForm's own doc comment says it
+// "calls ParseForm if necessary", but that's worth pinning with a real
+// multipart (not urlencoded) request specifically, since every other
+// test in this file predates uc-infra#92 and only ever exercises the
+// urlencoded shape.
+func TestIssueReport_Submit_MultipartWithoutRecording_StillCreatesRecord(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	req := newIssueReportSubmitRequest(t, "/issue-report/submit", tenantID, "farshid", map[string]string{
+		"title":       "Multipart, no recording",
+		"description": "Plain multipart submission with no screen_recording part.",
+	}, nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "recording") {
+		t.Fatalf("expected no recording-related note when nothing was recorded, got:\n%s", rec.Body.String())
+	}
+}
+
+// TestIssueReport_Submit_WithScreenRecording_CreatesLinkedAttachment is
+// the core end-to-end proof for uc-infra#92: a submission carrying a
+// screen_recording part durably stores the blob and links it to the new
+// IssueReport via a real Attachment record (entity_type="IssueReport"),
+// discoverable and downloadable exactly like any other attachment
+// (attachment.go's own already-tested machinery) — not a bespoke
+// side-channel.
+func TestIssueReport_Submit_WithScreenRecording_CreatesLinkedAttachment(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
+
+	h := testHandler(t, router)
+	h.SetBlobstore(newFSStoreAt(t, t.TempDir()))
+	mux := http.NewServeMux()
+	h.Routes(mux)
+
+	recording := bytes.Repeat([]byte("screen-bytes"), 100)
+	req := newIssueReportSubmitRequest(t, "/issue-report/submit", tenantID, "farshid", map[string]string{
+		"title":       "Save throws on click",
+		"description": "See attached recording.",
+	}, recording)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "could not be attached") {
+		t.Fatalf("expected no attach-failure note on the happy path, got:\n%s", rec.Body.String())
+	}
+
+	// Find the created IssueReport's id.
+	listReq := newRequest("GET", "/api/records/IssueReport", tenantID, "farshid", nil)
+	listRec := httptest.NewRecorder()
+	mux.ServeHTTP(listRec, listReq)
+	var issueList struct {
+		Data []struct {
+			ID   string `json:"id"`
+			Data struct {
+				Title string `json:"title"`
+			} `json:"data"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(listRec.Body.Bytes(), &issueList); err != nil {
+		t.Fatalf("decode IssueReport list: %v (%s)", err, listRec.Body.String())
+	}
+	var issueID string
+	for _, rec := range issueList.Data {
+		if rec.Data.Title == "Save throws on click" {
+			issueID = rec.ID
+		}
+	}
+	if issueID == "" {
+		t.Fatalf("expected to find the created IssueReport, got: %s", listRec.Body.String())
+	}
+
+	// Find the linked Attachment and confirm its shape.
+	attReq := newRequest("GET", "/api/records/Attachment", tenantID, "farshid", nil)
+	attRec := httptest.NewRecorder()
+	mux.ServeHTTP(attRec, attReq)
+	var attList struct {
+		Data []struct {
+			ID   string `json:"id"`
+			Data struct {
+				EntityType  string  `json:"entity_type"`
+				RecordID    string  `json:"record_id"`
+				FileName    string  `json:"file_name"`
+				MimeType    string  `json:"mime_type"`
+				SizeBytes   float64 `json:"size_bytes"`
+				StoragePath string  `json:"storage_path"`
+			} `json:"data"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(attRec.Body.Bytes(), &attList); err != nil {
+		t.Fatalf("decode Attachment list: %v (%s)", err, attRec.Body.String())
+	}
+	var attachmentID string
+	for _, a := range attList.Data {
+		if a.Data.EntityType == "IssueReport" && a.Data.RecordID == issueID {
+			attachmentID = a.ID
+			if a.Data.MimeType != "video/webm" {
+				t.Errorf("expected mime_type video/webm, got %q", a.Data.MimeType)
+			}
+			if int(a.Data.SizeBytes) != len(recording) {
+				t.Errorf("expected size_bytes %d, got %v", len(recording), a.Data.SizeBytes)
+			}
+			if !strings.HasPrefix(a.Data.StoragePath, tenantID+"/IssueReport/"+issueID+"/") {
+				t.Errorf("expected storage_path namespaced under %s/IssueReport/%s/, got %q", tenantID, issueID, a.Data.StoragePath)
+			}
+		}
+	}
+	if attachmentID == "" {
+		t.Fatalf("expected a linked Attachment for IssueReport %s, got: %s", issueID, attRec.Body.String())
+	}
+
+	// And the blob is genuinely retrievable, byte-for-byte, through the
+	// same generic download endpoint every other attachment uses.
+	dlReq := newRequest("GET", "/api/attachments/"+attachmentID, tenantID, "farshid", nil)
+	dlRec := httptest.NewRecorder()
+	mux.ServeHTTP(dlRec, dlReq)
+	if dlRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 downloading the recording, got %d: %s", dlRec.Code, dlRec.Body.String())
+	}
+	if !bytes.Equal(dlRec.Body.Bytes(), recording) {
+		t.Fatalf("expected the downloaded bytes to round-trip exactly, got %d bytes, want %d", dlRec.Body.Len(), len(recording))
+	}
+}
+
+// TestIssueReport_Submit_ScreenRecordingWithNoBlobstoreConfigured_
+// SavesReportAndNotesFailure is attachScreenRecording's defensive
+// fallback path (uc-infra#92 design note): even though
+// issueReportNewPage's AttachmentsEnabled gate keeps this unreachable
+// through the real UI in practice (no blobstore means the button was
+// never rendered), a request that somehow still carries a
+// screen_recording part must not lose the report itself — the IssueReport
+// is saved regardless, with a translated note instead of a silent drop.
+func TestIssueReport_Submit_ScreenRecordingWithNoBlobstoreConfigured_SavesReportAndNotesFailure(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux) // no blobstore wired
+
+	req := newIssueReportSubmitRequest(t, "/issue-report/submit", tenantID, "farshid", map[string]string{
+		"title":       "Recording with no storage configured",
+		"description": "Should still save.",
+	}, []byte("some video bytes"))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 — the report itself must still be saved, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "could not be attached") {
+		t.Fatalf("expected the translated recording_not_attached note, got:\n%s", rec.Body.String())
+	}
+
+	listReq := newRequest("GET", "/api/records/IssueReport", tenantID, "farshid", nil)
+	listRec := httptest.NewRecorder()
+	mux.ServeHTTP(listRec, listReq)
+	if !strings.Contains(listRec.Body.String(), "Recording with no storage configured") {
+		t.Fatalf("expected the IssueReport to be saved despite the attach failure, got:\n%s", listRec.Body.String())
+	}
+
+	attReq := newRequest("GET", "/api/records/Attachment", tenantID, "farshid", nil)
+	attRec := httptest.NewRecorder()
+	mux.ServeHTTP(attRec, attReq)
+	if strings.Contains(attRec.Body.String(), `"entity_type":"IssueReport"`) {
+		t.Fatalf("expected no Attachment record created when storage isn't configured, got:\n%s", attRec.Body.String())
+	}
+}
+
+// TestIssueReport_Submit_OversizedRecordingIs400 confirms
+// maxIssueReportSubmitBytes is actually enforced at the HTTP boundary,
+// same "cap it before it ever reaches application logic" contract every
+// other upload in this package documents.
+func TestIssueReport_Submit_OversizedRecordingIs400(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
+
+	h := testHandler(t, router)
+	h.SetBlobstore(newFSStoreAt(t, t.TempDir()))
+	mux := http.NewServeMux()
+	h.Routes(mux)
+
+	oversized := bytes.Repeat([]byte("x"), maxIssueReportSubmitBytes+1024)
+	req := newIssueReportSubmitRequest(t, "/issue-report/submit", tenantID, "farshid", map[string]string{
+		"title":       "Too big",
+		"description": "This recording is oversized.",
+	}, oversized)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an oversized submission, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestIssueReport_Submit_MalformedUrlencodedBodyIs400 is the regression
+// test for independent review's finding on the first version of
+// uc-infra#92: issueReportSubmit used to call r.ParseMultipartForm
+// unconditionally and swallow any http.ErrNotMultipart it returned,
+// treating that as "this is just a legacy urlencoded submission, safe to
+// proceed." But Go's ParseMultipartForm returns http.ErrNotMultipart
+// whenever the content type isn't multipart/form-data REGARDLESS of
+// whether its own internal ParseForm call succeeded — it only surfaces
+// ParseForm's own error on ParseMultipartForm's success path. So a
+// genuinely malformed urlencoded body (a bare semicolon — rejected by
+// net/url's ParseQuery since Go 1.17 as an invalid separator, and a real
+// character a pasted JS stack trace can easily contain) used to be
+// silently accepted with the offending field just dropped from
+// r.PostForm, rather than 400ing like every other malformed submission.
+// The fix branches on Content-Type explicitly instead of relying on
+// ParseMultipartForm's dual-purpose error.
+func TestIssueReport_Submit_MalformedUrlencodedBodyIs400(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	form := "title=Bug&description=ok&console_log=a;b"
+	req := newRequest("POST", "/issue-report/submit", tenantID, "farshid", []byte(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a malformed urlencoded body (bare semicolon), got %d: %s", rec.Code, rec.Body.String())
 	}
 }

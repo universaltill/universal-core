@@ -34,6 +34,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 
 	"github.com/universaltill/universal-core/internal/httpx"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
@@ -45,6 +46,55 @@ import (
 // HTTP boundary" reasoning maxUploadBytes documents for the CSV import
 // wizard.
 const maxVoiceNoteBytes = 10 << 20 // 10 MiB
+
+// screenRecordingDurationCapSeconds bounds how long the capture page's
+// JS lets a screen recording run before auto-stopping it (uc-infra#92):
+// long enough to actually show a bug reproducing, short enough that the
+// video stays a reasonable size at the bitrate below without needing a
+// mid-recording server round-trip to check. Referenced from Go only for
+// the size-cap arithmetic in the doc comment below — the actual
+// enforcement is client-side (issueReportTmpl's own script) plus the
+// server-side byte cap as a hard backstop.
+const screenRecordingDurationCapSeconds = 180 // 3 minutes
+
+// maxScreenRecordingBytes bounds an uploaded screen-recording video. At
+// the videoBitsPerSecond hint the capture page's MediaRecorder requests
+// (2 Mbps — see issueReportTmpl), a full screenRecordingDurationCapSeconds
+// recording is ~45 MiB; this leaves headroom for encoder/keyframe
+// variance without landing anywhere near the CSV import wizard's 50 MiB
+// cap (import.go) — video legitimately needs more than either that or
+// the 20 MiB generic attachment cap (attachment.go), same "cap it at the
+// HTTP boundary" reasoning as every other upload in this package.
+const maxScreenRecordingBytes = 60 << 20 // 60 MiB
+
+// maxIssueReportSubmitBytes bounds the WHOLE /issue-report/submit
+// request body — text fields plus the optional screen-recording file
+// part together. maxScreenRecordingBytes dominates; the extra 1 MiB is
+// headroom for the form's own text fields (title/description/transcript/
+// console_log can each carry a fair amount of pasted text) and
+// multipart boundary/header overhead, neither of which individually
+// approaches this cap on its own.
+const maxIssueReportSubmitBytes = maxScreenRecordingBytes + (1 << 20) // 61 MiB
+
+// screenRecordingFormField is the multipart field name the capture
+// page's JS attaches the recorded video Blob under — a hidden
+// <input type="file"> set programmatically via a DataTransfer (see
+// issueReportTmpl's own doc comment on why: no HTMX equivalent exists
+// for assigning a captured Blob to a file input either). Mirrors
+// issueReportTranscribe's "audio" field name and attachmentUpload's
+// "file" field name — one fixed name per upload shape in this package.
+const screenRecordingFormField = "screen_recording"
+
+// isMultipartFormData reports whether r's Content-Type is
+// multipart/form-data — the explicit branch issueReportSubmit uses to
+// decide between ParseMultipartForm and plain ParseForm, rather than
+// calling ParseMultipartForm unconditionally and swallowing its
+// http.ErrNotMultipart return (see issueReportSubmit's own doc comment
+// on why that would silently discard a real ParseForm error on a
+// malformed urlencoded body instead).
+func isMultipartFormData(r *http.Request) bool {
+	return strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data")
+}
 
 // issueReportNewPage renders the capture form: a title field, a
 // description textarea, a record-voice-note button (real browser
@@ -60,17 +110,32 @@ func (h *Handler) issueReportNewPage(w http.ResponseWriter, r *http.Request) {
 
 	var buf bytes.Buffer
 	err := issueReportTmpl.ExecuteTemplate(&buf, "page", issueReportPageView{
-		TranscribeHref:    "/issue-report/transcribe",
-		SubmitHref:        "/issue-report/submit",
-		TitleLabel:        h.catalog.T(locale, "issue_report.title_label"),
-		DescriptionLabel:  h.catalog.T(locale, "issue_report.description_label"),
-		RecordLabel:       h.catalog.T(locale, "issue_report.record_button"),
-		StopLabel:         h.catalog.T(locale, "issue_report.stop_button"),
-		TranscribingLabel: h.catalog.T(locale, "issue_report.transcribing"),
-		TranscriptLabel:   h.catalog.T(locale, "issue_report.transcript_label"),
-		ConsoleLogLabel:   h.catalog.T(locale, "issue_report.console_log_label"),
-		SubmitLabel:       h.catalog.T(locale, "issue_report.submit_button"),
-		NoMicLabel:        h.catalog.T(locale, "issue_report.no_mic"),
+		TranscribeHref:               "/issue-report/transcribe",
+		SubmitHref:                   "/issue-report/submit",
+		TitleLabel:                   h.catalog.T(locale, "issue_report.title_label"),
+		DescriptionLabel:             h.catalog.T(locale, "issue_report.description_label"),
+		RecordLabel:                  h.catalog.T(locale, "issue_report.record_button"),
+		StopLabel:                    h.catalog.T(locale, "issue_report.stop_button"),
+		TranscribingLabel:            h.catalog.T(locale, "issue_report.transcribing"),
+		TranscriptLabel:              h.catalog.T(locale, "issue_report.transcript_label"),
+		ConsoleLogLabel:              h.catalog.T(locale, "issue_report.console_log_label"),
+		SubmitLabel:                  h.catalog.T(locale, "issue_report.submit_button"),
+		NoMicLabel:                   h.catalog.T(locale, "issue_report.no_mic"),
+		ScreenRecordLabel:            h.catalog.T(locale, "issue_report.screen_record_button"),
+		RecordingLabel:               h.catalog.T(locale, "issue_report.screen_recording_label"),
+		ScreenPreviewLabel:           h.catalog.T(locale, "issue_report.screen_preview_label"),
+		NoScreenShareLabel:           h.catalog.T(locale, "issue_report.no_screen_share"),
+		ScreenRecordingTooLargeLabel: h.catalog.T(locale, "issue_report.screen_recording_too_large"),
+		// AttachmentsEnabled gates the screen-record control client-side
+		// (issueReportTmpl): a real deployment always wires a blobstore
+		// (handlers.go's own doc comment on the field), so this is
+		// primarily a dev/test-environment degrade, not a production
+		// path — attachScreenRecording below still re-checks
+		// defensively, since a page rendered before a hot-reconfigure
+		// could still submit with this true.
+		AttachmentsEnabled:                h.blobstore != nil,
+		ScreenRecordingDurationCapSeconds: screenRecordingDurationCapSeconds,
+		MaxScreenRecordingBytes:           maxScreenRecordingBytes,
 	})
 	if err != nil {
 		writeInternalError(w, "render issue report page", err)
@@ -167,7 +232,44 @@ func (h *Handler) issueReportSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := r.ParseForm(); err != nil {
+	// The capture page now posts multipart/form-data unconditionally
+	// (issueReportTmpl) so a screen-recording file part can ride along
+	// with the ordinary text fields on the exact same native, non-fetch
+	// browser POST — but a plain application/x-www-form-urlencoded
+	// submission (every test in this package predating uc-infra#92, and
+	// any client that never captured a recording) must still work.
+	// Branching on Content-Type explicitly, rather than always calling
+	// ParseMultipartForm and swallowing its http.ErrNotMultipart return,
+	// is deliberate: ParseMultipartForm calls ParseForm internally and
+	// only surfaces ParseForm's OWN error on its success path (Go's
+	// ParseMultipartForm returns `parseFormErr` only after a successful
+	// multipart parse; if multipartReader itself fails — e.g. because
+	// this isn't a multipart body at all — it returns THAT error
+	// instead, discarding parseFormErr). Blindly ignoring
+	// ErrNotMultipart would therefore also silently ignore a REAL
+	// ParseForm failure on a genuinely malformed urlencoded body (a
+	// stray query-string separator in a pasted console_log stack trace,
+	// for one) and proceed on partially-populated fields instead of
+	// 400ing — independent review caught this on the first pass.
+	r.Body = http.MaxBytesReader(w, r.Body, maxIssueReportSubmitBytes)
+	if isMultipartFormData(r) {
+		// maxMemory deliberately small and independent of
+		// maxIssueReportSubmitBytes: that's already the hard ceiling via
+		// MaxBytesReader above. Passing the full 61 MiB cap here as well
+		// would make ParseMultipartForm buffer an entire large recording
+		// into process heap (multipart.Reader.ReadForm only spills a
+		// part to a temp file past maxMemory) instead of spilling it —
+		// independent review flagged this as a real memory-exhaustion
+		// risk under concurrent large uploads. A spilled part still
+		// reads back fine through header.Open() in attachScreenRecording
+		// below; this constant only controls where the bytes sit while
+		// parsing, not what the handler can do with them afterward.
+		const issueReportSubmitParseMemory = 8 << 20 // 8 MiB
+		if err := r.ParseMultipartForm(issueReportSubmitParseMemory); err != nil {
+			httpx.WriteError(w, http.StatusBadRequest, fmt.Sprintf("invalid or oversized submission (max %d MiB): %s", maxIssueReportSubmitBytes>>20, err.Error()))
+			return
+		}
+	} else if err := r.ParseForm(); err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, "invalid form submission: "+err.Error())
 		return
 	}
@@ -205,36 +307,157 @@ func (h *Handler) issueReportSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	recordingNote := h.attachScreenRecording(r, ts, rec.ID, rc, locale)
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := issueReportTmpl.ExecuteTemplate(w, "result", issueReportResultView{
-		Heading: h.catalog.T(locale, "issue_report.result_heading"),
-		Body:    h.catalog.T(locale, "issue_report.result_body"),
-		ID:      rec.ID,
+		Heading:       h.catalog.T(locale, "issue_report.result_heading"),
+		Body:          h.catalog.T(locale, "issue_report.result_body"),
+		ID:            rec.ID,
+		RecordingNote: recordingNote,
 	}); err != nil {
 		writeInternalError(w, "render issue report result", err)
 	}
 }
 
+// attachScreenRecording durably stores an optional screen-recording
+// video the capture page's JS attached under screenRecordingFormField,
+// linking it to the just-created IssueReport record recordID via the
+// same generic Attachment machinery attachmentUpload (attachment.go)
+// uses — reusing its storage-key/orphan-cleanup helpers rather than
+// reimplementing them. This orchestration stays here, entity-specific,
+// rather than inside attachment.go's own entity-agnostic handlers (same
+// "no `if entityType == ...`" boundary attachment.go's own doc comment
+// draws for the generic engine).
+//
+// By the time this runs, the IssueReport record itself is ALREADY
+// durably created (issueReportSubmit only calls this after ts.crud.
+// Create succeeds) — a failure here (no storage configured, a transient
+// write error) never unwinds the report the human just filed. It
+// returns a non-empty, already-localized note for the result page
+// instead, so nobody is left silently wondering whether their recording
+// actually made it in — same "never a silent failure" principle
+// no_screen_share/NoMicLabel already follow on the capture side. This is
+// deliberately NOT attachmentUpload's own "fail closed, nothing saved"
+// contract: that endpoint's only job IS the attachment, so refusing
+// outright is correct there; here the attachment is a secondary
+// enhancement to a primary submission that already succeeded, and the
+// capture page's own AttachmentsEnabled flag (issueReportNewPage) already
+// keeps this the rare/defensive path in practice — a real deployment
+// always wires a blobstore (handlers.go's own doc comment on the field).
+func (h *Handler) attachScreenRecording(r *http.Request, ts tenantScope, recordID string, rc httpx.RequestContext, locale string) string {
+	if r.MultipartForm == nil {
+		return ""
+	}
+	files := r.MultipartForm.File[screenRecordingFormField]
+	if len(files) == 0 {
+		return ""
+	}
+	header := files[0]
+
+	fail := func(reason string, err error) string {
+		if err != nil {
+			log.Printf("api: attach screen recording to IssueReport %s: %s: %v", recordID, reason, err)
+		} else {
+			log.Printf("api: attach screen recording to IssueReport %s: %s", recordID, reason)
+		}
+		return h.catalog.T(locale, "issue_report.recording_not_attached")
+	}
+
+	if h.blobstore == nil {
+		return fail("attachment storage is not configured for this deployment", nil)
+	}
+	attachmentDef, err := ts.entityDef(r.Context(), "Attachment")
+	if err != nil {
+		return fail("resolve Attachment definition", err)
+	}
+	file, err := header.Open()
+	if err != nil {
+		return fail("open uploaded recording", err)
+	}
+	defer file.Close()
+
+	key, err := attachmentStorageKey(rc.TenantID, "IssueReport", recordID, header.Filename)
+	if err != nil {
+		return fail("compute attachment storage key", err)
+	}
+	if err := h.blobstore.Put(r.Context(), key, file); err != nil {
+		return fail("store recording blob", err)
+	}
+
+	mimeType := header.Header.Get("Content-Type")
+	if mimeType == "" {
+		mimeType = "video/webm"
+	}
+	fields := map[string]any{
+		"entity_type":  "IssueReport",
+		"record_id":    recordID,
+		"file_name":    header.Filename,
+		"mime_type":    mimeType,
+		"size_bytes":   float64(header.Size),
+		"storage_path": key,
+	}
+	if err := entity.ValidateRecord(attachmentDef, fields); err != nil {
+		h.cleanupOrphanBlob(r.Context(), key)
+		return fail("validate Attachment record", err)
+	}
+	if _, err := ts.crud.Create(r.Context(), attachmentDef, fields, rc.Actor); err != nil {
+		h.cleanupOrphanBlob(r.Context(), key)
+		return fail("create Attachment record", err)
+	}
+	return ""
+}
+
 // --- view models ---
 
 type issueReportPageView struct {
-	TranscribeHref    string
-	SubmitHref        string
-	TitleLabel        string
-	DescriptionLabel  string
-	RecordLabel       string
-	StopLabel         string
-	TranscribingLabel string
-	TranscriptLabel   string
-	ConsoleLogLabel   string
-	SubmitLabel       string
-	NoMicLabel        string
+	TranscribeHref     string
+	SubmitHref         string
+	TitleLabel         string
+	DescriptionLabel   string
+	RecordLabel        string
+	StopLabel          string
+	TranscribingLabel  string
+	TranscriptLabel    string
+	ConsoleLogLabel    string
+	SubmitLabel        string
+	NoMicLabel         string
+	ScreenRecordLabel  string
+	RecordingLabel     string
+	ScreenPreviewLabel string
+	NoScreenShareLabel string
+	// ScreenRecordingTooLargeLabel is shown (independent review,
+	// uc-infra#92: the earlier version had no client-side size check at
+	// all, so an oversized recording only surfaced as the server's
+	// MaxBytesReader 400ing the WHOLE submission — title, description,
+	// transcript and all) when the captured Blob exceeds
+	// MaxScreenRecordingBytes: the recording is dropped from the
+	// hidden file input (never rides along with Submit) but the rest of
+	// the form is left completely intact.
+	ScreenRecordingTooLargeLabel string
+	// AttachmentsEnabled hides the screen-record control entirely when
+	// false (no configured blobstore) rather than letting someone record
+	// a video that can never actually be attached — see its doc comment
+	// at the call site (issueReportNewPage).
+	AttachmentsEnabled                bool
+	ScreenRecordingDurationCapSeconds int
+	// MaxScreenRecordingBytes mirrors the Go-side maxScreenRecordingBytes
+	// constant so the client-side size check above and the server's own
+	// MaxBytesReader boundary can never drift apart — one source of
+	// truth, not two numbers that happen to agree today.
+	MaxScreenRecordingBytes int
 }
 
 type issueReportResultView struct {
 	Heading string
 	Body    string
 	ID      string
+	// RecordingNote is empty when no screen recording was submitted, or
+	// when one was submitted and attached successfully — it is only
+	// ever populated (already localized) by attachScreenRecording's rare
+	// failure path, so the person who filed the report is never left
+	// silently wondering whether their recording made it in.
+	RecordingNote string
 }
 
 // The record-voice-note control is real JS, not HTMX: capturing a
@@ -249,7 +472,7 @@ type issueReportResultView struct {
 var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
 {{define "page"}}
 <div class="uc-issue-report">
-<form id="uc-issue-report-form" class="uc-form" method="post" action="{{.SubmitHref}}">
+<form id="uc-issue-report-form" class="uc-form" method="post" action="{{.SubmitHref}}" enctype="multipart/form-data">
 <label for="uc-issue-title">{{.TitleLabel}}</label>
 <input type="text" id="uc-issue-title" name="title" required>
 
@@ -263,6 +486,18 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
 
 <label for="uc-issue-transcript">{{.TranscriptLabel}}</label>
 <textarea id="uc-issue-transcript" name="transcript" rows="4" readonly></textarea>
+
+{{if .AttachmentsEnabled}}
+<div class="uc-issue-screenrecord">
+<button type="button" id="uc-issue-screenrecord-btn">{{.ScreenRecordLabel}}</button>
+<span id="uc-issue-screenrecord-status"></span>
+<div id="uc-issue-screenrecord-preview-wrap" style="display:none">
+<label for="uc-issue-screenrecord-preview">{{.ScreenPreviewLabel}}</label>
+<video id="uc-issue-screenrecord-preview" controls playsinline></video>
+</div>
+<input type="file" name="screen_recording" id="uc-issue-screenrecord-file" style="display:none">
+</div>
+{{end}}
 
 <label for="uc-issue-console-log">{{.ConsoleLogLabel}}</label>
 <textarea id="uc-issue-console-log" name="console_log" rows="4"></textarea>
@@ -330,75 +565,236 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
   var chunks = [];
   var recording = false;
 
-  if (!navigator.mediaDevices || !window.MediaRecorder) {
+  // Deliberately an if/else, NOT an early "return" out of the whole IIFE
+  // (independent review, uc-infra#92: the earlier version DID return
+  // here, which meant the screen-recording setup below — entirely
+  // unrelated to microphone capture — never ran at all whenever
+  // navigator.mediaDevices was falsy, e.g. any non-secure-context page
+  // load. AttachmentsEnabled would still render the screen-record button
+  // into the DOM, but with no click handler and never disabled — a
+  // silently dead control in exactly the degraded environment the
+  // NoScreenShareLabel degrade exists to handle instead).
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.MediaRecorder) {
     recordBtn.disabled = true;
     statusEl.textContent = {{.NoMicLabel}};
-    return;
-  }
-
-  // extractErrorMessage reads httpx's own {"data":null,"error":"..."}
-  // envelope (internal/httpx/envelope.go) out of a failed response body
-  // and returns just the human message — the raw envelope text used to
-  // be dumped verbatim into statusEl on any failure (e.g. a disabled
-  // speechassist.Client's 503), showing a user the whole raw JSON
-  // envelope instead of a readable sentence. Falls back to the raw text
-  // only if it isn't the JSON shape this endpoint actually returns
-  // (never expected in practice, but safer than throwing here).
-  function extractErrorMessage(rawText) {
-    try {
-      var body = JSON.parse(rawText);
-      if (body && typeof body.error === "string" && body.error !== "") {
-        return body.error;
+  } else {
+    // extractErrorMessage reads httpx's own {"data":null,"error":"..."}
+    // envelope (internal/httpx/envelope.go) out of a failed response body
+    // and returns just the human message — the raw envelope text used to
+    // be dumped verbatim into statusEl on any failure (e.g. a disabled
+    // speechassist.Client's 503), showing a user the whole raw JSON
+    // envelope instead of a readable sentence. Falls back to the raw text
+    // only if it isn't the JSON shape this endpoint actually returns
+    // (never expected in practice, but safer than throwing here).
+    var extractErrorMessage = function(rawText) {
+      try {
+        var body = JSON.parse(rawText);
+        if (body && typeof body.error === "string" && body.error !== "") {
+          return body.error;
+        }
+      } catch (e) {
+        // Not JSON — fall through to the raw text.
       }
-    } catch (e) {
-      // Not JSON — fall through to the raw text.
-    }
-    return rawText;
+      return rawText;
+    };
+
+    recordBtn.addEventListener("click", function() {
+      if (!recording) {
+        navigator.mediaDevices.getUserMedia({ audio: true }).then(function(stream) {
+          chunks = [];
+          mediaRecorder = new MediaRecorder(stream);
+          mediaRecorder.ondataavailable = function(e) { if (e.data.size > 0) chunks.push(e.data); };
+          mediaRecorder.onstop = function() {
+            stream.getTracks().forEach(function(t) { t.stop(); });
+            var blob = new Blob(chunks, { type: "audio/webm" });
+            statusEl.textContent = {{.TranscribingLabel}};
+            var form = new FormData();
+            form.append("audio", blob, "note.webm");
+            fetch({{.TranscribeHref}}, { method: "POST", body: form })
+              .then(function(resp) {
+                if (!resp.ok) { return resp.text().then(function(t) { throw new Error(extractErrorMessage(t)); }); }
+                return resp.text();
+              })
+              .then(function(text) {
+                transcriptEl.value = text;
+                if (descriptionEl.value.trim() !== "") {
+                  descriptionEl.value = descriptionEl.value.replace(/\s+$/, "") + "\n\n" + text;
+                } else {
+                  descriptionEl.value = text;
+                }
+                statusEl.textContent = "";
+              })
+              .catch(function(err) {
+                statusEl.textContent = String(err.message || err);
+              });
+          };
+          mediaRecorder.start();
+          recording = true;
+          recordBtn.textContent = {{.StopLabel}};
+          statusEl.textContent = "";
+        }).catch(function(err) {
+          statusEl.textContent = String(err.message || err);
+        });
+      } else {
+        mediaRecorder.stop();
+        recording = false;
+        recordBtn.textContent = {{.RecordLabel}};
+      }
+    });
   }
 
-  recordBtn.addEventListener("click", function() {
-    if (!recording) {
-      navigator.mediaDevices.getUserMedia({ audio: true }).then(function(stream) {
-        chunks = [];
-        mediaRecorder = new MediaRecorder(stream);
-        mediaRecorder.ondataavailable = function(e) { if (e.data.size > 0) chunks.push(e.data); };
-        mediaRecorder.onstop = function() {
-          stream.getTracks().forEach(function(t) { t.stop(); });
-          var blob = new Blob(chunks, { type: "audio/webm" });
-          statusEl.textContent = {{.TranscribingLabel}};
-          var form = new FormData();
-          form.append("audio", blob, "note.webm");
-          fetch({{.TranscribeHref}}, { method: "POST", body: form })
-            .then(function(resp) {
-              if (!resp.ok) { return resp.text().then(function(t) { throw new Error(extractErrorMessage(t)); }); }
-              return resp.text();
-            })
-            .then(function(text) {
-              transcriptEl.value = text;
-              if (descriptionEl.value.trim() !== "") {
-                descriptionEl.value = descriptionEl.value.replace(/\s+$/, "") + "\n\n" + text;
-              } else {
-                descriptionEl.value = text;
-              }
-              statusEl.textContent = "";
-            })
-            .catch(function(err) {
-              statusEl.textContent = String(err.message || err);
-            });
-        };
-        mediaRecorder.start();
-        recording = true;
-        recordBtn.textContent = {{.StopLabel}};
-        statusEl.textContent = "";
-      }).catch(function(err) {
-        statusEl.textContent = String(err.message || err);
-      });
+  // Screen recording (uc-infra#92): same "no HTMX equivalent" reasoning
+  // as the mic capture above — getDisplayMedia's permission prompt and
+  // MediaRecorder's start/stop lifecycle are both real browser APIs HTMX
+  // has no declarative attribute for. Only present in the DOM at all
+  // when AttachmentsEnabled was true at page-render time (see
+  // issueReportNewPage's own doc comment on why: no configured
+  // blobstore means a recording could never actually be attached).
+  var screenBtn = document.getElementById("uc-issue-screenrecord-btn");
+  if (screenBtn) {
+    var screenStatusEl = document.getElementById("uc-issue-screenrecord-status");
+    var previewWrap = document.getElementById("uc-issue-screenrecord-preview-wrap");
+    var previewEl = document.getElementById("uc-issue-screenrecord-preview");
+    var fileInput = document.getElementById("uc-issue-screenrecord-file");
+    var screenRecorder = null;
+    var screenChunks = [];
+    var screenRecording = false;
+    var screenTimerId = null;
+    var screenAutoStopId = null;
+    var screenStartedAt = 0;
+
+    // revokePreviousPreview releases the previous recording's blob: URL
+    // (if any) before a new one replaces it — independent review,
+    // uc-infra#92: re-recording (explicitly supported — clicking Record
+    // Screen again just overwrites screenChunks) previously left every
+    // earlier take's blob pinned in memory for the rest of the page's
+    // lifetime, since URL.createObjectURL was never paired with a
+    // matching revokeObjectURL.
+    var revokePreviousPreview = function() {
+      if (previewEl.src) {
+        URL.revokeObjectURL(previewEl.src);
+      }
+    };
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia || !window.MediaRecorder) {
+      screenBtn.disabled = true;
+      screenStatusEl.textContent = {{.NoScreenShareLabel}};
     } else {
-      mediaRecorder.stop();
-      recording = false;
-      recordBtn.textContent = {{.RecordLabel}};
+      screenBtn.addEventListener("click", function() {
+        if (screenRecording) {
+          screenRecorder.stop();
+          return;
+        }
+        if (screenBtn.disabled) {
+          // Already awaiting a getDisplayMedia permission prompt from an
+          // earlier click on this same button — independent review,
+          // uc-infra#92: without this guard, two clicks before the first
+          // prompt resolves opened two separate capture streams, and
+          // Stop only ever stopped the second one, leaving the first
+          // stream's tracks (and the browser's "you are sharing your
+          // screen" indicator) live indefinitely. Disabling synchronously
+          // here, before the async permission prompt even opens, closes
+          // that window entirely rather than trying to reconcile two
+          // in-flight recorders after the fact.
+          return;
+        }
+        screenBtn.disabled = true;
+        navigator.mediaDevices.getDisplayMedia({ video: true }).then(function(stream) {
+          screenBtn.disabled = false;
+          screenChunks = [];
+          try {
+            screenRecorder = new MediaRecorder(stream, { videoBitsPerSecond: 2000000 });
+          } catch (e) {
+            // A browser that rejects the videoBitsPerSecond hint (or the
+            // whole options object) still gets a recording, just without
+            // the explicit bitrate hint — the duration cap still bounds
+            // recording length either way, and the onstop handler below
+            // independently checks the resulting blob's actual size
+            // before ever attaching it, regardless of what bitrate the
+            // browser chose on its own.
+            screenRecorder = new MediaRecorder(stream);
+          }
+          // onstop, not the click handler that calls .stop(), is where
+          // this cleanup has to live: reaching the duration cap calls
+          // screenRecorder.stop() directly (see screenAutoStopId below)
+          // without ever going through this button's own click handler,
+          // so onstop is the one place both paths converge.
+          screenRecorder.onstop = function() {
+            stream.getTracks().forEach(function(t) { t.stop(); });
+            clearInterval(screenTimerId);
+            clearTimeout(screenAutoStopId);
+            var blob = new Blob(screenChunks, { type: "video/webm" });
+            // Independent review, uc-infra#92: the videoBitsPerSecond
+            // hint above is only a hint (a multi-monitor/4K share, or
+            // the no-options MediaRecorder fallback just above, routinely
+            // encodes well past it) — this is the ONE place that checks
+            // what actually got recorded, before it ever touches the
+            // hidden file input. Without it, an oversized recording only
+            // surfaced server-side as MaxBytesReader 400ing the ENTIRE
+            // submission — title, description, transcript and all —
+            // destroying everything the person typed over a video they
+            // may not even have cared about keeping.
+            if (blob.size > {{.MaxScreenRecordingBytes}}) {
+              revokePreviousPreview();
+              fileInput.value = ""; // clear any earlier (valid-sized) file that rode in fileInput.files
+              previewEl.removeAttribute("src");
+              previewWrap.style.display = "none";
+              screenStatusEl.textContent = {{.ScreenRecordingTooLargeLabel}};
+              screenBtn.textContent = {{.ScreenRecordLabel}};
+              screenRecording = false;
+              return;
+            }
+            try {
+              var file = new File([blob], "screen-recording.webm", { type: "video/webm" });
+              var dt = new DataTransfer();
+              dt.items.add(file);
+              fileInput.files = dt.files;
+            } catch (e) {
+              // File/DataTransfer construction unsupported — the
+              // recording is still shown for review below, it just won't
+              // ride along with Submit. Same "degrade, never silently
+              // break the rest of the form" posture as every other
+              // capture control on this page.
+            }
+            revokePreviousPreview();
+            previewEl.src = URL.createObjectURL(blob);
+            previewWrap.style.display = "";
+            screenStatusEl.textContent = "";
+            screenBtn.textContent = {{.ScreenRecordLabel}};
+            screenRecording = false;
+          };
+          screenRecorder.ondataavailable = function(e) { if (e.data.size > 0) screenChunks.push(e.data); };
+          screenRecorder.start();
+          screenRecording = true;
+          screenBtn.textContent = {{.StopLabel}};
+          screenStartedAt = Date.now();
+          screenTimerId = setInterval(function() {
+            var elapsed = Math.floor((Date.now() - screenStartedAt) / 1000);
+            var m = Math.floor(elapsed / 60);
+            var s = elapsed % 60;
+            screenStatusEl.textContent = {{.RecordingLabel}} + " " + m + ":" + (s < 10 ? "0" : "") + s;
+          }, 1000);
+          // Auto-stop at the duration cap (screenRecordingDurationCapSeconds,
+          // issuereport.go) rather than relying on the person to remember
+          // to click Stop — bounds recording length without a
+          // mid-recording server round-trip; the blob.size check above
+          // is what actually bounds the upload, since duration alone
+          // doesn't bound bytes at an unpredictable real-world bitrate.
+          screenAutoStopId = setTimeout(function() {
+            if (screenRecording && screenRecorder && screenRecorder.state !== "inactive") {
+              screenRecorder.stop();
+            }
+          }, {{.ScreenRecordingDurationCapSeconds}} * 1000);
+        }).catch(function(err) {
+          // Covers both "no screen to share" denial (NotAllowedError)
+          // and any other getDisplayMedia rejection — same status-line
+          // surfacing the mic button's own .catch already uses.
+          screenBtn.disabled = false;
+          screenStatusEl.textContent = String(err.message || err);
+        });
+      });
     }
-  });
+  }
 })();
 </script>
 {{end}}
@@ -407,6 +803,7 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
 <div class="uc-issue-report-result">
 <h2>{{.Heading}}</h2>
 <p>{{.Body}} ({{.ID}})</p>
+{{if .RecordingNote}}<p class="uc-issue-report-recording-note">{{.RecordingNote}}</p>{{end}}
 </div>
 {{end}}
 `))

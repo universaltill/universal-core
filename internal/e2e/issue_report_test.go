@@ -2,13 +2,71 @@ package e2e
 
 import (
 	"context"
+	"database/sql"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/chromedp/cdproto/page"
 	cdpruntime "github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
+
+	"github.com/universaltill/universal-core/internal/api"
+	"github.com/universaltill/universal-core/internal/i18n"
+	"github.com/universaltill/universal-core/internal/kernel/blobstore"
+	"github.com/universaltill/universal-core/internal/kernel/foundation"
+	"github.com/universaltill/universal-core/internal/testexec"
 )
+
+// testServerWithBlobstore is testServer (csv_import_test.go) plus a real
+// filesystem-backed blobstore.Store wired in — a separate helper rather
+// than adding a parameter to testServer itself, so every other e2e test
+// using testServer stays exactly as it was (no blobstore configured,
+// matching a deployment that never called SetBlobstore), same pattern
+// internal/api's own testHandlerWithSpeech establishes for speechassist.
+// Needed here specifically because issueReportNewPage's AttachmentsEnabled
+// gate (uc-infra#92) only renders the screen-record control at all when
+// a blobstore is configured.
+func testServerWithBlobstore(t *testing.T) (srv *httptest.Server, tenantID string, tenantDB *sql.DB) {
+	t.Helper()
+	router := newTestRouter(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	id, err := router.Create(ctx, "E2E Tenant", "eu-west")
+	if err != nil {
+		t.Fatalf("router.Create: %v", err)
+	}
+	tenantDB, err = router.Get(ctx, id)
+	if err != nil {
+		t.Fatalf("router.Get: %v", err)
+	}
+	testexec.DropConnectedDatabase(t, tenantDB)
+
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := foundation.PublishForms(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.PublishForms: %v", err)
+	}
+
+	catalog, err := i18n.Load("en")
+	if err != nil {
+		t.Fatalf("load i18n catalog: %v", err)
+	}
+	h := api.New(router, catalog, nil, nil, nil, nil, nil)
+	store, err := blobstore.NewFSStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("blobstore.NewFSStore: %v", err)
+	}
+	h.SetBlobstore(store)
+	mux := http.NewServeMux()
+	h.Routes(mux)
+	srv = httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, id, tenantDB
+}
 
 // TestIssueReportPage_FormIsStyled is the real-browser regression test
 // for a bug Farshid found by actually looking at the rendered page: the
@@ -238,5 +296,315 @@ func TestIssueReportPage_ConsoleLogCapturedFromEarlierPageAndPrefilled(t *testin
 	}
 	if !strings.Contains(apiResult.Body, "Save failed") || !strings.Contains(apiResult.Body, "TypeError") {
 		t.Fatalf("expected the pre-filled console log to have actually been submitted and stored, got:\n%.500s", apiResult.Body)
+	}
+}
+
+// TestIssueReportPage_ScreenRecord_PreviewThenSubmitCreatesAttachment is
+// the real-browser proof for uc-infra#92: a real (headless-Chrome-driven)
+// click through the screen-record button, its review preview, and a
+// real form submission actually links a durable Attachment to the
+// created IssueReport — not just that issuereport.go's Go logic accepts
+// a hand-built multipart request (issuereport_test.go already proves
+// that at the HTTP layer). A headless browser has no real screen to
+// share, so this fakes getDisplayMedia/MediaRecorder the same way
+// TestIssueReportPage_VoiceRecordShowsCleanErrorNotRawJSON already fakes
+// getUserMedia/MediaRecorder for the mic — the fake still drives the
+// real click handler, the real File/DataTransfer assignment onto the
+// hidden file input, the real <video> preview, and the real native form
+// POST; only the actual screen capture itself is stubbed out.
+func TestIssueReportPage_ScreenRecord_PreviewThenSubmitCreatesAttachment(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, _ := testServerWithBlobstore(t)
+	ctx := browserCtx(t, tenantID)
+
+	const fakeDisplayMediaScript = `
+(function() {
+  navigator.mediaDevices = navigator.mediaDevices || {};
+  navigator.mediaDevices.getDisplayMedia = function() {
+    return Promise.resolve({ getTracks: function() { return []; } });
+  };
+  window.MediaRecorder = function() {
+    var self = this;
+    this.state = "recording";
+    this.start = function() {};
+    this.stop = function() {
+      self.state = "inactive";
+      if (self.ondataavailable) { self.ondataavailable({ data: new Blob(["fake screen recording bytes"]) }); }
+      if (self.onstop) { self.onstop(); }
+    };
+  };
+})();
+`
+	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		_, err := page.AddScriptToEvaluateOnNewDocument(fakeDisplayMediaScript).Do(ctx)
+		return err
+	})); err != nil {
+		t.Fatalf("inject fake display media script: %v", err)
+	}
+
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/issue-report/new"),
+		chromedp.WaitVisible(`#uc-issue-screenrecord-btn`, chromedp.ByQuery),
+		chromedp.Click(`#uc-issue-screenrecord-btn`, chromedp.ByQuery), // start "recording"
+		chromedp.Click(`#uc-issue-screenrecord-btn`, chromedp.ByQuery), // stop
+		chromedp.WaitVisible(`#uc-issue-screenrecord-preview-wrap`, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("record then stop a screen recording: %v", err)
+	}
+
+	// The review-before-upload proof: the captured recording is sitting
+	// in a real <video> preview element with a real playable src, and the
+	// hidden file input actually carries the File — both before Submit
+	// is ever clicked, same "reviewed before anything is sent" principle
+	// the transcript textarea already demonstrates for voice.
+	var previewSrc string
+	if err := chromedp.Run(ctx, chromedp.EvaluateAsDevTools(
+		`document.getElementById("uc-issue-screenrecord-preview").src`, &previewSrc,
+	)); err != nil {
+		t.Fatalf("read the preview video's src: %v", err)
+	}
+	if !strings.HasPrefix(previewSrc, "blob:") {
+		t.Fatalf(`expected the preview <video> src to be a real blob: URL, got %q`, previewSrc)
+	}
+	var fileCount int
+	if err := chromedp.Run(ctx, chromedp.EvaluateAsDevTools(
+		`document.getElementById("uc-issue-screenrecord-file").files.length`, &fileCount,
+	)); err != nil {
+		t.Fatalf("read the hidden file input's file count: %v", err)
+	}
+	if fileCount != 1 {
+		t.Fatalf("expected the recorded Blob assigned onto the hidden file input, got %d files", fileCount)
+	}
+
+	if err := chromedp.Run(ctx,
+		chromedp.SetValue(`#uc-issue-title`, "Real browser screen recording", chromedp.ByQuery),
+		chromedp.SetValue(`#uc-issue-description`, "See the attached screen recording.", chromedp.ByQuery),
+		chromedp.Click(`#uc-issue-report-form button[type="submit"]`, chromedp.ByQuery),
+		chromedp.WaitVisible(`.uc-issue-report-result`, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("submit the report: %v", err)
+	}
+
+	var resultText string
+	if err := chromedp.Run(ctx, chromedp.Text(`.uc-issue-report-result`, &resultText, chromedp.ByQuery)); err != nil {
+		t.Fatalf("read the result panel: %v", err)
+	}
+	if strings.Contains(resultText, "could not be attached") {
+		t.Fatalf("expected the recording to attach successfully, got the not-attached note: %q", resultText)
+	}
+
+	// Read the created Attachment back through the real API — the
+	// vacuous version of this test would still pass if the recording
+	// were silently dropped from Submit, since the result page looks the
+	// same either way.
+	var apiResult struct {
+		Status int    `json:"status"`
+		Body   string `json:"body"`
+	}
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`
+		fetch('/api/records/Attachment')
+			.then(function(r){ return r.text().then(function(t){ return {status: r.status, body: t}; }); })
+	`, &apiResult, func(p *cdpruntime.EvaluateParams) *cdpruntime.EvaluateParams {
+		return p.WithAwaitPromise(true)
+	})); err != nil {
+		t.Fatalf("fetch the stored Attachment records from the browser: %v", err)
+	}
+	if apiResult.Status != 200 {
+		t.Fatalf("expected 200 listing Attachment records, got %d: %.300s", apiResult.Status, apiResult.Body)
+	}
+	if !strings.Contains(apiResult.Body, `"entity_type":"IssueReport"`) {
+		t.Fatalf("expected a real Attachment linked to the submitted IssueReport, got:\n%.500s", apiResult.Body)
+	}
+}
+
+// TestIssueReportPage_BothRecordButtons_DisableWhenMediaDevicesUnavailable
+// is the regression test for the bug independent review caught in the
+// first version of uc-infra#92: the mic feature-detect used a bare
+// `return` out of the capture page's single top-level IIFE whenever
+// navigator.mediaDevices was falsy — which also skipped every line of
+// the screen-recording setup below it, entirely unrelated to
+// microphone capture. The screen-record button (AttachmentsEnabled is
+// true here) was left rendered, enabled, and with no click handler at
+// all: a silently dead control, in exactly the degraded environment the
+// no_screen_share message exists to explain. This test forces BOTH
+// navigator.mediaDevices and window.MediaRecorder to be absent (as they
+// genuinely are in a non-secure-context page load) and asserts both
+// buttons end up disabled with their respective localized messages —
+// the fixed version's if/else (not "if not-available, return") is what
+// makes the second half of that assertion possible at all.
+func TestIssueReportPage_BothRecordButtons_DisableWhenMediaDevicesUnavailable(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, _ := testServerWithBlobstore(t)
+	ctx := browserCtx(t, tenantID)
+
+	const removeMediaDevicesScript = `
+(function() {
+  try {
+    Object.defineProperty(navigator, "mediaDevices", { value: undefined, configurable: true });
+  } catch (e) {}
+  window.MediaRecorder = undefined;
+})();
+`
+	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		_, err := page.AddScriptToEvaluateOnNewDocument(removeMediaDevicesScript).Do(ctx)
+		return err
+	})); err != nil {
+		t.Fatalf("inject the remove-media-devices script: %v", err)
+	}
+
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/issue-report/new"),
+		chromedp.WaitVisible(`#uc-issue-screenrecord-btn`, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("navigate to the issue report page: %v", err)
+	}
+
+	var micDisabled bool
+	var micStatus string
+	if err := chromedp.Run(ctx,
+		chromedp.EvaluateAsDevTools(`document.getElementById("uc-issue-record-btn").disabled`, &micDisabled),
+		chromedp.Text(`#uc-issue-record-status`, &micStatus, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("read the mic button's disabled state and status: %v", err)
+	}
+	if !micDisabled {
+		t.Error("expected the mic button to be disabled with no mediaDevices/MediaRecorder available")
+	}
+	if !strings.Contains(micStatus, "isn't available") {
+		t.Errorf("expected the mic button's status to show the no-mic message, got %q", micStatus)
+	}
+
+	// The actual regression assertion: before the fix, this button was
+	// left enabled (and inert — no click handler ever attached) because
+	// the mic guard's early `return` skipped this setup code entirely.
+	var screenDisabled bool
+	var screenStatus string
+	if err := chromedp.Run(ctx,
+		chromedp.EvaluateAsDevTools(`document.getElementById("uc-issue-screenrecord-btn").disabled`, &screenDisabled),
+		chromedp.Text(`#uc-issue-screenrecord-status`, &screenStatus, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("read the screen-record button's disabled state and status: %v", err)
+	}
+	if !screenDisabled {
+		t.Fatal("expected the screen-record button to be disabled with no mediaDevices/MediaRecorder available (regression: uc-infra#92 independent review)")
+	}
+	if !strings.Contains(screenStatus, "isn't available") {
+		t.Errorf("expected the screen-record button's status to show the no-screen-share message, got %q", screenStatus)
+	}
+}
+
+// TestIssueReportPage_ScreenRecord_OversizedRecordingNotAttachedFormIntact
+// is the regression test for the second bug independent review caught:
+// with no client-side size check, an oversized recording rode into the
+// hidden file input unconditionally and only ever surfaced server-side
+// as http.MaxBytesReader 400ing the WHOLE /issue-report/submit request
+// — destroying the title, description and transcript along with it, the
+// exact opposite of attachScreenRecording's own "never unwind the
+// report" contract. This drives the real onstop handler with a fake
+// MediaRecorder that emits one chunk larger than MaxScreenRecordingBytes
+// and confirms: the oversized-recording message is shown, the preview
+// stays hidden, the hidden file input carries no file, and — the actual
+// proof this doesn't destroy anything — a normal, unrelated Submit right
+// afterward still succeeds and creates the IssueReport with no
+// screen_recording part riding along.
+func TestIssueReportPage_ScreenRecord_OversizedRecordingNotAttachedFormIntact(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, _ := testServerWithBlobstore(t)
+	ctx := browserCtx(t, tenantID)
+
+	// Fakes a recording whose single reported chunk is one byte larger
+	// than the server's maxScreenRecordingBytes (60 MiB) — big enough to
+	// trip the onstop size check, small enough to stay cheap to allocate
+	// in a headless tab.
+	const fakeOversizedRecordingScript = `
+(function() {
+  navigator.mediaDevices = navigator.mediaDevices || {};
+  navigator.mediaDevices.getDisplayMedia = function() {
+    return Promise.resolve({ getTracks: function() { return []; } });
+  };
+  window.MediaRecorder = function() {
+    var self = this;
+    this.state = "recording";
+    this.start = function() {};
+    this.stop = function() {
+      self.state = "inactive";
+      if (self.ondataavailable) {
+        var oversized = new Uint8Array((60 * 1024 * 1024) + 1);
+        self.ondataavailable({ data: new Blob([oversized]) });
+      }
+      if (self.onstop) { self.onstop(); }
+    };
+  };
+})();
+`
+	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		_, err := page.AddScriptToEvaluateOnNewDocument(fakeOversizedRecordingScript).Do(ctx)
+		return err
+	})); err != nil {
+		t.Fatalf("inject fake oversized-recording script: %v", err)
+	}
+
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/issue-report/new"),
+		chromedp.WaitVisible(`#uc-issue-screenrecord-btn`, chromedp.ByQuery),
+		chromedp.Click(`#uc-issue-screenrecord-btn`, chromedp.ByQuery), // start "recording"
+		chromedp.Click(`#uc-issue-screenrecord-btn`, chromedp.ByQuery), // stop -> trips the size check
+	); err != nil {
+		t.Fatalf("record then stop an oversized screen recording: %v", err)
+	}
+
+	var status string
+	if err := chromedp.Run(ctx, chromedp.PollFunction(
+		`function() {
+			var t = document.getElementById("uc-issue-screenrecord-status").textContent;
+			return t && t.length > 0 ? t : null;
+		}`,
+		&status,
+	)); err != nil {
+		t.Fatalf("wait for the oversized-recording status message: %v", err)
+	}
+	if !strings.Contains(status, "too large") {
+		t.Fatalf("expected the too-large message, got %q", status)
+	}
+
+	var previewHasSrc bool
+	var fileCount int
+	if err := chromedp.Run(ctx,
+		chromedp.EvaluateAsDevTools(`document.getElementById("uc-issue-screenrecord-preview").hasAttribute("src")`, &previewHasSrc),
+		chromedp.EvaluateAsDevTools(`document.getElementById("uc-issue-screenrecord-file").files.length`, &fileCount),
+	); err != nil {
+		t.Fatalf("read the preview/file-input state: %v", err)
+	}
+	if previewHasSrc {
+		t.Error("expected no preview src for a rejected oversized recording")
+	}
+	if fileCount != 0 {
+		t.Errorf("expected the hidden file input to carry no file after an oversized recording, got %d", fileCount)
+	}
+
+	// The actual "form intact" proof: Submit still works normally.
+	if err := chromedp.Run(ctx,
+		chromedp.SetValue(`#uc-issue-title`, "Oversized recording was rejected client-side", chromedp.ByQuery),
+		chromedp.SetValue(`#uc-issue-description`, "Should still submit fine without the video.", chromedp.ByQuery),
+		chromedp.Click(`#uc-issue-report-form button[type="submit"]`, chromedp.ByQuery),
+		chromedp.WaitVisible(`.uc-issue-report-result`, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("submit after an oversized recording was rejected: %v", err)
+	}
+
+	var apiResult struct {
+		Status int    `json:"status"`
+		Body   string `json:"body"`
+	}
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`
+		fetch('/api/records/IssueReport')
+			.then(function(r){ return r.text().then(function(t){ return {status: r.status, body: t}; }); })
+	`, &apiResult, func(p *cdpruntime.EvaluateParams) *cdpruntime.EvaluateParams {
+		return p.WithAwaitPromise(true)
+	})); err != nil {
+		t.Fatalf("fetch the stored IssueReport records from the browser: %v", err)
+	}
+	if apiResult.Status != 200 || !strings.Contains(apiResult.Body, "Oversized recording was rejected client-side") {
+		t.Fatalf("expected the report to have been saved despite the oversized recording, got %d: %.500s", apiResult.Status, apiResult.Body)
 	}
 }

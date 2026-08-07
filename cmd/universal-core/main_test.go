@@ -17,6 +17,7 @@ import (
 	"mime/multipart"
 	"net"
 	"net/http"
+	"net/textproto"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -984,5 +985,156 @@ func TestUniversalCore_AttachmentUploadDownload_ServedByRealBinary(t *testing.T)
 	}
 	if !foundOnDisk {
 		t.Fatalf("expected at least one file under BLOB_STORAGE_ROOT=%s after a successful upload", blobRoot)
+	}
+}
+
+// TestUniversalCore_IssueReportScreenRecording_ServedByRealBinary is the
+// smoke layer for uc-infra#92: the real compiled binary, wired to a real
+// filesystem-backed blob store via BLOB_STORAGE_ROOT (the same env var
+// TestUniversalCore_AttachmentUploadDownload_ServedByRealBinary already
+// proves main.go wires through blobstoreFromEnv), actually accepts a
+// screen-recording part on /issue-report/submit and creates a real,
+// linked, downloadable Attachment — proving main.go's wiring reaches
+// this new code path too, not just internal/api's own in-process
+// handler tests (issuereport_test.go) or the generic attachment routes
+// this one already covers.
+func TestUniversalCore_IssueReportScreenRecording_ServedByRealBinary(t *testing.T) {
+	controlDSN := testexec.FreshDatabase(t, "uc_test_server_control")
+
+	control := testexec.Open(t, controlDSN)
+	ctx := context.Background()
+	if err := db.ApplyControl(ctx, control); err != nil {
+		t.Fatalf("ApplyControl: %v", err)
+	}
+	router, err := tenantdb.NewRouter(control, controlDSN)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+	defer router.Close()
+	tenantID, err := router.Create(ctx, "Issue Report Screen Recording Smoke Test", "eu-west")
+	if err != nil {
+		t.Fatalf("router.Create: %v", err)
+	}
+	testexec.DropTenantDatabase(t, testexec.Open(t, controlDSN), tenantID)
+	tenantDB, err := router.Get(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("router.Get: %v", err)
+	}
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "smoke-test-setup"}
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	router.Close()
+	control.Close()
+
+	blobRoot := t.TempDir()
+	baseURL := startServer(t, controlDSN, "INSECURE_DEV_AUTH=true", "BLOB_STORAGE_ROOT="+blobRoot)
+
+	recording := []byte("real binary smoke test screen recording contents")
+	var submitBuf bytes.Buffer
+	mw := multipart.NewWriter(&submitBuf)
+	for name, value := range map[string]string{
+		"title":       "Smoke tested screen recording",
+		"description": "Filed by the real binary smoke test.",
+	} {
+		if err := mw.WriteField(name, value); err != nil {
+			t.Fatalf("write field %s: %v", name, err)
+		}
+	}
+	// Not mw.CreateFormFile: it hardcodes Content-Type:
+	// application/octet-stream, but a real browser sends the captured
+	// File's own "video/webm" type — see issueReportTmpl's
+	// `new File([blob], ..., { type: "video/webm" })`.
+	partHeader := make(textproto.MIMEHeader)
+	partHeader.Set("Content-Disposition", `form-data; name="screen_recording"; filename="screen-recording.webm"`)
+	partHeader.Set("Content-Type", "video/webm")
+	fw, err := mw.CreatePart(partHeader)
+	if err != nil {
+		t.Fatalf("create screen_recording form part: %v", err)
+	}
+	if _, err := fw.Write(recording); err != nil {
+		t.Fatalf("write screen_recording content: %v", err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+
+	submitReq, err := http.NewRequest(http.MethodPost, baseURL+"/issue-report/submit", &submitBuf)
+	if err != nil {
+		t.Fatalf("build submit request: %v", err)
+	}
+	submitReq.Header.Set("X-Tenant-ID", tenantID)
+	submitReq.Header.Set("X-Actor-ID", "smoke-test")
+	submitReq.Header.Set("Content-Type", mw.FormDataContentType())
+	submitResp, err := http.DefaultClient.Do(submitReq)
+	if err != nil {
+		t.Fatalf("POST /issue-report/submit: %v", err)
+	}
+	submitBody, _ := io.ReadAll(submitResp.Body)
+	submitResp.Body.Close()
+	if submitResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 submitting the report, got %d: %s", submitResp.StatusCode, submitBody)
+	}
+	if strings.Contains(string(submitBody), "could not be attached") {
+		t.Fatalf("expected the recording to attach successfully, got the not-attached note: %s", submitBody)
+	}
+
+	listReq, err := http.NewRequest(http.MethodGet, baseURL+"/api/records/Attachment", nil)
+	if err != nil {
+		t.Fatalf("build list request: %v", err)
+	}
+	listReq.Header.Set("X-Tenant-ID", tenantID)
+	listReq.Header.Set("X-Actor-ID", "smoke-test")
+	listResp, err := http.DefaultClient.Do(listReq)
+	if err != nil {
+		t.Fatalf("GET /api/records/Attachment: %v", err)
+	}
+	listBody, _ := io.ReadAll(listResp.Body)
+	listResp.Body.Close()
+	if listResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 listing Attachment records, got %d: %s", listResp.StatusCode, listBody)
+	}
+	var attachments struct {
+		Data []struct {
+			ID   string `json:"id"`
+			Data struct {
+				EntityType string `json:"entity_type"`
+				MimeType   string `json:"mime_type"`
+			} `json:"data"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(listBody, &attachments); err != nil {
+		t.Fatalf("unmarshal Attachment list: %v", err)
+	}
+	var attachmentID string
+	for _, a := range attachments.Data {
+		if a.Data.EntityType == "IssueReport" {
+			attachmentID = a.ID
+			if a.Data.MimeType != "video/webm" {
+				t.Errorf("expected mime_type video/webm, got %q", a.Data.MimeType)
+			}
+		}
+	}
+	if attachmentID == "" {
+		t.Fatalf("expected a linked IssueReport Attachment, got: %s", listBody)
+	}
+
+	downloadReq, err := http.NewRequest(http.MethodGet, baseURL+"/api/attachments/"+attachmentID, nil)
+	if err != nil {
+		t.Fatalf("build download request: %v", err)
+	}
+	downloadReq.Header.Set("X-Tenant-ID", tenantID)
+	downloadReq.Header.Set("X-Actor-ID", "smoke-test")
+	downloadResp, err := http.DefaultClient.Do(downloadReq)
+	if err != nil {
+		t.Fatalf("GET /api/attachments/%s: %v", attachmentID, err)
+	}
+	defer downloadResp.Body.Close()
+	downloadBody, _ := io.ReadAll(downloadResp.Body)
+	if downloadResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 downloading the recording, got %d: %s", downloadResp.StatusCode, downloadBody)
+	}
+	if !bytes.Equal(downloadBody, recording) {
+		t.Fatalf("downloaded content mismatch: got %q, want %q", downloadBody, recording)
 	}
 }
