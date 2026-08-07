@@ -1,13 +1,12 @@
-// The BYOK AI-provider settings page — Farshid's ask: a tenant should be
-// able to plug in their own Anthropic or OpenAI API key, or point at
-// their own (self-hosted, on their own machine or cloud) Ollama
-// instance, and have the app use it in place of the platform's own
-// default self-hosted Ollama. Subscription-login (OAuth against a
-// tenant's own Claude Pro/Max or ChatGPT Plus account) was researched
-// and ruled out: Anthropic bans third-party use of that flow outright,
-// and OpenAI's equivalent only works inside their own first-party
-// tooling — see QUEUE.md. This is the API-key/endpoint alternative
-// Farshid approved instead ("that is fine, go for the api and ollama").
+// The BYOK AI-provider settings page: a tenant can plug in their own
+// Anthropic or OpenAI API key, or point at their own (self-hosted, on
+// their own machine or cloud) Ollama instance, and have the app use it
+// in place of the platform's own default self-hosted Ollama.
+// Subscription-login (OAuth against a tenant's own Claude Pro/Max or
+// ChatGPT Plus account) was researched and ruled out: Anthropic bans
+// third-party use of that flow outright, and OpenAI's equivalent only
+// works inside their own first-party tooling. The API-key/endpoint
+// approach here is the approved alternative.
 //
 // One AIProviderConnection record per tenant (an upsert, not a list —
 // see foundation.go's own doc comment on that entity): this file is

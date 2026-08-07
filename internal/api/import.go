@@ -336,11 +336,11 @@ func previewUpload(ctx context.Context, ai aiprovider.Provider, data []byte, xls
 			// one: an interactive HTMX preview request shouldn't be able
 			// to tie up a request goroutine anywhere near that long just
 			// because Ollama is cold or overloaded. 25s comfortably
-			// covers the ~13-18s this took against the real homelab-k8s
-			// instance (small model, 2-node Raspberry Pi hardware) with
-			// headroom, while still failing fast enough that a slow
-			// model degrades to "the heuristic-only mapping, a beat
-			// later" rather than "the page hangs."
+			// covers the ~13-18s measured against the platform's
+			// reference self-hosted deployment (a small model on modest
+			// hardware) with headroom, while still failing fast enough
+			// that a slow model degrades to "the heuristic-only
+			// mapping, a beat later" rather than "the page hangs."
 			aiCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
 			var aiErr error
 			mapping, aiSuggested, aiErr = csvimport.SuggestMappingAI(aiCtx, ai, headers, sampleRows, def, mapping)

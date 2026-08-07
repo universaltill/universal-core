@@ -33,10 +33,10 @@ import (
 	"github.com/universaltill/universal-core/internal/zitadelmgmt"
 )
 
-// defaultOllamaModel matches the model already pulled by the reference
-// homelab-k8s Ollama deployment (kubernetes/apps/ollama) — small enough
-// to run on that cluster's 2-node Raspberry Pi hardware. A deployment
-// with a different model available should set OLLAMA_MODEL explicitly.
+// defaultOllamaModel matches the model already pulled by the platform's
+// reference self-hosted Ollama deployment — small enough to run on
+// modest hardware. A deployment with a different model available
+// should set OLLAMA_MODEL explicitly.
 const defaultOllamaModel = "llama3.2:3b"
 
 // aiClientFromEnv builds an aiassist.Client from OLLAMA_* environment
@@ -57,9 +57,8 @@ func aiClientFromEnv() (client *aiassist.Client, url, model string) {
 
 // speechClientFromEnv builds a speechassist.Client from WHISPER_URL —
 // same "empty is the expected, safe default" contract as
-// aiClientFromEnv, matching the reference homelab-k8s Whisper ASR
-// deployment (kubernetes/apps/whisper) this was verified end-to-end
-// against.
+// aiClientFromEnv, matching the platform's reference self-hosted
+// Whisper ASR deployment this was verified end-to-end against.
 func speechClientFromEnv() (client *speechassist.Client, url string) {
 	url = os.Getenv("WHISPER_URL")
 	return speechassist.NewClient(url), url
@@ -265,9 +264,9 @@ func main() {
 	// Runtime member management (universal-core#3, ADR-0010): the
 	// /settings/members page's outbound Zitadel client. Issuer reuses
 	// OIDC_ISSUER_URL — one identity instance for login and management;
-	// PAT and project id arrive from Key Vault (member-mgmt-zitadel-pat,
-	// zitadel-project-id). Any field empty ⇒ nil client ⇒ the page
-	// renders its "unavailable" state, nothing else is affected.
+	// PAT and project id arrive from the deployment's secret store. Any
+	// field empty ⇒ nil client ⇒ the page renders its "unavailable"
+	// state, nothing else is affected.
 	memberMgmt := zitadelmgmt.NewClient(zitadelmgmt.Config{
 		PAT:       os.Getenv("ZITADEL_MGMT_PAT"),
 		Issuer:    os.Getenv("OIDC_ISSUER_URL"),
