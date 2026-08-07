@@ -1946,6 +1946,39 @@ func TestRender_UnavailableSectionRollUpFieldKeepsSavedValue(t *testing.T) {
 	}
 }
 
+// TestRender_DegradedSectionRollUpFieldKeepsSavedValueAndDisplaysIt
+// (independent review of the 2026-08-07 PR-backlog merge, finding #1):
+// a DegradedSection — unlike an UnavailableSection above, which
+// buildViewModel omits from the form entirely — IS still rendered, so
+// its RollUpTotal display line must show the preserved value, not just
+// leave the underlying field alone. An earlier version of the merged
+// roll-up-preservation check populated rollUpTotals but never
+// rollUpComputed, so rollUpComputed[s.RollUpTarget] stayed false and
+// the ComponentMasterDetail case's `s.RollUp != "" &&
+// rollUpComputed[...]` guard silently suppressed the <p class="uc-
+// rollup"> line — display-only (the writable "total" input itself was
+// never at risk, see the shared assertion below), but a real,
+// unreviewed behavior change nothing else caught.
+func TestRender_DegradedSectionRollUpFieldKeepsSavedValueAndDisplaysIt(t *testing.T) {
+	r := testRenderer(t)
+	data := Data{
+		RecordID:         "po-1",
+		Record:           map[string]any{"payment_method": "Wire", "total": 350.5},
+		DegradedSections: map[string]bool{"POLine": true},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, `id="total" name="total" value="350.5"`) {
+		t.Errorf("expected the roll-up target field to keep its last-saved value rather than being recomputed to 0, got:\n%s", out)
+	}
+	if !strings.Contains(out, `<p class="uc-rollup" data-field="total">Total: 350.5</p>`) {
+		t.Errorf("expected the degraded section's roll-up line to display the preserved 350.5, not be suppressed entirely, got:\n%s", out)
+	}
+}
+
 func TestRender_AllActionKindsRendered(t *testing.T) {
 	r := testRenderer(t)
 	data := Data{RecordID: "po-1", Record: map[string]any{"payment_method": "Wire"}, Children: map[string][]map[string]any{}}

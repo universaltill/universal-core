@@ -416,10 +416,10 @@ func TestAPI_RenderRecordForm_MasterDetailSection_DegradedRollUpDoesNotCorruptOn
 // TestLoadMasterDetailChildren_DegradesOnErrDeniedNotOtherErrors is the
 // direct/unit-level counterpart to the HTTP-level tests above: it calls
 // loadMasterDetailChildren itself (same package, unexported method) so
-// the degrade branch (including its 4th return value, the degraded-
-// sections set formrender's roll-up fix above depends on) and the "a
-// genuine error still propagates" branch are each pinned independently
-// of formrender's HTML output.
+// the degrade branch (including masterDetailChildren.degraded, the
+// degraded-sections set formrender's roll-up fix above depends on) and
+// the "a genuine error still propagates" branch are each pinned
+// independently of formrender's HTML output.
 func TestLoadMasterDetailChildren_DegradesOnErrDeniedNotOtherErrors(t *testing.T) {
 	router := newTestRouter(t)
 	tenantID, db := newTestTenant(t, router)

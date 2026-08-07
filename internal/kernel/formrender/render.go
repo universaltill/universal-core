@@ -654,6 +654,21 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 			// "silently zeroed."
 			if n, ok := effective[s.RollUpTarget].(float64); ok {
 				rollUpTotals[s.RollUpTarget] = n
+				// A DegradedSection IS still rendered (unlike an
+				// UnavailableSection, which buildViewModel omits entirely
+				// below — see UnavailableSections' own doc comment), so it
+				// needs rollUpComputed set too, or the ComponentMasterDetail
+				// case's `s.RollUp != "" && rollUpComputed[...]` guard
+				// suppresses the RollUpTotal line entirely instead of
+				// showing the preserved value this comment promises
+				// (independent review of this merge, 2026-08-07: an earlier
+				// version of this fix populated rollUpTotals but never
+				// rollUpComputed, silently dropping PR#123's reviewed
+				// "surface the last-saved total" behavior for a degraded
+				// section — display-only, effective[s.RollUpTarget] was
+				// never at risk, but no review had approved the
+				// suppression and no test caught it).
+				rollUpComputed[s.RollUpTarget] = true
 			}
 			continue
 		}

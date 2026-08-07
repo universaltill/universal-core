@@ -1581,41 +1581,6 @@ func (h *Handler) pageReferenceLabels(ctx context.Context, ts tenantScope, def *
 // — a Definition mismatch here is a data-modeling bug to fix in the
 // Definition, not something that should 500 every form render for it.
 //
-// A section the viewer can read the RELATIONSHIP for but not the CHILD
-// entity TYPE itself degrades the same way: ts.crud.ListByField wraps
-// authz.ErrDenied when checkRead(childDef) fails, and that section is
-// skipped (omitted from the first three returned maps) rather than
-// failing the whole render — the viewer can still read the parent
-// record, so a child section they lack read access to must not turn the
-// entire form into a 403 (uc-infra#131). This mirrors loadCurrentReferenceLabels'
-// own ErrDenied degrade below: a target this viewer legitimately can't
-// see resolves to "nothing here," logged, not a page-wide failure. Any
-// OTHER error from ListByField (a real DB/lookup failure, not a
-// permission denial) still hard-fails the render — only the specific
-// "viewer isn't allowed to see this" case degrades.
-//
-// The fifth returned map (degraded) names exactly the sections that
-// hit that ErrDenied branch, keyed by section.Target. This is NOT
-// redundant with "absent from children": a section with genuinely zero
-// child rows is ALSO absent from children, but its roll-up must still
-// sum to 0, while a degraded section's roll-up must NOT (it isn't
-// "zero", it's "unknown" — see formrender.Data.DegradedSections and
-// render.go's roll-up loop for why conflating the two silently
-// corrupted a writable header field, independent review finding #1).
-//
-// It also resolves each section's own reference-typed columns to labels
-// (formrender.Data.ChildReferenceLabels), reusing pageReferenceLabels —
-// the same field->id->label lookup the top-level list view already does
-// per page — rather than a second lookup convention. A child section is
-// NOT actually page-sized the way a list view's `records` is (this
-// function's own child fetch above has no LIMIT), so pageReferenceLabels
-// now caps distinct ids resolved per field at referenceFilterMatchLimit
-// for exactly this reuse — see that function's own doc comment. Before
-// this, a related-list/master-detail FieldReference column (e.g.
-// Lead.campaign_id, Lead.status_id) rendered the raw stored id, because
-// nothing populated a label map for it at all (uc-infra#85).
-//
-// A section whose Target has no published Definition in this tenant
 // A section whose Target has no published Definition in this tenant
 // (module not licensed) is reported back via unavailable instead of
 // failing the whole lookup: this is the exact same "licensing gap, not
@@ -1628,22 +1593,42 @@ func (h *Handler) pageReferenceLabels(ctx context.Context, ts tenantScope, def *
 // exists and only one of its related child module types isn't licensed
 // (uc-infra#132).
 //
-// degraded names every section skipped specifically because the viewer
-// lacks read access to its child entity type (authz.ErrDenied from
-// ListByField below), as opposed to a section skipped for the unrelated
-// "no matching Relationship" reason a few lines down, or for the
-// unrelated "unlicensed" reason resolveMasterDetailSectionAvailability
-// already filtered out of availableChildDefs above.
-// formrender.Data.DegradedSections needs this distinction: a section
-// with genuinely zero child rows should still roll up to 0, but a
-// section we simply couldn't READ must not (uc-infra#131 independent
-// review finding #1 — recomputing "zero" here for an unreadable section
-// fed straight into a writable header field and would silently persist
-// a wrong total on the next save). The viewer can still read the parent
-// record, so a child section they lack read access to must not turn the
-// entire form into a 403 — this mirrors loadCurrentReferenceLabels' own
-// ErrDenied degrade below. Any OTHER error from ListByField (a real
-// DB/lookup failure, not a permission denial) still hard-fails.
+// A section the viewer can read the RELATIONSHIP for but not the CHILD
+// entity TYPE itself degrades the same way: ts.crud.ListByField wraps
+// authz.ErrDenied when checkRead(childDef) fails, and that section is
+// skipped (omitted from rows/defs/referenceLabels) rather than failing
+// the whole render — the viewer can still read the parent record, so a
+// child section they lack read access to must not turn the entire form
+// into a 403 (uc-infra#131). This mirrors loadCurrentReferenceLabels' own
+// ErrDenied degrade below: a target this viewer legitimately can't see
+// resolves to "nothing here," logged, not a page-wide failure. Any OTHER
+// error from ListByField (a real DB/lookup failure, not a permission
+// denial) still hard-fails the render — only the specific "viewer isn't
+// allowed to see this" case degrades.
+//
+// degraded names exactly the sections that hit that ErrDenied branch,
+// keyed by section.Target — as opposed to a section skipped for the
+// unrelated "no matching Relationship" reason above, or the unrelated
+// "unlicensed" reason resolveMasterDetailSectionAvailability already
+// filtered out of availableChildDefs. This is NOT redundant with "absent
+// from rows": a section with genuinely zero child rows is ALSO absent
+// from rows, but its roll-up must still sum to 0, while a degraded
+// section's roll-up must NOT (it isn't "zero", it's "unknown" — see
+// formrender.Data.DegradedSections and render.go's roll-up loop for why
+// conflating the two silently corrupted a writable header field,
+// independent review finding #1, uc-infra#131).
+//
+// It also resolves each section's own reference-typed columns to labels
+// (formrender.Data.ChildReferenceLabels), reusing pageReferenceLabels —
+// the same field->id->label lookup the top-level list view already does
+// per page — rather than a second lookup convention. A child section is
+// NOT actually page-sized the way a list view's `records` is (this
+// function's own child fetch above has no LIMIT), so pageReferenceLabels
+// now caps distinct ids resolved per field at referenceFilterMatchLimit
+// for exactly this reuse — see that function's own doc comment. Before
+// this, a related-list/master-detail FieldReference column (e.g.
+// Lead.campaign_id, Lead.status_id) rendered the raw stored id, because
+// nothing populated a label map for it at all (uc-infra#85).
 //
 // redacted is RedactedFields' own resolution (ts.crud.HiddenFields),
 // just keyed per section Target instead of once for the parent — see
