@@ -1,18 +1,22 @@
 // Package leakcheck guards specific source files against reintroducing
-// private-deployment detail into doc comments. universal-core is
+// private-deployment detail into comments. universal-core is
 // public (CLAUDE.md); comments describing internal infra topology or
 // quoting a private conversation verbatim have leaked into this repo's
 // public history before (uc-infra#138 — hostnames, hardware detail,
 // Key Vault secret *names*, and a verbatim owner quote; uc-infra#153 —
 // the same class of leak in 4 more files found during #138's
 // independent review; uc-infra#155 — the same class of leak in two
-// more files, missed by both earlier sweeps; no credential values in
-// any case). This is a narrow, source-text regression test scoped to the
-// exact files #138/#153/#155 fixed — it is not a general secret
-// scanner, and it does not catch the same pattern reappearing in a
-// file it doesn't watch (e.g. via copy-paste) or a file that already
-// had the pattern before this test existed. Widening this to a
-// repo-wide check is proposed in uc-infra#153's own follow-up notes.
+// more files, missed by both earlier sweeps; uc-infra#156 — the same
+// class of leak in a CI YAML file (a node hostname, hardware/cluster
+// topology, and a dangling pointer to a private-repo record), missed
+// because #138/#153/#155's sweeps only looked at Go source doc comments;
+// no credential values in any case). This is a narrow, source-text
+// regression test scoped to the exact files #138/#153/#155/#156 fixed
+// — it is not a general secret scanner, and it does not catch the same
+// pattern reappearing in a file it doesn't watch (e.g. via copy-paste)
+// or a file that already had the pattern before this test existed.
+// Widening this to a repo-wide check is proposed in uc-infra#153's own
+// follow-up notes.
 //
 // PR#119 (uc-infra#138) and PR#121 (uc-infra#153) both added a file at
 // this exact path/package/function name, each with a disjoint
@@ -21,6 +25,9 @@
 // neither PR's guard coverage was silently dropped by the merge.
 // uc-infra#155 added a 9th and 10th file (internal/api/issuereport.go
 // and internal/api/issuereport_test.go) on top of that merged map.
+// uc-infra#156 added an 11th: the first non-Go (YAML) file this test
+// covers — os.ReadFile works unchanged on any text file, so no
+// mechanism change was needed, only a new map entry.
 package leakcheck
 
 import (
@@ -93,6 +100,15 @@ var bannedInFile = map[string][]string{
 		"farshid reported",
 		"it works but only in english",
 	},
+	".github/workflows/build-and-push.yml": {
+		"mini-pc",
+		"raspberry-pi",
+		"raspberry pi",
+		"pi node",
+		"homelab",
+		"queue.md",
+		"hairpin",
+	},
 }
 
 func TestNoLeakedInfraDetailInDocComments(t *testing.T) {
@@ -114,7 +130,7 @@ func TestNoLeakedInfraDetailInDocComments(t *testing.T) {
 			content := strings.ToLower(string(data))
 			for _, s := range banned {
 				if strings.Contains(content, strings.ToLower(s)) {
-					t.Errorf("%s: reintroduced leaked detail %q (see uc-infra#138/#153/#155) — describe the deployment generically instead of naming the cluster/hardware/DNS/secret name/private-repo path, or quoting private planning context verbatim", relPath, s)
+					t.Errorf("%s: reintroduced leaked detail %q (see uc-infra#138/#153/#155/#156) — describe the deployment generically instead of naming the cluster/hardware/DNS/secret name/private-repo path, or quoting private planning context verbatim", relPath, s)
 				}
 			}
 		})
