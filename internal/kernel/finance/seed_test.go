@@ -364,6 +364,74 @@ func TestSyncGLAccounts_ResolvesRealCurrencyCode(t *testing.T) {
 	}
 }
 
+// TestSyncGLAccounts_FallsBackToTenantBaseCurrency is uc-infra#120's core
+// acceptance case for this function: an Account with no currency_id set
+// used to always land on the hardcoded DefaultGLCurrency ("USD"); once a
+// tenant has a Currency marked is_base=true, that becomes the fallback
+// instead.
+func TestSyncGLAccounts_FallsBackToTenantBaseCurrency(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	entityDefs := data.NewEntityDefinitionRepo(tenantDB)
+	currencyDefRaw, err := entityDefs.GetPublished(ctx, "Currency")
+	if err != nil {
+		t.Fatalf("GetPublished(Currency): %v", err)
+	}
+	currencyDef, err := entity.Unmarshal(currencyDefRaw.Definition)
+	if err != nil {
+		t.Fatalf("unmarshal Currency: %v", err)
+	}
+	accountDefRaw, err := entityDefs.GetPublished(ctx, "Account")
+	if err != nil {
+		t.Fatalf("GetPublished(Account): %v", err)
+	}
+	accountDef, err := entity.Unmarshal(accountDefRaw.Definition)
+	if err != nil {
+		t.Fatalf("unmarshal Account: %v", err)
+	}
+
+	engine := crud.NewEngine(tenantDB)
+	if _, err := engine.Create(ctx, currencyDef, map[string]any{
+		"code": "QAR", "name": "Qatari Riyal", "is_base": true,
+	}, actor); err != nil {
+		t.Fatalf("create base Currency: %v", err)
+	}
+	if _, err := engine.Create(ctx, accountDef, map[string]any{
+		"code": "1000", "name": "Assets", "type": "asset", "is_active": true,
+	}, actor); err != nil {
+		t.Fatalf("create Account: %v", err)
+	}
+
+	if err := SyncGLAccounts(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("SyncGLAccounts: %v", err)
+	}
+
+	glAccounts := data.NewGLAccountRepo(tenantDB)
+	id, _, err := glAccounts.IDByCode(ctx, "1000")
+	if err != nil {
+		t.Fatalf("expected gl_accounts row for code 1000, got: %v", err)
+	}
+	var currency string
+	if err := tenantDB.QueryRowContext(ctx, `SELECT currency FROM gl_accounts WHERE id = $1`, id).Scan(&currency); err != nil {
+		t.Fatalf("read gl_account currency: %v", err)
+	}
+	if currency != "QAR" {
+		t.Fatalf("expected the tenant's base currency %q to be used as the fallback, got %q", "QAR", currency)
+	}
+	if currency == DefaultGLCurrency {
+		t.Fatal("expected the configured base currency to override DefaultGLCurrency, not equal it by coincidence")
+	}
+}
+
 func TestSyncGLAccounts_IsIdempotent(t *testing.T) {
 	tenantDB := freshTenantDB(t)
 	ctx := context.Background()

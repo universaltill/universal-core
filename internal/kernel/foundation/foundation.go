@@ -253,6 +253,23 @@ func UomConversion() *entity.Definition {
 
 // Currency is a base currency; ExchangeRate (date-effective rates) is a
 // separate entity referencing it.
+//
+// v4 (uc-infra#120) added is_base: the tenant's functional/base currency,
+// consumed by finance.ResolveBaseCurrency as the fallback
+// finance.SyncGLAccounts and the SAF-T export use in place of a
+// per-account/per-ledger currency. Exactly one Currency row is expected
+// to hold is_base=true per tenant (ADR-0003: the database is the tenant,
+// so "per tenant" here just means "per database") — an application-level
+// convention, not a DB constraint the generic entity/crud layer can
+// express (same limitation PartyRole.own_organization's and
+// AIProviderConnection's one-row-per-tenant conventions already
+// document, pending the declarative-uniqueness work tracked separately,
+// uc-infra#121). A caller finding zero, or more than one, DISTINCT
+// Currency with is_base=true degrades to the hardcoded fallback rather
+// than guessing which one is correct — the same fail-safe posture those
+// two conventions already established. Additive field, no data
+// migration: rows written against v3 still hold legal values (is_base
+// defaults false).
 func Currency() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "Currency",
@@ -263,12 +280,14 @@ func Currency() *entity.Definition {
 		// catches the same bad value earlier, at the same generic layer
 		// every other bound in this sweep uses, instead of only when a
 		// depreciation schedule happens to touch this currency.
-		Version: 3,
+		// Version 4 (uc-infra#120): added is_base, see doc comment above.
+		Version: 4,
 		Module:  "foundation",
 		Fields: []entity.Field{
 			{Name: "code", Type: entity.FieldString, Required: true}, // ISO 4217, e.g. "QAR", "USD"
 			{Name: "name", Type: entity.FieldString, Required: true},
 			{Name: "minor_unit", Type: entity.FieldNumber, Default: float64(2), Min: entity.Float64Ptr(0), Max: entity.Float64Ptr(6)},
+			{Name: "is_base", Type: entity.FieldBool, Default: false},
 		},
 	}
 }

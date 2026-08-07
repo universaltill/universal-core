@@ -220,6 +220,14 @@ func (h *Handler) buildSAFTInput(r *http.Request, rc httpx.RequestContext, ts te
 	if err != nil {
 		return nil, err
 	}
+	// uc-infra#120: the fallback below used to be the hardcoded
+	// DefaultGLCurrency constant; it's now the tenant's actual configured
+	// base currency when one is set (ResolveBaseCurrency degrades to
+	// DefaultGLCurrency itself when it isn't).
+	baseCurrency, err := finance.ResolveBaseCurrency(ctx, ts.db)
+	if err != nil {
+		return nil, err
+	}
 
 	input := &saft.Input{
 		Created:         time.Now().UTC().Format("2006-01-02"),
@@ -227,12 +235,12 @@ func (h *Handler) buildSAFTInput(r *http.Request, rc httpx.RequestContext, ts te
 		To:              to,
 		SoftwareVersion: buildVersion(),
 		CompanyName:     h.tenantDisplayName(r, rc),
-		DefaultCurrency: finance.DefaultGLCurrency,
+		DefaultCurrency: baseCurrency,
 	}
 	// Single-currency ledger → that currency names the file's amounts.
 	// Anything else (empty chart, or the mixed-currency state the
-	// ledger's own known-gap notes cover) falls back to the same
-	// documented default gl_accounts itself uses.
+	// ledger's own known-gap notes cover) falls back to the tenant's
+	// configured base currency (or the hardcoded default, see above).
 	if len(currencies) == 1 {
 		input.DefaultCurrency = currencies[0]
 	}

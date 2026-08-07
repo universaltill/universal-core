@@ -16,6 +16,7 @@ import (
 
 	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/kernel/crud"
+	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/finance"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
 	"github.com/universaltill/universal-core/internal/kernel/saft"
@@ -282,6 +283,59 @@ func TestSAFTExport_EmptyTenantStillValidFile(t *testing.T) {
 	}
 	if file.GeneralLedgerEntries.NumberOfEntries != 0 {
 		t.Errorf("expected zero entries, got %d", file.GeneralLedgerEntries.NumberOfEntries)
+	}
+	validateSAFTAgainstXSD(t, rec.Body.Bytes())
+}
+
+// TestSAFTExport_DefaultCurrencyUsesTenantBaseCurrency is uc-infra#120's
+// acceptance case for the export: with no ledger data at all (so
+// glRepo.DistinctCurrencies returns zero currencies and the handler falls
+// through to its configured-base-currency fallback, same shape as
+// TestSAFTExport_EmptyTenantStillValidFile above), a tenant that has
+// marked a Currency is_base=true gets that currency's code as the file's
+// DefaultCurrencyCode instead of the hardcoded "USD".
+func TestSAFTExport_DefaultCurrencyUsesTenantBaseCurrency(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+	ctx := context.Background()
+	actor := humanActor()
+	if err := foundation.Publish(ctx, db, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := finance.Publish(ctx, db, actor); err != nil {
+		t.Fatalf("finance.Publish: %v", err)
+	}
+
+	entityDefs := data.NewEntityDefinitionRepo(db)
+	currencyDefRaw, err := entityDefs.GetPublished(ctx, "Currency")
+	if err != nil {
+		t.Fatalf("GetPublished(Currency): %v", err)
+	}
+	currencyDef, err := entity.Unmarshal(currencyDefRaw.Definition)
+	if err != nil {
+		t.Fatalf("unmarshal Currency: %v", err)
+	}
+	if _, err := crud.NewEngine(db).Create(ctx, currencyDef, map[string]any{
+		"code": "QAR", "name": "Qatari Riyal", "is_base": true,
+	}, actor); err != nil {
+		t.Fatalf("create base Currency: %v", err)
+	}
+
+	req := newRequest("GET", "/export/saft?from=2026-01-01&to=2026-12-31", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var file saft.AuditFile
+	if err := xml.Unmarshal(rec.Body.Bytes(), &file); err != nil {
+		t.Fatalf("unparseable: %v", err)
+	}
+	if file.Header.DefaultCurrencyCode != "QAR" {
+		t.Fatalf("expected the tenant's base currency %q, got %q", "QAR", file.Header.DefaultCurrencyCode)
 	}
 	validateSAFTAgainstXSD(t, rec.Body.Bytes())
 }

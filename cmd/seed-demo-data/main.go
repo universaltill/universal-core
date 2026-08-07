@@ -303,13 +303,22 @@ func (s *seeder) getOrCreate(entityType, keyField, keyValue string, fields map[s
 
 func (s *seeder) seedCurrencies() map[string]string {
 	ids := map[string]string{}
-	for _, c := range []struct{ code, name string }{
-		{"USD", "US Dollar"},
-		{"GBP", "British Pound"},
-		{"QAR", "Qatari Riyal"},
-		{"TRY", "Turkish Lira"},
+	for _, c := range []struct {
+		code, name string
+		isBase     bool
+	}{
+		// USD is_base=true (uc-infra#120): matches finance.DefaultGLCurrency's
+		// own hardcoded fallback exactly, so seeding it doesn't change any
+		// existing demo-tenant behavior — it just exercises the field with
+		// real data instead of leaving it untouched by every seeded Currency.
+		{"USD", "US Dollar", true},
+		{"GBP", "British Pound", false},
+		{"QAR", "Qatari Riyal", false},
+		{"TRY", "Turkish Lira", false},
 	} {
-		ids[c.code] = s.getOrCreate("Currency", "code", c.code, map[string]any{"code": c.code, "name": c.name})
+		ids[c.code] = s.getOrCreate("Currency", "code", c.code, map[string]any{
+			"code": c.code, "name": c.name, "is_base": c.isBase,
+		})
 	}
 	return ids
 }

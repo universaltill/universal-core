@@ -177,6 +177,36 @@ func TestCurrency_DefaultMinorUnit(t *testing.T) {
 	}
 }
 
+// TestCurrency_IsBaseFieldDefaultsFalse is uc-infra#120's Definition-level
+// acceptance case: is_base exists, is a bool, and defaults false so
+// existing v3 rows (which never set it) are still legal without a data
+// migration.
+func TestCurrency_IsBaseFieldDefaultsFalse(t *testing.T) {
+	def := Currency()
+	f, ok := def.FieldByName("is_base")
+	if !ok {
+		t.Fatal("expected an is_base field")
+	}
+	if f.Type != entity.FieldBool {
+		t.Fatalf("expected is_base to be FieldBool, got %v", f.Type)
+	}
+	if f.Default != false {
+		t.Fatalf("expected is_base to default false, got %v", f.Default)
+	}
+
+	// A record that never sets is_base at all (the pre-v4 shape) must
+	// still validate — additive field, no data migration.
+	record := map[string]any{"code": "USD", "name": "US Dollar"}
+	if err := entity.ValidateRecord(def, record); err != nil {
+		t.Fatalf("a Currency record without is_base set should still validate: %v", err)
+	}
+
+	explicit := map[string]any{"code": "QAR", "name": "Qatari Riyal", "is_base": true}
+	if err := entity.ValidateRecord(def, explicit); err != nil {
+		t.Fatalf("a Currency record with is_base=true should validate: %v", err)
+	}
+}
+
 // TestAddress_TypedAndMultiplePerParty is the point of Address being its
 // own entity rather than fields on Party: the same party_id can carry a
 // billing address and a shipping address as two independent records.

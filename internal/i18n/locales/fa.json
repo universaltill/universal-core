@@ -250,6 +250,7 @@
   "field.Currency.code": "کد",
   "field.Currency.name": "نام",
   "field.Currency.minor_unit": "واحد فرعی",
+  "field.Currency.is_base": "ارز پایه",
   "field.ExchangeRate.from_currency_id": "از ارز",
   "field.ExchangeRate.to_currency_id": "به ارز",
   "field.ExchangeRate.effective_date": "تاریخ اجرا",

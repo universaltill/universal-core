@@ -17,8 +17,10 @@ import "math"
 // and money.Decimals), not per-currency-aware. A real 0-decimal
 // (JPY-style) or 3-decimal (KWD/BHD-style) currency would round wrong
 // here. Revisit once a currency-aware money type actually exists — same
-// tracked gap ADR-0021's own "Alternatives rejected" section notes,
-// alongside finance.DefaultGLCurrency (uc-infra#120).
+// tracked gap ADR-0021's own "Alternatives rejected" section notes
+// (uc-infra#163; not the same gap as finance.DefaultGLCurrency/
+// ResolveBaseCurrency, uc-infra#120, which is about which currency is
+// the tenant's base, not decimal-place correctness).
 func ToMinorUnits(amount float64) int64 {
 	return int64(math.Round(amount * 100))
 }
