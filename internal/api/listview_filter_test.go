@@ -195,6 +195,126 @@ func TestListPage_ExplicitFilterFieldWithoutQuery_SurvivesSortClick(t *testing.T
 	}
 }
 
+// TestListPage_FilterFormPreservesSort is a regression test for uc-infra#139,
+// found during #129's own independent review: the filter FORM (as opposed
+// to the sort-header/pager links keepQuery already covers) carried no
+// hidden sort=/dir= at all, and its action attribute (FilterHref) was a
+// bare "/records/{entityType}" with no query string. So loading a list
+// page already sorted, then typing into the search box and submitting,
+// silently reverted the ordering to the default (created_at) — the exact
+// "in-page navigation silently discards URL state the viewer didn't ask
+// to lose" family #129 fixed for the hidden filter field, just via the
+// filter form instead.
+func TestListPage_FilterFormPreservesSort(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := foundation.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	publishEntityAndForm(t, db, widgetFilterEntityDef(), &form.Definition{
+		EntityType: "Widget", Version: 1,
+		Sections: []form.Section{{Title: "D", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "name"}, {Name: "secret"}}}},
+	})
+	eng := crud.NewEngine(db)
+	for _, n := range []string{"Apple", "Banana", "Cherry"} {
+		if _, err := eng.Create(ctx, widgetFilterEntityDef(), map[string]any{"name": n, "secret": "s"}, humanActor()); err != nil {
+			t.Fatalf("seed %s: %v", n, err)
+		}
+	}
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	// A plain landing page (no ?sort= at all) renders no hidden sort/dir
+	// fields — nothing to preserve, and rendering empty ones would be
+	// noise. Asserted as the boundary this fix must not widen past.
+	plain := getAs(t, mux, "/records/Widget", tenantID, "anyone").Body.String()
+	if strings.Contains(plain, `name="sort"`) || strings.Contains(plain, `name="dir"`) {
+		t.Fatalf("plain landing page (no ?sort=) should render no hidden sort/dir fields:\n%s", plain)
+	}
+
+	// ?sort=name&dir=desc: the filter form must carry both forward as
+	// hidden inputs so the NEXT submit doesn't silently drop them.
+	descLoaded := getAs(t, mux, "/records/Widget?sort=name&dir=desc", tenantID, "anyone").Body.String()
+	if !strings.Contains(descLoaded, `name="sort" value="name"`) {
+		t.Fatalf("?sort=name&dir=desc should render a hidden sort field naming \"name\":\n%s", descLoaded)
+	}
+	if !strings.Contains(descLoaded, `name="dir" value="desc"`) {
+		t.Fatalf("?sort=name&dir=desc should render a hidden dir field naming \"desc\":\n%s", descLoaded)
+	}
+
+	// Ascending sort (?sort=name, no ?dir=) carries the hidden sort field
+	// but no dir field — dir=desc is the only explicit value, matching
+	// keepQuery's own sortParams (ascending is the implicit default, never
+	// written to the URL). A spurious dir="" would be indistinguishable
+	// from "no sort active" to a later request.
+	ascLoaded := getAs(t, mux, "/records/Widget?sort=name", tenantID, "anyone").Body.String()
+	if !strings.Contains(ascLoaded, `name="sort" value="name"`) {
+		t.Fatalf("?sort=name should render a hidden sort field naming \"name\":\n%s", ascLoaded)
+	}
+	if strings.Contains(ascLoaded, `name="dir"`) {
+		t.Fatalf("?sort=name (ascending, no explicit dir) should render no hidden dir field:\n%s", ascLoaded)
+	}
+
+	// The actual next submit a browser would send once someone types into
+	// the search box from a sorted page: sort=name&dir=desc carried forward
+	// via the (now-fixed) hidden fields, plus the new filter=name&q=an.
+	// This one narrows to a single row (Banana), so it doesn't itself prove
+	// sort survived — the composed case just below does that.
+	submitted := getAs(t, mux, "/records/Widget?sort=name&dir=desc&filter=name&q=an", tenantID, "anyone").Body.String()
+	if !strings.Contains(submitted, "Banana") || strings.Contains(submitted, "Apple") || strings.Contains(submitted, "Cherry") {
+		t.Fatalf("filter=name q=an should show only Banana regardless of sort:\n%s", submitted)
+	}
+
+	// Sort and filter actually COMPOSE: all three widgets share secret="s",
+	// so filtering on it keeps every row, and the result must still be in
+	// descending-name order (Cherry, Banana, Apple) — proving the carried-
+	// forward sort is applied to the filtered set, not silently dropped in
+	// favor of the filter (or vice versa).
+	composed := getAs(t, mux, "/records/Widget?sort=name&dir=desc&filter=secret&q=s", tenantID, "anyone").Body.String()
+	ci, bi, ai := strings.Index(composed, "Cherry"), strings.Index(composed, "Banana"), strings.Index(composed, "Apple")
+	if ci == -1 || bi == -1 || ai == -1 || !(ci < bi && bi < ai) {
+		t.Fatalf("sort=name&dir=desc&filter=secret&q=s should show all three rows in descending order (Cherry, Banana, Apple), got positions C=%d B=%d A=%d:\n%s", ci, bi, ai, composed)
+	}
+
+	// FilterHref (the form's action=) itself must not silently drop the
+	// active sort either. A GET form's submit is built from the form's own
+	// fields, NOT the action attribute's query string — a browser discards
+	// whatever query string action= carries and reconstructs one from
+	// scratch out of every named input/value pair. That's the actual reason
+	// hidden inputs (not an action="...?sort=...") are the fix: an action
+	// query string would be silently thrown away on every submit regardless.
+	// This just confirms the action stays the plain list path, consistent
+	// with the existing filter hidden field's own approach.
+	if !strings.Contains(descLoaded, `action="/records/Widget"`) {
+		t.Fatalf("filter form action should remain the plain list path:\n%s", descLoaded)
+	}
+
+	// The "Clear" link sits two lines below the search box in the same
+	// form and was found, during independent review, silently dropping the
+	// sort the same way the search box itself used to (uc-infra#139): it
+	// must carry the active sort forward while dropping the filter this
+	// link is meant to clear (unlike the hidden inputs above, which
+	// preserve the filter, this is the one place in the form that must
+	// NOT do so). Checked against `submitted` (sort=name&dir=desc AND an
+	// active filter), not `descLoaded` — the Clear link only renders at
+	// all when FilterValue is set, so a page with no active filter has no
+	// Clear link to check. Params come out "dir" before "sort" —
+	// url.Values.Encode() sorts keys alphabetically.
+	if !strings.Contains(submitted, `href="/records/Widget?dir=desc&amp;sort=name"`) {
+		t.Fatalf("Clear link should drop the filter but keep sort=name&dir=desc:\n%s", submitted)
+	}
+	// No sort active: Clear reverts to the plain list path, same as before
+	// this fix — nothing to carry forward.
+	filteredNoSort := getAs(t, mux, "/records/Widget?filter=name&q=an", tenantID, "anyone").Body.String()
+	if !strings.Contains(filteredNoSort, `href="/records/Widget"`) {
+		t.Fatalf("Clear link with no active sort should be the plain list path:\n%s", filteredNoSort)
+	}
+}
+
 // TestListPage_FilterFieldHidden_RendersNoHiddenInput is a regression
 // guard for the false-path of the condition uc-infra#129's fix
 // introduced (filterFieldValid): an explicit ?filter= naming a column
@@ -239,6 +359,58 @@ func TestListPage_FilterFieldHidden_RendersNoHiddenInput(t *testing.T) {
 	}
 	if strings.Contains(unknown.Body.String(), `name="filter"`) {
 		t.Fatalf("?filter=<unknown field> must render no hidden filter field:\n%s", unknown.Body.String())
+	}
+}
+
+// TestListPage_SortFieldHidden_RendersNoHiddenInput is the hidden-`sort`-
+// input counterpart to TestListPage_FilterFieldHidden_RendersNoHiddenInput
+// above — found missing during uc-infra#139's independent review. The new
+// hidden sort input (this file's own TestListPage_FilterFormPreservesSort)
+// echoes opts.SortField back into the DOM the same way the hidden filter
+// input already does, so it needs the identical RBAC-oracle guard:
+// opts.SortField is only ever set (renderRecordList, ?sort= handling) after
+// isVisibleColumn && sortFilterableField both pass, so a field the viewer
+// can't see or that doesn't exist must never be echoed back, confirming the
+// DOM itself (not just the response code TestListPage_FilterAndSort already
+// checks for a hidden-field sort attempt) stays silent.
+func TestListPage_SortFieldHidden_RendersNoHiddenInput(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := foundation.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	publishEntityAndForm(t, db, widgetFilterEntityDef(), &form.Definition{
+		EntityType: "Widget", Version: 1,
+		Sections: []form.Section{{Title: "D", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "name"}, {Name: "secret"}}}},
+	})
+	if _, err := crud.NewEngine(db).Create(ctx, widgetFilterEntityDef(), map[string]any{"name": "Apple", "secret": "alpha"}, humanActor()); err != nil {
+		t.Fatalf("seed Apple: %v", err)
+	}
+	seedFieldRule(t, db, "clerk", "user-clerk", "Widget", "secret")
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	// A role that cannot see "secret" must not have it echoed back as a
+	// hidden sort field just because it named the column explicitly in the
+	// URL — the same RBAC oracle the hidden filter field already guards
+	// against, now for sort=.
+	hidden := getAs(t, mux, "/records/Widget?sort=secret", tenantID, "user-clerk").Body.String()
+	if strings.Contains(hidden, `name="sort"`) || strings.Contains(hidden, `name="dir"`) {
+		t.Fatalf("?sort=secret from a viewer who cannot see \"secret\" must render no hidden sort/dir field (RBAC oracle):\n%s", hidden)
+	}
+
+	// A field name that doesn't exist on the Definition at all degrades
+	// the same way — no panic, no hidden field.
+	unknown := getAs(t, mux, "/records/Widget?sort=does_not_exist", tenantID, "anyone")
+	if unknown.Code != http.StatusOK {
+		t.Fatalf("?sort=<unknown field> should degrade to a normal 200 page, not %d", unknown.Code)
+	}
+	if strings.Contains(unknown.Body.String(), `name="sort"`) {
+		t.Fatalf("?sort=<unknown field> must render no hidden sort field:\n%s", unknown.Body.String())
 	}
 }
 

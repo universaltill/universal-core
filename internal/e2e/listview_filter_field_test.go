@@ -116,3 +116,89 @@ func TestListPage_ExplicitFilterFieldWithoutQuery_RealBrowser(t *testing.T) {
 		t.Fatalf("filter=name q=Gadget should match Gadget only, got:\n%s", bodyText)
 	}
 }
+
+// TestListPage_FilterFormPreservesSort_RealBrowser is the real-browser
+// counterpart to internal/api's TestListPage_FilterFormPreservesSort
+// (uc-infra#139): a list page loaded already sorted must render real,
+// browser-parsed hidden `sort`/`dir` inputs in the filter form — proving
+// the DOM a real browser builds from the server's HTML actually carries
+// the active sort into the next submit, not just that the template's
+// string output contains the right substring.
+func TestListPage_FilterFormPreservesSort_RealBrowser(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, tenantDB := testServer(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	eng := crud.NewEngine(tenantDB)
+	itemDef := purchasing.Item()
+	if _, err := eng.Create(ctx, itemDef, map[string]any{
+		"sku": "SKU-100", "name": "Widget", "item_type": "stock",
+	}, actor); err != nil {
+		t.Fatalf("seed Widget: %v", err)
+	}
+	if _, err := eng.Create(ctx, itemDef, map[string]any{
+		"sku": "SKU-200", "name": "Gadget", "item_type": "stock",
+	}, actor); err != nil {
+		t.Fatalf("seed Gadget: %v", err)
+	}
+
+	bctx := browserCtx(t, tenantID)
+
+	// A plain landing page (no ?sort= at all) renders no hidden sort/dir
+	// inputs — nothing to preserve. Pins the boundary this fix must not
+	// widen past, same discipline as the plain-landing-page check above.
+	var plainHasSort, plainHasDir bool
+	if err := chromedp.Run(bctx,
+		chromedp.Navigate(srv.URL+"/records/Item"),
+		chromedp.WaitVisible(`form.uc-list-filter`, chromedp.ByQuery),
+		chromedp.Evaluate(`!!document.querySelector('form.uc-list-filter input[name="sort"]')`, &plainHasSort),
+		chromedp.Evaluate(`!!document.querySelector('form.uc-list-filter input[name="dir"]')`, &plainHasDir),
+	); err != nil {
+		t.Fatalf("load plain Item list page: %v", err)
+	}
+	if plainHasSort || plainHasDir {
+		t.Fatal("plain /records/Item landing (no ?sort=) rendered a hidden sort/dir field")
+	}
+
+	// ?sort=name&dir=desc: the real browser DOM must carry both forward as
+	// hidden inputs in the filter form.
+	var sortValue, dirValue string
+	var sortPresent, dirPresent bool
+	if err := chromedp.Run(bctx,
+		chromedp.Navigate(srv.URL+"/records/Item?sort=name&dir=desc"),
+		chromedp.WaitVisible(`form.uc-list-filter`, chromedp.ByQuery),
+		chromedp.Evaluate(`!!document.querySelector('form.uc-list-filter input[name="sort"]')`, &sortPresent),
+		chromedp.Evaluate(`(function(){var i=document.querySelector('form.uc-list-filter input[name="sort"]');return i?i.value:"";})()`, &sortValue),
+		chromedp.Evaluate(`!!document.querySelector('form.uc-list-filter input[name="dir"]')`, &dirPresent),
+		chromedp.Evaluate(`(function(){var i=document.querySelector('form.uc-list-filter input[name="dir"]');return i?i.value:"";})()`, &dirValue),
+	); err != nil {
+		t.Fatalf("load ?sort=name&dir=desc page: %v", err)
+	}
+	if !sortPresent || sortValue != "name" {
+		t.Fatalf("real browser DOM hidden sort input: present=%v value=%q, want present=true value=\"name\" (uc-infra#139 gap)", sortPresent, sortValue)
+	}
+	if !dirPresent || dirValue != "desc" {
+		t.Fatalf("real browser DOM hidden dir input: present=%v value=%q, want present=true value=\"desc\" (uc-infra#139 gap)", dirPresent, dirValue)
+	}
+
+	// The URL that submitting this form (with "Gadget" typed into the
+	// search box) would produce — confirms the sort survives alongside the
+	// new filter, not silently dropped back to the default ordering.
+	var rows int
+	var bodyText string
+	if err := chromedp.Run(bctx,
+		chromedp.Navigate(srv.URL+"/records/Item?sort=name&dir=desc&filter=name&q=Gadget"),
+		chromedp.WaitVisible(`table.uc-table`, chromedp.ByQuery),
+		chromedp.Evaluate(`document.querySelectorAll('table.uc-table tbody tr').length`, &rows),
+		chromedp.Text(`table.uc-table`, &bodyText, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("load sort=name&dir=desc&filter=name&q=Gadget: %v", err)
+	}
+	if rows != 1 {
+		t.Fatalf("sort=name&dir=desc&filter=name&q=Gadget should show exactly 1 row, got %d:\n%s", rows, bodyText)
+	}
+	if !strings.Contains(bodyText, "Gadget") || strings.Contains(bodyText, "Widget") {
+		t.Fatalf("sort=name&dir=desc&filter=name&q=Gadget should match Gadget only, got:\n%s", bodyText)
+	}
+}
