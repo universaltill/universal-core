@@ -3,15 +3,21 @@
 // public (CLAUDE.md); comments describing internal infra topology or
 // quoting a private conversation verbatim have leaked into this repo's
 // public history before (uc-infra#138 — hostnames, hardware detail,
-// Key Vault secret *names*, and a verbatim owner quote, no credential
-// values). This is a narrow, source-text regression test scoped to the
-// exact files uc-infra#138 fixed — it is not a general secret scanner,
-// and it does not catch the same pattern reappearing in a file it
-// doesn't watch (e.g. via copy-paste) or a file that already had the
-// pattern before this test existed. Both are real gaps, not oversights:
-// the additional occurrences #138's own review found elsewhere in the
-// tree are tracked separately as uc-infra#153, which is also where
-// widening this guard to a repo-wide check is proposed.
+// Key Vault secret *names*, and a verbatim owner quote; uc-infra#153 —
+// the same class of leak in 4 more files found during #138's
+// independent review; no credential values in either case). This is a
+// narrow, source-text regression test scoped to the exact files
+// #138/#153 fixed — it is not a general secret scanner, and it does not
+// catch the same pattern reappearing in a file it doesn't watch (e.g.
+// via copy-paste) or a file that already had the pattern before this
+// test existed. Widening this to a repo-wide check is proposed in
+// uc-infra#153's own follow-up notes.
+//
+// PR#119 (uc-infra#138) and PR#121 (uc-infra#153) both added a file at
+// this exact path/package/function name, each with a disjoint
+// bannedInFile map — merged here into one map covering all 8 files
+// (both sides taken together) rather than picking either side, so
+// neither PR's guard coverage was silently dropped by the merge.
 package leakcheck
 
 import (
@@ -22,11 +28,13 @@ import (
 )
 
 // bannedInFile maps a repo-relative file path to substrings it must
-// never contain again — matched case-insensitively so a re-typed
-// capitalization variant doesn't slip past. Where the leaked text used
-// both a hyphenated and a spaced form in different files, both forms are
-// listed here so a reintroduction in the "wrong" file's style still gets
-// caught, not just the exact original wording of that file.
+// never contain again — matched case-insensitively (both the file
+// content and each needle are lowercased before comparing) so a
+// re-typed capitalization variant doesn't slip past. Where the leaked
+// text used both a hyphenated and a spaced form in different files,
+// both forms are listed here so a reintroduction in the "wrong" file's
+// style still gets caught, not just the exact original wording of that
+// file.
 var bannedInFile = map[string][]string{
 	"internal/kernel/aiassist/aiassist.go": {
 		"homelab-k8s",
@@ -54,6 +62,23 @@ var bannedInFile = map[string][]string{
 		"that is fine, go for the api and ollama",
 		"see queue.md",
 	},
+	"internal/zitadelmgmt/zitadelmgmt.go": {
+		"member-mgmt-zitadel-pat",
+		"zitadel-project-id",
+		"universal-core-member-mgmt",
+		"key vault",
+		"keyvault",
+	},
+	"internal/kernel/speechassist/speechassist.go": {
+		"homelab-k8s",
+		"kubernetes/apps",
+	},
+	"internal/kernel/csvimport/ai.go": {
+		"homelab",
+	},
+	"internal/api/import_test.go": {
+		"homelab",
+	},
 }
 
 func TestNoLeakedInfraDetailInDocComments(t *testing.T) {
@@ -74,8 +99,8 @@ func TestNoLeakedInfraDetailInDocComments(t *testing.T) {
 			}
 			content := strings.ToLower(string(data))
 			for _, s := range banned {
-				if strings.Contains(content, s) {
-					t.Errorf("%s: reintroduced leaked detail %q (see uc-infra#138) — describe the deployment generically instead of naming the cluster/hardware/DNS/secret name, or quoting private planning context verbatim", relPath, s)
+				if strings.Contains(content, strings.ToLower(s)) {
+					t.Errorf("%s: reintroduced leaked detail %q (see uc-infra#138/#153) — describe the deployment generically instead of naming the cluster/hardware/DNS/secret name/private-repo path, or quoting private planning context verbatim", relPath, s)
 				}
 			}
 		})

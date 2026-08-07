@@ -48,18 +48,18 @@ const TenantMemberRole = "tenant_member"
 // as an error: the exact contract aiassist/speechassist/secretcrypt
 // already follow for optional integrations.
 type Config struct {
-	// PAT is the universal-core-member-mgmt machine user's Personal
-	// Access Token (ZITADEL_MGMT_PAT ← Key Vault's
-	// member-mgmt-zitadel-pat).
+	// PAT is a dedicated management machine user's Personal Access Token
+	// (its identity is deployment configuration; ZITADEL_MGMT_PAT ← the
+	// deployment's secret store).
 	PAT string
 	// Issuer is the Zitadel base URL — the same value webauth's
 	// OIDC_ISSUER_URL carries (one identity instance for login and for
 	// management).
 	Issuer string
 	// ProjectID is the Universal Core project whose tenant_member role
-	// this client grants (ZITADEL_PROJECT_ID ← Key Vault's
-	// zitadel-project-id — mirrored through Key Vault so this public
-	// repo hardcodes no Zitadel ids, ADR-0010).
+	// this client grants (ZITADEL_PROJECT_ID ← the deployment's secret
+	// store — mirrored that way so this public repo hardcodes no
+	// Zitadel ids, ADR-0010).
 	ProjectID string
 }
 
