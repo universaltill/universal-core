@@ -205,6 +205,22 @@ type Data struct {
 	// the RBAC engine and the entity-display-name/i18n lookups needed to
 	// build this text, so it is precomputed the same way CurrentLabel is.
 	ReferenceCreateLabels map[string]string
+	// UnavailableSections names master_detail/related_list sections (keyed
+	// by section Target, same convention as Children/ChildDefs) whose
+	// child entity type has no published Definition for this tenant —
+	// typically because that module isn't licensed here. Such a section
+	// is omitted from the rendered form entirely (buildViewModel skips
+	// it) rather than rendered as a misleadingly-empty table with a
+	// broken "add" link, or allowed to fail the whole render: the parent
+	// record and every other section are still perfectly renderable, and
+	// a missing related module is a normal, supported tenant
+	// configuration (foundation.go's Attachment/Item split, CRM without
+	// Purchasing, etc.), not an error condition (uc-infra#132). The
+	// caller (internal/api) is the only thing with access to the
+	// Definition registry needed to tell "not licensed" apart from "list
+	// query failed", so it resolves this the same way it precomputes
+	// RedactedFields/ReferenceCreateLabels.
+	UnavailableSections map[string]bool
 }
 
 // Render writes the HTML/HTMX form for def against ent's field shapes and
@@ -519,6 +535,16 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 		if s.Component != form.ComponentMasterDetail || s.RollUp == "" {
 			continue
 		}
+		if data.UnavailableSections[s.Target] {
+			// Don't recompute (and don't zero) the roll-up target field
+			// from a section we can't actually read children for right
+			// now — leave whatever was last saved on the record alone,
+			// the same "preserve, don't silently wipe" treatment an
+			// off-form field already gets elsewhere in this file, rather
+			// than confidently showing 0 for a total that may well be
+			// nonzero.
+			continue
+		}
 		total, err := computeRollUp(data.Children[s.Target], s.RollUp)
 		if err != nil {
 			return viewModel{}, fmt.Errorf("section %q: %w", s.Title, err)
@@ -542,6 +568,19 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 	rendered := make(map[string]bool, len(ent.Fields))
 
 	for _, s := range def.Sections {
+		// A master_detail/related_list section whose Target has no
+		// published Definition here (module not licensed for this
+		// tenant) is omitted entirely — see UnavailableSections' doc
+		// comment. Checked before building anything else for this
+		// section, and guarded on s.Target != "": UnavailableSections is
+		// keyed by Target, and a ComponentFields section's Target is
+		// conventionally empty (form.Definition.Validate only REQUIRES
+		// Target on the other two component kinds, it doesn't forbid one
+		// here), so without the guard a stray same-named entry could
+		// wrongly hide a fields section too.
+		if s.Target != "" && data.UnavailableSections[s.Target] {
+			continue
+		}
 		title := r.i18n.TOrDefault(locale, SectionCatalogKey(def.EntityType, s.Title), s.Title)
 		sv := sectionView{Title: title, Component: s.Component, Target: s.Target}
 

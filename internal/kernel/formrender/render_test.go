@@ -1329,6 +1329,122 @@ func TestRender_RelatedListHeaderRendersEvenWhenEmpty(t *testing.T) {
 	}
 }
 
+// TestRender_UnavailableSectionIsOmitted (uc-infra#132): a master_detail
+// or related_list section whose Target module isn't licensed for this
+// tenant must be OMITTED from the rendered form entirely — no section
+// heading, no empty-state table, no "add" affordance pointing at a type
+// this tenant has no Definition for — while every other section on the
+// same form still renders normally. Before this, the caller
+// (internal/api's loadMasterDetailChildren) had no way to tell the
+// renderer "this section's data isn't available" at all, so the only
+// options were a raw child fetch error (which renderForm's own
+// errors.Is(data.ErrNotFound) check then mistook for "the record itself
+// doesn't exist" and 404ed the whole form) or rendering a misleading
+// empty table with a broken link. This test exercises the RENDERER half
+// of the fix in isolation, given UnavailableSections precomputed exactly
+// as the real caller now does; the internal/api-layer integration test
+// (TestAPI_RenderRecordForm_UnlicensedMasterDetailChildOmitsSectionNot404)
+// proves the caller actually produces it.
+func TestRender_UnavailableSectionIsOmitted(t *testing.T) {
+	r := testRenderer(t)
+	data := Data{
+		RecordID:            "po-1",
+		Record:              map[string]any{"payment_method": "Wire"},
+		UnavailableSections: map[string]bool{"POLine": true},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if strings.Contains(out, "<h2>Lines</h2>") {
+		t.Errorf("expected the unavailable POLine section to be omitted entirely, got:\n%s", out)
+	}
+	if strings.Contains(out, "No lines yet") {
+		t.Errorf("expected no empty-state table for the unavailable section either, got:\n%s", out)
+	}
+	if strings.Contains(out, "/api/records/POLine/new") {
+		t.Errorf("expected no add-child link for a target this tenant has no Definition for, got:\n%s", out)
+	}
+	// The OTHER sections on the same form — including the one sharing the
+	// same PurchaseOrder target as the related list — must still render:
+	// one section's target being unavailable is not a whole-form failure.
+	if !strings.Contains(out, "<h2>Header</h2>") {
+		t.Errorf("expected the unrelated Header section to still render, got:\n%s", out)
+	}
+	if !strings.Contains(out, "<h2>Past Orders</h2>") {
+		t.Errorf("expected the unrelated related_list section to still render, got:\n%s", out)
+	}
+}
+
+// TestRender_UnavailableRelatedListSectionIsOmitted (uc-infra#132,
+// independent review): the sibling of TestRender_UnavailableSectionIsOmitted
+// for a related_list rather than a master_detail section. The omission
+// check in buildViewModel runs before the switch on s.Component, so both
+// component kinds share it — but nothing proved that for related_list
+// specifically until now: TestRender_UnavailableSectionIsOmitted only
+// ever marks "POLine" (a master_detail Target) unavailable, and its own
+// related_list section ("Past Orders", Target "PurchaseOrder") was
+// always the AVAILABLE one in that test, never the omitted one. Marks
+// "PurchaseOrder" unavailable instead, so this test actually exercises
+// the related_list branch of the omission path a future refactor could
+// otherwise silently break (e.g. one that moved the check inside the
+// ComponentMasterDetail case only) while the formrender unit suite
+// stayed green.
+func TestRender_UnavailableRelatedListSectionIsOmitted(t *testing.T) {
+	r := testRenderer(t)
+	data := Data{
+		RecordID:            "po-1",
+		Record:              map[string]any{"payment_method": "Wire"},
+		UnavailableSections: map[string]bool{"PurchaseOrder": true},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if strings.Contains(out, "<h2>Past Orders</h2>") {
+		t.Errorf("expected the unavailable related_list section to be omitted entirely, got:\n%s", out)
+	}
+	if strings.Contains(out, "No related records.") {
+		t.Errorf("expected no empty-state message for the unavailable related_list section either, got:\n%s", out)
+	}
+	// The master_detail section sharing the same form must be unaffected
+	// — it targets POLine, a different key, and was never marked
+	// unavailable here.
+	if !strings.Contains(out, "<h2>Lines</h2>") {
+		t.Errorf("expected the unrelated master_detail section to still render, got:\n%s", out)
+	}
+	if !strings.Contains(out, "<h2>Header</h2>") {
+		t.Errorf("expected the unrelated Header section to still render, got:\n%s", out)
+	}
+}
+
+// TestRender_UnavailableSectionRollUpFieldKeepsSavedValue: a roll-up
+// field on the parent (PurchaseOrder.total, summed from POLine.line_total
+// via the "Lines" section's RollUp) must NOT be silently zeroed just
+// because its children are currently unreadable — that would show a
+// stale-looking "0" for a total that may well be nonzero, which is worse
+// than leaving the last-saved value in place (the same "preserve, don't
+// wipe" treatment an off-form field already gets — see
+// TestRender_VisibleIfHiddenFieldStillPreservesItsValue).
+func TestRender_UnavailableSectionRollUpFieldKeepsSavedValue(t *testing.T) {
+	r := testRenderer(t)
+	data := Data{
+		RecordID:            "po-1",
+		Record:              map[string]any{"payment_method": "Wire", "total": 350.5},
+		UnavailableSections: map[string]bool{"POLine": true},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, `id="total" name="total" value="350.5"`) {
+		t.Errorf("expected the roll-up target field to keep its last-saved value rather than being recomputed to 0, got:\n%s", out)
+	}
+}
+
 func TestRender_AllActionKindsRendered(t *testing.T) {
 	r := testRenderer(t)
 	data := Data{RecordID: "po-1", Record: map[string]any{"payment_method": "Wire"}, Children: map[string][]map[string]any{}}

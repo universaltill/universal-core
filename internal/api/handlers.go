@@ -1228,13 +1228,27 @@ func (h *Handler) buildFormRenderData(ctx context.Context, ts tenantScope, entDe
 		renderData.Record = rec.Data
 		renderData.RecordLabel = h.recordLabel(entDef, rec, locale)
 
-		children, childDefs, childReferenceLabels, err := h.loadMasterDetailChildren(ctx, ts, entDef, formDef, id, locale)
+		children, childDefs, childReferenceLabels, unavailableSections, err := h.loadMasterDetailChildren(ctx, ts, entDef, formDef, id, locale)
 		if err != nil {
 			return formrender.Data{}, fmt.Errorf("load master-detail children: %w", err)
 		}
 		renderData.Children = children
 		renderData.ChildDefs = childDefs
 		renderData.ChildReferenceLabels = childReferenceLabels
+		renderData.UnavailableSections = unavailableSections
+	} else {
+		// A not-yet-saved record has no children to fetch, but section
+		// AVAILABILITY is a Definition-level fact, not a record-level
+		// one — a "new PurchaseOrder" form must omit an unlicensed
+		// POLine section exactly as much as an existing one's does,
+		// rather than showing an empty table with a dead "add" link
+		// only to have the section vanish once the record is actually
+		// saved (independent review, uc-infra#132).
+		_, unavailableSections, err := h.resolveMasterDetailSectionAvailability(ctx, ts, entDef, formDef)
+		if err != nil {
+			return formrender.Data{}, fmt.Errorf("resolve master-detail section availability: %w", err)
+		}
+		renderData.UnavailableSections = unavailableSections
 	}
 	// Resolved AFTER the record is loaded, because it depends on the
 	// record's current values: the combobox (#24) only needs each
@@ -1560,7 +1574,23 @@ func (h *Handler) pageReferenceLabels(ctx context.Context, ts tenantScope, def *
 // this, a related-list/master-detail FieldReference column (e.g.
 // Lead.campaign_id, Lead.status_id) rendered the raw stored id, because
 // nothing populated a label map for it at all (uc-infra#85).
-func (h *Handler) loadMasterDetailChildren(ctx context.Context, ts tenantScope, entDef *entity.Definition, formDef *form.Definition, recordID, locale string) (map[string][]map[string]any, map[string]*entity.Definition, map[string]map[string]map[string]string, error) {
+//
+// A section whose Target has no published Definition in this tenant
+// (module not licensed) is reported back via the fourth return value
+// instead of failing the whole lookup: this is the exact same
+// "licensing gap, not a data problem" case internal/api's own
+// referenceIDsMatching already degrades gracefully for, on the same
+// data.ErrNotFound signal. Before this, that error propagated up through
+// buildFormRenderData unchanged and renderForm's own errors.Is(err,
+// data.ErrNotFound) check — written to mean "the record itself doesn't
+// exist" — mistook it for exactly that, 404ing the whole parent form
+// even though the record plainly exists and only one of its related
+// child module types isn't licensed (uc-infra#132).
+func (h *Handler) loadMasterDetailChildren(ctx context.Context, ts tenantScope, entDef *entity.Definition, formDef *form.Definition, recordID, locale string) (map[string][]map[string]any, map[string]*entity.Definition, map[string]map[string]map[string]string, map[string]bool, error) {
+	availableChildDefs, unavailable, err := h.resolveMasterDetailSectionAvailability(ctx, ts, entDef, formDef)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
 	children := make(map[string][]map[string]any)
 	// The child Definitions travel with the rows: the renderer needs
 	// them for column order and to resolve i18n_text cells to the
@@ -1581,6 +1611,65 @@ func (h *Handler) loadMasterDetailChildren(ctx context.Context, ts tenantScope, 
 		if section.Component != form.ComponentMasterDetail && section.Component != form.ComponentRelatedList {
 			continue
 		}
+		// availableChildDefs already excludes both "unlicensed" (see
+		// unavailable) and "no matching Relationship declared" (a
+		// Definition-mismatch bug in the Definitions themselves, not
+		// something this loop has an opinion about) — a section absent
+		// from here needs no fetch either way.
+		childDef, ok := availableChildDefs[section.Target]
+		if !ok {
+			continue
+		}
+		var rel *entity.Relationship
+		for i := range entDef.Relationships {
+			if entDef.Relationships[i].Target == section.Target {
+				rel = &entDef.Relationships[i]
+				break
+			}
+		}
+		records, err := ts.crud.ListByField(ctx, childDef, rel.ParentField, recordID)
+		if err != nil {
+			return nil, nil, nil, nil, fmt.Errorf("list %s children: %w", section.Target, err)
+		}
+		rows := make([]map[string]any, len(records))
+		for i, rec := range records {
+			rows[i] = rec.Data
+		}
+		children[section.Target] = rows
+		childDefs[section.Target] = childDef
+		referenceLabels[section.Target] = h.pageReferenceLabels(ctx, ts, childDef, records, locale)
+	}
+	return children, childDefs, referenceLabels, unavailable, nil
+}
+
+// resolveMasterDetailSectionAvailability resolves, for every
+// master_detail/related_list section in formDef, whether its Target has
+// a published Definition in this tenant — independent of whether any
+// record (let alone a specific one's children) is being fetched, so a
+// brand-new, not-yet-saved record's form omits an unlicensed section
+// exactly the same way an existing record's form does. Before this
+// split, that resolution only ran inside loadMasterDetailChildren, which
+// buildFormRenderData only calls when id != "" — so a new-record form
+// (id == "") rendered the section anyway (empty table, "add" link
+// pointing at a type this tenant has no Definition for), the one case
+// the fix's own goal ("the section is omitted") didn't reach
+// (independent review, uc-infra#132).
+//
+// Returns the resolved child Definition for every AVAILABLE section, so
+// loadMasterDetailChildren's own subsequent fetch doesn't re-resolve it
+// a second time, alongside the set of unavailable ones. A section with
+// no matching entity.Relationship (or one missing ParentField) is left
+// out of BOTH maps — that's the pre-existing "Definition mismatch, not
+// a licensing gap" case loadMasterDetailChildren always tolerated by
+// skipping silently, unrelated to whether the target module is
+// licensed, and not something this function should report either way.
+func (h *Handler) resolveMasterDetailSectionAvailability(ctx context.Context, ts tenantScope, entDef *entity.Definition, formDef *form.Definition) (map[string]*entity.Definition, map[string]bool, error) {
+	available := make(map[string]*entity.Definition)
+	unavailable := make(map[string]bool)
+	for _, section := range formDef.Sections {
+		if section.Component != form.ComponentMasterDetail && section.Component != form.ComponentRelatedList {
+			continue
+		}
 		var rel *entity.Relationship
 		for i := range entDef.Relationships {
 			if entDef.Relationships[i].Target == section.Target {
@@ -1592,22 +1681,16 @@ func (h *Handler) loadMasterDetailChildren(ctx context.Context, ts tenantScope, 
 			continue
 		}
 		childDef, err := ts.entityDef(ctx, section.Target)
+		if errors.Is(err, data.ErrNotFound) {
+			unavailable[section.Target] = true
+			continue
+		}
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("look up %s definition for master-detail section: %w", section.Target, err)
+			return nil, nil, fmt.Errorf("look up %s definition for master-detail section: %w", section.Target, err)
 		}
-		records, err := ts.crud.ListByField(ctx, childDef, rel.ParentField, recordID)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("list %s children: %w", section.Target, err)
-		}
-		rows := make([]map[string]any, len(records))
-		for i, rec := range records {
-			rows[i] = rec.Data
-		}
-		children[section.Target] = rows
-		childDefs[section.Target] = childDef
-		referenceLabels[section.Target] = h.pageReferenceLabels(ctx, ts, childDef, records, locale)
+		available[section.Target] = childDef
 	}
-	return children, childDefs, referenceLabels, nil
+	return available, unavailable, nil
 }
 
 func writeDefinitionLookupError(w http.ResponseWriter, entityType string, err error) {
