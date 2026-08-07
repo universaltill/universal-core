@@ -2532,6 +2532,11 @@ func TestAPI_RenderRecordForm_MasterDetailChildRedactedFieldColumnAbsent(t *test
 		t.Errorf("expected the redacted note column (header and cell) absent from the rendered form, got:\n%s", body)
 	}
 	if strings.Contains(body, "confidential margin note") {
+		// Belt-and-braces: GuardedEngine.ListByField already strips a
+		// hidden field's VALUE from every row before this handler ever
+		// sees it, so this assertion alone would still pass with this
+		// change reverted — the column NAME/LABEL (asserted above) was
+		// the actual leak this fix closes.
 		t.Errorf("expected the redacted field's value not to reach the DOM, got:\n%s", body)
 	}
 	if !strings.Contains(body, `data-field="line_total"`) {

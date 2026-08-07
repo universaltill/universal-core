@@ -211,6 +211,11 @@ func TestFieldPermission_MasterDetailChildColumnAbsentFromLiveDOM(t *testing.T) 
 	if unitPriceNodeCount != 0 {
 		t.Fatalf("redacted child column is present in the live DOM (%d node(s) for unit_price)", unitPriceNodeCount)
 	}
+	// Belt-and-braces: authz.GuardedEngine.ListByField already strips a
+	// hidden field's VALUE from every row before it ever reaches this
+	// handler, so this check alone would still pass with the fix
+	// reverted — the column identity (asserted above, via
+	// data-field="unit_price") was the actual leak uc-infra#127 closes.
 	var leaks bool
 	if err := chromedp.Run(bctx, chromedp.EvaluateAsDevTools(
 		`document.documentElement.outerHTML.includes("42.5")`, &leaks,
