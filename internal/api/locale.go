@@ -119,20 +119,60 @@ type regionOption struct {
 // accountant (the two-letter language codes in the language switcher
 // are a recognised convention; this is not). The href preserves the
 // current query string, so choosing a region on a filtered, sorted,
-// paginated list doesn't silently reset all three.
+// paginated list doesn't silently reset all three — EXCEPT "q" (see
+// below), which is dropped deliberately.
+//
+// "q" can hold text that isn't locale-invariant: since board #74, a
+// FieldNumber/FieldDate filter's "q" is the RAW text the viewer typed
+// under the PREVIOUS region's grouping/decimal/date-order rules, and
+// listview.go re-parses that same raw text under whatever region is now
+// active. Carrying it across a region switch can silently reinterpret it
+// as a DIFFERENT valid value under the new rules (en-GB's day-first
+// "04/03/2026" reads as en-US's month-first 4 April, not 3 April — no
+// error, no empty result, just a different match, with no indication to
+// the viewer that the filter's meaning changed) or stop it matching
+// altogether — either way, the viewer never asked for that (uc-infra#128).
+//
+// This drops "q" unconditionally, for every region switch and every
+// field type — not only when the two regions actually disagree, and not
+// only for FieldNumber/FieldDate. regionOptions only has the request and
+// the language: it has no Definition to check the active filter field's
+// type against (nav renders on every page, not just a list page, and
+// doing a tenant-scoped lookup here just to maybe skip clearing a search
+// box is not IO this shared chrome should own — see renderNav's own
+// "must never turn into a hard failure" framing). The honest tradeoff:
+// switching between two regions that format identically (e.g. any two of
+// en-GB/en-IE/en-AU/en-NZ, or any two "ar" choices), or while filtering a
+// plain FieldString, still clears a search box that didn't need clearing
+// — a re-type, not a silent surprise. "filter" (which FIELD is targeted)
+// has no locale dependence and always stays, matching the
+// already-supported bookmarked-"?filter=weight"-with-no-"q" case
+// (uc-infra#129) — a region switch just leaves that same box empty
+// instead of guessing what the old text now means.
+//
+// What this does NOT close: "q" traveling back in via a route other than
+// this picker's own generated link — the Back button, a bookmark, or a
+// link shared to someone whose region cookie differs — since neither the
+// filter form nor the sort/page links pin the region they were rendered
+// under. That's a real, separate gap (filed as uc-infra#164), not
+// silently reopened by this fix.
 func (h *Handler) regionOptions(r *http.Request, language string) []regionOption {
 	choices := regionChoices[language]
 	if len(choices) < 2 {
 		return nil
 	}
+	// One stripped base, reused across choices: Set below overwrites just
+	// the "region" key each iteration, so there's no need to re-parse (or
+	// copy) the query string per choice.
+	base := r.URL.Query()
+	base.Del("q")
 	out := make([]regionOption, 0, len(choices))
 	for _, tag := range choices {
-		q := r.URL.Query()
-		q.Set("region", tag)
+		base.Set("region", tag)
 		out = append(out, regionOption{
 			Tag:   tag,
 			Label: h.catalog.TOrDefault(language, "region."+strings.NewReplacer("-", "_").Replace(tag), tag),
-			Href:  r.URL.Path + "?" + q.Encode(),
+			Href:  r.URL.Path + "?" + base.Encode(),
 		})
 	}
 	return out

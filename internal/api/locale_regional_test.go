@@ -50,6 +50,82 @@ func setupRegionalTenant(t *testing.T) (tenantID string, mux *http.ServeMux) {
 	return tenantID, mux
 }
 
+// setupRegionalTenantTwoRows is setupRegionalTenant plus a second
+// Shipment record whose weight doesn't match the first row's under any
+// region this suite exercises — so "the full list, unfiltered" and "the
+// original filtered result" are actually distinguishable, not the same
+// one-row page either way (uc-infra#128's independent review: a
+// single-row fixture can't prove a filter was truly CLEARED rather than
+// still active and coincidentally still matching that one row).
+func setupRegionalTenantTwoRows(t *testing.T) (tenantID string, mux *http.ServeMux) {
+	t.Helper()
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := foundation.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	publishEntityAndForm(t, db, regionalEntityDef(), &form.Definition{
+		EntityType: "Shipment", Version: 1,
+		Sections: []form.Section{{Title: "D", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "name"}, {Name: "ship_date"}, {Name: "weight"}}}},
+	})
+	eng := crud.NewEngine(db)
+	if _, err := eng.Create(ctx, regionalEntityDef(), map[string]any{
+		"name": "Container 1", "ship_date": "2026-04-03", "weight": 1234567.5,
+	}, humanActor()); err != nil {
+		t.Fatalf("seed Shipment: %v", err)
+	}
+	if _, err := eng.Create(ctx, regionalEntityDef(), map[string]any{
+		"name": "Container 2", "ship_date": "2026-01-15", "weight": 42.0,
+	}, humanActor()); err != nil {
+		t.Fatalf("seed second Shipment: %v", err)
+	}
+	mux = http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+	return tenantID, mux
+}
+
+// setupAmbiguousDateTenant seeds two Shipment rows whose ISO dates are
+// each other's day/month swap — 3 April vs 4 March — so the SAME literal
+// date-shaped text ("03/04/2026") is a valid, DIFFERENT match under
+// en-GB's day-first rules than under en-US's month-first rules. That's
+// what makes it possible to prove a region switch REINTERPRETS a filter
+// (matches a different record, silently) rather than merely stopping it
+// from matching anything — the weight-grouping pair used elsewhere in
+// this file only demonstrates the latter, weaker failure mode
+// (uc-infra#128's independent review, F1).
+func setupAmbiguousDateTenant(t *testing.T) (tenantID string, mux *http.ServeMux) {
+	t.Helper()
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := foundation.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	publishEntityAndForm(t, db, regionalEntityDef(), &form.Definition{
+		EntityType: "Shipment", Version: 1,
+		Sections: []form.Section{{Title: "D", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "name"}, {Name: "ship_date"}, {Name: "weight"}}}},
+	})
+	eng := crud.NewEngine(db)
+	if _, err := eng.Create(ctx, regionalEntityDef(), map[string]any{
+		"name": "AprilThird", "ship_date": "2026-04-03", "weight": 1.0,
+	}, humanActor()); err != nil {
+		t.Fatalf("seed AprilThird: %v", err)
+	}
+	if _, err := eng.Create(ctx, regionalEntityDef(), map[string]any{
+		"name": "MarchFourth", "ship_date": "2026-03-04", "weight": 2.0,
+	}, humanActor()); err != nil {
+		t.Fatalf("seed MarchFourth: %v", err)
+	}
+	mux = http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+	return tenantID, mux
+}
+
 func getList(t *testing.T, mux *http.ServeMux, tenantID, query string, cookies ...*http.Cookie) *httptest.ResponseRecorder {
 	t.Helper()
 	req := newRequest("GET", "/records/Shipment"+query, tenantID, "farshid", nil)
