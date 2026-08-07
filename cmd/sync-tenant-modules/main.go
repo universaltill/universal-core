@@ -629,7 +629,12 @@ func requiredFieldWarnings(
 				continue
 			}
 			n, err := records.CountMissingField(ctx, c.entityType, f.Name)
-			if err != nil || n == 0 {
+			if err != nil {
+				log.Printf("WARNING: %s: %s — could not check existing records against the now-required %q, this warning may be incomplete: %v",
+					tenantName, c.entityType, f.Name, err)
+				continue
+			}
+			if n == 0 {
 				continue
 			}
 			out = append(out, fmt.Sprintf(
@@ -696,7 +701,12 @@ func targetConstraintWarnings(
 				continue
 			}
 			n, err := crud.CountTargetConstraintViolations(ctx, tenantDB, records, newDef, f.Name)
-			if err != nil || n == 0 {
+			if err != nil {
+				log.Printf("WARNING: %s: %s — could not check existing records against the new reference constraint on %q, this warning may be incomplete: %v",
+					tenantName, c.entityType, f.Name, err)
+				continue
+			}
+			if n == 0 {
 				continue
 			}
 			out = append(out, fmt.Sprintf(
