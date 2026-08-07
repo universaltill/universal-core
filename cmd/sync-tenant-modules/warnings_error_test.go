@@ -259,6 +259,46 @@ func TestNumericBoundWarnings_CountErrorIsSurfacedNotSwallowed(t *testing.T) {
 	}
 }
 
+func TestNumericBoundWarnings_ZeroCountStaysSilent(t *testing.T) {
+	// Guards the other half of the branch split, the same way
+	// TestRequiredFieldWarnings_ZeroCountStaysSilent does above: n == 0
+	// with no error must still produce no output at all, not even a
+	// WARNING — needs a real, empty tenant database (a closed one would
+	// hit the error branch instead). Independent review of this change
+	// confirmed a mutation that emits a spurious WARNING on a zero count
+	// (while leaving the returned []string correct) passed the rest of
+	// this package's suite undetected before this test existed.
+	_, control, router := controlPlane(t)
+	const name = "Demo Organization"
+	_, tenantDB := newTenant(t, control, router, name)
+	entityDefs := data.NewEntityDefinitionRepo(tenantDB)
+
+	minVal := 0.0
+	def := &entity.Definition{
+		EntityType: "Gauge",
+		Fields: []entity.Field{
+			{Name: "reading", Type: entity.FieldNumber, Min: &minVal},
+		},
+	}
+	defFor := func(entityType string) (*entity.Definition, bool) {
+		if entityType != "Gauge" {
+			return nil, false
+		}
+		return def, true
+	}
+	changes := []change{{entityType: "Gauge", from: 0, to: 1}}
+
+	logged := captureLog(t, func() {
+		out := numericBoundWarnings(context.Background(), tenantDB, entityDefs, name, changes, defFor)
+		if len(out) != 0 {
+			t.Errorf("expected no warnings against an empty table, got %v", out)
+		}
+	})
+	if logged != "" {
+		t.Errorf("zero violations (no error) must stay silent, got log output: %q", logged)
+	}
+}
+
 func TestUniqueConstraintWarnings_CountErrorIsSurfacedNotSwallowed(t *testing.T) {
 	// Two declared Unique sets, not one — same "the loop must keep going
 	// past a transient error" reasoning as the tests above.
@@ -313,5 +353,42 @@ func TestUniqueConstraintWarnings_CountErrorIsSurfacedNotSwallowed(t *testing.T)
 	}
 	if !strings.Contains(logged, "database is closed") {
 		t.Errorf("expected the WARNING to carry the underlying error, got: %q", logged)
+	}
+}
+
+func TestUniqueConstraintWarnings_ZeroCountStaysSilent(t *testing.T) {
+	// Guards the other half of the branch split, the same way
+	// TestRequiredFieldWarnings_ZeroCountStaysSilent and
+	// TestNumericBoundWarnings_ZeroCountStaysSilent do above: n == 0 with
+	// no error must still produce no output at all, not even a WARNING —
+	// needs a real, empty tenant database (a closed one would hit the
+	// error branch instead).
+	_, control, router := controlPlane(t)
+	const name = "Demo Organization"
+	_, tenantDB := newTenant(t, control, router, name)
+	entityDefs := data.NewEntityDefinitionRepo(tenantDB)
+
+	def := &entity.Definition{
+		EntityType: "Voucher",
+		Unique: [][]string{
+			{"code"},
+		},
+	}
+	defFor := func(entityType string) (*entity.Definition, bool) {
+		if entityType != "Voucher" {
+			return nil, false
+		}
+		return def, true
+	}
+	changes := []change{{entityType: "Voucher", from: 0, to: 1}}
+
+	logged := captureLog(t, func() {
+		out := uniqueConstraintWarnings(context.Background(), tenantDB, entityDefs, name, changes, defFor)
+		if len(out) != 0 {
+			t.Errorf("expected no warnings against an empty table, got %v", out)
+		}
+	})
+	if logged != "" {
+		t.Errorf("zero violations (no error) must stay silent, got log output: %q", logged)
 	}
 }
