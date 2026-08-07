@@ -221,6 +221,21 @@ type Data struct {
 	// query failed", so it resolves this the same way it precomputes
 	// RedactedFields/ReferenceCreateLabels.
 	UnavailableSections map[string]bool
+	// DegradedSections names every master-detail/related-list section
+	// (keyed by section.Target, same key space as Children) whose child
+	// rows could NOT be loaded because the viewer lacks read access to
+	// the child entity type (internal/api's loadMasterDetailChildren
+	// degrading authz.ErrDenied rather than failing the whole render —
+	// uc-infra#131). Distinct both from a section simply having zero real
+	// children (absent from DegradedSections but still meant to roll up
+	// to 0) and from UnavailableSections above (unlicensed at the
+	// Definition level, omitted from the form entirely) — a degraded
+	// section IS licensed and IS rendered, just without any rows this
+	// viewer is allowed to see. A section IN this set must not be
+	// treated as "zero children" by the roll-up computation below — see
+	// that code's own comment for why conflating the two silently
+	// corrupts a writable header field.
+	DegradedSections map[string]bool
 }
 
 // Render writes the HTML/HTMX form for def against ent's field shapes and
@@ -535,14 +550,40 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 		if s.Component != form.ComponentMasterDetail || s.RollUp == "" {
 			continue
 		}
-		if data.UnavailableSections[s.Target] {
+		if data.UnavailableSections[s.Target] || data.DegradedSections[s.Target] {
 			// Don't recompute (and don't zero) the roll-up target field
 			// from a section we can't actually read children for right
 			// now — leave whatever was last saved on the record alone,
 			// the same "preserve, don't silently wipe" treatment an
 			// off-form field already gets elsewhere in this file, rather
 			// than confidently showing 0 for a total that may well be
-			// nonzero.
+			// nonzero. This covers two distinct cases: UnavailableSections
+			// (unlicensed — the section is omitted from the form entirely,
+			// so this is largely moot for display) and DegradedSections
+			// (licensed and rendered, but this viewer lacks read access to
+			// its children — Children[s.Target] being empty/absent here
+			// means "couldn't load," not "zero rows," and summing it would
+			// silently produce 0). RollUpTarget is an ordinary writable
+			// field on the parent (e.g. PurchaseOrder.total, edited like
+			// any other header field), not a read-only computed one, so a
+			// wrong 0 here doesn't just mis-render — saving this form
+			// persists it over the real total (independent review,
+			// uc-infra#131: found live-corrupting internal/kernel/
+			// purchasing/ledger.go's GL posting, which reads the stored
+			// total directly). Leave effective[s.RollUpTarget] exactly as
+			// maps.Copy already set it above (the record's last stored
+			// value) and surface that same number as the displayed total
+			// below (relevant for the DegradedSections case, since that
+			// section IS still rendered), rather than a total this render
+			// cannot actually verify. That value can itself be stale by
+			// whatever changed since it was last saved — an accepted,
+			// bounded gap: a viewer denied read on the child type
+			// structurally cannot verify a live total either way, and
+			// "possibly stale" is a materially smaller failure than
+			// "silently zeroed."
+			if n, ok := effective[s.RollUpTarget].(float64); ok {
+				rollUpTotals[s.RollUpTarget] = n
+			}
 			continue
 		}
 		total, err := computeRollUp(data.Children[s.Target], s.RollUp)
