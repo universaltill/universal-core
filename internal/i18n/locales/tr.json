@@ -250,6 +250,7 @@
   "field.Currency.code": "Kod",
   "field.Currency.name": "Ad",
   "field.Currency.minor_unit": "Kesir Birimi",
+  "field.Currency.is_base": "Baz Para Birimi",
   "field.ExchangeRate.from_currency_id": "Kaynak Para Birimi",
   "field.ExchangeRate.to_currency_id": "Hedef Para Birimi",
   "field.ExchangeRate.effective_date": "Geçerlilik Tarihi",

@@ -250,6 +250,7 @@
   "field.Currency.code": "الرمز",
   "field.Currency.name": "الاسم",
   "field.Currency.minor_unit": "الوحدة الفرعية",
+  "field.Currency.is_base": "العملة الأساسية",
   "field.ExchangeRate.from_currency_id": "من عملة",
   "field.ExchangeRate.to_currency_id": "إلى عملة",
   "field.ExchangeRate.effective_date": "تاريخ السريان",

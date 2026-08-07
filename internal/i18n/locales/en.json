@@ -250,6 +250,7 @@
   "field.Currency.code": "Code",
   "field.Currency.name": "Name",
   "field.Currency.minor_unit": "Minor Unit",
+  "field.Currency.is_base": "Base Currency",
   "field.ExchangeRate.from_currency_id": "From Currency",
   "field.ExchangeRate.to_currency_id": "To Currency",
   "field.ExchangeRate.effective_date": "Effective Date",

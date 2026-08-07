@@ -57,16 +57,17 @@ func PublishForms(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 	return moduleseed.PublishAll(ctx, repo, items, actor)
 }
 
-// DefaultGLCurrency is the fallback ISO 4217 code SyncGLAccounts uses
-// when a finance.Account record has no currency_id set — gl_accounts.
-// currency is NOT NULL, but Account.currency_id is optional (an account
-// isn't required to declare one, and cmd/seed-demo-data's sample chart
-// doesn't set it on any account today). A real per-tenant functional/
-// base currency concept doesn't exist yet anywhere in this kernel
-// (foundation.Currency has no is_base-style flag) — this constant is a
-// known, narrow simplification for this first slice, not a hidden
-// assumption: revisit once a tenant-level base currency is actually
-// modeled, per erp/BACKLOG-TASKS.md.
+// DefaultGLCurrency is the last-resort ISO 4217 code SyncGLAccounts and
+// the SAF-T export (via ResolveBaseCurrency, uc-infra#120) fall back to
+// when a finance.Account record has no currency_id set and the tenant
+// hasn't configured a real base currency either (foundation.Currency's
+// is_base flag) — gl_accounts.currency is NOT NULL, but Account.
+// currency_id is optional (an account isn't required to declare one,
+// and cmd/seed-demo-data's sample chart doesn't set it on any account
+// today), so *some* fallback always has to exist. A tenant that HAS
+// configured is_base gets that currency instead — see
+// ResolveBaseCurrency's own doc comment for the resolution and
+// fail-safe-degradation rules.
 const DefaultGLCurrency = "USD"
 
 // SyncGLAccounts brings gl_accounts (the ledger core's own typed chart of
@@ -104,6 +105,22 @@ func SyncGLAccounts(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 		return fmt.Errorf("list Account records: %w", err)
 	}
 
+	// uc-infra#120: the per-account fallback used to be the hardcoded
+	// DefaultGLCurrency constant unconditionally; it's now the tenant's
+	// actual configured base currency when one is set, still degrading to
+	// DefaultGLCurrency when it isn't (ResolveBaseCurrency's own doc
+	// comment covers the zero/many-is_base cases). This re-fetches and
+	// re-unmarshals the Currency Definition ResolveBaseCurrency already
+	// looked up above for currencyDef — a real, if small, redundant round
+	// trip on this cold (per-Sync, not per-account) path; not worth
+	// plumbing the already-unmarshalled Definition through
+	// ResolveBaseCurrency's exported signature just to save it, since that
+	// signature is shared with saftexport.go's unrelated call site.
+	baseCurrency, err := ResolveBaseCurrency(ctx, db)
+	if err != nil {
+		return fmt.Errorf("resolve base currency: %w", err)
+	}
+
 	glAccounts := data.NewGLAccountRepo(db)
 	currencyCodeCache := map[string]string{}
 	for _, acc := range accounts {
@@ -112,7 +129,7 @@ func SyncGLAccounts(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 		accountType, _ := acc.Data["type"].(string)
 		isActive, _ := acc.Data["is_active"].(bool)
 
-		currency := DefaultGLCurrency
+		currency := baseCurrency
 		usedFallback := true
 		if currencyID, _ := acc.Data["currency_id"].(string); currencyID != "" {
 			usedFallback = false
@@ -133,9 +150,10 @@ func SyncGLAccounts(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 			// Not a hidden assumption (see DefaultGLCurrency's own doc
 			// comment), but it should be observable, not silent — a
 			// GBP-only tenant whose accounts never set currency_id would
-			// otherwise get every gl_account silently labeled USD with no
-			// trace anywhere (a real gap independent review caught).
-			log.Printf("finance: SyncGLAccounts: Account %s has no currency_id set, defaulting gl_accounts.currency to %s", code, DefaultGLCurrency)
+			// otherwise get every gl_account silently labeled USD (or
+			// whatever the tenant's base currency is) with no trace
+			// anywhere (a real gap independent review caught).
+			log.Printf("finance: SyncGLAccounts: Account %s has no currency_id set, defaulting gl_accounts.currency to %s", code, baseCurrency)
 		}
 
 		if _, err := glAccounts.UpsertByCode(ctx, code, name, accountType, currency, isActive); err != nil {

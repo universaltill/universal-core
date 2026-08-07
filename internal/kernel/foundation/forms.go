@@ -478,7 +478,12 @@ func UomConversionForm() *form.Definition {
 func CurrencyForm() *form.Definition {
 	return &form.Definition{
 		EntityType: "Currency",
-		Version:    1,
+		// Version 2 (uc-infra#120): added is_base — see Currency()'s own
+		// doc comment. Listed explicitly here, not inferred from the
+		// entity's field list: this form (like every other Definition in
+		// this package) declares its own field set, so a new entity
+		// field that isn't added here would silently never render.
+		Version: 2,
 		Sections: []form.Section{
 			{
 				Title:     "Details",
@@ -487,6 +492,7 @@ func CurrencyForm() *form.Definition {
 					{Name: "code", Label: "Code"},
 					{Name: "name", Label: "Name"},
 					{Name: "minor_unit", Label: "Minor Unit"},
+					{Name: "is_base", Label: "Base Currency"},
 				},
 			},
 		},

@@ -10,6 +10,7 @@ import (
 	"github.com/universaltill/universal-core/internal/i18n"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/form"
+	"github.com/universaltill/universal-core/internal/kernel/foundation"
 )
 
 // purchaseOrderEntity/purchaseOrderForm are the same worked example as
@@ -2233,6 +2234,39 @@ func TestRender_NonSaveActionLabelWithoutCatalogKeyFallsBackToLiteral(t *testing
 // erroring, so a slugify drift would NOT fail loudly on its own —
 // i18n_coverage_test.go is the backstop that catches it in practice, but
 // this test pins the transform itself).
+// TestRender_CurrencyFormRendersIsBaseCheckbox is the render-layer
+// closure for uc-infra#120's independent review finding: every other
+// test proving is_base exists (foundation package) or resolves
+// correctly (finance package) works against the Definition/data layer
+// only — nothing pinned that the REAL foundation.CurrencyForm()
+// Definition (not a synthetic one, unlike TestRender_
+// BoolFieldHasHiddenFalseFallbackAndTrueCheckboxValue above) actually
+// lists is_base among its rendered fields with its real catalog-resolved
+// label. A form.Definition that explicitly lists fields (CurrencyForm's
+// own doc comment) silently drops a field that's forgotten from that
+// list — this is what would have caught it.
+func TestRender_CurrencyFormRendersIsBaseCheckbox(t *testing.T) {
+	r := testRenderer(t)
+	ent := foundation.Currency()
+	def := foundation.CurrencyForm()
+	data := Data{Record: map[string]any{"code": "GBP", "name": "British Pound", "is_base": true}}
+
+	var buf strings.Builder
+	if err := r.Render(&buf, def, ent, data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	body := buf.String()
+	if !strings.Contains(body, `name="is_base"`) {
+		t.Fatalf("expected the real CurrencyForm to render an is_base field, got:\n%s", body)
+	}
+	if !strings.Contains(body, `type="checkbox" id="is_base" name="is_base" value="true" checked`) {
+		t.Fatalf("expected is_base to render as a checked checkbox for a true value, got:\n%s", body)
+	}
+	if !strings.Contains(body, "Base Currency") {
+		t.Fatalf("expected the is_base field's real catalog-resolved label \"Base Currency\", got:\n%s", body)
+	}
+}
+
 func TestSlugifyTitle(t *testing.T) {
 	cases := []struct{ title, want string }{
 		{"Header", "header"},
