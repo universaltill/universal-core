@@ -834,5 +834,12 @@
   "entity.validation.below_minimum": "{field} أقل من الحد الأدنى المسموح به.",
   "entity.validation.above_maximum": "{field} أكبر من الحد الأقصى المسموح به.",
   "entity.validation.invalid": "{field} غير صالح.",
-  "crud.error.unique_constraint_violation": "هذا المزيج من {fields} مستخدم بالفعل من قبل سجل آخر."
+  "crud.error.unique_constraint_violation": "هذا المزيج من {fields} مستخدم بالفعل من قبل سجل آخر.",
+  "help.viewer.title": "مساعدة",
+  "help.viewer.search_placeholder": "ابحث في مواضيع المساعدة…",
+  "help.viewer.no_results": "لا توجد مواضيع تطابق بحثك.",
+  "help.viewer.empty_state": "اختر موضوعًا من القائمة لقراءته هنا.",
+  "help.viewer.admin_badge": "مسؤول",
+  "help.viewer.not_found_title": "موضوع المساعدة غير موجود",
+  "help.viewer.not_found_body": "لا يوجد موضوع المساعدة هذا، أو ليس لديك إذن لعرضه."
 }

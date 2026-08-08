@@ -377,6 +377,17 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	// entity type — this report is scoped to exactly one RFQ, unlike the
 	// purchasing report above which aggregates across every record.
 	mux.Handle("GET /reports/rfq/{id}", authPage(h.renderRFQComparisonReport))
+	// The in-product help manual viewer (ADR-0023, uc-infra#144) — see
+	// help.go's own doc comment. /help/search is registered as its own
+	// literal route (not folded into the {topicID...} wildcard below) so
+	// the search box's htmx partial and a real topic id can never
+	// collide — Go's ServeMux prefers the more specific literal match
+	// over an overlapping wildcard one regardless of registration order,
+	// the same "saft" vs {entityType} precedent /export/saft's own
+	// comment above already relies on.
+	mux.Handle("GET /help", authPage(h.renderHelpIndex))
+	mux.Handle("GET /help/search", auth(h.helpSearchFragment))
+	mux.Handle("GET /help/{topicID...}", authPage(h.renderHelpTopic))
 	// The BYOK AI-provider settings page — see aiprovidersettings.go's own
 	// doc comment. Not entity-scoped in the URL, same reasoning as
 	// /issue-report/*: AIProviderConnection is one fixed foundation
