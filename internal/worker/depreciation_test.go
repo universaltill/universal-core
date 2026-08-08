@@ -58,6 +58,29 @@ func TestShouldPostDepreciation_ZeroIntervalUsesDefault(t *testing.T) {
 	}
 }
 
+// TestWithDefaults_ZeroDepreciationPostBatchSizeUsesDefault is
+// uc-infra#137/ADR-0025's direct regression test for the new batch-cap
+// Config field defaulting the same way every other zero-value Config
+// field here already does — same shape as
+// TestShouldPostDepreciation_ZeroIntervalUsesDefault above.
+func TestWithDefaults_ZeroDepreciationPostBatchSizeUsesDefault(t *testing.T) {
+	r := &Runner{cfg: Config{}.withDefaults()}
+	if r.cfg.DepreciationPostBatchSize != defaultDepreciationPostBatchSize {
+		t.Fatalf("withDefaults() left DepreciationPostBatchSize = %d, want the %d default", r.cfg.DepreciationPostBatchSize, defaultDepreciationPostBatchSize)
+	}
+}
+
+// TestWithDefaults_PositiveDepreciationPostBatchSizePreserved confirms
+// an explicitly-configured cap is not clobbered by withDefaults() — the
+// same "only zero/negative falls back" guarantee every other Config
+// field's own default guard already gives.
+func TestWithDefaults_PositiveDepreciationPostBatchSizePreserved(t *testing.T) {
+	r := &Runner{cfg: Config{DepreciationPostBatchSize: 5}.withDefaults()}
+	if r.cfg.DepreciationPostBatchSize != 5 {
+		t.Fatalf("withDefaults() overwrote an explicit DepreciationPostBatchSize: got %d, want 5", r.cfg.DepreciationPostBatchSize)
+	}
+}
+
 func TestForgetDepreciationPost_ClearsThrottleForRetry(t *testing.T) {
 	r := &Runner{cfg: Config{DepreciationPostInterval: time.Minute}.withDefaults()}
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)

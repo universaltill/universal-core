@@ -56,14 +56,29 @@ type Config struct {
 	// "more DB connections held polling."
 	Concurrency int
 	// DepreciationPostInterval is how often (per tenant, at most)
-	// assets.PostDueDepreciation runs (uc-infra#76, ADR-0022). Zero means
-	// the 30s default. Separate from PollInterval for the same reason
-	// ScheduleSyncInterval is: scanning every DepreciationSchedule row in
-	// the tenant is an O(n) table scan, and a depreciation posting is
-	// due at most once a day per asset — running that every 2s forever
+	// assets.PostDueDepreciationBatch runs (uc-infra#76, ADR-0022). Zero
+	// means the 30s default. Separate from PollInterval for the same
+	// reason ScheduleSyncInterval is: scanning every DepreciationSchedule
+	// row in the tenant is an O(n) table scan, and a depreciation posting
+	// is due at most once a day per asset — running that every 2s forever
 	// is pure waste for a job nothing needs sub-minute latency on. A
 	// period that came due mid-interval waits at most this long to post.
 	DepreciationPostInterval time.Duration
+	// DepreciationPostBatchSize caps how many DepreciationSchedule rows
+	// one assets.PostDueDepreciationBatch call posts (uc-infra#137,
+	// ADR-0025). Zero means the 200-row default. This is the actual fix
+	// for uc-infra#137, not DepreciationPostInterval above:
+	// DepreciationPostInterval only throttles how OFTEN a run starts —
+	// nothing previously bounded how LONG one run could take, and
+	// tick()'s sequential per-tenant loop means a slow run for one
+	// tenant (a large catch-up backlog — exactly the scenario this
+	// job's own "catch-up, not skip" design intentionally supports)
+	// delayed every OTHER tenant's tick, including the queued-job work a
+	// user is actually waiting on. A tenant whose backlog exceeds this
+	// cap simply resumes posting the remainder on its next
+	// DepreciationPostInterval tick, same latency model as
+	// DepreciationPostInterval's own "waits at most this long" tradeoff.
+	DepreciationPostBatchSize int
 }
 
 const (
@@ -71,6 +86,25 @@ const (
 	defaultLeaseTimeout             = 5 * time.Minute
 	defaultConcurrency              = 2
 	defaultDepreciationPostInterval = 30 * time.Second
+	// defaultDepreciationPostBatchSize (uc-infra#137, ADR-0025):
+	// assets.PostDueDepreciationBatch does one DB transaction per
+	// attempted row (postDepreciationRow), so the POSTING portion of a
+	// call's wall-clock cost is roughly linear in rows attempted, capped
+	// here. This does NOT bound the whole call: PostDueDepreciationBatch
+	// still reads and decodes every DepreciationSchedule row in the
+	// tenant on every call (assets.records.List has no due-filter or
+	// LIMIT — see that function's own doc comment) before applying this
+	// cap, so a tenant with a very large total schedule row count still
+	// pays that full-scan cost each call, capped or not — tracked as a
+	// follow-up (uc-infra#182) rather than fixed here, since fixing it
+	// for real needs a due-filtered/LIMITed internal/data query method,
+	// not a worker-side change. 200 keeps the POSTING portion of a
+	// single call's worst case to a small fraction of a second —
+	// bounding how long one tenant can delay every other tenant's tick
+	// on that part — while still making real catch-up progress every
+	// DepreciationPostInterval. Deployments with unusually large
+	// per-tenant asset counts can raise this via Config.
+	defaultDepreciationPostBatchSize = 200
 )
 
 func (c Config) withDefaults() Config {
@@ -85,6 +119,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.DepreciationPostInterval <= 0 {
 		c.DepreciationPostInterval = defaultDepreciationPostInterval
+	}
+	if c.DepreciationPostBatchSize <= 0 {
+		c.DepreciationPostBatchSize = defaultDepreciationPostBatchSize
 	}
 	return c
 }
@@ -242,16 +279,20 @@ func (r *Runner) tickTenant(ctx context.Context, tenantID string, q *workflow.Qu
 			log.Printf("worker: tenant %s: fired %d scheduled workflow(s): %v", tenantID, len(fired), fired)
 		}
 
-		// assets.PostDueDepreciation (uc-infra#76, ADR-0022): a plain
-		// per-tenant function call, not a workflow — see ADR-0022 for
-		// why this isn't routed through the workflow StepKind engine.
-		// Throttled the same way schedule-sync is, and for the same
-		// reason: it's a full DepreciationSchedule table scan, and
-		// nothing here needs sub-minute latency. Failures are logged
+		// assets.PostDueDepreciationBatch (uc-infra#76, ADR-0022; capped
+		// uc-infra#137, ADR-0025): a plain per-tenant function call, not
+		// a workflow — see ADR-0022 for why this isn't routed through
+		// the workflow StepKind engine. Throttled the same way
+		// schedule-sync is, and for the same reason: it's a full
+		// DepreciationSchedule table scan, and nothing here needs
+		// sub-minute latency. Capped by DepreciationPostBatchSize (see
+		// its own doc comment) so a large catch-up backlog can't make
+		// this one call block every other tenant's tick — the remainder
+		// resumes on this tenant's next due tick. Failures are logged
 		// and skipped, never fatal to this tenant's tick — same
 		// isolation as every other per-tenant step in this function.
 		if r.shouldPostDepreciation(tenantID, now) {
-			posted, err := assets.PostDueDepreciation(ctx, db, assets.SchedulerActor())
+			posted, err := assets.PostDueDepreciationBatch(ctx, db, assets.SchedulerActor(), r.cfg.DepreciationPostBatchSize)
 			// finishDepreciationPost unconditionally, success or error:
 			// this is what lets a SECOND poller (RunConcurrent) pick this
 			// tenant back up as soon as this run ends, rather than staying
