@@ -572,7 +572,24 @@ func (h *Handler) buildQualityRows(stats forecast.QualityResult, rows []data.Goo
 // — the report needs per-item sums, not every InventoryItem record. A
 // tenant without the Purchasing module published has no ReorderRule
 // Definition to read — data.ErrNotFound here just means "no rules",
-// not an error page.
+// not an error page. The Item lookup below degrades the same way and
+// for the same reason: a ReorderRule with no readable Item Definition
+// has nothing this section can meaningfully render either (uc-infra#157
+// — independent review found this lookup didn't mirror the ReorderRule
+// one above it, so an inconsistent-publish tenant state — real
+// ReorderRule records but no published Item Definition — 500'd the
+// whole report instead of degrading the reorder section like every
+// other missing-Definition case here).
+//
+// authz.ErrDenied from either call is a DIFFERENT, already-unreachable
+// case: renderPurchasingReport's own requireReportRead gates the whole
+// page on read access to every type buildReorderSignals touches
+// (purchasingReportEntityTypes includes both ReorderRule and Item), so
+// a viewer denied read on either one never reaches this function at all
+// — the page 403s first. Not handled specially here; any ErrDenied that
+// somehow did arrive would still correctly hard-fail below, same as any
+// other unexpected error, rather than silently showing a wrong "no
+// signals" state to someone who might otherwise have seen real ones.
 func (h *Handler) buildReorderSignals(ctx context.Context, ts tenantScope, stats forecast.Result, locale string) ([]reorderRowView, error) {
 	reorderDef, err := ts.entityDef(ctx, "ReorderRule")
 	if errors.Is(err, data.ErrNotFound) {
@@ -590,6 +607,9 @@ func (h *Handler) buildReorderSignals(ctx context.Context, ts tenantScope, stats
 	}
 
 	itemDef, err := ts.entityDef(ctx, "Item")
+	if errors.Is(err, data.ErrNotFound) {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}
