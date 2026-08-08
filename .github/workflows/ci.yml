@@ -31,6 +31,63 @@ jobs:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/universal_core_test?sslmode=disable
     steps:
       - uses: actions/checkout@v4
+      # A script nothing runs is only ever read, not verified — this
+      # exercises check-coverage-floor.sh's own comparison logic against
+      # fixtures (including a real-ci.yml-based case) before the tamper
+      # check below trusts it against a real PR. Always runs, unlike the
+      # tamper check itself, since it's testing the script, not doing a
+      # PR-specific comparison — no reason to skip it on a plain push.
+      - name: Coverage floor script self-test
+        run: .github/scripts/check-coverage-floor_test.sh
+      # Tamper-resistance for the Coverage gate step's floor, below: the
+      # same PR that regresses coverage can otherwise also lower
+      # COVERAGE_FLOOR to make itself pass, with nothing structural
+      # stopping it (found via uc-infra#56's independent review,
+      # uc-infra#113). Runs only on pull_request — a plain push to main
+      # has no base ref to diff the floor against. Placed first, before
+      # Go is even set up, so a tampered PR fails in seconds rather than
+      # after the full DB-backed test run below.
+      #
+      # Honest gap: a direct push to main (bypassing a PR) isn't checked
+      # at all — nothing here stops that push from lowering the floor.
+      # This pipeline has no tool access to configure branch protection
+      # requiring PRs, so that gap isn't closed, only named.
+      #
+      # Fetches the PR's base commit by SHA, not by branch name. This
+      # doesn't pin to "the commit the PR was opened against" — GitHub's
+      # `pull_request.base.sha` is the base tip as of the triggering
+      # event and moves across `synchronize` events like any other base
+      # ref — but it does mean this run compares against the exact base
+      # commit *this* CI run's event payload named, not a branch tip
+      # that could have moved again by the time the comparison executes.
+      #
+      # One documented approximation: for pull_request events,
+      # actions/checkout@v4's default ref is the merge commit (base
+      # merged with head), not the raw PR head, so ".github/workflows/
+      # ci.yml" on disk here is technically that merge result. In the
+      # normal case (no conflicting concurrent edit to this exact line)
+      # that's equivalent to the PR's own value — flagging it as an
+      # accepted approximation rather than a silent assumption.
+      #
+      # Known, accepted gap: check-coverage-floor.sh only catches a
+      # *lowered numeric value* at a single anchored assignment. It does
+      # not stop someone deleting the whole Coverage gate step, or
+      # editing this very tamper-check step/script in the same PR that
+      # also lowers the floor (pull_request checkout includes the PR's
+      # own workflow changes, so a sufficiently determined PR can disable
+      # its own check) — that's a heavier structural fix (a separate
+      # checked-in file with CODEOWNERS/branch-protection was
+      # uc-infra#113's Option 2, deliberately not built here: this
+      # pipeline has no tool access to configure branch protection). The
+      # Reviewer step's own manual check (reviewer/SKILL.md: "confirm the
+      # diff doesn't drop ci.yml's whole-program coverage threshold")
+      # stays as defense-in-depth for what this script can't see.
+      - name: Coverage floor tamper check
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch origin ${{ github.event.pull_request.base.sha }} --depth=1
+          git show ${{ github.event.pull_request.base.sha }}:.github/workflows/ci.yml > "${RUNNER_TEMP}/base-ci.yml"
+          .github/scripts/check-coverage-floor.sh .github/workflows/ci.yml "${RUNNER_TEMP}/base-ci.yml"
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
