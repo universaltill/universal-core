@@ -370,26 +370,47 @@ func (h *Handler) saftParties(r *http.Request, ts tenantScope) (customers, suppl
 
 // saftCompanyProfile reads the Party holding the "own_organization"
 // PartyRole (uc-infra#63) — the tenant's own statutory identity — through
-// the guarded engine, the same access path saftParties already uses for
-// customers/suppliers. Zero such Party (no statutory profile configured
+// ownOrganizationParty, which goes through the same guarded engine
+// saftParties already uses for customers/suppliers. Zero such Party (no
+// statutory profile configured
 // yet — today's status quo for every existing tenant), more than one
-// DISTINCT such Party (an unresolvable data-quality ambiguity this export
-// has no business guessing at), and a role row whose party_id resolves to
-// nothing (deleted, blank, or malformed) all degrade identically to
-// all-empty: saft.Build already falls back to the spec's NA markers for
-// empty Input fields, the same
-// fail-safe "don't guess, degrade" posture foundation.SystemOfRecord's
-// own doc comment argues for a structurally similar one-row-per-tenant
+// DISTINCT such Party, and a role row whose party_id resolves to nothing
+// all degrade identically to all-empty: saft.Build already falls back to
+// the spec's NA markers for empty Input fields, the same fail-safe
+// "don't guess, degrade" posture foundation.SystemOfRecord's own doc
+// comment argues for a structurally similar one-row-per-tenant
 // convention.
 func (h *Handler) saftCompanyProfile(r *http.Request, ts tenantScope) (regNum, taxRegNum, contactFirst, contactLast string, err error) {
-	ctx := r.Context()
+	org, ok, err := h.ownOrganizationParty(r.Context(), ts)
+	if err != nil || !ok {
+		return "", "", "", "", err
+	}
+	return stringField(org.Data, "registration_number"),
+		stringField(org.Data, "tax_id"),
+		stringField(org.Data, "contact_first_name"),
+		stringField(org.Data, "contact_last_name"),
+		nil
+}
+
+// ownOrganizationParty resolves the Party holding the "own_organization"
+// PartyRole (uc-infra#63) — the tenant's own statutory identity — through
+// the guarded engine. ok=false covers every degrade case a caller must
+// treat identically to "no statutory profile configured": zero matching
+// role rows, more than one DISTINCT resolved Party (an unresolvable
+// data-quality ambiguity no caller has business guessing at), and a role
+// row whose party_id resolves to nothing (deleted, blank, or malformed).
+// Shared by saftCompanyProfile and the UBL export's own tenant-party
+// resolution (uc-infra#119) so this dedupe/guard logic — the exact two
+// bugs #63's independent review found and fixed — lives in exactly one
+// place instead of drifting across two copies.
+func (h *Handler) ownOrganizationParty(ctx context.Context, ts tenantScope) (org data.Record, ok bool, err error) {
 	roleDef, err := ts.entityDef(ctx, "PartyRole")
 	if err != nil {
-		return "", "", "", "", fmt.Errorf("look up PartyRole definition: %w", err)
+		return data.Record{}, false, fmt.Errorf("look up PartyRole definition: %w", err)
 	}
 	roleRecs, err := ts.crud.ListByField(ctx, roleDef, "role_type", "own_organization")
 	if err != nil {
-		return "", "", "", "", fmt.Errorf("list own_organization PartyRole records: %w", err)
+		return data.Record{}, false, fmt.Errorf("list own_organization PartyRole records: %w", err)
 	}
 	// Resolved by DISTINCT party id, not by row count: nothing in the
 	// generic entity/crud layer makes PartyRole rows unique, so the same
@@ -411,42 +432,37 @@ func (h *Handler) saftCompanyProfile(r *http.Request, ts tenantScope) (regNum, t
 	// only asserts "non-nil string" — and without this guard, records.id
 	// being a uuid column means the Get below returns a raw Postgres
 	// "invalid input syntax for type uuid" driver error rather than
-	// data.ErrNotFound, so one junk role row 500s the whole statutory
-	// export for the tenant. Treated as the tolerated dangling reference
-	// it is, exactly like the ErrNotFound case below.
+	// data.ErrNotFound, so one junk role row 500s the whole caller.
+	// Treated as the tolerated dangling reference it is, exactly like the
+	// ErrNotFound case below.
 	partyID := ""
 	for i, rec := range roleRecs {
-		id, ok := ids.Canonical(stringField(rec.Data, "party_id"))
-		if !ok || (i > 0 && id != partyID) {
-			return "", "", "", "", nil
+		id, idOK := ids.Canonical(stringField(rec.Data, "party_id"))
+		if !idOK || (i > 0 && id != partyID) {
+			return data.Record{}, false, nil
 		}
 		partyID = id
 	}
 	if partyID == "" {
 		// No own_organization role at all — every tenant's status quo
 		// before a statutory profile is configured.
-		return "", "", "", "", nil
+		return data.Record{}, false, nil
 	}
 
 	partyDef, err := ts.entityDef(ctx, "Party")
 	if err != nil {
-		return "", "", "", "", fmt.Errorf("look up Party definition: %w", err)
+		return data.Record{}, false, fmt.Errorf("look up Party definition: %w", err)
 	}
-	org, err := ts.crud.Get(ctx, partyDef, partyID)
+	org, err = ts.crud.Get(ctx, partyDef, partyID)
 	if errors.Is(err, data.ErrNotFound) {
 		// The role points at a Party that no longer exists — degrade
-		// the same as the zero-match case above, not an export failure.
-		return "", "", "", "", nil
+		// the same as the zero-match case above, not a caller failure.
+		return data.Record{}, false, nil
 	}
 	if err != nil {
-		return "", "", "", "", fmt.Errorf("get own_organization Party: %w", err)
+		return data.Record{}, false, fmt.Errorf("get own_organization Party: %w", err)
 	}
-
-	return stringField(org.Data, "registration_number"),
-		stringField(org.Data, "tax_id"),
-		stringField(org.Data, "contact_first_name"),
-		stringField(org.Data, "contact_last_name"),
-		nil
+	return org, true, nil
 }
 
 // tenantDisplayName resolves the exporting tenant's human name for the

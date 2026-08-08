@@ -54,9 +54,10 @@ const (
 )
 
 // Party is one side of a document — a foundation Party record, or the
-// exporting tenant itself (whose statutory profile doesn't exist yet;
-// see the tenant statutory-profile card on the board — until it ships
-// the tenant side carries its display name and no tax registration).
+// exporting tenant itself. The tenant side's TaxID is wired from the
+// tenant's own_organization Party when one is configured (uc-infra#119);
+// with none configured it carries its display name and no tax
+// registration, same as before that card shipped.
 type Party struct {
 	Name string
 	// TaxID is the Party record's tax_id, when set — emitted as a

@@ -36,12 +36,26 @@ import (
 // an invoice renders its customer and the linked sales order's number
 // only (the summary-line shape), so Item and the line entities are
 // correctly absent from its set.
+//
+// PartyRole (party_id, role_type) is declared in every entry because
+// ublTenantParty (uc-infra#119) resolves the own_organization role for
+// every document type, the same PartyRole.party_id/role_type read
+// saftFieldReads already declares for SAF-T's identical lookup — an
+// actor lacking PartyRole read access, or with either field hidden,
+// must be refused up front, not silently degraded to "no statutory
+// profile configured" as if the tenant genuinely had none (the
+// "silently dropped" failure shape saftFieldReads's own comment
+// describes, not the "rendered blank" one). Party.tax_id is already
+// declared below for the counterparty and covers the tenant's own
+// org Party too — HiddenFields is a per-entity-type check, not
+// per-record, so one declaration gates both reads.
 var ublDocReads = map[string]map[string][]string{
 	"PurchaseOrder": {
 		"PurchaseOrder": {"po_number", "vendor_id", "order_date", "currency_id", "total"},
 		"POLine":        {"purchase_order_id", "item_id", "qty", "unit_price", "line_total"},
 		"Item":          {"sku", "name"},
 		"Party":         {"name", "tax_id"},
+		"PartyRole":     {"party_id", "role_type"},
 		"Currency":      {"code", "minor_unit"},
 	},
 	"SalesOrder": {
@@ -49,12 +63,14 @@ var ublDocReads = map[string]map[string][]string{
 		"SOLine":     {"sales_order_id", "item_id", "qty", "unit_price", "line_total"},
 		"Item":       {"sku", "name"},
 		"Party":      {"name", "tax_id"},
+		"PartyRole":  {"party_id", "role_type"},
 		"Currency":   {"code", "minor_unit"},
 	},
 	"CustomerInvoice": {
 		"CustomerInvoice": {"invoice_number", "sales_order_id", "customer_id", "invoice_date", "currency_id", "total"},
 		"SalesOrder":      {"so_number"},
 		"Party":           {"name", "tax_id"},
+		"PartyRole":       {"party_id", "role_type"},
 		"Currency":        {"code", "minor_unit"},
 	},
 }
@@ -226,7 +242,10 @@ func (h *Handler) buildUBLOrder(r *http.Request, rc httpx.RequestContext, ts ten
 		Lines:        lines,
 		Total:        floatField(rec.Data, "total"),
 	}
-	tenant := h.ublTenantParty(r, rc)
+	tenant, err := h.ublTenantParty(r, rc, ts)
+	if err != nil {
+		return nil, "", err
+	}
 	if entityType == "PurchaseOrder" {
 		in.Buyer, in.Seller = tenant, counterparty
 	} else {
@@ -281,13 +300,17 @@ func (h *Handler) buildUBLInvoice(r *http.Request, rc httpx.RequestContext, ts t
 		}
 	}
 
+	tenant, err := h.ublTenantParty(r, rc, ts)
+	if err != nil {
+		return nil, "", err
+	}
 	doc, err := ubl.BuildInvoice(ubl.InvoiceInput{
 		ID:           number,
 		IssueDate:    stringField(rec.Data, "invoice_date"),
 		OrderRef:     orderRef,
 		CurrencyCode: currency,
 		MinorUnit:    minor,
-		Supplier:     h.ublTenantParty(r, rc),
+		Supplier:     tenant,
 		Customer:     customer,
 		Total:        floatField(rec.Data, "total"),
 	})
@@ -399,18 +422,40 @@ func (h *Handler) ublLines(ctx context.Context, ts tenantScope, lineEntity, line
 	return lines, nil
 }
 
-// ublTenantParty is the exporting tenant's side of every document. No
-// tenant statutory profile exists yet (tracked on the board), so this
-// is the display name — falling back to the tenant id when no name
-// source is wired (control-plane repo or session), because a UBL party
-// with an empty name is materially incomplete while the id is at least
-// a truthful identifier. No tax registration until the profile ships.
-func (h *Handler) ublTenantParty(r *http.Request, rc httpx.RequestContext) ubl.Party {
+// ublTenantParty is the exporting tenant's side of every document. Name
+// is the tenant display name — falling back to the tenant id when no
+// name source is wired (control-plane repo or session), because a UBL
+// party with an empty name is materially incomplete while the id is at
+// least a truthful identifier. This name resolution is deliberately
+// unchanged by uc-infra#119: the own_organization Party's own `name`
+// field is never used as a display-name override, the same precedent
+// saftCompanyProfile already set for SAF-T's CompanyName (its own
+// Company element is sourced from tenantDisplayName too, never the org
+// Party's name) — only registration/tax identifiers flow from that
+// Party, never the display name.
+//
+// TaxID comes from the own_organization Party (uc-infra#63/#119) via
+// ownOrganizationParty, the same access path and degrade semantics
+// saftCompanyProfile uses: no statutory profile configured yet, an
+// ambiguous own_organization Party, or a dangling role all leave TaxID
+// empty (ubl.Party's own doc comment: empty omits PartyTaxScheme
+// entirely, which is UBL-optional, unlike SAF-T's mandatory-with-"NA"
+// convention) — today's pre-#119 status quo for every tenant without a
+// statutory profile.
+func (h *Handler) ublTenantParty(r *http.Request, rc httpx.RequestContext, ts tenantScope) (ubl.Party, error) {
 	name := h.tenantDisplayName(r, rc)
 	if name == "" {
 		name = rc.TenantID
 	}
-	return ubl.Party{Name: name}
+	party := ubl.Party{Name: name}
+	org, ok, err := h.ownOrganizationParty(r.Context(), ts)
+	if err != nil {
+		return ubl.Party{}, err
+	}
+	if ok {
+		party.TaxID = stringField(org.Data, "tax_id")
+	}
+	return party, nil
 }
 
 // floatField reads a JSONB number field as float64 (the entity engine's
