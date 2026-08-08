@@ -75,31 +75,40 @@ type Actor struct {
 var (
 	ErrMissingActorID      = errors.New("audit: actor id is required")
 	ErrMissingModelVersion = errors.New("audit: ai_agent actor requires a model_version")
+	ErrMissingInput        = errors.New("audit: ai_agent actor requires an input")
 )
 
 // Validate checks that an Actor is well-formed before it's allowed to
 // author an audit entry.
 //
-// This deliberately does NOT require Input for an ActorAgent, even
-// though ADR-0001 §14 names input_hash a required part of an ai_agent
-// audit row alongside model_version: internal/kernel/entity (Definition
-// drafting), internal/kernel/csvimport, and internal/kernel/sqlsource
-// already construct valid ActorAgent actors with no Input today
-// (uc-infra#124's own investigation confirmed this at every one of
-// those call sites), and turning this into a hard Validate() failure
-// would break them, not just the CLI binaries this task actually
-// touches. uc-infra#124 populates Input for the 7 CLI binaries that
-// construct an ai_agent actor (see CLIInvocationInput below) without
-// making Validate() enforce it — flipping Validate() to require Input
-// for every ActorAgent is real, separate follow-up work (audit every
-// remaining ai_agent call site, give each a real Input, then enforce),
-// tracked as its own backlog item rather than done here.
+// Every ActorAgent must carry a non-empty Input (uc-infra#161): ADR-0001
+// §14 names input_hash a required part of an ai_agent audit row
+// alongside model_version, and until uc-infra#161 this was only true for
+// the 7 CLI binaries uc-infra#124 fixed — internal/kernel/entity
+// (Definition drafting), internal/kernel/csvimport, and
+// internal/kernel/sqlsource could still construct a valid ActorAgent
+// actor with no Input, so this check stayed deliberately loose rather
+// than break them. uc-infra#161's audit found every real (non-test)
+// ActorAgent construction site already populates Input: the 7 CLI
+// binaries via CLIInvocationInput (see below); internal/kernel/entity's
+// only production ActorAgent callers are those same CLI binaries
+// (install-module, sync-tenant-modules, provision-tenant) publishing
+// through internal/kernel/moduleseed; and internal/kernel/csvimport and
+// internal/kernel/sqlsource have no production ActorAgent caller at
+// all — their only production callers (internal/api's import/
+// extsqlimport handlers) always pass the request's rc.Actor, which
+// every httpx.RequestContext construction site sets to ActorHuman, never
+// ActorAgent. So enforcing this here closes the gap without changing
+// any production caller.
 func (a Actor) Validate() error {
 	if a.ID == "" {
 		return ErrMissingActorID
 	}
 	if a.Type == ActorAgent && a.ModelVersion == "" {
 		return ErrMissingModelVersion
+	}
+	if a.Type == ActorAgent && a.Input == "" {
+		return ErrMissingInput
 	}
 	return nil
 }

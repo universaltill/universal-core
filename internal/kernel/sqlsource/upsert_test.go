@@ -129,7 +129,14 @@ func (f *fakeEngine) seedIdentity(sourceID, relation, entityType, recordID, key 
 	})
 }
 
-var upsertTestActor = audit.Actor{Type: audit.ActorAgent, ID: "sqlsource-upsert-test", ModelVersion: "test"}
+// uc-infra#161: every caller of this shared fixture goes through
+// fakeEngine (the real-Postgres path is integration_test.go's own
+// actors, fixed separately above), so Actor.Validate() is never
+// exercised by these tests today — Input is set anyway so this fixture
+// stays a realistic ActorAgent rather than one that would fail
+// Validate() the moment any of these tests is ever pointed at a real
+// engine.
+var upsertTestActor = audit.Actor{Type: audit.ActorAgent, ID: "sqlsource-upsert-test", ModelVersion: "test", Input: "sqlsource upsert test fixture"}
 
 func itemImportShape() ([]string, csvimport.ColumnMapping) {
 	// The post-ApplyConstants shape a NAV Item pull arrives in.

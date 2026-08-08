@@ -271,9 +271,21 @@ func TestEntityDefinitionRegistry_CreateDraftWritesAuditEntry(t *testing.T) {
 	ctx := context.Background()
 	repo := data.NewEntityDefinitionRepo(db)
 	def := vendorDef()
-	actor := audit.Actor{Type: audit.ActorAgent, ID: "definition-registry-agent", ModelVersion: "claude-fable-5"}
+	defJSON := marshalDef(t, def)
+	// uc-infra#161: Input must be the prompt/request that produced this
+	// change (ADR-0001 §14), not the drafted Definition itself — the
+	// drafted JSON is the model's *output*, and CreateDraft already
+	// stores it as the audit diff (internal/data/definitions.go), so
+	// hashing it as Input too would be tautological. This package's own
+	// production ActorAgent callers (install-module/sync-tenant-modules,
+	// via internal/kernel/moduleseed) populate Input from the CLI
+	// invocation, not the definition bytes (audit.CLIInvocationInput) —
+	// this fixture uses an equally representative prompt-shaped string
+	// instead, matching this package's own house convention
+	// (audit_test.go's "add a field").
+	actor := audit.Actor{Type: audit.ActorAgent, ID: "definition-registry-agent", ModelVersion: "claude-fable-5", Input: "add a Vendor entity with a lead_time_days field"}
 
-	if _, err := repo.CreateDraft(ctx, def.EntityType, def.Version, marshalDef(t, def), actor); err != nil {
+	if _, err := repo.CreateDraft(ctx, def.EntityType, def.Version, defJSON, actor); err != nil {
 		t.Fatalf("CreateDraft: %v", err)
 	}
 
