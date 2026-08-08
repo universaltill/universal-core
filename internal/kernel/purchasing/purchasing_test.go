@@ -624,6 +624,92 @@ func TestPurchaseOrderForm_RollsUpLineTotalsIntoTotal(t *testing.T) {
 	}
 }
 
+// TestPurchaseOrder_TotalIsFieldMoney pins uc-infra#136's mechanical
+// migration (the same class of change RequestForQuotationQuoteLine.
+// unit_price's own v1->v2 bump made, uc-infra#68): total's TYPE changed
+// FieldNumber -> FieldMoney, Version bumped 8->9. Min:0 is uc-infra#80's
+// pre-existing bound, unchanged by the type migration.
+func TestPurchaseOrder_TotalIsFieldMoney(t *testing.T) {
+	def := PurchaseOrder()
+	if def.Version != 9 {
+		t.Errorf("PurchaseOrder.Version = %d, want 9 (uc-infra#136's total FieldMoney migration)", def.Version)
+	}
+	f, ok := def.FieldByName("total")
+	if !ok {
+		t.Fatal("expected a total field")
+	}
+	if f.Type != entity.FieldMoney {
+		t.Fatalf("expected total to be FieldMoney, got %s", f.Type)
+	}
+	if f.Min == nil || *f.Min != 0 {
+		t.Fatalf("expected total's Min:0 bound to survive the type migration, got %+v", f.Min)
+	}
+}
+
+// TestPOLine_UnitPriceAndLineTotalAreFieldMoney is POLine's counterpart
+// to TestPurchaseOrder_TotalIsFieldMoney — both money fields migrate in
+// the same Version 3->4 bump (uc-infra#136), since PurchaseOrderForm's
+// own RollUp wires POLine.line_total straight into PurchaseOrder.total
+// (TestPurchaseOrderForm_RollsUpLineTotalsIntoTotal above): migrating
+// one without the other would roll up a FieldMoney total from a
+// FieldNumber child, or vice versa.
+func TestPOLine_UnitPriceAndLineTotalAreFieldMoney(t *testing.T) {
+	def := POLine()
+	if def.Version != 4 {
+		t.Errorf("POLine.Version = %d, want 4 (uc-infra#136's unit_price/line_total FieldMoney migration)", def.Version)
+	}
+	priceField, ok := def.FieldByName("unit_price")
+	if !ok || priceField.Type != entity.FieldMoney || !priceField.Required {
+		t.Fatalf("expected a Required unit_price FieldMoney, got %+v", priceField)
+	}
+	if priceField.Min == nil || *priceField.Min != 0 {
+		t.Fatalf("expected unit_price's Min:0 bound to survive the type migration, got %+v", priceField.Min)
+	}
+	totalField, ok := def.FieldByName("line_total")
+	if !ok || totalField.Type != entity.FieldMoney {
+		t.Fatalf("expected line_total to be FieldMoney, got %+v", totalField)
+	}
+	if totalField.Min == nil || *totalField.Min != 0 {
+		t.Fatalf("expected line_total's Min:0 bound to survive the type migration, got %+v", totalField.Min)
+	}
+	// qty stays FieldNumber — it's a quantity, not an amount, and was
+	// never part of this migration's scope.
+	qtyField, ok := def.FieldByName("qty")
+	if !ok || qtyField.Type != entity.FieldNumber {
+		t.Fatalf("expected qty to remain FieldNumber, got %+v", qtyField)
+	}
+}
+
+// TestPOLine_UnitPriceRejectsMajorUnitFraction mirrors
+// TestRequestForQuotationQuoteLine_UnitPriceRejectsMajorUnitFraction
+// (rfq_test.go, uc-infra#68): now that unit_price is FieldMoney
+// (uc-infra#136), a caller submitting a major-unit dollar amount like
+// 9.5 directly must be rejected as not a whole number of minor units,
+// not silently accepted as "9.5 minor units".
+func TestPOLine_UnitPriceRejectsMajorUnitFraction(t *testing.T) {
+	def := POLine()
+	err := entity.ValidateRecord(def, map[string]any{
+		"purchase_order_id": "po-1", "item_id": "item-1", "qty": float64(1), "unit_price": float64(9.5),
+	})
+	if err == nil {
+		t.Fatal("expected a fractional unit_price to be rejected as not a whole number of minor units")
+	}
+}
+
+// TestPurchaseOrder_TotalRejectsMajorUnitFraction is
+// TestPOLine_UnitPriceRejectsMajorUnitFraction's counterpart for
+// PurchaseOrder.total.
+func TestPurchaseOrder_TotalRejectsMajorUnitFraction(t *testing.T) {
+	def := PurchaseOrder()
+	err := entity.ValidateRecord(def, map[string]any{
+		"po_number": "PO-TEST-1", "vendor_id": "party-1", "order_date": "2026-07-20",
+		"status_id": "status-1", "total": float64(95.5),
+	})
+	if err == nil {
+		t.Fatal("expected a fractional total to be rejected as not a whole number of minor units")
+	}
+}
+
 // Facility is the location dimension #12/R19 added. Pinned as shape
 // rather than behaviour because it has no behaviour of its own — it is
 // the thing InventoryItem is keyed by.

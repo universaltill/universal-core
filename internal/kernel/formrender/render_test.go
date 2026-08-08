@@ -899,6 +899,119 @@ func TestRender_MasterDetailRollUp(t *testing.T) {
 	}
 }
 
+// moneyRollUpEntity/moneyRollUpForm are purchaseOrderEntity/
+// purchaseOrderForm's own worked example, narrowed to just the Header +
+// Lines sections and with total/line_total declared FieldMoney instead
+// of FieldNumber — the real shape purchasing.PurchaseOrder/POLine now
+// declare (uc-infra#136). PurchaseOrderForm's Lines section is the
+// FIRST FieldMoney RollUpTarget in this kernel, so this is the unit-level
+// pin for computeRollUp's isMoney branch and render.go's money-aware
+// RollUpTotal formatting — internal/e2e/purchase_order_money_test.go
+// covers the identical scenario end to end through a real browser; this
+// isolates the same logic at the renderer-unit level, the same "both a
+// focused unit test and a real browser test, not one substituting for
+// the other" discipline CLAUDE.md's testing section requires.
+func moneyRollUpEntity() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "PurchaseOrder",
+		Fields: []entity.Field{
+			{Name: "vendor_id", Type: entity.FieldString, Required: true},
+			{Name: "total", Type: entity.FieldMoney},
+		},
+	}
+}
+
+func moneyRollUpForm() *form.Definition {
+	return &form.Definition{
+		EntityType: "PurchaseOrder",
+		Version:    1,
+		Sections: []form.Section{
+			{
+				Title:     "Header",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "vendor_id", Label: "Vendor"},
+					{Name: "total", Label: "Total"},
+				},
+			},
+			{
+				Title:        "Lines",
+				Component:    form.ComponentMasterDetail,
+				Target:       "POLine",
+				RollUp:       "line_total",
+				RollUpTarget: "total",
+			},
+		},
+		Actions: []form.Action{{Label: "Save", Op: form.OpSave}},
+	}
+}
+
+// TestRender_MasterDetailRollUp_Money is TestRender_MasterDetailRollUp's
+// FieldMoney counterpart: two children summing to 3000 minor units
+// ($30.00) must render as the major-unit decimal "30.00" in BOTH the
+// roll-up summary paragraph and the header's own visible total input —
+// not the raw summed integer "3000" a naive FormatNumber/FormatFloat
+// call would print (the exact bug this migration's own render.go fix
+// closes).
+func TestRender_MasterDetailRollUp_Money(t *testing.T) {
+	r := testRenderer(t)
+	data := Data{
+		RecordID: "po-1",
+		Record:   map[string]any{"vendor_id": "vendor-1"},
+		Children: map[string][]map[string]any{
+			"POLine": {
+				{"line_total": 2000.0},
+				{"line_total": 1000.0},
+			},
+		},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, moneyRollUpForm(), moneyRollUpEntity(), data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, `<p class="uc-rollup" data-field="total">Total: 30.00</p>`) {
+		t.Fatalf("expected the roll-up total to render as the major-unit decimal 30.00, got:\n%s", out)
+	}
+	if strings.Contains(out, `Total: 3000`) || strings.Contains(out, `Total: 3,000`) {
+		t.Fatalf("roll-up total rendered the raw minor-units integer instead of a money decimal, got:\n%s", out)
+	}
+	if !strings.Contains(out, `id="total" name="total" value="30.00"`) {
+		t.Fatalf("expected the roll-up target field on the Header section to carry the freshly computed total as a money decimal, got:\n%s", out)
+	}
+}
+
+// TestRender_MasterDetailRollUp_MoneyDegradesOnFractionalChildValue
+// (independent review of uc-infra#136's first pass) proves the render
+// path does NOT fail the whole page over a legacy, not-yet-backfilled
+// fractional child value — that's ordinary, expected mid-migration data
+// (see computeRollUp's own doc comment), not a reason to 500 the one
+// screen an operator would use to see and fix it. The valid sibling
+// child still contributes to the total; the fractional one is simply
+// excluded from the sum, matching internal/data/reporting.go's own
+// "one bad row's problem, not the whole page's" guard.
+func TestRender_MasterDetailRollUp_MoneyDegradesOnFractionalChildValue(t *testing.T) {
+	r := testRenderer(t)
+	data := Data{
+		RecordID: "po-1",
+		Record:   map[string]any{"vendor_id": "vendor-1"},
+		Children: map[string][]map[string]any{
+			"POLine": {
+				{"line_total": 10.5},   // legacy, un-backfilled major-unit decimal — excluded
+				{"line_total": 1000.0}, // valid minor-units amount — counted
+			},
+		},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, moneyRollUpForm(), moneyRollUpEntity(), data, "en"); err != nil {
+		t.Fatalf("Render must not error on a legacy fractional child value: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, `<p class="uc-rollup" data-field="total">Total: 10.00</p>`) {
+		t.Fatalf("expected the roll-up total to count only the valid child (10.00), got:\n%s", out)
+	}
+}
+
 // TestRender_MasterDetailRollUpSkipsRecomputeWhenSourceFieldRedacted
 // (uc-infra#127 independent review): a FieldPermission hiding the
 // section's own RollUp SOURCE field (POLine.line_total) must NOT
@@ -1976,6 +2089,33 @@ func TestRender_DegradedSectionRollUpFieldKeepsSavedValueAndDisplaysIt(t *testin
 	}
 	if !strings.Contains(out, `<p class="uc-rollup" data-field="total">Total: 350.5</p>`) {
 		t.Errorf("expected the degraded section's roll-up line to display the preserved 350.5, not be suppressed entirely, got:\n%s", out)
+	}
+}
+
+// TestRender_DegradedSectionRollUpFieldMoney_LegacyValueStillDisplays
+// (independent review of uc-infra#136's first pass) is
+// TestRender_DegradedSectionRollUpFieldKeepsSavedValueAndDisplaysIt's own
+// regression re-verification for a FieldMoney RollUpTarget specifically:
+// a preserved value is never recomputed (DegradedSections above), so it
+// can itself be a legacy, not-yet-backfilled FRACTIONAL amount that
+// money.FromAny rejects. That must not suppress the roll-up line
+// entirely — the exact same silent-display-regression class the named
+// test above exists to catch, just reached through the money branch
+// this migration added rather than the original rollUpComputed bug.
+func TestRender_DegradedSectionRollUpFieldMoney_LegacyValueStillDisplays(t *testing.T) {
+	r := testRenderer(t)
+	data := Data{
+		RecordID:         "po-1",
+		Record:           map[string]any{"vendor_id": "vendor-1", "total": 350.5}, // legacy fractional, pre-backfill
+		DegradedSections: map[string]bool{"POLine": true},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, moneyRollUpForm(), moneyRollUpEntity(), data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, `<p class="uc-rollup" data-field="total">Total: 350.5</p>`) {
+		t.Errorf("expected the degraded section's roll-up line to still display the preserved legacy value, not be suppressed entirely, got:\n%s", out)
 	}
 }
 

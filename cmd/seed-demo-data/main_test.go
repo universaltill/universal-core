@@ -1168,3 +1168,56 @@ func TestSeedDemoData_ConvergesOnTheDocumentedUpgradePath(t *testing.T) {
 		t.Errorf("SKU-1008 still has %d row(s) at MAIN — a row at an undeclared facility must be re-pointed, not left beside a new one", mainRows)
 	}
 }
+
+// TestSeedDemoData_VendorInvoicesActuallyMatch (independent review of
+// uc-infra#136: seedVendorInvoices' own comment claimed a wrong unit
+// conversion would strand VINV-2026-0001/0002 in match_exception, but
+// nothing verified that — MatchVendorInvoiceOnUpdate redirects rather
+// than errors, so the seeder itself would exit 0 either way).
+// PurchaseOrder.total is minor units now (uc-infra#136); this pins that
+// seedVendorInvoices' money.Money(...).Major() conversion when copying a
+// PurchaseOrder's total into its VendorInvoice actually produces a
+// value the real 3-way match agrees with — both invoices must reach the
+// status their own table entry names (paid / matched), never
+// match_exception.
+func TestSeedDemoData_VendorInvoicesActuallyMatch(t *testing.T) {
+	controlDSN, id := provisionedTenant(t, "purchasing", "sales", "finance", "assets", "projects", "hr", "crm")
+	if _, stderr, code := run(t, []string{"DATABASE_URL=" + controlDSN}, "-tenant-id="+id, "-actor-id=smoke-test"); code != 0 {
+		t.Fatalf("run: exit %d, stderr: %s", code, stderr)
+	}
+
+	control := testexec.Open(t, controlDSN)
+	router, err := tenantdb.NewRouter(control, controlDSN)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+	t.Cleanup(func() { router.Close() })
+	tenantDB, err := router.Get(context.Background(), id)
+	if err != nil {
+		t.Fatalf("router.Get: %v", err)
+	}
+
+	statusCode := func(invoiceNumber string) string {
+		t.Helper()
+		var code string
+		err := tenantDB.QueryRowContext(context.Background(),
+			`SELECT st.data->>'code'
+			 FROM records inv
+			 JOIN records st ON st.entity_type = 'Status' AND st.deleted_at IS NULL
+			                 AND st.id = (inv.data->>'status_id')::uuid
+			 WHERE inv.entity_type = 'VendorInvoice' AND inv.deleted_at IS NULL
+			   AND inv.data->>'invoice_number' = $1`, invoiceNumber,
+		).Scan(&code)
+		if err != nil {
+			t.Fatalf("look up %s status: %v", invoiceNumber, err)
+		}
+		return code
+	}
+
+	if got := statusCode("VINV-2026-0001"); got != "paid" {
+		t.Errorf("VINV-2026-0001 status = %q, want %q (a real 3-way-match failure would redirect it to match_exception instead)", got, "paid")
+	}
+	if got := statusCode("VINV-2026-0002"); got != "matched" {
+		t.Errorf("VINV-2026-0002 status = %q, want %q (a real 3-way-match failure would redirect it to match_exception instead)", got, "matched")
+	}
+}

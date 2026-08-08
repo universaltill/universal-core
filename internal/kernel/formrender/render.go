@@ -690,7 +690,18 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 			// untouched, rollUpComputed stays false for this target.
 			continue
 		}
-		total, err := computeRollUp(data.Children[s.Target], s.RollUp)
+		// isMoney: RollUpTarget names a field on the PARENT entity (see
+		// this loop's own later comment on that convention) — its
+		// declared Type, not the child RollUp field's, is what a
+		// subsequent Save round-trips through entity.ValidateRecord
+		// against, so that's the type computeRollUp must sum as. By
+		// construction (Architect-level design, uc-infra#136) a
+		// coherent Definition never mismatches the two: a FieldMoney
+		// header total is always rolled up from a FieldMoney child
+		// field (PurchaseOrder.total <- POLine.line_total), never a
+		// plain FieldNumber one.
+		targetField, _ := ent.FieldByName(s.RollUpTarget)
+		total, err := computeRollUp(data.Children[s.Target], s.RollUp, targetField.Type == entity.FieldMoney)
 		if err != nil {
 			return viewModel{}, fmt.Errorf("section %q: %w", s.Title, err)
 		}
@@ -762,18 +773,56 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 				// belong to the entity Definition, not the form one.
 				sv.RollUpField = s.RollUpTarget
 				sv.RollUpLabel = r.i18n.TOrDefault(locale, "field."+ent.EntityType+"."+s.RollUpTarget, s.RollUpTarget)
-				// Regionally formatted (uc-infra#133, independent review):
-				// the child rows summed into this total now render their
-				// own line_total/qty cells through regionalLoc — leaving
-				// the total on raw strconv.FormatFloat would show a
-				// grouped/Jalali-digit line item one row above an
-				// ungrouped Latin-digit total that doesn't visually agree
-				// with what it's the sum of, the same mismatch this
-				// package's own history already flagged in the opposite
-				// direction (childCellValue's doc comment, "a line_total
-				// column could show 1e+06 one row above a roll-up total
-				// reading 1000000").
-				sv.RollUpTotal = regionalLoc.FormatNumber(rollUpTotals[s.RollUpTarget], -1)
+				if targetField, ok := ent.FieldByName(s.RollUpTarget); ok && targetField.Type == entity.FieldMoney {
+					// The stored/summed total is minor units (uc-infra#136,
+					// computeRollUp's own isMoney branch) — the SAME fix
+					// buildFields'/childCellValue's own FieldMoney cases
+					// already apply (uc-infra#68): a plain FormatNumber
+					// call would print the raw integer ("2000") instead of
+					// the major-unit decimal a human reads as money
+					// ("20.00"). Ungrouped m.String(), not regionally
+					// grouped via loc.FormatNumber(m.Major(), ...): this
+					// total sits directly below the child rows'
+					// line_total cells, which childCellValue's own
+					// FieldMoney case already renders ungrouped (see that
+					// function's doc comment on why it's a separate,
+					// not-yet-fixed gap from the top-level list page's
+					// grouped FieldMoney cell) — matching that immediate
+					// visual context beats matching an unrelated page.
+					if m, err := money.FromAny(rollUpTotals[s.RollUpTarget]); err == nil {
+						sv.RollUpTotal = m.String()
+					} else {
+						// A PRESERVED value (DegradedSections/
+						// UnavailableSections above leave rollUpTotals at
+						// whatever was last stored, never recomputed) can
+						// itself be a legacy, not-yet-backfilled fractional
+						// amount — money.FromAny rejecting it must not
+						// suppress this line entirely (independent review
+						// of uc-infra#136's first pass): that reintroduces
+						// the exact silent-display-regression class
+						// TestRender_DegradedSectionRollUpFieldKeepsSavedValueAndDisplaysIt
+						// exists to catch, just reached through a legacy
+						// money value instead of a missing rollUpComputed
+						// flag. The raw number isn't a trustworthy
+						// major-unit decimal yet, but showing it beats
+						// silently hiding the total a form's own visible
+						// "total" field still displays right above it.
+						sv.RollUpTotal = regionalLoc.FormatNumber(rollUpTotals[s.RollUpTarget], -1)
+					}
+				} else {
+					// Regionally formatted (uc-infra#133, independent review):
+					// the child rows summed into this total now render their
+					// own line_total/qty cells through regionalLoc — leaving
+					// the total on raw strconv.FormatFloat would show a
+					// grouped/Jalali-digit line item one row above an
+					// ungrouped Latin-digit total that doesn't visually agree
+					// with what it's the sum of, the same mismatch this
+					// package's own history already flagged in the opposite
+					// direction (childCellValue's doc comment, "a line_total
+					// column could show 1e+06 one row above a roll-up total
+					// reading 1000000").
+					sv.RollUpTotal = regionalLoc.FormatNumber(rollUpTotals[s.RollUpTarget], -1)
+				}
 			}
 
 		case form.ComponentRelatedList:

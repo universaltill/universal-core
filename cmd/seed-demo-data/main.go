@@ -29,6 +29,8 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/finance"
 	"github.com/universaltill/universal-core/internal/kernel/hr"
+	"github.com/universaltill/universal-core/internal/kernel/ledger"
+	"github.com/universaltill/universal-core/internal/kernel/money"
 	"github.com/universaltill/universal-core/internal/kernel/projects"
 	"github.com/universaltill/universal-core/internal/kernel/purchasing"
 	"github.com/universaltill/universal-core/internal/kernel/sales"
@@ -1205,7 +1207,7 @@ func (s *seeder) seedPurchaseOrders(vendors, currencies, items map[string]string
 	type line struct {
 		sku      string
 		qty      float64
-		unitCost float64
+		unitCost float64 // major-unit decimal (e.g. 18.5 = $18.50) — converted to POLine.unit_price's FieldMoney minor units at write time below (uc-infra#136).
 	}
 	// stages (#29): the six R10 lead-time timestamps, chronological per
 	// PO and deliberately varied in duration — this is #30's forecast
@@ -1329,16 +1331,25 @@ func (s *seeder) seedPurchaseOrders(vendors, currencies, items map[string]string
 		if err != nil {
 			log.Fatalf("create PurchaseOrder for %s: %v", o.vendor, err)
 		}
-		var total float64
+		// total/lineTotalMinor accumulate in MINOR units now
+		// (uc-infra#136: POLine.unit_price/line_total and
+		// PurchaseOrder.total are all FieldMoney) — ledger.ToMinorUnits
+		// converts each line's human-typed major-unit unitCost the same
+		// way any other still-FieldNumber caller of that helper does
+		// (see its own doc comment); everything downstream of that one
+		// conversion per line is exact int64 arithmetic, never a second
+		// float64 accumulation of an already-scaled amount.
+		var total int64
 		for _, l := range o.lines {
-			lineTotal := l.qty * l.unitCost
-			total += lineTotal
+			unitPriceMinor := ledger.ToMinorUnits(l.unitCost)
+			lineTotalMinor := int64(math.Round(l.qty * float64(unitPriceMinor)))
+			total += lineTotalMinor
 			if _, err := s.crud.Create(s.ctx, lineDef, map[string]any{
 				"purchase_order_id": poID.ID,
 				"item_id":           items[l.sku],
 				"qty":               l.qty,
-				"unit_price":        l.unitCost,
-				"line_total":        lineTotal,
+				"unit_price":        unitPriceMinor,
+				"line_total":        lineTotalMinor,
 			}, s.actor); err != nil {
 				log.Fatalf("create POLine: %v", err)
 			}
@@ -1486,7 +1497,18 @@ func (s *seeder) seedVendorInvoices(vendors, currencies map[string]string) {
 		if len(pos) == 0 {
 			log.Fatalf("no PurchaseOrder found for po_number %s (was seedPurchaseOrders run first?)", inv.poNumber)
 		}
-		total, _ := pos[0].Data["total"].(float64)
+		// PurchaseOrder.total is minor units now (uc-infra#136), but
+		// VendorInvoice.total is NOT part of that migration and stays a
+		// FieldNumber major-unit decimal — money.Money(...).Major()
+		// converts the PO's stored minor-unit total back to the
+		// major-unit amount this invoice's own field expects. Without
+		// this conversion the invoice would carry a total 100x too
+		// large, and vendorInvoiceMatchDetail's 3-way match (ledger.go)
+		// would never agree with what was actually received, silently
+		// stranding both invoices below in match_exception instead of
+		// the matched/paid demo narrative this data is meant to show.
+		totalMinor, _ := pos[0].Data["total"].(float64)
+		total := money.Money(int64(totalMinor)).Major()
 		fields := map[string]any{
 			"invoice_number":    inv.invoiceNumber,
 			"purchase_order_id": pos[0].ID,

@@ -26,3 +26,5 @@
 /universal-core
 /backfill-purchase-order-status
 /backfill-quote-line-unit-price
+/backfill-purchase-order-total
+/backfill-poline-money

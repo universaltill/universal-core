@@ -25,6 +25,8 @@ import (
 	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/httpx"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
+	"github.com/universaltill/universal-core/internal/kernel/entity"
+	"github.com/universaltill/universal-core/internal/kernel/money"
 	"github.com/universaltill/universal-core/internal/kernel/ubl"
 )
 
@@ -240,7 +242,13 @@ func (h *Handler) buildUBLOrder(r *http.Request, rc httpx.RequestContext, ts ten
 		CurrencyCode: currency,
 		MinorUnit:    minor,
 		Lines:        lines,
-		Total:        floatField(rec.Data, "total"),
+		// amountField, not floatField (uc-infra#136): this same function
+		// builds both a PurchaseOrder (total is FieldMoney now, minor
+		// units) and a SalesOrder (total is still FieldNumber, major
+		// units) document — def is whichever of the two rec actually is,
+		// so amountField's own field-type check is what keeps this one
+		// call site correct for both without an entityType branch here.
+		Total: amountField(rec.Data, def, "total"),
 	}
 	tenant, err := h.ublTenantParty(r, rc, ts)
 	if err != nil {
@@ -312,7 +320,14 @@ func (h *Handler) buildUBLInvoice(r *http.Request, rc httpx.RequestContext, ts t
 		MinorUnit:    minor,
 		Supplier:     tenant,
 		Customer:     customer,
-		Total:        floatField(rec.Data, "total"),
+		// amountField, not floatField (nit from independent review of
+		// uc-infra#136): CustomerInvoice.total is still FieldNumber
+		// today, so this reads identically to floatField either way —
+		// but using the same Definition-driven helper as buildUBLOrder's
+		// two call sites means this one self-corrects for free the day
+		// CustomerInvoice.total migrates too, instead of needing its own
+		// separate fix then.
+		Total: amountField(rec.Data, def, "total"),
 	})
 	if err != nil {
 		return nil, "", ublInputError{msg: err.Error()}
@@ -397,10 +412,17 @@ func (h *Handler) ublLines(ctx context.Context, ts tenantScope, lineEntity, line
 	lines := make([]ubl.Line, 0, len(recs))
 	for _, rec := range recs {
 		line := ubl.Line{
-			ID:        rec.ID,
-			Qty:       floatField(rec.Data, "qty"),
-			UnitPrice: floatField(rec.Data, "unit_price"),
-			LineTotal: floatField(rec.Data, "line_total"),
+			ID:  rec.ID,
+			Qty: floatField(rec.Data, "qty"), // qty never migrates to FieldMoney — it's a quantity, not an amount.
+			// amountField, not floatField (uc-infra#136): this function
+			// builds lines for both POLine (unit_price/line_total are
+			// FieldMoney now, minor units) and SOLine (still FieldNumber,
+			// major units) — lineDef is whichever of the two lineEntity
+			// actually is, so amountField's own field-type check is what
+			// keeps these two call sites correct for both without a
+			// lineEntity branch here.
+			UnitPrice: amountField(rec.Data, lineDef, "unit_price"),
+			LineTotal: amountField(rec.Data, lineDef, "line_total"),
 		}
 		if itemID := stringField(rec.Data, "item_id"); itemID != "" {
 			item, ok := items[itemID]
@@ -464,4 +486,47 @@ func (h *Handler) ublTenantParty(r *http.Request, rc httpx.RequestContext, ts te
 func floatField(recData map[string]any, field string) float64 {
 	v, _ := recData[field].(float64)
 	return v
+}
+
+// amountField reads recData[field] as a major-unit decimal amount — what
+// a UBL amount element requires — honoring def's declared field type
+// (uc-infra#136). entity.FieldMoney's stored value is minor units
+// (1050), so it goes through money.FromAny(...).Major() to reach the
+// major-unit decimal (10.50) a UBL amount needs; an entity.FieldNumber
+// field is already a major-unit decimal and reads via floatField
+// unchanged. Exists because buildUBLOrder/ublLines are shared between an
+// entity type whose amount fields have migrated to FieldMoney
+// (PurchaseOrder/POLine) and one that hasn't yet (SalesOrder/SOLine) —
+// without this, the same unconditional floatField call would read a
+// migrated field's raw minor-units integer straight into the XML,
+// producing an amount 100x too large.
+//
+// Falls back to floatField for a field def doesn't declare at all (def
+// nil, or FieldByName miss) — a defensive path, not currently reached by
+// any real caller (every call site here passes the actual Definition
+// ublDocReads/this handler's own lookups already resolved), but the same
+// "missing/wrong-shape degrades to 0" leniency floatField/stringField
+// already establish, not a reason to fail the whole export.
+//
+// money.Major() always divides by 100 (money.Decimals' own documented,
+// deliberate 2-decimal-place simplification — uc-infra#163, tracked
+// separately from this migration) regardless of the document's actual
+// currency, so a 3-decimal currency (KWD/BHD) would export a PurchaseOrder/
+// POLine FieldMoney amount 10x wrong even though ublCurrency (below)
+// already resolves the real minor_unit two functions away for the XML's
+// own currencyID/decimal-place metadata. Not a regression this migration
+// introduces (every FieldMoney amount in this kernel shares the same
+// 2-decimal assumption since ADR-0021), but it is newly REACHABLE here —
+// naming it in this comment rather than only in the money package's, so
+// a future currency-aware fix knows to check this call site too.
+func amountField(recData map[string]any, def *entity.Definition, field string) float64 {
+	if def != nil {
+		if f, ok := def.FieldByName(field); ok && f.Type == entity.FieldMoney {
+			if m, err := money.FromAny(recData[field]); err == nil {
+				return m.Major()
+			}
+			return 0
+		}
+	}
+	return floatField(recData, field)
 }

@@ -181,6 +181,101 @@ func TestTopVendorsBySpend_RanksDescendingAndExcludesMalformedRefs(t *testing.T)
 	}
 }
 
+// TestPurchaseOrderStatusBreakdown_LegacyFractionalTotalExcludedNotFatal
+// (uc-infra#136) mirrors rfq_reporting_test.go's own
+// TestRFQComparison_LegacyFractionalUnitPriceExcludedNotFatal: a
+// PurchaseOrder written before total's FieldNumber->FieldMoney Version
+// bump still carries a fractional major-unit decimal until
+// cmd/backfill-purchase-order-total converts it. The moneyMinorUnitsPattern
+// guard must exclude that row from the SUM without erroring the whole
+// query or dropping the row from count(*) — it's still a real
+// PurchaseOrder in this status, just one whose value can't be trusted
+// yet.
+func TestPurchaseOrderStatusBreakdown_LegacyFractionalTotalExcludedNotFatal(t *testing.T) {
+	ctx := context.Background()
+	tenantDB := freshTenantDB(t)
+	records := data.NewRecordRepo(tenantDB)
+	reporting := data.NewReportingRepo(tenantDB)
+
+	draft, err := records.Create(ctx, "Status", map[string]any{"code": "draft", "name": "Draft"})
+	if err != nil {
+		t.Fatalf("create Status: %v", err)
+	}
+	// The pre-migration shape: a real major-unit decimal, exactly what
+	// total held before the Version bump.
+	if _, err := records.Create(ctx, "PurchaseOrder", map[string]any{
+		"po_number": "PO-LEGACY", "status_id": draft.ID, "total": 9.5,
+	}); err != nil {
+		t.Fatalf("create legacy PurchaseOrder: %v", err)
+	}
+	// A real, already-migrated (post-backfill) minor-units row in the
+	// same status — must still sum normally alongside the excluded
+	// legacy row, proving the guard excludes only the bad row's VALUE,
+	// not the row itself.
+	if _, err := records.Create(ctx, "PurchaseOrder", map[string]any{
+		"po_number": "PO-MIGRATED", "status_id": draft.ID, "total": 1025,
+	}); err != nil {
+		t.Fatalf("create migrated PurchaseOrder: %v", err)
+	}
+
+	rows, err := reporting.PurchaseOrderStatusBreakdown(ctx)
+	if err != nil {
+		t.Fatalf("PurchaseOrderStatusBreakdown must not error on a legacy fractional total: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected exactly 1 status row, got %d: %+v", len(rows), rows)
+	}
+	got := rows[0]
+	// Count includes BOTH POs — the legacy row still really exists and
+	// is still really in this status; only its contribution to Value is
+	// excluded.
+	if got.Count != 2 {
+		t.Errorf("expected Count=2 (legacy row still counted), got %d", got.Count)
+	}
+	if got.Value != 1025 {
+		t.Errorf("expected Value=1025 (only the migrated row's total summed), got %v", got.Value)
+	}
+}
+
+// TestTopVendorsBySpend_LegacyFractionalTotalExcludedNotFatal is
+// TestPurchaseOrderStatusBreakdown_LegacyFractionalTotalExcludedNotFatal's
+// counterpart for the vendor-spend query.
+func TestTopVendorsBySpend_LegacyFractionalTotalExcludedNotFatal(t *testing.T) {
+	ctx := context.Background()
+	tenantDB := freshTenantDB(t)
+	records := data.NewRecordRepo(tenantDB)
+	reporting := data.NewReportingRepo(tenantDB)
+
+	vendor, err := records.Create(ctx, "Party", map[string]any{"name": "Legacy Vendor", "party_type": "organization"})
+	if err != nil {
+		t.Fatalf("create Party: %v", err)
+	}
+	if _, err := records.Create(ctx, "PurchaseOrder", map[string]any{
+		"po_number": "PO-LEGACY", "vendor_id": vendor.ID, "total": 9.5,
+	}); err != nil {
+		t.Fatalf("create legacy PurchaseOrder: %v", err)
+	}
+	if _, err := records.Create(ctx, "PurchaseOrder", map[string]any{
+		"po_number": "PO-MIGRATED", "vendor_id": vendor.ID, "total": 1025,
+	}); err != nil {
+		t.Fatalf("create migrated PurchaseOrder: %v", err)
+	}
+
+	got, err := reporting.TopVendorsBySpend(ctx, 10)
+	if err != nil {
+		t.Fatalf("TopVendorsBySpend must not error on a legacy fractional total: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected exactly 1 vendor row, got %d: %+v", len(got), got)
+	}
+	if got[0].OrderCount != 2 {
+		t.Errorf("expected OrderCount=2 (legacy row still counted), got %d", got[0].OrderCount)
+	}
+	if got[0].Total != 1025 {
+		t.Errorf("expected Total=1025 (only the migrated row's total summed), got %v", got[0].Total)
+	}
+}
+
 // TestCompletedPOLeadTimes_ReceivedAtWithGoodsReceiptFallback covers
 // #30's query-time receipt derivation: a PO's own received_at wins when
 // present, the EARLIEST GoodsReceipt.received_date fills in when it

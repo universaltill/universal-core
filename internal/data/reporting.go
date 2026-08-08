@@ -3,6 +3,8 @@ package data
 import (
 	"context"
 	"fmt"
+
+	"github.com/universaltill/universal-core/internal/kernel/money"
 )
 
 // uuidPattern guards every join below that casts a FieldReference's
@@ -50,10 +52,18 @@ func NewReportingRepo(db querier) *ReportingRepo {
 
 // PurchaseOrderStatusCount is one row of the status breakdown — order
 // count and total (summed) value for every PurchaseOrder in that status.
+//
+// Value is money.Money (minor units), not float64 (uc-infra#136,
+// following up uc-infra#68's own RFQComparisonLine.QuotesByVendor
+// precedent): PurchaseOrder.total is FieldMoney now, and this is a raw
+// SQL sum of that stored value, so keeping it in minor units all the way
+// to the caller is what makes internal/api/reporting.go's own display
+// conversion (money.Money.String()/.Major()) the one and only place a
+// float touches this amount.
 type PurchaseOrderStatusCount struct {
 	Status string
 	Count  int
-	Value  float64
+	Value  money.Money
 }
 
 // PurchaseOrderStatusBreakdown groups every PurchaseOrder record by
@@ -72,9 +82,22 @@ type PurchaseOrderStatusCount struct {
 // Same uuidPattern guard as TopVendorsBySpend/StockoutRiskItems below:
 // a malformed status_id (bad CSV import, say) is excluded from the
 // breakdown rather than aborting the whole aggregate with a cast error.
+//
+// The sum itself casts to ::bigint, not ::numeric (uc-infra#136:
+// PurchaseOrder.total is FieldMoney now, a whole number of minor
+// units), guarded by moneyMinorUnitsPattern (rfq_reporting.go's own
+// const, same package) inside a CASE rather than the WHERE clause: a
+// malformed/not-yet-backfilled total must not exclude that PurchaseOrder
+// from count(*) too — it still really exists and is still really in
+// this status — only from the SUM, where it contributes 0 instead of
+// aborting the whole aggregate with a Postgres ::bigint cast error on a
+// legacy fractional value (same "one bad row's problem, not the whole
+// report's" resolution rfq_reporting.go's own guard doc comment
+// describes, applied to a SUM instead of a per-row grid cell).
 func (r *ReportingRepo) PurchaseOrderStatusBreakdown(ctx context.Context) ([]PurchaseOrderStatusCount, error) {
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT st.data->>'code' AS status, count(*), coalesce(sum((po.data->>'total')::numeric), 0)
+		`SELECT st.data->>'code' AS status, count(*),
+		        coalesce(sum(CASE WHEN po.data->>'total' ~ $2 THEN (po.data->>'total')::bigint ELSE 0 END), 0)
 		 FROM records po
 		 JOIN records st
 		   ON st.entity_type = 'Status'
@@ -84,7 +107,7 @@ func (r *ReportingRepo) PurchaseOrderStatusBreakdown(ctx context.Context) ([]Pur
 		   AND po.deleted_at IS NULL
 		   AND po.data->>'status_id' ~ $1
 		 GROUP BY st.data->>'code'`,
-		uuidPattern,
+		uuidPattern, moneyMinorUnitsPattern,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("purchase order status breakdown: %w", err)
@@ -94,9 +117,11 @@ func (r *ReportingRepo) PurchaseOrderStatusBreakdown(ctx context.Context) ([]Pur
 	var out []PurchaseOrderStatusCount
 	for rows.Next() {
 		var row PurchaseOrderStatusCount
-		if err := rows.Scan(&row.Status, &row.Count, &row.Value); err != nil {
+		var valueMinor int64
+		if err := rows.Scan(&row.Status, &row.Count, &valueMinor); err != nil {
 			return nil, fmt.Errorf("scan status breakdown row: %w", err)
 		}
+		row.Value = money.Money(valueMinor)
 		out = append(out, row)
 	}
 	return out, rows.Err()
@@ -106,20 +131,30 @@ func (r *ReportingRepo) PurchaseOrderStatusBreakdown(ctx context.Context) ([]Pur
 // pointing at it (regardless of status — a submitted-but-not-yet-
 // received order is still committed spend for a management report,
 // unlike, say, revenue recognition, which would care about status).
+//
+// Total is money.Money (minor units), not float64 — see
+// PurchaseOrderStatusCount.Value's own doc comment (uc-infra#136).
 type VendorSpend struct {
 	VendorID   string
 	VendorName string
 	OrderCount int
-	Total      float64
+	Total      money.Money
 }
 
 // TopVendorsBySpend returns vendors ranked by total PurchaseOrder value,
 // highest first, capped at limit. A vendor_id that doesn't resolve to a
 // live Party row (deleted, or simply malformed — see uuidPattern's doc
 // comment) is excluded rather than aborting the whole query.
+//
+// Same CASE-guarded ::bigint sum as PurchaseOrderStatusBreakdown above,
+// and the same reasoning for why the guard lives in the SUM's CASE
+// rather than the WHERE clause: a malformed/not-yet-backfilled total
+// shouldn't drop that PurchaseOrder out of this vendor's order_count
+// too, only out of the spend sum.
 func (r *ReportingRepo) TopVendorsBySpend(ctx context.Context, limit int) ([]VendorSpend, error) {
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT v.id, coalesce(v.data->>'name', v.id::text), count(po.id), coalesce(sum((po.data->>'total')::numeric), 0) AS spend
+		`SELECT v.id, coalesce(v.data->>'name', v.id::text), count(po.id),
+		        coalesce(sum(CASE WHEN po.data->>'total' ~ $3 THEN (po.data->>'total')::bigint ELSE 0 END), 0) AS spend
 		 FROM records po
 		 JOIN records v
 		   ON v.entity_type = 'Party'
@@ -131,7 +166,7 @@ func (r *ReportingRepo) TopVendorsBySpend(ctx context.Context, limit int) ([]Ven
 		 GROUP BY v.id, v.data->>'name'
 		 ORDER BY spend DESC, v.id
 		 LIMIT $1`,
-		limit, uuidPattern,
+		limit, uuidPattern, moneyMinorUnitsPattern,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("top vendors by spend: %w", err)
@@ -141,9 +176,11 @@ func (r *ReportingRepo) TopVendorsBySpend(ctx context.Context, limit int) ([]Ven
 	var out []VendorSpend
 	for rows.Next() {
 		var row VendorSpend
-		if err := rows.Scan(&row.VendorID, &row.VendorName, &row.OrderCount, &row.Total); err != nil {
+		var totalMinor int64
+		if err := rows.Scan(&row.VendorID, &row.VendorName, &row.OrderCount, &totalMinor); err != nil {
 			return nil, fmt.Errorf("scan vendor spend row: %w", err)
 		}
+		row.Total = money.Money(totalMinor)
 		out = append(out, row)
 	}
 	return out, rows.Err()

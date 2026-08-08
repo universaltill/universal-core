@@ -13,6 +13,7 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
+	"github.com/universaltill/universal-core/internal/kernel/ledger"
 )
 
 // goodsReceiptFixture bundles everything a ledger.go test needs: a real
@@ -92,6 +93,11 @@ func statusIDByCode(t *testing.T, engine *crud.Engine, tenantDB *sql.DB, statusT
 	return ""
 }
 
+// setUpGoodsReceiptFixture's unitPrice stays a human-typed major-unit
+// dollar amount (uc-infra#136 kept every existing call site unchanged
+// rather than converting each one to minor units by hand) — converted
+// to POLine.unit_price's now-FieldMoney minor units here, at the one
+// place that actually writes it.
 func setUpGoodsReceiptFixture(t *testing.T, unitPrice float64) goodsReceiptFixture {
 	t.Helper()
 	tenantDB := freshTenantDB(t)
@@ -144,7 +150,7 @@ func setUpGoodsReceiptFixture(t *testing.T, unitPrice float64) goodsReceiptFixtu
 		t.Fatalf("create PurchaseOrder: %v", err)
 	}
 	line, err := engine.Create(ctx, defFor(t, tenantDB, "POLine"), map[string]any{
-		"purchase_order_id": po.ID, "item_id": item.ID, "qty": float64(10), "unit_price": unitPrice,
+		"purchase_order_id": po.ID, "item_id": item.ID, "qty": float64(10), "unit_price": ledger.ToMinorUnits(unitPrice),
 	}, actor)
 	if err != nil {
 		t.Fatalf("create POLine: %v", err)
@@ -221,7 +227,10 @@ type vendorInvoiceFixture struct {
 // (qty x unitPrice), then receives receivedQty of it in full via a real
 // GoodsReceipt/GoodsReceiptLine — receivedQty < qty lets a test exercise
 // a partial receipt (the match should key off what was actually
-// received, not the PO's ordered qty).
+// received, not the PO's ordered qty). unitPrice stays a human-typed
+// major-unit dollar amount, same reasoning as setUpGoodsReceiptFixture's
+// own doc comment (uc-infra#136) — converted to minor units at the one
+// place it's actually written to POLine below.
 func setUpVendorInvoiceFixture(t *testing.T, qty, unitPrice, receivedQty float64) vendorInvoiceFixture {
 	t.Helper()
 	tenantDB := freshTenantDB(t)
@@ -262,7 +271,7 @@ func setUpVendorInvoiceFixture(t *testing.T, qty, unitPrice, receivedQty float64
 		t.Fatalf("create PurchaseOrder: %v", err)
 	}
 	line, err := engine.Create(ctx, defFor(t, tenantDB, "POLine"), map[string]any{
-		"purchase_order_id": po.ID, "item_id": item.ID, "qty": qty, "unit_price": unitPrice,
+		"purchase_order_id": po.ID, "item_id": item.ID, "qty": qty, "unit_price": ledger.ToMinorUnits(unitPrice),
 	}, actor)
 	if err != nil {
 		t.Fatalf("create POLine: %v", err)
@@ -302,6 +311,71 @@ func createDraftVendorInvoice(t *testing.T, fx vendorInvoiceFixture, total float
 		t.Fatalf("create VendorInvoice: %v", err)
 	}
 	return rec
+}
+
+// TestPostGoodsReceiptLineToLedger_LegacyFractionalUnitPrice_RejectsReceipt
+// (independent review of uc-infra#136's first pass) is the regression
+// pin for a real bug the first version of this migration shipped: a
+// legacy POLine.unit_price written before the FieldNumber->FieldMoney
+// Version bump still holds a fractional major-unit decimal until
+// cmd/backfill-poline-money converts it. The first draft discarded
+// money.FromAny's error here, which fell through to unitPriceMinor==0
+// and the amountMinor==0 "nothing to post" branch — silently crediting
+// InventoryItem (a real physical receipt) while posting NO journal
+// entry at all, an understated AP liability with no error anywhere.
+// This pins the fix: the whole GoodsReceiptLine create must fail and
+// roll back — including the InventoryItem credit, which must NOT have
+// happened either — rather than silently under-post.
+func TestPostGoodsReceiptLineToLedger_LegacyFractionalUnitPrice_RejectsReceipt(t *testing.T) {
+	fx := setUpGoodsReceiptFixture(t, 12.50)
+	// Simulate a genuinely pre-migration row: entity.ValidateRecord would
+	// reject this on any real write path now that unit_price is
+	// FieldMoney, so the only way to reproduce it is a direct SQL
+	// corruption of an already-created POLine, the same technique
+	// cmd/backfill-poline-money's own tests use for "legacy" fixtures.
+	if _, err := fx.tenantDB.ExecContext(context.Background(),
+		`UPDATE records SET data = jsonb_set(data, '{unit_price}', '12.5') WHERE id = $1`, fx.poLineID,
+	); err != nil {
+		t.Fatalf("corrupt POLine unit_price to a legacy fractional value: %v", err)
+	}
+	fx.engine.SetHook("GoodsReceiptLine", PostGoodsReceiptLineToLedger)
+	ctx := context.Background()
+	actor := humanActor()
+
+	gr, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceipt"), map[string]any{
+		"purchase_order_id": fx.poID, "received_date": "2026-01-10", "facility_id": fx.facilityID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create GoodsReceipt: %v", err)
+	}
+
+	_, err = fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"), map[string]any{
+		"goods_receipt_id": gr.ID, "po_line_id": fx.poLineID,
+		"item_id": fx.itemID, "qty_received": float64(4),
+	}, actor)
+	if err == nil {
+		t.Fatal("expected GoodsReceiptLine create to fail against a legacy fractional POLine.unit_price")
+	}
+	if !strings.Contains(err.Error(), "invalid unit_price") {
+		t.Fatalf("expected an invalid-unit_price error naming the cause, got: %v", err)
+	}
+
+	// Nothing must have been posted OR credited — the whole transaction
+	// rolled back, not just the ledger half.
+	entries, err := data.NewJournalEntryRepo(fx.tenantDB).List(ctx)
+	if err != nil {
+		t.Fatalf("List journal entries: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("expected NO journal entry posted for a rejected receipt, got %d", len(entries))
+	}
+	invRecs, err := fx.engine.List(ctx, defFor(t, fx.tenantDB, "InventoryItem"))
+	if err != nil {
+		t.Fatalf("list InventoryItem: %v", err)
+	}
+	if len(invRecs) != 0 {
+		t.Fatalf("expected NO InventoryItem credited for a rejected receipt, got %d", len(invRecs))
+	}
 }
 
 func TestPostGoodsReceiptLineToLedger_PostsInventoryAndAP(t *testing.T) {
