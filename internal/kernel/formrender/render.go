@@ -780,15 +780,16 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 					// already apply (uc-infra#68): a plain FormatNumber
 					// call would print the raw integer ("2000") instead of
 					// the major-unit decimal a human reads as money
-					// ("20.00"). Ungrouped m.String(), not regionally
-					// grouped via loc.FormatNumber(m.Major(), ...): this
-					// total sits directly below the child rows'
-					// line_total cells, which childCellValue's own
-					// FieldMoney case already renders ungrouped (see that
-					// function's doc comment on why it's a separate,
-					// not-yet-fixed gap from the top-level list page's
-					// grouped FieldMoney cell) — matching that immediate
-					// visual context beats matching an unrelated page.
+					// ("20.00").
+					//
+					// STILL ungrouped (m.String()) here, unlike
+					// childCellValue's own FieldMoney case, which is now
+					// regionally grouped (uc-infra#166) — this total sits
+					// directly below the child rows' line_total cells and
+					// as of #166 now visually DISAGREES with them for a
+					// grouped locale. Tracked, not fixed here, as
+					// uc-infra#189 (#166's own "Non-goals" deliberately
+					// deferred this rather than folding it into that diff).
 					if m, err := money.FromAny(rollUpTotals[s.RollUpTarget]); err == nil {
 						sv.RollUpTotal = m.String()
 					} else {
@@ -1332,8 +1333,8 @@ func childCellValue(child map[string]any, name string, childDef *entity.Definiti
 		// Same reasoning as cellText's FieldNumber case: locale-aware
 		// grouping/decimal separator and digit shapes, precision left at
 		// -1 (this column has no currency context to fix a scale from —
-		// a FieldMoney child cell is its own case below, and still
-		// doesn't get this treatment; see that case's own comment).
+		// a FieldMoney child cell is its own case below, fixed at
+		// money.Decimals instead; see that case's own comment).
 		if n, ok := v.(float64); ok {
 			return loc.FormatNumber(n, -1)
 		}
@@ -1348,13 +1349,14 @@ func childCellValue(child map[string]any, name string, childDef *entity.Definiti
 		// to nil — same "blank rather than garbage" choice as the
 		// i18n_text case above.
 		//
-		// m.String() is NOT regionally grouped the way cellText's own
-		// FieldMoney case (loc.FormatNumber(m.Major(), money.Decimals))
-		// is on the top-level list page — a real, separate gap from this
-		// case's FieldDate/FieldNumber fix above, filed rather than
-		// folded in here (out of uc-infra#133's stated scope).
+		// Regionally grouped via loc.FormatNumber(m.Major(),
+		// money.Decimals), matching cellText's own FieldMoney case on
+		// the top-level list page (uc-infra#166) — this used to be
+		// m.String() (ungrouped), a real, separate gap from this case's
+		// FieldDate/FieldNumber fix above, filed rather than folded in
+		// here (out of uc-infra#133's stated scope) and now closed.
 		if m, err := money.FromAny(v); err == nil {
-			return m.String()
+			return loc.FormatNumber(m.Major(), money.Decimals)
 		}
 		return nil
 	case entity.FieldReference:

@@ -6,6 +6,7 @@ import (
 
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/form"
+	uclocale "github.com/universaltill/universal-core/internal/kernel/locale"
 )
 
 // quoteLineEntity/quoteLineForm are a minimal single-money-field worked
@@ -147,6 +148,66 @@ func TestRender_MasterDetailChildMoneyCellShowsMajorUnitDecimal(t *testing.T) {
 	}
 	if strings.Contains(out, `data-field="unit_price">1050<`) {
 		t.Fatalf("expected the raw minor-units integer NOT to leak into the child cell, got:\n%s", out)
+	}
+}
+
+// TestRender_MasterDetailMoneyChildCellIsRegionallyFormatted (uc-infra#166):
+// childCellValue's FieldMoney case now renders through the viewer's
+// regional number format (grouping/decimal separator) — matching
+// cellText's own FieldMoney case on the top-level list page
+// (internal/api/listview.go) and this package's own sibling
+// FieldDate/FieldNumber fix (uc-infra#133,
+// TestRender_MasterDetailDateAndNumberCellsAreRegionallyFormatted). Uses
+// the same worked value (123456789 minor units == $1,234,567.89) as
+// internal/api's TestListPage_MoneyFieldDisplaysMajorUnitDecimal, so a
+// mismatch here would mean the two surfaces actually disagree, not just
+// that this test's own math is wrong.
+func TestRender_MasterDetailMoneyChildCellIsRegionallyFormatted(t *testing.T) {
+	r := testRenderer(t)
+	childDef := &entity.Definition{
+		EntityType: "POLine", Version: 1,
+		Fields: []entity.Field{
+			{Name: "unit_price", Type: entity.FieldMoney},
+			{Name: "parent_id", Type: entity.FieldReference, Target: "PurchaseOrder"},
+		},
+	}
+	baseData := Data{
+		Record: map[string]any{"payment_method": "Wire"},
+		Children: map[string][]map[string]any{
+			"POLine": {{"unit_price": float64(123456789)}},
+		},
+		ChildDefs: map[string]*entity.Definition{"POLine": childDef},
+	}
+
+	for name, tc := range map[string]struct {
+		regionTag string
+		wantAmt   string
+	}{
+		"american": {"en-US", "1,234,567.89"},
+		"turkish":  {"tr-TR", "1.234.567,89"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			loc, err := uclocale.Parse(tc.regionTag)
+			if err != nil {
+				t.Fatalf("uclocale.Parse(%q): %v", tc.regionTag, err)
+			}
+			data := baseData
+			data.RegionalLocale = loc
+			var buf strings.Builder
+			if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
+				t.Fatalf("render: %v", err)
+			}
+			out := buf.String()
+			if !strings.Contains(out, `data-field="unit_price">`+tc.wantAmt+`<`) {
+				t.Errorf("expected the regionally formatted amount %q in the unit_price cell, got:\n%s", tc.wantAmt, out)
+			}
+			if strings.Contains(out, `data-field="unit_price">1234567.89<`) {
+				t.Errorf("ungrouped amount leaked into a %s-locale child cell, got:\n%s", name, out)
+			}
+			if strings.Contains(out, `data-field="unit_price">123456789<`) {
+				t.Errorf("raw minor-units integer leaked into a %s-locale child cell, got:\n%s", name, out)
+			}
+		})
 	}
 }
 
