@@ -125,6 +125,43 @@ func (idx *Index) resolve(id, locale string) (Rendered, bool) {
 	return idx.byLocaleID["en"][id], true
 }
 
+// ContentLocales returns a copy of the fixed four-locale set this
+// package's content walk (BuildIndexFrom) and every coverage gate built
+// on it check against — a copy, not contentLocales itself, so a caller
+// can't mutate the package-level slice through the returned value.
+// Exported so internal/help/coverage_test.go (an external _test package,
+// help.go's own TopicID doc comment explains why it has to be one) has a
+// single place to read this list from instead of a second hardcoded
+// literal that could silently drift from this one the day a fifth
+// locale ships (uc-infra#146 review finding).
+func ContentLocales() []string {
+	out := make([]string, len(contentLocales))
+	copy(out, contentLocales)
+	return out
+}
+
+// OwnPlainText returns id's rendered plain-text body for locale
+// specifically, with NO fallback to en — unlike Get/resolve, whose
+// fallback exists to answer the *reader's* question ("show me
+// something") and is exactly the wrong answer for the *coverage gate's*
+// question ("is this locale itself actually translated"). A topic
+// present only in en and missing in ar/fa/tr is a real documentation gap
+// the same way a missing i18n catalog key is one (CLAUDE.md's i18n
+// section); resolve's fallback would hide that gap from any check built
+// on it, which is why the coverage gate is built on this method instead.
+//
+// Returns the parsed PlainText, not just a bool for "file exists": a
+// front-matter-only stub with an empty body would satisfy an
+// existence-only check while documenting nothing (the exact hole
+// i18n_coverage_test.go's hasRealTranslation closes one level up, for
+// translation strings instead of help topics) — a caller wanting the
+// coverage gate's actual question should check the returned text is
+// non-blank, not just that ok is true.
+func (idx *Index) OwnPlainText(id, locale string) (string, bool) {
+	r, ok := idx.byLocaleID[locale][id]
+	return r.PlainText, ok
+}
+
 // Topics returns one entry per topic id that has an en file, each using
 // locale's own file if present else falling back to en, sorted by
 // Module, then Order, then Title (the resolved/localized values, so a
