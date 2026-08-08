@@ -110,3 +110,87 @@ func TestPurchaseOrderForm_RollUpTotalRendersAsMoneyDecimal_RealBrowser(t *testi
 		t.Fatalf("expected the header total input to show 30.00, got %q", totalInputValue)
 	}
 }
+
+// TestPurchaseOrderForm_MoneyChildCellAndRollUpAreRegionallyFormatted_RealBrowser
+// (uc-infra#166 independent review, finding 2) is the real-browser layer
+// this card's fix was otherwise missing entirely: a FieldMoney
+// master-detail child cell (childCellValue's own FieldMoney case) and its
+// money-typed roll-up total (both fixed by the same commit — the roll-up
+// fold-in was formerly filed separately as uc-infra#189) must actually
+// render regionally grouped in a real Chromium DOM under a Turkish
+// region, not just in a rendered-HTML-string test. Uses a whole-dollar
+// amount over 999.99 (uc-infra#166 independent review, finding 1): a
+// wrong "natural precision" (-1) FormatNumber call would print the
+// shorter "1.234.567" with no decimals, distinguishable here from the
+// correct fixed-precision "1.234.567,00".
+func TestPurchaseOrderForm_MoneyChildCellAndRollUpAreRegionallyFormatted_RealBrowser(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, tenantDB := testServer(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	if err := purchasing.PublishStatuses(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("PublishStatuses: %v", err)
+	}
+	engine := crud.NewEngine(tenantDB)
+
+	vendor, err := engine.Create(ctx, foundation.Party(), map[string]any{
+		"name": "Regional Money RollUp Vendor", "party_type": "organization", "status": "active",
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed vendor: %v", err)
+	}
+	if _, err := engine.Create(ctx, foundation.PartyRole(), map[string]any{
+		"party_id": vendor.ID, "role_type": "vendor",
+	}, actor); err != nil {
+		t.Fatalf("seed vendor PartyRole: %v", err)
+	}
+	item, err := engine.Create(ctx, purchasing.Item(), map[string]any{
+		"sku": "SKU-E2E-MONEY-ROLLUP-REGIONAL", "name": "Regional Money RollUp Widget", "item_type": "stock",
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed Item: %v", err)
+	}
+	statusID := publishedStatusID(t, tenantDB, "purchase_order_status", "draft")
+	po, err := engine.Create(ctx, purchasing.PurchaseOrder(), map[string]any{
+		"po_number": "PO-MONEY-ROLLUP-REGIONAL-1", "vendor_id": vendor.ID, "order_date": "2026-08-01", "status_id": statusID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed PurchaseOrder: %v", err)
+	}
+	// One line, 123456700 minor units == $1,234,567.00 exactly — large
+	// enough to require Turkish thousands grouping, and a whole-dollar
+	// amount so a wrong -1 precision (no decimals) is distinguishable
+	// from the correct fixed money.Decimals (always ".00").
+	if _, err := engine.Create(ctx, purchasing.POLine(), map[string]any{
+		"purchase_order_id": po.ID, "item_id": item.ID, "qty": 1, "unit_price": 123456700, "line_total": 123456700,
+	}, actor); err != nil {
+		t.Fatalf("seed POLine: %v", err)
+	}
+
+	bctx := browserCtx(t, tenantID)
+	var rollUpText, lineTotalText string
+	if err := chromedp.Run(bctx,
+		chromedp.Navigate(srv.URL+"/forms/PurchaseOrder/"+po.ID+"?lang=tr&region=tr-TR"),
+		chromedp.WaitVisible(`table.uc-master-detail`, chromedp.ByQuery),
+		chromedp.Text(`p.uc-rollup[data-field="total"]`, &rollUpText, chromedp.ByQuery),
+		chromedp.Text(`table.uc-master-detail tbody tr:first-child td[data-field="line_total"]`, &lineTotalText, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("open /forms/PurchaseOrder/%s?lang=tr&region=tr-TR: %v", po.ID, err)
+	}
+
+	// Turkish groups thousands with a dot, decimals with a comma:
+	// 1234567.00 -> "1.234.567,00".
+	if !strings.Contains(lineTotalText, "1.234.567,00") {
+		t.Fatalf("expected the child cell to render the Turkish-grouped amount 1.234.567,00, got %q", lineTotalText)
+	}
+	if strings.Contains(lineTotalText, "1.234.567<") || strings.TrimSpace(lineTotalText) == "1.234.567" {
+		t.Fatalf("child cell rendered the natural-precision amount (missing ,00) instead of the fixed-precision one, got %q", lineTotalText)
+	}
+	if !strings.Contains(rollUpText, "1.234.567,00") {
+		t.Fatalf("expected the roll-up total to render the SAME Turkish-grouped amount as its own child cell (1.234.567,00), got %q", rollUpText)
+	}
+	if strings.TrimSpace(rollUpText) == "Toplam: 1.234.567" {
+		t.Fatalf("roll-up total rendered the natural-precision amount (missing ,00) instead of the fixed-precision one, got %q", rollUpText)
+	}
+}
