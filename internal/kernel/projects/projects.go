@@ -55,15 +55,24 @@
 // Project exactly as POLine composes under PurchaseOrder. It
 // deliberately has NO computed "actual" column and NO currency_id of
 // its own:
-//   - An "actual" would need to price TimeEntry's hours (no employee
-//     cost-rate concept exists anywhere in this kernel — grep confirms
-//     it) and/or a non-labour expense record (also does not exist —
-//     VendorInvoice/GoodsReceiptLine carry no project dimension). #79's
-//     own body warned against exactly this: "a budget line that
-//     silently compares planned cost against labour-only actuals would
-//     read as complete while being wrong in the direction that
-//     matters." Shipping a partial actual would be worse than shipping
-//     none — filed as uc-infra#134 rather than guessed at here.
+//   - An "actual" needs to price TimeEntry's hours and/or a non-labour
+//     expense record. At the time this entity shipped, neither existed:
+//     no employee cost-rate concept anywhere in this kernel, and no
+//     non-labour expense source (VendorInvoice/GoodsReceiptLine still
+//     carry no project dimension). #79's own body warned against
+//     shipping a partial actual that "silently compares planned cost
+//     against labour-only actuals" and "reads as complete while being
+//     wrong in the direction that matters" — filed as uc-infra#134
+//     rather than guessed at here. uc-infra#134 has since shipped the
+//     labour half (Employee.cost_rate, internal/data/reporting.go's
+//     ProjectBudgetActuals) — deliberately as a REPORT-time computed
+//     value, never a field on THIS entity, which is why ProjectBudgetLine
+//     itself is still exactly the 3 fields below (see this package's own
+//     TestProjectBudgetLine_HasNoCurrencyOrComputedActual, still
+//     unmodified) and why the warning above still applies undiminished
+//     to the non-labour categories: ProjectBudgetActuals reports those
+//     as "not available" (nil), not a computed 0, for precisely the
+//     reason this paragraph originally named.
 //   - No currency_id: every OTHER composition child line-item in this
 //     kernel (POLine, SOLine, GoodsReceiptLine) has none either — the
 //     parent document (here, Project.currency_id, already a field)

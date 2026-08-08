@@ -706,3 +706,214 @@ func (r *ReportingRepo) GoodsReceiptLineQualities(ctx context.Context) ([]GoodsR
 	}
 	return out, rows.Err()
 }
+
+// ProjectCategoryActual is uc-infra#134's labour-only slice of "actual"
+// cost for one ProjectBudgetLine category on one Project. Only category
+// "labour" can ever produce a real Actual today — TimeEntry is the only
+// source this kernel can price (via Employee.cost_rate, added by this
+// same card), and even that source is priced only where cost_rate
+// happens to be set. Every other category (materials/travel/equipment/
+// other) has no expense source at all yet (VendorInvoice/
+// GoodsReceiptLine carry no project dimension, no Expense entity
+// exists) and comes back with Actual == nil, never a computed 0 — a
+// tenant comparing planned vs. actual must be able to tell "we don't
+// know yet" from "confirmed zero spend"; collapsing the two understates
+// spend in exactly the direction uc-infra#79's own warning called out.
+type ProjectCategoryActual struct {
+	Category string
+	// Actual is nil when no actual can be computed for this category at
+	// all (see type doc comment above). Never a computed 0 standing in
+	// for "unknown."
+	Actual *money.Money
+	// UnpricedHours/UnpricedEntries count TimeEntry rows this Actual
+	// EXCLUDED because the hours couldn't be priced (the logging
+	// employee has no cost_rate set, or no Employee record resolves for
+	// them at all — see this method's own doc comment on how employee
+	// resolution works). Non-zero here means Actual (for "labour") is a
+	// real but PARTIAL sum, not the true total — surfaced separately
+	// rather than silently folded into a lower number, same
+	// don't-misreport-partial-as-complete reasoning as Actual==nil
+	// above. Always 0 for a non-labour category (nothing is ever
+	// "priced or unpriced" for a category with no source at all).
+	UnpricedHours   float64
+	UnpricedEntries int
+}
+
+// ProjectBudgetActuals computes the actual for every category that has
+// at least one ProjectBudgetLine row on the given Project, keyed by
+// category (not by individual ProjectBudgetLine row — planned_amount is
+// already tracked per category per Project, uc-infra#79, so actual is
+// compared the same way; if a Project has two "labour" budget lines,
+// which is not prevented today, they still share one combined actual).
+// A Project with no ProjectBudgetLine rows returns an empty slice, not
+// an error.
+//
+// "labour" actual = sum(TimeEntry.hours * Employee.cost_rate) across
+// every TimeEntry logged against one of this Project's Tasks (Task.
+// project_id = the given project), for TimeEntry rows that resolve to
+// an Employee with cost_rate set. Every other category present on the
+// project's budget lines comes back with Actual == nil (see
+// ProjectCategoryActual's own doc comment).
+//
+// Employee resolution for a TimeEntry: TimeEntry.employee_id targets
+// Party, not Employee (ADR-0013 rule 4 — see projects.go's own doc
+// comment), so this looks up the Employee record(s) whose party_id
+// matches that Party. A Party can hold more than one Employee record
+// over time (rehire — hr.go's own doc comment) or, in a case that
+// exists but isn't prevented, more than one simultaneously; this
+// method does NOT try to match the employment that was active on the
+// entry's own date (that needs point-in-time rate history this kernel
+// doesn't have — same deliberate simplification cost_rate's own field
+// doc comment names). It uses whichever of that Party's Employee
+// records with cost_rate SET has the latest hire_date — the most
+// recent employment's rate, applied uniformly regardless of which
+// employment the hours were actually logged under, breaking a tie (same
+// hire_date, or hire_date absent on a record that skipped validation)
+// deterministically by id, same as LatestPOVendorByItem's own
+// `DESC NULLS LAST, po.id` above — NULLS LAST specifically because
+// Postgres sorts NULL FIRST on a bare DESC, which would otherwise let a
+// malformed/missing-hire_date row (hire_date is Required, so this can
+// only happen via data that bypassed validation, the same threat model
+// uuidPattern's own doc comment defends against elsewhere in this file)
+// silently outrank a real, validly-dated rate. If the Party has no
+// Employee record with cost_rate set at all, every TimeEntry for that
+// party_id is unpriced (see UnpricedHours/UnpricedEntries).
+//
+// The employee-rate lookup runs ONCE per query as its own DISTINCT-ON
+// subquery (employee_rates below), not once per TimeEntry row: an
+// earlier version of this method used a per-row LATERAL join here,
+// which independent review measured at O(TimeEntries × total Employee
+// rows) with the indexes this table actually has (idx_records_data_gin
+// doesn't serve a `data->>'party_id' = ...` equality lookup) — 3.4s on
+// a syntheic 8k-record fixture. This CTE form is the same
+// per-key-latest-row shape LatestPOVendorByItem already uses in this
+// file, just keyed by party_id instead of item_id, and measured at
+// ~17ms on the same fixture.
+//
+// Deliberately currency-agnostic, like every other money figure in this
+// file — this does not check Project.currency_id against anything
+// Employee.cost_rate might be denominated in, because no FieldMoney
+// value anywhere in this kernel is denominated in a specific currency
+// at the record level yet (money.Money's own package doc comment names
+// this tracked gap; it is not new to this method).
+//
+// The minor-units product of a fractional TimeEntry.hours (e.g. 1.5)
+// and an integer cost_rate can itself be fractional (1.5 hours at a
+// $25.01/hr rate is 3751.5 minor units) — summed in exact NUMERIC
+// arithmetic across every priced entry first, then rounded to the
+// nearest whole minor unit ONCE at the end (Postgres round(), half away
+// from zero), rather than rounding every individual line first. That
+// avoids compounding a per-line rounding error across many small
+// entries; it is not pinned to a specific per-line rounding rule
+// because none is specified anywhere else in this kernel today.
+//
+// Malformed references are excluded, not fatal, matching this file's
+// existing uuidPattern/moneyMinorUnitsPattern convention throughout: a
+// TimeEntry whose task_id isn't a well-formed UUID, or whose employee's
+// cost_rate isn't a well-formed minor-units integer, is treated as
+// unpriced/excluded rather than aborting the whole aggregate. A
+// TimeEntry whose own `hours` value isn't a well-formed number is
+// excluded from the aggregate entirely (its hours cannot be trusted
+// enough to count as either priced or unpriced), the same "one bad row
+// doesn't abort the whole report" resolution applied one level further.
+// A ProjectBudgetLine row with no `category` key at all (malformed —
+// category is Required) is excluded from the returned categories the
+// same way, rather than surfacing as a bogus empty-string category or
+// aborting the whole call on a NULL scan.
+//
+// CAUTION for whoever wires this up next: Actual is money.Money, i.e.
+// MINOR units — ProjectBudgetLine.planned_amount (projects.go) is a
+// plain entity.FieldNumber in MAJOR units (uc-infra#79 predates
+// FieldMoney; tracked under uc-infra#136 alongside every other
+// leftover FieldNumber money field). Comparing the two directly without
+// scaling planned_amount by 100 first is a 100x error in exactly the
+// class of bug internal/kernel/money exists to prevent.
+func (r *ReportingRepo) ProjectBudgetActuals(ctx context.Context, projectID string) ([]ProjectCategoryActual, error) {
+	catRows, err := r.db.QueryContext(ctx,
+		`SELECT DISTINCT data->>'category'
+		 FROM records
+		 WHERE entity_type = 'ProjectBudgetLine'
+		   AND deleted_at IS NULL
+		   AND coalesce(data->>'category', '') <> ''
+		   AND data->>'project_id' = $1
+		 ORDER BY 1`,
+		projectID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("project budget actuals: list categories: %w", err)
+	}
+	var categories []string
+	for catRows.Next() {
+		var cat string
+		if err := catRows.Scan(&cat); err != nil {
+			catRows.Close()
+			return nil, fmt.Errorf("project budget actuals: scan category: %w", err)
+		}
+		categories = append(categories, cat)
+	}
+	catErr := catRows.Err()
+	catRows.Close()
+	if catErr != nil {
+		return nil, fmt.Errorf("project budget actuals: %w", catErr)
+	}
+
+	out := make([]ProjectCategoryActual, 0, len(categories))
+	for _, cat := range categories {
+		if cat != "labour" {
+			// No expense source exists for any other category yet (see
+			// this method's own doc comment) — Actual stays nil, never a
+			// computed 0.
+			out = append(out, ProjectCategoryActual{Category: cat})
+			continue
+		}
+
+		var actualMinor int64
+		var unpricedHours float64
+		var unpricedEntries int
+		err := r.db.QueryRowContext(ctx,
+			`WITH employee_rates AS (
+			   SELECT DISTINCT ON (e.data->>'party_id')
+			          e.data->>'party_id' AS party_id,
+			          (e.data->>'cost_rate')::bigint AS cost_rate_minor
+			   FROM records e
+			   WHERE e.entity_type = 'Employee'
+			     AND e.deleted_at IS NULL
+			     AND e.data->>'cost_rate' ~ $4
+			   ORDER BY e.data->>'party_id', e.data->>'hire_date' DESC NULLS LAST, e.id
+			 )
+			 SELECT
+			   coalesce(round(sum(CASE WHEN er.cost_rate_minor IS NOT NULL
+			                           THEN (te.data->>'hours')::numeric * er.cost_rate_minor
+			                           ELSE 0 END)), 0)::bigint,
+			   coalesce(sum(CASE WHEN er.cost_rate_minor IS NULL
+			                     THEN (te.data->>'hours')::numeric
+			                     ELSE 0 END), 0)::float8,
+			   count(*) FILTER (WHERE er.cost_rate_minor IS NULL)
+			 FROM records te
+			 JOIN records t
+			   ON t.entity_type = 'Task'
+			  AND t.deleted_at IS NULL
+			  AND t.id = (te.data->>'task_id')::uuid
+			 LEFT JOIN employee_rates er
+			   ON er.party_id = te.data->>'employee_id'
+			 WHERE te.entity_type = 'TimeEntry'
+			   AND te.deleted_at IS NULL
+			   AND te.data->>'task_id' ~ $2
+			   AND te.data->>'hours' ~ $3
+			   AND t.data->>'project_id' = $1`,
+			projectID, uuidPattern, numericPattern, moneyMinorUnitsPattern,
+		).Scan(&actualMinor, &unpricedHours, &unpricedEntries)
+		if err != nil {
+			return nil, fmt.Errorf("project budget actuals: labour aggregate: %w", err)
+		}
+
+		actual := money.Money(actualMinor)
+		out = append(out, ProjectCategoryActual{
+			Category:        cat,
+			Actual:          &actual,
+			UnpricedHours:   unpricedHours,
+			UnpricedEntries: unpricedEntries,
+		})
+	}
+	return out, nil
+}

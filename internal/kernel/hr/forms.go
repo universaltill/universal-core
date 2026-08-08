@@ -7,10 +7,15 @@ import "github.com/universaltill/universal-core/internal/kernel/form"
 // employment is. The leave history is a read-only related list for the
 // same reason it is a related list on the entity: it records decisions
 // that outlive the employment.
+//
+// Version 2 (uc-infra#134) adds the "Compensation" section, riding along
+// with hr.Employee's own v1->v2 bump for cost_rate — see that entity's
+// doc comment on why the form has to carry a version bump too, not just
+// the Definition, for a new field to actually reach a tenant's screen.
 func EmployeeForm() *form.Definition {
 	return &form.Definition{
 		EntityType: "Employee",
-		Version:    1,
+		Version:    2,
 		Sections: []form.Section{
 			{
 				Title:     "Employment",
@@ -29,6 +34,13 @@ func EmployeeForm() *form.Definition {
 					{Name: "department_id", Label: "Department"},
 					{Name: "hire_date", Label: "Hire Date"},
 					{Name: "end_date", Label: "End Date"},
+				},
+			},
+			{
+				Title:     "Compensation",
+				Component: form.ComponentFields,
+				Fields: []form.FormField{
+					{Name: "cost_rate", Label: "Cost Rate"},
 				},
 			},
 			{
