@@ -13,6 +13,7 @@ import (
 
 	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/db"
+	"github.com/universaltill/universal-core/internal/kernel/projects"
 )
 
 // This package's own tests (unlike every other repo, which is only ever
@@ -1394,5 +1395,670 @@ func TestGoodsReceiptLineQualities_DeletedPurchaseOrderExcludesItsLines(t *testi
 	}
 	if len(got) != 0 {
 		t.Fatalf("got %d rows, want 0 — a deleted PurchaseOrder's receipt lines must be excluded", len(got))
+	}
+}
+
+// --- ProjectBudgetActuals (uc-infra#134) ---
+//
+// projectActualsFixture is the shared setup every test below builds on:
+// a Project, and helpers for the Task/TimeEntry/Employee/Party rows a
+// "labour" actual is computed from. Kept minimal — only the fields
+// ProjectBudgetActuals' own query actually reads — since RecordRepo.Create
+// (like every other fixture in this file) bypasses entity.ValidateRecord
+// entirely, so it never enforces Required/Min/Max on what's written here.
+type projectActualsFixture struct {
+	t         *testing.T
+	ctx       context.Context
+	records   *data.RecordRepo
+	reporting *data.ReportingRepo
+	projectID string
+}
+
+func newProjectActualsFixture(t *testing.T, projectCode string) *projectActualsFixture {
+	t.Helper()
+	ctx := context.Background()
+	tenantDB := freshTenantDB(t)
+	records := data.NewRecordRepo(tenantDB)
+	reporting := data.NewReportingRepo(tenantDB)
+	proj, err := records.Create(ctx, "Project", map[string]any{
+		"project_code": projectCode, "name": projectCode, "start_date": "2026-01-01",
+	})
+	if err != nil {
+		t.Fatalf("create Project: %v", err)
+	}
+	return &projectActualsFixture{t: t, ctx: ctx, records: records, reporting: reporting, projectID: proj.ID}
+}
+
+func (f *projectActualsFixture) budgetLine(category string) {
+	f.t.Helper()
+	if _, err := f.records.Create(f.ctx, "ProjectBudgetLine", map[string]any{
+		"project_id": f.projectID, "category": category, "planned_amount": 0.0,
+	}); err != nil {
+		f.t.Fatalf("create ProjectBudgetLine: %v", err)
+	}
+}
+
+func (f *projectActualsFixture) task() string {
+	f.t.Helper()
+	task, err := f.records.Create(f.ctx, "Task", map[string]any{
+		"project_id": f.projectID, "title": "work",
+	})
+	if err != nil {
+		f.t.Fatalf("create Task: %v", err)
+	}
+	return task.ID
+}
+
+// party creates a bare Party row — TimeEntry.employee_id targets Party
+// (ADR-0013 rule 4), and RecordRepo.Create never enforces the
+// employee-PartyRole TargetFilter (that's a crud.Engine-time check, not
+// exercised by this repo-level test), so an empty Party record is
+// sufficient to exist as the referenced id.
+func (f *projectActualsFixture) party(name string) string {
+	f.t.Helper()
+	p, err := f.records.Create(f.ctx, "Party", map[string]any{"name": name, "party_type": "person"})
+	if err != nil {
+		f.t.Fatalf("create Party: %v", err)
+	}
+	return p.ID
+}
+
+// employee creates an Employee record for partyID. costRateMinor < 0
+// means "leave cost_rate unset" (Go has no natural "absent" sentinel for
+// an int literal in a table-driven caller, and a real cost_rate can
+// never legitimately be negative per its own Min:0 bound, so it's a safe
+// sentinel here).
+func (f *projectActualsFixture) employee(partyID, hireDate string, costRateMinor int64) string {
+	f.t.Helper()
+	fields := map[string]any{"employee_number": "E-" + partyID, "party_id": partyID, "hire_date": hireDate}
+	if costRateMinor >= 0 {
+		fields["cost_rate"] = costRateMinor
+	}
+	emp, err := f.records.Create(f.ctx, "Employee", fields)
+	if err != nil {
+		f.t.Fatalf("create Employee: %v", err)
+	}
+	return emp.ID
+}
+
+func (f *projectActualsFixture) timeEntry(taskID, employeeID string, hours float64) {
+	f.t.Helper()
+	if _, err := f.records.Create(f.ctx, "TimeEntry", map[string]any{
+		"task_id": taskID, "employee_id": employeeID, "entry_date": "2026-02-01", "hours": hours,
+	}); err != nil {
+		f.t.Fatalf("create TimeEntry: %v", err)
+	}
+}
+
+func (f *projectActualsFixture) byCategory(rows []data.ProjectCategoryActual) map[string]data.ProjectCategoryActual {
+	out := map[string]data.ProjectCategoryActual{}
+	for _, r := range rows {
+		out[r.Category] = r
+	}
+	return out
+}
+
+// TestProjectBudgetActuals_LabourCategoryAllPriced (uc-infra#134) is the
+// simple happy path: every TimeEntry's employee has cost_rate set, so
+// Actual is the exact sum and nothing is Unpriced.
+func TestProjectBudgetActuals_LabourCategoryAllPriced(t *testing.T) {
+	f := newProjectActualsFixture(t, "P-LABOUR-ALL-PRICED")
+	f.budgetLine("labour")
+	task := f.task()
+
+	partyA := f.party("Alice")
+	f.employee(partyA, "2020-01-01", 2500) // $25.00/hr
+	partyB := f.party("Bob")
+	f.employee(partyB, "2021-01-01", 1000) // $10.00/hr
+
+	f.timeEntry(task, partyA, 2) // 2h * $25.00 = $50.00 = 5000 minor
+	f.timeEntry(task, partyB, 3) // 3h * $10.00 = $30.00 = 3000 minor
+
+	got, err := f.reporting.ProjectBudgetActuals(f.ctx, f.projectID)
+	if err != nil {
+		t.Fatalf("ProjectBudgetActuals: %v", err)
+	}
+	byCat := f.byCategory(got)
+	labour, ok := byCat["labour"]
+	if !ok {
+		t.Fatal("expected a labour row")
+	}
+	if labour.Actual == nil {
+		t.Fatal("expected a non-nil Actual — real TimeEntry data was logged and fully priced")
+	}
+	if *labour.Actual != 8000 {
+		t.Errorf("Actual = %d, want 8000 (5000 + 3000 minor units)", *labour.Actual)
+	}
+	if labour.UnpricedHours != 0 || labour.UnpricedEntries != 0 {
+		t.Errorf("expected no unpriced hours/entries, got %v/%v", labour.UnpricedHours, labour.UnpricedEntries)
+	}
+}
+
+// TestProjectBudgetActuals_LabourCategoryPartiallyPriced (uc-infra#134)
+// is the case the whole Unpriced* pair exists for: some TimeEntry rows'
+// employees have no cost_rate set at all, so those hours/entries must be
+// excluded from Actual and counted separately — Actual must reflect only
+// the priced subset, never the full total and never a fabricated $0.
+func TestProjectBudgetActuals_LabourCategoryPartiallyPriced(t *testing.T) {
+	f := newProjectActualsFixture(t, "P-LABOUR-PARTIAL")
+	f.budgetLine("labour")
+	task := f.task()
+
+	pricedParty := f.party("Priced Employee")
+	f.employee(pricedParty, "2020-01-01", 2000) // $20.00/hr
+
+	unpricedParty := f.party("Unpriced Employee")
+	f.employee(unpricedParty, "2020-01-01", -1) // no cost_rate set
+
+	f.timeEntry(task, pricedParty, 4)     // 4h * $20.00 = $80.00 = 8000 minor
+	f.timeEntry(task, unpricedParty, 6)   // unpriced: no cost_rate
+	f.timeEntry(task, unpricedParty, 1.5) // unpriced: another entry, same party
+
+	got, err := f.reporting.ProjectBudgetActuals(f.ctx, f.projectID)
+	if err != nil {
+		t.Fatalf("ProjectBudgetActuals: %v", err)
+	}
+	labour := f.byCategory(got)["labour"]
+	if labour.Actual == nil || *labour.Actual != 8000 {
+		t.Fatalf("Actual = %v, want a real 8000 (only the priced entry) — not $0, not the full total", labour.Actual)
+	}
+	if labour.UnpricedHours != 7.5 {
+		t.Errorf("UnpricedHours = %v, want 7.5 (6 + 1.5)", labour.UnpricedHours)
+	}
+	if labour.UnpricedEntries != 2 {
+		t.Errorf("UnpricedEntries = %v, want 2", labour.UnpricedEntries)
+	}
+}
+
+// TestProjectBudgetActuals_NonLabourCategoryIsNilNotZero (uc-infra#134)
+// pins the headline invariant of this whole design: a category with no
+// expense source at all (materials, here) must report Actual == nil,
+// distinguishable from a genuine zero, even when the project has zero
+// labour activity either.
+func TestProjectBudgetActuals_NonLabourCategoryIsNilNotZero(t *testing.T) {
+	f := newProjectActualsFixture(t, "P-MATERIALS-ONLY")
+	f.budgetLine("materials")
+
+	got, err := f.reporting.ProjectBudgetActuals(f.ctx, f.projectID)
+	if err != nil {
+		t.Fatalf("ProjectBudgetActuals: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d rows, want 1", len(got))
+	}
+	if got[0].Category != "materials" {
+		t.Errorf("Category = %q, want materials", got[0].Category)
+	}
+	if got[0].Actual != nil {
+		t.Errorf("Actual = %v, want nil — materials has no expense source to compute one from", *got[0].Actual)
+	}
+	if got[0].UnpricedHours != 0 || got[0].UnpricedEntries != 0 {
+		t.Errorf("expected zero Unpriced* for a non-labour category, got %+v", got[0])
+	}
+}
+
+// TestProjectBudgetActuals_LabourCategoryZeroTimeEntriesIsComputedZero
+// (uc-infra#134) is the deliberate counterpart to the nil case above: a
+// "labour" budget line with genuinely nothing logged against it gets a
+// REAL computed 0, not nil — there is a labour cost source, it just has
+// no activity yet, which is a known fact, not an unknown one.
+func TestProjectBudgetActuals_LabourCategoryZeroTimeEntriesIsComputedZero(t *testing.T) {
+	f := newProjectActualsFixture(t, "P-LABOUR-NO-ACTIVITY")
+	f.budgetLine("labour")
+	// No Task, no TimeEntry at all.
+
+	got, err := f.reporting.ProjectBudgetActuals(f.ctx, f.projectID)
+	if err != nil {
+		t.Fatalf("ProjectBudgetActuals: %v", err)
+	}
+	labour := f.byCategory(got)["labour"]
+	if labour.Actual == nil {
+		t.Fatal("expected a non-nil, computed-zero Actual for labour with zero logged activity — not nil")
+	}
+	if *labour.Actual != 0 {
+		t.Errorf("Actual = %d, want 0", *labour.Actual)
+	}
+	if labour.UnpricedHours != 0 || labour.UnpricedEntries != 0 {
+		t.Errorf("expected zero Unpriced* with zero TimeEntry rows, got %+v", labour)
+	}
+}
+
+// TestProjectBudgetActuals_RehireUsesLatestHireDateWithCostRateSet
+// (uc-infra#134) pins the doc comment's employee-resolution rule: a
+// Party with two Employee records (a rehire) uses whichever record WITH
+// cost_rate SET has the latest hire_date, not simply the latest
+// Employee record overall.
+func TestProjectBudgetActuals_RehireUsesLatestHireDateWithCostRateSet(t *testing.T) {
+	f := newProjectActualsFixture(t, "P-REHIRE")
+	f.budgetLine("labour")
+	task := f.task()
+
+	party := f.party("Rehired Employee")
+	// Earlier employment: cost_rate set.
+	f.employee(party, "2018-01-01", 1500) // $15.00/hr
+	// Later employment (the rehire): NO cost_rate set. If resolution
+	// picked "latest hire_date, full stop" this would make the whole
+	// party unpriced instead of using the earlier, priced employment.
+	f.employee(party, "2026-01-01", -1)
+
+	f.timeEntry(task, party, 4) // should price at $15.00/hr = 6000 minor
+
+	got, err := f.reporting.ProjectBudgetActuals(f.ctx, f.projectID)
+	if err != nil {
+		t.Fatalf("ProjectBudgetActuals: %v", err)
+	}
+	labour := f.byCategory(got)["labour"]
+	if labour.Actual == nil || *labour.Actual != 6000 {
+		t.Fatalf("Actual = %v, want 6000 — must fall back to the earlier employment's cost_rate, since the latest employment has none set", labour.Actual)
+	}
+	if labour.UnpricedHours != 0 || labour.UnpricedEntries != 0 {
+		t.Errorf("expected the entry to be priced via the earlier employment, got Unpriced* = %+v", labour)
+	}
+}
+
+// TestProjectBudgetActuals_NoProjectBudgetLinesReturnsEmptySlice
+// (uc-infra#134): a Project with no ProjectBudgetLine rows at all
+// returns an empty slice, not an error and not a fabricated row.
+func TestProjectBudgetActuals_NoProjectBudgetLinesReturnsEmptySlice(t *testing.T) {
+	f := newProjectActualsFixture(t, "P-NO-BUDGET-LINES")
+
+	got, err := f.reporting.ProjectBudgetActuals(f.ctx, f.projectID)
+	if err != nil {
+		t.Fatalf("ProjectBudgetActuals: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("got %d rows, want 0", len(got))
+	}
+}
+
+// TestProjectBudgetActuals_MalformedTaskIDExcludedNotAborted
+// (uc-infra#134) is this method's version of TopVendorsBySpend's own
+// malformed-reference guard test: a TimeEntry whose task_id isn't even
+// a well-formed UUID must be excluded from the aggregate, not abort the
+// whole query with a Postgres ::uuid cast error.
+func TestProjectBudgetActuals_MalformedTaskIDExcludedNotAborted(t *testing.T) {
+	f := newProjectActualsFixture(t, "P-MALFORMED-TASK-ID")
+	f.budgetLine("labour")
+	task := f.task()
+
+	party := f.party("Guard Employee")
+	f.employee(party, "2020-01-01", 4000) // $40.00/hr
+
+	f.timeEntry(task, party, 2) // valid: 2h * $40.00 = 8000 minor
+	// A TimeEntry with a task_id that isn't a well-formed UUID at all —
+	// same "bad CSV import mapping" scenario uuidPattern's own doc
+	// comment (reporting.go) describes for every other join in this file.
+	if _, err := f.records.Create(f.ctx, "TimeEntry", map[string]any{
+		"task_id": "not-a-uuid", "employee_id": party, "entry_date": "2026-02-01", "hours": 99.0,
+	}); err != nil {
+		f.t.Fatalf("create malformed TimeEntry: %v", err)
+	}
+
+	got, err := f.reporting.ProjectBudgetActuals(f.ctx, f.projectID)
+	if err != nil {
+		t.Fatalf("ProjectBudgetActuals: %v", err)
+	}
+	labour := f.byCategory(got)["labour"]
+	if labour.Actual == nil || *labour.Actual != 8000 {
+		t.Fatalf("Actual = %v, want 8000 — the malformed-task_id row must be excluded, not counted or aborting the query", labour.Actual)
+	}
+	if labour.UnpricedHours != 0 || labour.UnpricedEntries != 0 {
+		t.Errorf("the malformed row must be excluded entirely, not counted as unpriced either, got %+v", labour)
+	}
+}
+
+// TestProjectBudgetActuals_MissingHireDateDoesNotOutrankARealDate
+// (uc-infra#134, independent review finding) pins a regression: Postgres
+// sorts NULL FIRST on a bare `ORDER BY ... DESC`, so an Employee record
+// missing hire_date entirely (hire_date is Required, so this can only
+// happen via data that bypassed validation — the same threat model
+// uuidPattern's own doc comment defends against elsewhere in this file)
+// would silently outrank a real, validly-dated rate under a naive
+// `DESC` sort. The employee_rates CTE's `DESC NULLS LAST, id` must push
+// the missing-hire_date row to the back, not the front, so the
+// genuinely-dated employment's cost_rate is the one actually used.
+func TestProjectBudgetActuals_MissingHireDateDoesNotOutrankARealDate(t *testing.T) {
+	f := newProjectActualsFixture(t, "P-MISSING-HIRE-DATE")
+	f.budgetLine("labour")
+	task := f.task()
+
+	party := f.party("Party With A Malformed Employee Row")
+	// The real, validly-dated employment.
+	f.employee(party, "2020-01-01", 3000) // $30.00/hr
+	// A malformed row for the SAME party: cost_rate set, but no
+	// hire_date key at all — bypasses the fixture's employee() helper,
+	// which always sets one, the same way the malformed-task_id test
+	// above bypasses timeEntry() to construct an invalid row directly.
+	if _, err := f.records.Create(f.ctx, "Employee", map[string]any{
+		"employee_number": "E-NO-HIRE-DATE", "party_id": party, "cost_rate": int64(100),
+	}); err != nil {
+		t.Fatalf("create malformed Employee (no hire_date): %v", err)
+	}
+
+	f.timeEntry(task, party, 2)
+
+	got, err := f.reporting.ProjectBudgetActuals(f.ctx, f.projectID)
+	if err != nil {
+		t.Fatalf("ProjectBudgetActuals: %v", err)
+	}
+	labour := f.byCategory(got)["labour"]
+	if labour.Actual == nil || *labour.Actual != 6000 {
+		t.Fatalf("Actual = %v, want 6000 (2h * $30.00) — the real, dated employment's rate must win over a malformed record with no hire_date at all, not the other way around", labour.Actual)
+	}
+}
+
+// TestProjectBudgetActuals_TieBreakOnHireDateIsDeterministic
+// (uc-infra#134, independent review finding) pins the other half of the
+// same fix: two Employee records for one Party sharing the exact same
+// hire_date (an accepted-but-unprevented case — hr.go's own doc comment
+// names simultaneous employments as "accepted") must resolve to the
+// SAME record every time, not whatever a heap scan happens to return
+// first. The employee_rates CTE breaks the tie by `id` — the smaller id
+// wins, since DISTINCT ON's default ORDER BY direction on the trailing
+// key is ascending.
+func TestProjectBudgetActuals_TieBreakOnHireDateIsDeterministic(t *testing.T) {
+	f := newProjectActualsFixture(t, "P-HIRE-DATE-TIE")
+	f.budgetLine("labour")
+	task := f.task()
+
+	party := f.party("Simultaneous Employments")
+	empA, err := f.records.Create(f.ctx, "Employee", map[string]any{
+		"employee_number": "E-TIE-A", "party_id": party, "hire_date": "2022-06-01", "cost_rate": int64(1111),
+	})
+	if err != nil {
+		t.Fatalf("create Employee A: %v", err)
+	}
+	empB, err := f.records.Create(f.ctx, "Employee", map[string]any{
+		"employee_number": "E-TIE-B", "party_id": party, "hire_date": "2022-06-01", "cost_rate": int64(2222),
+	})
+	if err != nil {
+		t.Fatalf("create Employee B: %v", err)
+	}
+	wantRate := int64(1111)
+	if empB.ID < empA.ID {
+		wantRate = 2222
+	}
+
+	f.timeEntry(task, party, 1)
+
+	// Run it twice — a nondeterministic tie-break would be the whole
+	// point of this test, and a single run can't distinguish "always
+	// resolves this way" from "happened to resolve this way once."
+	for i := 0; i < 2; i++ {
+		got, err := f.reporting.ProjectBudgetActuals(f.ctx, f.projectID)
+		if err != nil {
+			t.Fatalf("ProjectBudgetActuals (run %d): %v", i, err)
+		}
+		labour := f.byCategory(got)["labour"]
+		if labour.Actual == nil || int64(*labour.Actual) != wantRate {
+			t.Fatalf("run %d: Actual = %v, want %d — the tie-break must deterministically pick the same Employee record (lowest id) every time", i, labour.Actual, wantRate)
+		}
+	}
+}
+
+// TestProjectBudgetActuals_ExcludesCrossProjectTimeEntries (uc-infra#134,
+// independent review finding) is the one filter every shipped scenario
+// so far left completely unexercised: every fixture above builds exactly
+// one Project, so `AND t.data->>'project_id' = $1` never had a second
+// project's data around to actually exclude. A bug that leaked another
+// project's hours into this project's actual would have passed all of
+// them.
+func TestProjectBudgetActuals_ExcludesCrossProjectTimeEntries(t *testing.T) {
+	f := newProjectActualsFixture(t, "P-ISOLATION-TARGET")
+	f.budgetLine("labour")
+	task := f.task()
+	party := f.party("Target Project Employee")
+	f.employee(party, "2020-01-01", 1000) // $10.00/hr
+	f.timeEntry(task, party, 2)           // 2h * $10.00 = 2000 minor — the only entry that should count
+
+	// A second, unrelated Project in the SAME tenant database, with its
+	// own much larger labour activity that must not leak into the
+	// target project's actual.
+	other, err := f.records.Create(f.ctx, "Project", map[string]any{
+		"project_code": "P-ISOLATION-OTHER", "name": "P-ISOLATION-OTHER", "start_date": "2026-01-01",
+	})
+	if err != nil {
+		t.Fatalf("create other Project: %v", err)
+	}
+	otherTask, err := f.records.Create(f.ctx, "Task", map[string]any{
+		"project_id": other.ID, "title": "unrelated work",
+	})
+	if err != nil {
+		t.Fatalf("create other Project's Task: %v", err)
+	}
+	if _, err := f.records.Create(f.ctx, "TimeEntry", map[string]any{
+		"task_id": otherTask.ID, "employee_id": party, "entry_date": "2026-02-01", "hours": 100.0,
+	}); err != nil {
+		t.Fatalf("create other Project's TimeEntry: %v", err)
+	}
+
+	got, err := f.reporting.ProjectBudgetActuals(f.ctx, f.projectID)
+	if err != nil {
+		t.Fatalf("ProjectBudgetActuals: %v", err)
+	}
+	labour := f.byCategory(got)["labour"]
+	if labour.Actual == nil || *labour.Actual != 2000 {
+		t.Fatalf("Actual = %v, want 2000 — a different Project's 100h must not leak into this one's actual", labour.Actual)
+	}
+}
+
+// TestProjectBudgetActuals_AllUnpricedIsComputedZeroWithUnpricedCount
+// (uc-infra#134) is the most dangerous untested reading of this API a
+// caller could get wrong: when EVERY TimeEntry on a labour-active
+// project is unpriced, Actual is still a real, non-nil, computed 0 (real
+// labour activity exists, none of it happens to be priced) — a caller
+// that reads Actual alone without checking UnpricedEntries would see
+// "confirmed zero spend," which is exactly wrong. This differs from
+// TestProjectBudgetActuals_LabourCategoryZeroTimeEntriesIsComputedZero
+// (which has zero TimeEntry rows at all, so UnpricedEntries is also 0)
+// by having real, unpriced activity.
+func TestProjectBudgetActuals_AllUnpricedIsComputedZeroWithUnpricedCount(t *testing.T) {
+	f := newProjectActualsFixture(t, "P-ALL-UNPRICED")
+	f.budgetLine("labour")
+	task := f.task()
+
+	party := f.party("Entirely Unpriced Employee")
+	f.employee(party, "2020-01-01", -1) // no cost_rate set at all
+	f.timeEntry(task, party, 5)
+	f.timeEntry(task, party, 2.5)
+
+	got, err := f.reporting.ProjectBudgetActuals(f.ctx, f.projectID)
+	if err != nil {
+		t.Fatalf("ProjectBudgetActuals: %v", err)
+	}
+	labour := f.byCategory(got)["labour"]
+	if labour.Actual == nil {
+		t.Fatal("expected a non-nil, computed-zero Actual — real activity exists, it's just entirely unpriced")
+	}
+	if *labour.Actual != 0 {
+		t.Errorf("Actual = %d, want 0 (nothing priced)", *labour.Actual)
+	}
+	if labour.UnpricedEntries != 2 {
+		t.Errorf("UnpricedEntries = %d, want 2 — a caller must be able to tell this apart from genuine zero activity", labour.UnpricedEntries)
+	}
+	if labour.UnpricedHours != 7.5 {
+		t.Errorf("UnpricedHours = %v, want 7.5", labour.UnpricedHours)
+	}
+}
+
+// TestProjectBudgetActuals_MalformedHoursExcludedEntirely (uc-infra#134)
+// is this method's own doc-comment promise ("A TimeEntry whose own
+// `hours` value isn't a well-formed number is excluded from the
+// aggregate entirely") — untested until now. A malformed hours value
+// must not count as priced, unpriced, or abort the query.
+func TestProjectBudgetActuals_MalformedHoursExcludedEntirely(t *testing.T) {
+	f := newProjectActualsFixture(t, "P-MALFORMED-HOURS")
+	f.budgetLine("labour")
+	task := f.task()
+	party := f.party("Malformed Hours Employee")
+	f.employee(party, "2020-01-01", 4000) // $40.00/hr
+
+	f.timeEntry(task, party, 2) // valid: 2h * $40.00 = 8000 minor
+	if _, err := f.records.Create(f.ctx, "TimeEntry", map[string]any{
+		"task_id": task, "employee_id": party, "entry_date": "2026-02-01", "hours": "not-a-number",
+	}); err != nil {
+		t.Fatalf("create malformed-hours TimeEntry: %v", err)
+	}
+
+	got, err := f.reporting.ProjectBudgetActuals(f.ctx, f.projectID)
+	if err != nil {
+		t.Fatalf("ProjectBudgetActuals: %v", err)
+	}
+	labour := f.byCategory(got)["labour"]
+	if labour.Actual == nil || *labour.Actual != 8000 {
+		t.Fatalf("Actual = %v, want 8000 — the malformed-hours row must be excluded, not counted at any rate", labour.Actual)
+	}
+	if labour.UnpricedHours != 0 || labour.UnpricedEntries != 0 {
+		t.Errorf("the malformed-hours row must be excluded entirely, not counted as unpriced either (its hours can't be trusted enough to count as either), got %+v", labour)
+	}
+}
+
+// TestProjectBudgetActuals_MalformedCostRateTreatedAsUnpriced
+// (uc-infra#134) is this method's moneyMinorUnitsPattern guard — an
+// Employee record whose cost_rate isn't a well-formed minor-units
+// integer must not resolve as that employee's rate; the employee_rates
+// CTE's own `~ $4` filter should simply exclude that Employee row,
+// leaving the party unpriced exactly as if no cost_rate were set at all.
+func TestProjectBudgetActuals_MalformedCostRateTreatedAsUnpriced(t *testing.T) {
+	f := newProjectActualsFixture(t, "P-MALFORMED-COST-RATE")
+	f.budgetLine("labour")
+	task := f.task()
+	party := f.party("Malformed Cost Rate Employee")
+	if _, err := f.records.Create(f.ctx, "Employee", map[string]any{
+		"employee_number": "E-MALFORMED-RATE", "party_id": party, "hire_date": "2020-01-01", "cost_rate": "not-a-rate",
+	}); err != nil {
+		t.Fatalf("create Employee with malformed cost_rate: %v", err)
+	}
+	f.timeEntry(task, party, 3)
+
+	got, err := f.reporting.ProjectBudgetActuals(f.ctx, f.projectID)
+	if err != nil {
+		t.Fatalf("ProjectBudgetActuals: %v", err)
+	}
+	labour := f.byCategory(got)["labour"]
+	if labour.Actual == nil || *labour.Actual != 0 {
+		t.Fatalf("Actual = %v, want a computed 0 — a malformed cost_rate must not be usable as a rate", labour.Actual)
+	}
+	if labour.UnpricedEntries != 1 || labour.UnpricedHours != 3 {
+		t.Errorf("expected the entry counted as unpriced (malformed cost_rate == no usable rate), got %+v", labour)
+	}
+}
+
+// TestProjectBudgetActuals_ExcludesSoftDeletedRows (uc-infra#134) checks
+// all three deleted_at IS NULL guards this query relies on: a
+// soft-deleted TimeEntry, a soft-deleted Task (which takes its
+// TimeEntries out of the join entirely), and a soft-deleted Employee
+// (whose cost_rate must stop being usable, same effect as never having
+// been set) must each be excluded — matching this file's own house
+// precedent, TestGoodsReceiptLineQualities_DeletedPurchaseOrderExcludesItsLines.
+func TestProjectBudgetActuals_ExcludesSoftDeletedRows(t *testing.T) {
+	f := newProjectActualsFixture(t, "P-SOFT-DELETES")
+	f.budgetLine("labour")
+
+	liveTask := f.task()
+	liveParty := f.party("Live Employee")
+	f.employee(liveParty, "2020-01-01", 1000) // $10.00/hr
+	f.timeEntry(liveTask, liveParty, 2)       // 2h * $10.00 = 2000 minor — the only entry that should survive
+
+	// A soft-deleted TimeEntry, otherwise identical to a valid one.
+	deletedEntry, err := f.records.Create(f.ctx, "TimeEntry", map[string]any{
+		"task_id": liveTask, "employee_id": liveParty, "entry_date": "2026-02-01", "hours": 50.0,
+	})
+	if err != nil {
+		t.Fatalf("create TimeEntry to delete: %v", err)
+	}
+	if err := f.records.Delete(f.ctx, "TimeEntry", deletedEntry.ID); err != nil {
+		t.Fatalf("soft-delete TimeEntry: %v", err)
+	}
+
+	// A soft-deleted Task with a real, otherwise-valid TimeEntry under it.
+	deletedTask := f.task()
+	f.timeEntry(deletedTask, liveParty, 75)
+	if err := f.records.Delete(f.ctx, "Task", deletedTask); err != nil {
+		t.Fatalf("soft-delete Task: %v", err)
+	}
+
+	// A soft-deleted Employee: cost_rate must stop being usable.
+	deletedRateParty := f.party("Soft-Deleted Employee")
+	deletedEmp, err := f.records.Create(f.ctx, "Employee", map[string]any{
+		"employee_number": "E-DELETED", "party_id": deletedRateParty, "hire_date": "2020-01-01", "cost_rate": int64(9999),
+	})
+	if err != nil {
+		t.Fatalf("create Employee to delete: %v", err)
+	}
+	if err := f.records.Delete(f.ctx, "Employee", deletedEmp.ID); err != nil {
+		t.Fatalf("soft-delete Employee: %v", err)
+	}
+	f.timeEntry(liveTask, deletedRateParty, 10)
+
+	got, err := f.reporting.ProjectBudgetActuals(f.ctx, f.projectID)
+	if err != nil {
+		t.Fatalf("ProjectBudgetActuals: %v", err)
+	}
+	labour := f.byCategory(got)["labour"]
+	if labour.Actual == nil || *labour.Actual != 2000 {
+		t.Fatalf("Actual = %v, want 2000 — soft-deleted TimeEntry/Task rows must not contribute at all", labour.Actual)
+	}
+	if labour.UnpricedEntries != 1 || labour.UnpricedHours != 10 {
+		t.Errorf("expected exactly the soft-deleted-Employee's TimeEntry counted as unpriced (10h), got %+v", labour)
+	}
+}
+
+// TestProjectBudgetActuals_TwoLabourBudgetLinesShareOneCombinedRow
+// (uc-infra#134) pins this method's own doc comment claim: a Project
+// with two "labour" ProjectBudgetLine rows (not prevented by the
+// entity's own schema — nothing enforces one row per category) still
+// gets exactly one combined "labour" row back, not two, and not an
+// error.
+func TestProjectBudgetActuals_TwoLabourBudgetLinesShareOneCombinedRow(t *testing.T) {
+	f := newProjectActualsFixture(t, "P-TWO-LABOUR-LINES")
+	f.budgetLine("labour")
+	f.budgetLine("labour") // a second labour line — not prevented today
+	task := f.task()
+	party := f.party("Combined Row Employee")
+	f.employee(party, "2020-01-01", 500) // $5.00/hr
+	f.timeEntry(task, party, 4)          // 4h * $5.00 = 2000 minor
+
+	got, err := f.reporting.ProjectBudgetActuals(f.ctx, f.projectID)
+	if err != nil {
+		t.Fatalf("ProjectBudgetActuals: %v", err)
+	}
+	count := 0
+	for _, r := range got {
+		if r.Category == "labour" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("got %d labour rows, want exactly 1 combined row even with two ProjectBudgetLine rows sharing that category", count)
+	}
+	labour := f.byCategory(got)["labour"]
+	if labour.Actual == nil || *labour.Actual != 2000 {
+		t.Fatalf("Actual = %v, want 2000", labour.Actual)
+	}
+}
+
+// TestProjectBudgetActuals_LabourEnumValueStillMatchesProjectsPackage
+// (uc-infra#134, independent review finding) guards against
+// ProjectBudgetLine's "labour" EnumValues entry being renamed in
+// projects.go without anyone noticing that ProjectBudgetActuals' own
+// `cat != "labour"` string comparison (reporting.go) would then silently
+// treat EVERY category as non-priceable, with no build or test failure
+// anywhere else to catch it.
+func TestProjectBudgetActuals_LabourEnumValueStillMatchesProjectsPackage(t *testing.T) {
+	def := projects.ProjectBudgetLine()
+	f, ok := def.FieldByName("category")
+	if !ok {
+		t.Fatal("expected a category field on ProjectBudgetLine")
+	}
+	found := false
+	for _, v := range f.EnumValues {
+		if v == "labour" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("ProjectBudgetLine.category's EnumValues = %v, want \"labour\" present — ProjectBudgetActuals' string comparison depends on this exact value", f.EnumValues)
 	}
 }

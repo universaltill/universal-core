@@ -1880,6 +1880,12 @@ func (s *seeder) seedHR() {
 		"party_id":        person,
 		"hire_date":       "2024-03-04",
 		"status_id":       s.statusID("employee_status", "active"),
+		// cost_rate (uc-infra#134): without this, this employee's logged
+		// TimeEntry hours are all unpriced, and PRJ-2026-001's labour
+		// ProjectBudgetActuals would read as $0 spend on first run — the
+		// exact "looks like confirmed zero, not unknown" failure the
+		// Unpriced* counters exist to make visible instead of hiding.
+		"cost_rate": float64(6500), // $65.00/hr in minor units
 	})
 	if hasPublished(s.ctx, s.entityDefs, "AttendanceRecord") {
 		attDef := s.def("AttendanceRecord")

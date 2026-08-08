@@ -294,3 +294,123 @@ func TestHR_AttendanceListIsFilterableByEmployee(t *testing.T) {
 		t.Errorf("a filter matching no employee must return no rows, got:\n%s", none)
 	}
 }
+
+// TestHR_EmployeeCostRateRendersAsMoneyDecimal_RealBrowser (uc-infra#134,
+// independent review finding) is the real-browser counterpart the
+// "Compensation" section's cost_rate FieldMoney input didn't have: a
+// rendered-HTML-string test proves the input is present in the markup,
+// never that the browser actually shows the right DECIMAL VALUE — the
+// same distinction CLAUDE.md draws for CSS/script behavior, applied
+// here to formrender's minor-to-major money conversion (render.go's
+// FieldMoney case: `fv.Value = m.String()`). This is also the first e2e
+// coverage anywhere in this repo for a plain, non-roll-up FieldMoney
+// input's decimal rendering — every existing money e2e test
+// (TestPurchaseOrderForm_RollUpTotalRendersAsMoneyDecimal_RealBrowser)
+// covers a roll-up TOTAL cell, not an ordinary editable money field like
+// unit_price or this one.
+func TestHR_EmployeeCostRateRendersAsMoneyDecimal_RealBrowser(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, tenantDB := testServer(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	for _, step := range []struct {
+		name string
+		fn   func() error
+	}{
+		{"foundation", func() error { return foundation.Publish(ctx, tenantDB, actor) }},
+		{"foundation forms", func() error { return foundation.PublishForms(ctx, tenantDB, actor) }},
+		{"hr", func() error { return hr.Publish(ctx, tenantDB, actor) }},
+		{"hr forms", func() error { return hr.PublishForms(ctx, tenantDB, actor) }},
+		{"hr statuses", func() error { return hr.PublishStatuses(ctx, tenantDB, actor) }},
+	} {
+		if err := step.fn(); err != nil {
+			t.Fatalf("publish %s: %v", step.name, err)
+		}
+	}
+
+	engine := crud.NewEngine(tenantDB)
+	def := func(entityType string) *entity.Definition {
+		t.Helper()
+		v, err := data.NewEntityDefinitionRepo(tenantDB).GetPublished(ctx, entityType)
+		if err != nil {
+			t.Fatalf("GetPublished(%s): %v", entityType, err)
+		}
+		d, err := entity.Unmarshal(v.Definition)
+		if err != nil {
+			t.Fatalf("unmarshal %s: %v", entityType, err)
+		}
+		return d
+	}
+	status := func(typeCode, code string) string {
+		t.Helper()
+		types, _ := engine.ListByField(ctx, def("StatusType"), "code", typeCode)
+		if len(types) == 0 {
+			t.Fatalf("no StatusType %s", typeCode)
+		}
+		rows, _ := engine.ListByField(ctx, def("Status"), "status_type_id", types[0].ID)
+		for _, r := range rows {
+			if c, _ := r.Data["code"].(string); c == code {
+				return r.ID
+			}
+		}
+		t.Fatalf("no %s/%s", typeCode, code)
+		return ""
+	}
+
+	person, err := engine.Create(ctx, def("Party"), map[string]any{
+		"party_type": "person", "name": "Rate Test Employee", "status": "active",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create Party: %v", err)
+	}
+	// cost_rate stored in MINOR units (6550 = $65.50/hr) — the field this
+	// whole test exists to check renders correctly back out in MAJOR
+	// units, not the raw stored integer.
+	employee, err := engine.Create(ctx, def("Employee"), map[string]any{
+		"employee_number": "EMP-RATE-1", "party_id": person.ID,
+		"hire_date": "2024-01-08", "status_id": status("employee_status", "active"),
+		"cost_rate": float64(6550),
+	}, actor)
+	if err != nil {
+		t.Fatalf("create Employee: %v", err)
+	}
+
+	browser := browserCtx(t, tenantID)
+	var sectionText, inputValue, stepAttr string
+	if err := chromedp.Run(browser,
+		chromedp.Navigate(srv.URL+"/forms/Employee/"+employee.ID),
+		chromedp.WaitVisible(`input[name="cost_rate"]`, chromedp.ByQuery),
+		chromedp.Text(`body`, &sectionText, chromedp.ByQuery),
+		chromedp.Evaluate(`document.querySelector('input[name="cost_rate"]').value`, &inputValue),
+		chromedp.Evaluate(`document.querySelector('input[name="cost_rate"]').step`, &stepAttr),
+	); err != nil {
+		t.Fatalf("render Employee form: %v", err)
+	}
+	if !strings.Contains(sectionText, "Compensation") {
+		t.Errorf("the Compensation section title is missing from the rendered form:\n%s", sectionText)
+	}
+	if inputValue != "65.50" {
+		t.Errorf("cost_rate input's real DOM value = %q, want \"65.50\" — 6550 minor units rendered as major-unit decimal (a markup-only test would have missed a 100x-off or unconverted-integer regression here)", inputValue)
+	}
+	if stepAttr != "0.01" {
+		t.Errorf("cost_rate input's step = %q, want \"0.01\" (a 2-decimal money input)", stepAttr)
+	}
+
+	// A fresh (no cost_rate) Employee's create form must show an EMPTY
+	// input, not "0.00" — render.go's own doc comment on this exact
+	// point: coercing an absent optional money value to a displayed zero
+	// would contradict the whole "absent means unknown, not $0" design
+	// this field exists for (hr.go's own field doc comment).
+	var newFormValue string
+	if err := chromedp.Run(browser,
+		chromedp.Navigate(srv.URL+"/forms/Employee/new"),
+		chromedp.WaitVisible(`input[name="cost_rate"]`, chromedp.ByQuery),
+		chromedp.Evaluate(`document.querySelector('input[name="cost_rate"]').value`, &newFormValue),
+	); err != nil {
+		t.Fatalf("render Employee new form: %v", err)
+	}
+	if newFormValue != "" {
+		t.Errorf("a new Employee's cost_rate input value = %q, want empty — an unset optional money field must not render as a displayed zero", newFormValue)
+	}
+}

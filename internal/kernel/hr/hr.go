@@ -92,10 +92,19 @@ import "github.com/universaltill/universal-core/internal/kernel/entity"
 // person is — no name, no contact, no language: those are Party's, and
 // duplicating them here is the failure mode this shape exists to
 // prevent.
+//
+// Version 2 (uc-infra#134) adds cost_rate — see that field's own doc
+// comment for what it represents and why it is optional with no
+// Default. Per this package's own AttendanceRecord version-bump lesson
+// ("a version bump has to carry the FORM too or it silently delivers
+// nothing to existing tenants"), EmployeeForm (forms.go) bumped to
+// Version 2 in the same change, adding a "Compensation" section that
+// surfaces the new field — without that, this v1->v2 bump would reach
+// no tenant's screen at all.
 func Employee() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "Employee",
-		Version:    1,
+		Version:    2,
 		Module:     "hr",
 		// Employee has no name of its own by design (ADR-0013 — the
 		// person's name is Party's), which without this made every
@@ -126,6 +135,52 @@ func Employee() *entity.Definition {
 			// never needs clearing to bring someone back.
 			{Name: "end_date", Type: entity.FieldDate, NotBefore: "hire_date"},
 			{Name: "status_id", Type: entity.FieldReference, Required: true, Target: "Status"},
+			// cost_rate (Version 2, uc-infra#134) is this employment's
+			// CURRENT labour cost rate — a single always-current value, not
+			// a point-in-time-correct history (see the SIMPLIFICATION note
+			// below, which is what actually governs how this is priced).
+			// Feeds internal/data/reporting.go's ProjectBudgetActuals when
+			// it prices a TimeEntry's hours against the logging Party's
+			// Employee record. Like every FieldMoney in this kernel today,
+			// it is currency-agnostic (internal/kernel/money's own package
+			// doc comment names this a deliberate, tracked simplification,
+			// not something this field invents).
+			//
+			// Deliberately optional with NO Default. Most existing
+			// Employee records predate this field and genuinely don't have
+			// a known rate — that must stay representable as "absent", not
+			// coerced to a stored 0. A Default: float64(0) would be
+			// actively wrong here, unlike ProjectBudgetLine.planned_amount's
+			// Default: float64(0): a $0 cost_rate is indistinguishable from
+			// "we don't know this employee's rate" and would silently price
+			// every hour they log as free — exactly the "understates spend"
+			// failure uc-infra#79's own warning called out, now inherited
+			// by #134's actuals. Leaving Default unset keeps that
+			// distinction real: entity.ValidateRecord never injects a
+			// Default into a record's data — it only validates whatever
+			// key IS present and skips a field entirely when absent (see
+			// ValidateRecord's own "if absent { continue }" step), and
+			// formrender only ever honors Default as an enum field's
+			// pre-selected <option> at render time (render.go), never as
+			// a value written back into storage. So an Employee record
+			// that never had cost_rate set simply has no "cost_rate" key
+			// in its stored JSONB at all, not a stored 0 — "absent" and
+			// "known to be zero" stay two different, distinguishable
+			// states all the way through to ProjectBudgetActuals'
+			// Unpriced* counters.
+			//
+			// Min: entity.Float64Ptr(0) — a negative rate has no meaning,
+			// the same convention unit_price/total use elsewhere in this
+			// kernel.
+			//
+			// SIMPLIFICATION, deliberately deferred (BA scoping, no
+			// evidence yet that tenants need point-in-time-correct
+			// historical rates): this is NOT a rate-history entity. A raise
+			// or a contractor rate change overwrites this one value going
+			// forward; a past-dated TimeEntry recomputed later prices
+			// against whatever rate is CURRENTLY stored here, not the rate
+			// that was actually in effect on the entry's own date.
+			{Name: "cost_rate", Type: entity.FieldMoney, Min: entity.Float64Ptr(0)},
 		},
 		Relationships: []entity.Relationship{
 			// Related list, not composition: a leave request records
