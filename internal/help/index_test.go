@@ -157,6 +157,82 @@ func TestIndex_Get(t *testing.T) {
 	}
 }
 
+func TestIndex_OwnPlainText(t *testing.T) {
+	fsys := fstest.MapFS{
+		"content/en/entity/Item.md": mdFile(itemTopicEN()),
+		"content/tr/entity/Item.md": mdFile(itemTopicTR()),
+	}
+	idx, err := BuildIndexFrom(fsys)
+	if err != nil {
+		t.Fatalf("BuildIndexFrom: %v", err)
+	}
+
+	if text, ok := idx.OwnPlainText("entity/Item", "en"); !ok || strings.TrimSpace(text) == "" {
+		t.Fatalf("OwnPlainText(entity/Item, en) = %q, %v, want non-blank text, true", text, ok)
+	}
+
+	if text, ok := idx.OwnPlainText("entity/Item", "tr"); !ok || strings.TrimSpace(text) == "" {
+		t.Fatalf("OwnPlainText(entity/Item, tr) = %q, %v, want non-blank text, true", text, ok)
+	}
+
+	// fa has no file of its own for this topic — unlike Get/resolve, this
+	// must NOT fall back to en. This is the whole reason the method
+	// exists: help-coverage-gate callers need to know fa itself has
+	// nothing, not that something renders for a fa reader via fallback.
+	if text, ok := idx.OwnPlainText("entity/Item", "fa"); ok {
+		t.Errorf("OwnPlainText(entity/Item, fa) = %q, true, want ok=false — no fallback to en", text)
+	}
+
+	if _, ok := idx.OwnPlainText("entity/DoesNotExist", "en"); ok {
+		t.Error("OwnPlainText(entity/DoesNotExist, en) = true, want false")
+	}
+}
+
+func TestIndex_OwnPlainText_EmptyBodyStub(t *testing.T) {
+	// A topic file with front matter but no real body must not read as
+	// "documented" to a caller that (correctly) checks the returned text
+	// for non-blank content — OwnPlainText itself just reports what the
+	// file parsed to; a front-matter-only stub parses fine and legitimately
+	// returns ok=true with empty PlainText, and it's the caller's job (the
+	// help-coverage gate) to treat empty text as undocumented, same as
+	// this repo's i18n coverage gate treats a blank catalog value as
+	// untranslated rather than present.
+	fsys := fstest.MapFS{
+		"content/en/entity/Item.md": mdFile("---\ntitle: Item\naudience: user\nmodule: inventory\norder: 1\n---\n"),
+	}
+	idx, err := BuildIndexFrom(fsys)
+	if err != nil {
+		t.Fatalf("BuildIndexFrom: %v", err)
+	}
+	text, ok := idx.OwnPlainText("entity/Item", "en")
+	if !ok {
+		t.Fatal("OwnPlainText(entity/Item, en) ok = false, want true (file exists and parses)")
+	}
+	if strings.TrimSpace(text) != "" {
+		t.Fatalf("OwnPlainText(entity/Item, en) = %q, want blank (stub has no body)", text)
+	}
+}
+
+func TestContentLocales(t *testing.T) {
+	got := ContentLocales()
+	want := []string{"en", "ar", "fa", "tr"}
+	if len(got) != len(want) {
+		t.Fatalf("ContentLocales() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("ContentLocales() = %v, want %v", got, want)
+		}
+	}
+	// Mutating the returned slice must not affect the package's own
+	// source of truth — ContentLocales returns a copy, not the live
+	// contentLocales slice, so a later call must still see the real set.
+	got[0] = "xx"
+	if got2 := ContentLocales(); got2[0] != "en" {
+		t.Fatalf("ContentLocales() after mutating a previous result = %v, want unaffected (%q at index 0)", got2, "en")
+	}
+}
+
 func TestIndex_Search_EmptyQueryReturnsNilNotError(t *testing.T) {
 	idx, err := BuildIndexFrom(fstest.MapFS{"content/en/entity/Item.md": mdFile(itemTopicEN())})
 	if err != nil {

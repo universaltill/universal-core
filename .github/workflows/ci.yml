@@ -88,6 +88,30 @@ jobs:
           git fetch origin ${{ github.event.pull_request.base.sha }} --depth=1
           git show ${{ github.event.pull_request.base.sha }}:.github/workflows/ci.yml > "${RUNNER_TEMP}/base-ci.yml"
           .github/scripts/check-coverage-floor.sh .github/workflows/ci.yml "${RUNNER_TEMP}/base-ci.yml"
+      # Same self-test-before-trusting-it discipline as the Coverage
+      # floor script self-test above, for check-help-allowlist.sh
+      # (uc-infra#146's help-coverage gate, CLAUDE.md's "In-product help
+      # manual" section) — always runs, not gated on pull_request.
+      - name: Help allowlist script self-test
+        run: .github/scripts/check-help-allowlist_test.sh
+      # Tamper-resistance for internal/help/coverage_test.go's
+      # undocumentedAllowlist: the same PR that grandfathers a newly-
+      # shipped, undocumented entity type into the allowlist can
+      # otherwise make that pass with nothing structural stopping it —
+      # found via independent review of uc-infra#146 itself (an earlier
+      # version of this gate tried to enforce the ratchet with a second
+      # Go map literal in the same file/commit, which is not a ratchet:
+      # a PR editing that file can edit both literals together). Same
+      # base-ref-anchoring, same placement (before Go is set up), and
+      # the same accepted/named gaps as the Coverage floor tamper check
+      # above — see check-help-allowlist.sh's own header for the exact
+      # list rather than duplicating it here.
+      - name: Help allowlist tamper check
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch origin ${{ github.event.pull_request.base.sha }} --depth=1
+          git show ${{ github.event.pull_request.base.sha }}:internal/help/coverage_test.go > "${RUNNER_TEMP}/base-coverage_test.go" 2>/dev/null || true
+          .github/scripts/check-help-allowlist.sh internal/help/coverage_test.go "${RUNNER_TEMP}/base-coverage_test.go"
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod

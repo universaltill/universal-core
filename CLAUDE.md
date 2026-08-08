@@ -149,6 +149,26 @@ catalog-with-graceful-fallback pattern field labels already use
   makes this a convention future modules are held to, not just a
   docstring.
 
+## In-product help manual (ADR-0023)
+A change that adds or alters a user-visible feature updates its help
+topic (`internal/help/content/{locale}/entity/{EntityType}.md`, or
+`route/{slug}.md` for a non-entity page) in the same commit — this is
+part of the definition of done, not a follow-up card.
+- `internal/help/coverage_test.go` enforces it: it walks every module's
+  entity and form Definitions and fails the build when one has no real
+  (non-blank) help topic in **each** of the four shipped locales, unless
+  the entity type is listed in that file's `undocumentedAllowlist`.
+- The allowlist only ever **shrinks** — never add an entity type to it
+  to make a change pass; write the topic instead. A newly-shipped
+  Definition must ship documented from day one, the same "ratchets one
+  direction only" discipline the coverage floor above already uses.
+  Unlike the coverage floor, this isn't enforced by a Go test comparing
+  two in-file literals (a same-commit PR could edit both together) — it
+  is enforced by `.github/scripts/check-help-allowlist.sh`, run against
+  the PR's base ref by `ci.yml`'s "Help allowlist tamper check" step,
+  the same base-ref-anchored mechanism the coverage-floor tamper check
+  already uses for `COVERAGE_FLOOR`.
+
 ## Process
 Document-first (ADR-0007): architectural changes get an ADR in
 `../uc-infra/docs/adr/` before the code lands. Every substantive change
