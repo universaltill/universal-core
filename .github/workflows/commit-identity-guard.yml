@@ -1,0 +1,55 @@
+name: commit-identity-guard
+
+# Independent safety net for uc-infra#186 (a recurrence of uc-infra#83):
+# a real personal email address leaked into this PUBLIC repo's history
+# more than once because a pipeline cycle merged a PR via the GitHub API
+# instead of the required local-merge procedure
+# (uc-infra/.claude/skills/devops/SKILL.md §5). Doc-only guidance
+# ("merge locally") is necessary but was shown, repeatedly, not to be
+# sufficient by itself. This workflow catches a violation the moment it
+# lands on `main` — a failing, visible check run — instead of a future
+# cycle's manual `git log` audit finding it days later, which is how
+# both prior leaks were actually discovered. See
+# check-commit-identity.sh's own header for the honest gaps in this
+# approach (it's detection, not prevention; a same-push edit to this
+# workflow or the script can defeat it; the allowlist is deliberately
+# narrow) — named there rather than repeated here.
+#
+# Deliberately separate from ci.yml: this check has nothing to do with
+# Go/Postgres and needs full commit history (fetch-depth: 0), which
+# ci.yml's shared build job doesn't otherwise need.
+#
+# Self-test and the real guard run as two STEPS in one job, not two
+# jobs joined by `needs:` — matching how ci.yml's own "Coverage floor
+# script self-test" step runs inline rather than gating the real check
+# behind a separate job. A `needs:` dependency would mean a self-test
+# failure (including an environment flake unrelated to this script)
+# makes the `guard` step never run at all — and "never ran" is a very
+# different signal from "ran and found a violation." Same job, two
+# steps: either failure turns the job red, and the log makes clear
+# which step actually failed.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: the script diffs github.event.before..after by
+          # SHA, which needs those commits (and their parents) actually
+          # present locally, not just the shallow tip a default checkout
+          # would give it.
+          fetch-depth: 0
+      # A script nothing runs is only ever read, not verified — same
+      # reasoning as ci.yml's own "Coverage floor script self-test" step.
+      - name: check-commit-identity.sh self-test
+        run: .github/scripts/check-commit-identity_test.sh
+      - name: Check new commits' author/committer identity
+        run: .github/scripts/check-commit-identity.sh "${{ github.event.before }}" "${{ github.event.after }}"
