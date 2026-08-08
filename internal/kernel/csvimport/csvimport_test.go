@@ -430,9 +430,20 @@ func TestCommit_WritesAuditRowsPerRecord(t *testing.T) {
 	ctx := context.Background()
 	engine := crud.NewEngine(db)
 	def := vendorDef()
-	actor := audit.Actor{Type: audit.ActorAgent, ID: "csv-import-agent", ModelVersion: "claude-fable-5"}
-
 	csvData := "Vendor Name\nAcme\nBeta\n"
+	// uc-infra#161: this package has no production ActorAgent caller
+	// today (internal/api/import.go always passes the request's human
+	// rc.Actor) — this fixture's Input is a representative placeholder,
+	// not a prescribed convention. In particular it must NOT become "hash
+	// the raw file content": Commit calls engine.Create per row
+	// (csvimport.go), and each Create recomputes actor.InputHash() —
+	// hashing a whole file's bytes on every one of its own rows would be
+	// O(rows × file size), not O(file size). A real ActorAgent import
+	// caller should use a small batch descriptor (e.g. filename + row
+	// count) as Input, the same shape as CLIInvocationInput's own
+	// resolved-invocation string, not the payload itself.
+	actor := audit.Actor{Type: audit.ActorAgent, ID: "csv-import-agent", ModelVersion: "claude-fable-5", Input: "import vendors.csv (2 rows)"}
+
 	results, err := Commit(ctx, strings.NewReader(csvData), def, ColumnMapping{"Vendor Name": "name"}, engine, actor)
 	if err != nil {
 		t.Fatalf("Commit: %v", err)

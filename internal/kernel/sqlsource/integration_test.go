@@ -122,7 +122,11 @@ func TestFullPull_NAVShapedSourceIntoRealTenant(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	actor := audit.Actor{Type: audit.ActorAgent, ID: "sqlsource-import", ModelVersion: "test"}
+	// uc-infra#161: an ai_agent actor's Input for a SQL-source pull is a
+	// description of the query/relation actually pulled — the closest
+	// analogue to a "drafted content" or "file content" Input for a
+	// source that isn't a file at all (ADR-0001 §14).
+	actor := audit.Actor{Type: audit.ActorAgent, ID: "sqlsource-import", ModelVersion: "test", Input: `external SQL pull: public."Demo Organization$Item"`}
 	results, err := csvimport.CommitRows(ctx, h, r, def, m, engine, actor)
 	if err != nil {
 		t.Fatal(err)
@@ -205,7 +209,15 @@ func TestUpsert_ReImportUpdatesInsteadOfDuplicating(t *testing.T) {
 	engine := crud.NewEngine(tenantDB)
 	def := purchasing.Item()
 	identityDef := foundation.ExternalIdentity()
-	actor := audit.Actor{Type: audit.ActorAgent, ID: "sqlsource-import", ModelVersion: "test"}
+	// uc-infra#161: this actor is reused below for the source
+	// registration, both pulls, and the hand-edit Update — not only a
+	// pull, unlike TestFullPull_NAVShapedSourceIntoRealTenant's single-
+	// purpose actor above — so the Input describes the source generically
+	// rather than claiming "pull" for every use. Matches the unquoted
+	// `relation` constant's own format below (the identity-scope value
+	// CommitRowsUpserting actually uses), not a quoted/SQL-identifier
+	// rendering of it.
+	actor := audit.Actor{Type: audit.ActorAgent, ID: "sqlsource-import", ModelVersion: "test", Input: "external SQL source: public.Demo Organization$Item"}
 
 	// The registered source this pull runs against — its record ID is
 	// what scopes every ExternalIdentity row written below.

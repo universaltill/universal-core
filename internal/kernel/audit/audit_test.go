@@ -21,14 +21,15 @@ func TestActorValidate(t *testing.T) {
 			ErrMissingModelVersion,
 		},
 		{
-			// Deliberately still valid: internal/kernel/entity, csvimport,
-			// and sqlsource all construct a real ActorAgent with no Input
-			// today (uc-infra#124) — Validate() must keep accepting that
-			// until every one of those call sites is given a real Input to
-			// hash, not just the 7 CLI binaries this task touches.
-			"ai agent with no input is still valid",
+			// uc-infra#161: every real ActorAgent call site now populates
+			// Input (the CLI binaries directly; entity's production
+			// ActorAgent callers are those same CLI binaries via
+			// moduleseed; csvimport/sqlsource have no production
+			// ActorAgent caller at all), so this is a hard reject, not the
+			// "still valid" carve-out uc-infra#124 left in place.
+			"ai agent missing input",
 			Actor{Type: ActorAgent, ID: "kernel-agent", ModelVersion: "claude-fable-5"},
-			nil,
+			ErrMissingInput,
 		},
 	}
 	for _, tc := range cases {
@@ -65,6 +66,14 @@ func TestNew_RejectsInvalidActor(t *testing.T) {
 	_, err := New("Vendor", "rec-1", ActionCreate, Actor{Type: ActorAgent, ID: "a"}, nil)
 	if err != ErrMissingModelVersion {
 		t.Fatalf("expected ErrMissingModelVersion, got %v", err)
+	}
+}
+
+func TestNew_RejectsMissingInput(t *testing.T) {
+	_, err := New("Vendor", "rec-1", ActionCreate,
+		Actor{Type: ActorAgent, ID: "a", ModelVersion: "v1"}, nil)
+	if err != ErrMissingInput {
+		t.Fatalf("expected ErrMissingInput, got %v", err)
 	}
 }
 
