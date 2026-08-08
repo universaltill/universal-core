@@ -28,3 +28,10 @@
 /backfill-quote-line-unit-price
 /backfill-purchase-order-total
 /backfill-poline-money
+
+# A TestCaptureHelpScreenshots run (internal/e2e/help_screenshot_capture_
+# test.go, uc-infra#145) killed mid-write leaves its temp file behind —
+# writeAssetAtomic renames it into place on success, so one surviving
+# here means an interrupted capture, never a real screenshot `git add -A`
+# should pick up.
+/internal/help/content/assets/**/.tmp-capture-*

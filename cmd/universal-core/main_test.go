@@ -400,6 +400,39 @@ func TestUniversalCore_HelpRoutes_RegisteredAndGated(t *testing.T) {
 	}
 }
 
+// TestUniversalCore_HelpAssetRoute_ServedUnauthenticated is the smoke
+// layer for the help-screenshot static asset route (uc-infra#145,
+// independent review finding): unlike every path in
+// TestUniversalCore_HelpRoutes_RegisteredAndGated above, GET
+// /help/assets/{path...} must succeed on the real compiled binary WITH
+// NO dev-auth headers at all — that's the whole point of registering it
+// unauthenticated (internal/api/helpassets.go's own doc comment). The
+// route-precedence claim ("assets" outranks the /help/{topicID...}
+// wildcard) was previously only verified against an in-process
+// http.NewServeMux built inside internal/api's own tests, never against
+// the production mux this binary actually serves — this closes that gap
+// at the smoke layer CLAUDE.md requires ("a real compiled binary/server
+// actually starts, responds, and serves the routes it claims to").
+func TestUniversalCore_HelpAssetRoute_ServedUnauthenticated(t *testing.T) {
+	controlDSN := testexec.FreshDatabase(t, "uc_test_server_control")
+	baseURL := startServer(t, controlDSN, "INSECURE_DEV_AUTH=true")
+
+	// No dev-auth headers sent, deliberately — a 401 here would mean this
+	// route fell through to authPage(renderHelpTopic) instead of landing
+	// on serveHelpAsset.
+	resp, err := http.Get(baseURL + "/help/assets/list/en.jpg")
+	if err != nil {
+		t.Fatalf("GET /help/assets/list/en.jpg: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /help/assets/list/en.jpg (no auth headers) = %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "image/jpeg" {
+		t.Errorf("Content-Type = %q, want %q (would be text/html from the page shell if this fell through to renderHelpTopic)", ct, "image/jpeg")
+	}
+}
+
 // TestUniversalCore_HelpRoute_ServedByRealBinary is the "authenticated,
 // actually renders" counterpart to
 // TestUniversalCore_HelpRoutes_RegisteredAndGated above (which only

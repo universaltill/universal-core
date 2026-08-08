@@ -717,6 +717,19 @@ th a.uc-sort:hover { text-decoration: underline; }
 }
 .uc-help-empty-state { color: var(--uc-muted); }
 .uc-help-not-found { padding: 1rem 0; }
+/* A captured screenshot (uc-infra#145) ships at a fixed 1280x800 pixel
+   size, always wider than #uc-help-detail's own content column — without
+   this rule it overflows the pane and forces the whole page to scroll
+   horizontally (independent review: measured for real in headless
+   Chrome, the image rendered at its native 1280px width inside a 792px
+   pane). display:block clears the small inline baseline gap under an
+   <img> the same way every other block-level element in this pane
+   already sits flush. */
+.uc-help-image {
+  display: block; max-width: 100%; height: auto;
+  border: 1px solid var(--uc-border); border-radius: 4px;
+  margin: 0.75rem 0;
+}
 
 @media (max-width: 48rem) {
   .uc-help-layout { flex-direction: column; }

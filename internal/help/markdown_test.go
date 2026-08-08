@@ -112,6 +112,110 @@ func TestRenderMarkdown_Link_DataAndMailtoSchemesRejected(t *testing.T) {
 	}
 }
 
+func TestRenderMarkdown_Image_Basic(t *testing.T) {
+	html, _ := RenderMarkdown("![A warehouse shelf](/help/assets/list/en.jpg)")
+	s := string(html)
+	want := `<img src="/help/assets/list/en.jpg" alt="A warehouse shelf" loading="lazy" class="uc-help-image">`
+	if !strings.Contains(s, want) {
+		t.Errorf("html = %q, expected to contain %q", s, want)
+	}
+}
+
+func TestRenderMarkdown_Image_AltTextInPlainText(t *testing.T) {
+	_, plain := RenderMarkdown("![A warehouse shelf](/help/assets/list/en.jpg)")
+	if !strings.Contains(plain, "A warehouse shelf") {
+		t.Errorf("plain = %q, expected the alt text present so the image is searchable", plain)
+	}
+	if strings.Contains(plain, "![") || strings.Contains(plain, "(/help") {
+		t.Errorf("plain = %q, expected no leftover markdown image syntax", plain)
+	}
+}
+
+func TestRenderMarkdown_Image_UnsafeSrcRejected(t *testing.T) {
+	for _, url := range []string{"javascript:alert(1)", "//evil.example/x", "data:text/html,x"} {
+		t.Run(url, func(t *testing.T) {
+			html, plain := RenderMarkdown("![alt text](" + url + ")")
+			s := string(html)
+			if strings.Contains(s, "<img") {
+				t.Errorf("html = %q, an unsafe src must never become a live <img>", s)
+			}
+			if !strings.Contains(s, "alt text") {
+				t.Errorf("html = %q, expected the alt text to still show even with a rejected src", s)
+			}
+			if plain != "alt text" {
+				t.Errorf("plain = %q, want %q", plain, "alt text")
+			}
+		})
+	}
+}
+
+// TestRenderMarkdown_Image_RootRelativeSrcAllowed proves the one src
+// shape a real topic ever actually uses (a same-origin /help/assets/...
+// screenshot, helpassets.go) renders as a live <img>.
+func TestRenderMarkdown_Image_RootRelativeSrcAllowed(t *testing.T) {
+	html, _ := RenderMarkdown("![diagram](/help/assets/form/en.jpg)")
+	s := string(html)
+	want := `src="/help/assets/form/en.jpg"`
+	if !strings.Contains(s, want) {
+		t.Errorf("html = %q, expected a live src of %q", s, want)
+	}
+}
+
+// TestRenderMarkdown_Image_HTTPSchemesRejected is the complement of
+// TestRenderMarkdown_Image_RootRelativeSrcAllowed (independent review,
+// uc-infra#145): unlike a [text](url) LINK — a user-initiated
+// navigation, safe to point at any http(s):// origin — an ![alt](url)
+// IMAGE fires an unconditional request the instant the topic renders.
+// isSafeHelpImageSrc (markdown.go) is deliberately narrower than
+// isSafeHelpLinkURL for exactly this reason: same-origin "/" only, no
+// http(s):// branch, so a topic can never make this self-hosted,
+// air-gapped-capable product silently phone home to a third-party host
+// just by rendering.
+func TestRenderMarkdown_Image_HTTPSchemesRejected(t *testing.T) {
+	for _, url := range []string{"https://example.com/diagram.png", "http://example.com/diagram.png"} {
+		t.Run(url, func(t *testing.T) {
+			html, plain := RenderMarkdown("![diagram](" + url + ")")
+			s := string(html)
+			if strings.Contains(s, "<img") {
+				t.Errorf("html = %q, an off-origin http(s):// src must never become a live <img> (unlike a link href, an image src fires unconditionally on render)", s)
+			}
+			if !strings.Contains(s, "diagram") {
+				t.Errorf("html = %q, expected the alt text to still show even with a rejected src", s)
+			}
+			if plain != "diagram" {
+				t.Errorf("plain = %q, want %q", plain, "diagram")
+			}
+		})
+	}
+}
+
+// TestRenderMarkdown_ImageNotMisparsedAsLiteralBangThenLink is the exact
+// regression case CLAUDE.md's test-first rule exists for: without the
+// "!" being consumed as part of the image marker, `![alt](url)` would
+// fall through to the "[" case and render as a literal "!" followed by a
+// live <a> link (linkText="alt"), never an <img> at all.
+func TestRenderMarkdown_ImageNotMisparsedAsLiteralBangThenLink(t *testing.T) {
+	html, _ := RenderMarkdown("![alt](/help/assets/list/en.jpg)")
+	s := string(html)
+	if strings.Contains(s, "<a ") {
+		t.Errorf("html = %q, expected no <a> link — this must parse as an image, not a literal \"!\" plus a [text](url) link", s)
+	}
+	if !strings.HasPrefix(s, "<p><img") {
+		t.Errorf("html = %q, expected the image to start the paragraph with no leading literal \"!\"", s)
+	}
+}
+
+func TestRenderMarkdown_Image_EscapesAltAndSrc(t *testing.T) {
+	html, _ := RenderMarkdown(`![<b>alt</b>](/help/assets/list/en.jpg)`)
+	s := string(html)
+	if strings.Contains(s, "<b>alt</b>") {
+		t.Errorf("html = %q, expected the alt text HTML-escaped, not interpreted", s)
+	}
+	if !strings.Contains(s, "&lt;b&gt;alt&lt;/b&gt;") {
+		t.Errorf("html = %q, expected the escaped alt text present", s)
+	}
+}
+
 func TestRenderMarkdown_UnorderedList(t *testing.T) {
 	html, plain := RenderMarkdown("- one\n- two\n* three\n")
 	s := string(html)
