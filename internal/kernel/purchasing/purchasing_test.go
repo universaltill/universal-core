@@ -181,6 +181,30 @@ func TestPurchaseOrder_RequiresPONumber(t *testing.T) {
 	}
 }
 
+// TestPurchaseOrder_UniqueOnPONumber confirms uc-infra#121's Unique
+// declaration: one live PurchaseOrder per po_number — the Definition-level
+// half of a duplicate-PO-number rejection, which relies on
+// crud.WriteUniqueConstraintKeys rejecting a concurrent second CREATE for
+// the same po_number (see TestPurchaseOrder_DuplicatePONumberRejected in
+// ledger_test.go for the real-Postgres end-to-end case).
+func TestPurchaseOrder_UniqueOnPONumber(t *testing.T) {
+	def := PurchaseOrder()
+	if def.Version != 9 {
+		t.Errorf("PurchaseOrder is v%d, want v9 — the po_number Unique constraint (uc-infra#121)", def.Version)
+	}
+	if len(def.Unique) != 1 {
+		t.Fatalf("PurchaseOrder.Unique = %v, want exactly one declared set", def.Unique)
+	}
+	want := []string{"po_number"}
+	got := append([]string(nil), def.Unique[0]...)
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("PurchaseOrder.Unique[0] = %v, want %v", got, want)
+	}
+	if err := def.Validate(); err != nil {
+		t.Fatalf("PurchaseOrder must validate as a Definition: %v", err)
+	}
+}
+
 func TestPOLine_ReferencesParentAndItem(t *testing.T) {
 	def := POLine()
 	poField, ok := def.FieldByName("purchase_order_id")

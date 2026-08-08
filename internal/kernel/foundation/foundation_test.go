@@ -1,8 +1,11 @@
 package foundation
 
 import (
+	"context"
+	"errors"
 	"testing"
 
+	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 )
 
@@ -800,5 +803,212 @@ func TestSystemOfRecord_ModeEnum(t *testing.T) {
 		"entity_type": "Item", "mode": "write_back_someday",
 	}); err == nil {
 		t.Error("expected an error for an unknown SystemOfRecord mode")
+	}
+}
+
+// TestSystemOfRecord_UniqueOnEntityTypeAndSource confirms uc-infra#121's
+// Unique declaration: one live SystemOfRecord row per (entity_type,
+// source_id) pair — the Definition-level half of a duplicate-pair
+// rejection (see TestSystemOfRecord_DuplicateEntityTypeAndSourceRejected
+// for the real-Postgres end-to-end case). Deliberately NOT entity_type
+// alone: an independent review of this same card caught that
+// authz.checkSoRReadOnly is written to accept several rows per
+// entity_type, one per external source (readOnlySources is a set) — a
+// tenant mirroring Party from two different sources legitimately holds
+// two SystemOfRecord rows naming "Party," and an entity_type-only
+// constraint would have silently made that configuration impossible.
+// The authz "most restrictive wins" resolution stays in place regardless
+// — it is not just a pre-migration fallback, it is what this multi-source
+// configuration actually relies on (see SystemOfRecord's own doc comment).
+func TestSystemOfRecord_UniqueOnEntityTypeAndSource(t *testing.T) {
+	def := SystemOfRecord()
+	if def.Version != 2 {
+		t.Errorf("SystemOfRecord is v%d, want v2 — the (entity_type, source_id) Unique constraint (uc-infra#121)", def.Version)
+	}
+	if len(def.Unique) != 1 {
+		t.Fatalf("SystemOfRecord.Unique = %v, want exactly one declared set", def.Unique)
+	}
+	want := []string{"entity_type", "source_id"}
+	got := append([]string(nil), def.Unique[0]...)
+	if len(got) != len(want) {
+		t.Fatalf("SystemOfRecord.Unique[0] = %v, want %v", got, want)
+	}
+	seen := map[string]bool{}
+	for _, f := range got {
+		seen[f] = true
+	}
+	for _, f := range want {
+		if !seen[f] {
+			t.Errorf("SystemOfRecord.Unique[0] = %v, missing %q", got, f)
+		}
+	}
+	if err := def.Validate(); err != nil {
+		t.Fatalf("SystemOfRecord must validate as a Definition: %v", err)
+	}
+}
+
+// TestExternalIdentity_UniqueOnCompositeKey confirms uc-infra#121's Unique
+// declaration on (source_id, source_relation, entity_type, external_key)
+// — the Definition-level half (see
+// TestExternalIdentity_DuplicateCompositeKeyRejected for the real-Postgres
+// end-to-end case).
+func TestExternalIdentity_UniqueOnCompositeKey(t *testing.T) {
+	def := ExternalIdentity()
+	if def.Version != 2 {
+		t.Errorf("ExternalIdentity is v%d, want v2 — the composite Unique constraint (uc-infra#121)", def.Version)
+	}
+	if len(def.Unique) != 1 {
+		t.Fatalf("ExternalIdentity.Unique = %v, want exactly one declared set", def.Unique)
+	}
+	want := []string{"source_id", "source_relation", "entity_type", "external_key"}
+	got := append([]string(nil), def.Unique[0]...)
+	if len(got) != len(want) {
+		t.Fatalf("ExternalIdentity.Unique[0] = %v, want %v", got, want)
+	}
+	seen := map[string]bool{}
+	for _, f := range got {
+		seen[f] = true
+	}
+	for _, f := range want {
+		if !seen[f] {
+			t.Errorf("ExternalIdentity.Unique[0] = %v, missing %q", got, f)
+		}
+	}
+	if err := def.Validate(); err != nil {
+		t.Fatalf("ExternalIdentity must validate as a Definition: %v", err)
+	}
+}
+
+// TestSystemOfRecord_DuplicateEntityTypeAndSourceRejected is the
+// real-Postgres end-to-end case: a second SystemOfRecord row repeating
+// the same (entity_type, source_id) pair must be rejected by crud.Engine
+// itself (record_unique_keys' real Postgres UNIQUE index, ADR-0018
+// §3(c)) — but a SECOND source declaring the SAME entity_type must still
+// succeed, since that is the legitimate multi-source configuration
+// authz.checkSoRReadOnly is written to support (see
+// TestSystemOfRecord_UniqueOnEntityTypeAndSource's own doc comment).
+func TestSystemOfRecord_DuplicateEntityTypeAndSourceRejected(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+	engine := crud.NewEngine(tenantDB)
+	def := SystemOfRecord()
+
+	sourceA, err := engine.Create(ctx, ExternalSQLSource(), map[string]any{
+		"name": "NAV mirror", "driver": "postgres", "host": "h", "database": "nav",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create ExternalSQLSource A: %v", err)
+	}
+	sourceB, err := engine.Create(ctx, ExternalSQLSource(), map[string]any{
+		"name": "old CRM", "driver": "postgres", "host": "h", "database": "crm",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create ExternalSQLSource B: %v", err)
+	}
+
+	if _, err := engine.Create(ctx, def, map[string]any{
+		"entity_type": "Item", "source_id": sourceA.ID, "mode": "read_only",
+	}, actor); err != nil {
+		t.Fatalf("create first SystemOfRecord: %v", err)
+	}
+
+	// Same entity_type, SAME source: a genuinely redundant/contradictory
+	// re-declaration — rejected.
+	_, err = engine.Create(ctx, def, map[string]any{
+		"entity_type": "Item", "source_id": sourceA.ID, "mode": "platform_owned",
+	}, actor)
+	if err == nil {
+		t.Fatal("expected a second SystemOfRecord row for the same (entity_type, source_id) to be rejected")
+	}
+	var uniqueErr *crud.UniqueConstraintError
+	if !errors.As(err, &uniqueErr) {
+		t.Fatalf("expected a *crud.UniqueConstraintError, got %T: %v", err, err)
+	}
+	if uniqueErr.EntityType != "SystemOfRecord" {
+		t.Errorf("UniqueConstraintError.EntityType = %q, want %q", uniqueErr.EntityType, "SystemOfRecord")
+	}
+
+	// Same entity_type, a DIFFERENT source: the legitimate multi-source
+	// configuration — must still succeed.
+	if _, err := engine.Create(ctx, def, map[string]any{
+		"entity_type": "Item", "source_id": sourceB.ID, "mode": "read_only",
+	}, actor); err != nil {
+		t.Fatalf("expected a second source's SystemOfRecord row for the same entity_type to succeed: %v", err)
+	}
+
+	// A DIFFERENT entity_type must also still succeed.
+	if _, err := engine.Create(ctx, def, map[string]any{
+		"entity_type": "Party", "source_id": sourceA.ID, "mode": "platform_owned",
+	}, actor); err != nil {
+		t.Fatalf("expected a SystemOfRecord row for a distinct entity_type to succeed: %v", err)
+	}
+}
+
+// TestExternalIdentity_DuplicateCompositeKeyRejected is the real-Postgres
+// end-to-end case: a second ExternalIdentity row repeating the same
+// (source_id, source_relation, entity_type, external_key) must be
+// rejected by crud.Engine itself, not merely surface later as a per-row
+// "ambiguous identity" import error.
+func TestExternalIdentity_DuplicateCompositeKeyRejected(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+	engine := crud.NewEngine(tenantDB)
+
+	source, err := engine.Create(ctx, ExternalSQLSource(), map[string]any{
+		"name": "NAV mirror", "driver": "postgres",
+		"host": "legacy.example.internal", "database": "navmirror",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create ExternalSQLSource: %v", err)
+	}
+	party1, err := engine.Create(ctx, Party(), map[string]any{
+		"name": "Vendor One", "party_type": "organization", "status": "active",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create first Party: %v", err)
+	}
+	party2, err := engine.Create(ctx, Party(), map[string]any{
+		"name": "Vendor Two", "party_type": "organization", "status": "active",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create second Party: %v", err)
+	}
+
+	def := ExternalIdentity()
+	if _, err := engine.Create(ctx, def, map[string]any{
+		"source_id": source.ID, "source_relation": "dbo.CRONUS$Vendor",
+		"entity_type": "Party", "record_id": party1.ID, "external_key": "V-1000",
+	}, actor); err != nil {
+		t.Fatalf("create first ExternalIdentity: %v", err)
+	}
+
+	// Same source/relation/entity_type/external_key, different record_id
+	// (record_id is not part of the Unique set — it's the identity's
+	// payload, not its key) — must still collide.
+	_, err = engine.Create(ctx, def, map[string]any{
+		"source_id": source.ID, "source_relation": "dbo.CRONUS$Vendor",
+		"entity_type": "Party", "record_id": party2.ID, "external_key": "V-1000",
+	}, actor)
+	if err == nil {
+		t.Fatal("expected a second ExternalIdentity row with the same composite key to be rejected")
+	}
+	var uniqueErr *crud.UniqueConstraintError
+	if !errors.As(err, &uniqueErr) {
+		t.Fatalf("expected a *crud.UniqueConstraintError, got %T: %v", err, err)
+	}
+	if uniqueErr.EntityType != "ExternalIdentity" {
+		t.Errorf("UniqueConstraintError.EntityType = %q, want %q", uniqueErr.EntityType, "ExternalIdentity")
+	}
+
+	// A different source_relation (uc-infra#101's $Customer/$Vendor
+	// overlap scenario) with the SAME external_key must still succeed —
+	// source_relation is part of the scope, not decoration.
+	if _, err := engine.Create(ctx, def, map[string]any{
+		"source_id": source.ID, "source_relation": "dbo.CRONUS$Customer",
+		"entity_type": "Party", "record_id": party2.ID, "external_key": "V-1000",
+	}, actor); err != nil {
+		t.Fatalf("expected an ExternalIdentity row with a distinct source_relation to succeed: %v", err)
 	}
 }

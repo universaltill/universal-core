@@ -824,6 +824,7 @@
   "sor.read_only_blocked_no_source": "این رکورد متعلق به یک سامانه مرجع خارجی فقط‌خواندنی است — ویرایش‌ها با ورود بعدی بازنویسی می‌شوند.",
   "sor.mode_reserved": "حالت \"bidirectional\" برای موتور همگام‌سازی آینده رزرو شده است و هنوز قابل ذخیره نیست.",
   "crud.error.target_constraint_violation": "مقدار انتخاب‌شده برای {field} محدودیت لازم این فیلد را برآورده نمی‌کند.",
+  "field.SystemOfRecord.entity_type": "نوع موجودیت",
   "form.SystemOfRecord.section.details": "جزئیات",
   "entity.validation.required": "{field} الزامی است.",
   "entity.validation.type_mismatch": "{field} مقدار نامعتبری دارد.",

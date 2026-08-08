@@ -111,7 +111,11 @@ func missingKeyError(keyColumn string) error {
 
 // identityTarget is one pre-loaded identity: which record a key maps to,
 // and whether the mapping is ambiguous (more than one identity row for
-// the same key — the app-level-uniqueness limitation surfacing).
+// the same key — foundation.ExternalIdentity's Unique declaration
+// (uc-infra#121) prevents this for any tenant whose sync has reached
+// that Version bump; this still surfaces for a pre-migration tenant's
+// existing rows, which is exactly the case that ambiguity check remains
+// for).
 type identityTarget struct {
 	recordID  string
 	ambiguous bool
@@ -155,11 +159,12 @@ type identityTarget struct {
 //
 // Sequencing: record first, then its identity row, each atomic on its
 // own but not jointly — a crash between the two leaves one record whose
-// identity was never written, which a re-run would duplicate once
-// (accepted until #81-class constraints allow a real transactional
-// upsert). A row whose record landed but whose identity write failed is
-// reported as a row error even though RecordID is set — the error text
-// says exactly that.
+// identity was never written, which a re-run would duplicate once (a gap
+// a real transactional upsert would close; #81/uc-infra#121 close the
+// DUPLICATE-KEY half of this file's app-level-uniqueness concerns, not
+// this atomicity-across-two-writes one, which remains open). A row whose
+// record landed but whose identity write failed is reported as a row
+// error even though RecordID is set — the error text says exactly that.
 func CommitRowsUpserting(ctx context.Context, headers []string, rows [][]string, def *entity.Definition, mapping csvimport.ColumnMapping, keyColumn, sourceRecordID, sourceRelation string, records RecordEngine, identities RecordEngine, identityDef *entity.Definition, actor audit.Actor) ([]UpsertResult, error) {
 	keyIdx, err := KeyIndex(headers, keyColumn)
 	if err != nil {

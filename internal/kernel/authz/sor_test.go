@@ -231,8 +231,17 @@ func TestGuardedEngine_SoR_PlatformOwnedAndUndeclaredStayOpen(t *testing.T) {
 func TestGuardedEngine_SoR_MixedModes_ReadOnlyWins(t *testing.T) {
 	sf := newSoRFixture(t)
 	ctx := context.Background()
-	// A second, contradictory declaration for the same type and source.
-	sf.create("SystemOfRecord", map[string]any{
+	// A second, contradictory declaration for the SAME type AND source —
+	// createUnconstrained, not create: uc-infra#121's Unique constraint on
+	// SystemOfRecord's (entity_type, source_id) pair now rejects a second
+	// LIVE row for ("Party", sf.source.ID) through the ordinary write
+	// path (a genuinely redundant/contradictory re-declaration, not the
+	// legitimate multi-source case that constraint deliberately still
+	// allows), so this simulates the pre-migration data the "most
+	// restrictive wins" fallback below still exists to handle for a
+	// tenant whose sync hasn't reached this Version bump yet (see
+	// createUnconstrained's own doc comment).
+	sf.createUnconstrained("SystemOfRecord", map[string]any{
 		"entity_type": "Party", "source_id": sf.source.ID, "mode": "platform_owned",
 	})
 
@@ -417,7 +426,12 @@ func TestGuardedEngine_ForImportFrom_ScopedBypass(t *testing.T) {
 
 	// Blank-source read_only rule: the rule has no source to compare, so
 	// the bypass is decided by the identity row's source — the owning
-	// source's import still writes, anyone else still doesn't.
+	// source's import still writes, anyone else still doesn't. Plain
+	// create, not createRaw: uc-infra#121's Unique declaration is on
+	// (entity_type, source_id) together, and this row's source_id is
+	// absent — absent/nil exempts a record from the constraint entirely
+	// (mirrors SQL NULL semantics), so a second blank-source row for
+	// "Party" does not collide with the fixture's first (sourced) row.
 	sf.create("SystemOfRecord", map[string]any{
 		"entity_type": "Party", "mode": "read_only", // no source_id
 	})
