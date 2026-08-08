@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/universaltill/universal-core/internal/kernel/money"
@@ -24,7 +25,9 @@ import (
 type ValidationErrorKind string
 
 const (
-	// KindRequired: a Required field was omitted or submitted as nil.
+	// KindRequired: a Required field was omitted, submitted as nil, or
+	// submitted as an empty or whitespace-only string (uc-infra#86,
+	// widened by uc-infra#105 — see IsBlankString).
 	KindRequired ValidationErrorKind = "required"
 	// KindTypeMismatch: the submitted value's Go type doesn't match
 	// what the field's declared Type expects (string/number/bool, or
@@ -124,20 +127,34 @@ func ValidateRecord(def *Definition, data map[string]any) error {
 	for _, f := range def.Fields {
 		v, present := data[f.Name]
 		absent := !present || v == nil
-		// Required additionally rejects an empty string (uc-infra#86):
-		// the form handler and CSV importer both convert a blank input to
-		// absent before it ever reaches here, but a direct JSON call can
-		// submit "" instead of omitting the key. `v == ""` only matches a
-		// `v` whose dynamic type is string, so a required bool `false` or
-		// number `0` is unaffected — this tightens Required only, never
-		// loosens the type check below for an optional field's `""`.
+		// Required additionally rejects an empty or whitespace-only string
+		// (uc-infra#86, widened by uc-infra#105). Two of this function's
+		// three callers already keep a whitespace-only value from ever
+		// reaching here as a plain string: csvimport.buildRowData trims a
+		// cell before building the row (csvimport.go), and the generated
+		// form's handler (internal/api/handlers.go) treats a literal ""
+		// submission as absent — but NOT a whitespace-only one (it checks
+		// `raw == ""`, no TrimSpace), so "   " from a real form still
+		// arrives here as the literal string and is caught by this check
+		// directly rather than via the absent path. A direct JSON call can
+		// likewise submit "" or "   " instead of omitting the key. Without
+		// IsBlankString here, all three paths could disagree about what
+		// "blank" means for the identical Definition. IsBlankString only
+		// matches a `v` whose dynamic type is string, so a required bool
+		// `false` or number `0` is unaffected — this tightens Required
+		// only, never loosens the type check below for an optional
+		// field's whitespace (an OPTIONAL field submitted as "   " via
+		// the form is still stored verbatim, unlike CSV import's trim —
+		// that residual asymmetry is real, pre-existing scope creep this
+		// fix deliberately did not fold in; see uc-infra#105's own "not a
+		// general behavior change" scoping note).
 		//
 		// Returns the same structured *ValidationError (KindRequired) the
 		// absent case has used since uc-infra#96's translation layer
 		// landed, NOT the bare fmt.Errorf this check originally shipped
 		// with — the two are the same failure to a user, so they must
 		// localize identically rather than one leaking raw English.
-		if f.Required && (absent || v == "") {
+		if f.Required && (absent || IsBlankString(v)) {
 			return &ValidationError{
 				Kind:       KindRequired,
 				EntityType: def.EntityType,
@@ -374,11 +391,15 @@ func validateFieldValue(entityType string, f Field, v any) *ValidationError {
 // structural-only ADR-0009 check regardless of what this returns.
 //
 // A whitespace-only string ("   ") counts as content here, matching this
-// field's pre-existing baseline for what "non-empty" means. Whether
-// whitespace-only should also fail Required is uc-infra#105's gap
-// (JSON API vs. CSV import disagreeing on blank for other field types)
-// — deliberately not folded in here; that's a distinct, separately
-// scoped fix.
+// field's pre-existing baseline for what "non-empty" means. uc-infra#105
+// widened the plain FieldString/FieldReference/etc. Required check above
+// to reject whitespace-only (via IsBlankString) but deliberately left
+// this function's own rule alone — a FieldString "   " and a
+// FieldI18nText {"en":"   "} on otherwise-identical Required fields now
+// disagree on whether that's content, which is intentional scope
+// discipline (per #105's own "Required-only, not a general behavior
+// change" note, same as #86 before it), not an oversight to "fix" here
+// without its own design pass.
 func i18nTextHasContent(v any) bool {
 	m, ok := v.(map[string]any)
 	if !ok {
@@ -390,4 +411,26 @@ func i18nTextHasContent(v any) bool {
 		}
 	}
 	return false
+}
+
+// IsBlankString reports whether v is a string that is empty or contains
+// only whitespace (uc-infra#105) — the shared "blank" test the Required
+// check below uses to match csvimport.buildRowData's own TrimSpace
+// treatment of a blank cell. A non-string v (bool false, number 0, an
+// i18n_text map, ...) is never blank by this definition; those types have
+// their own, unrelated notions of "empty" that Required must not conflate
+// with a blank string (see the "not treated as empty" test for bool/
+// number, and i18nTextHasContent for FieldI18nText's separate rule).
+//
+// Exported, not package-private, so crud.uniqueKeyValue can call the
+// exact same definition rather than keep its own "" == blank check in
+// sync by hand — independent review, uc-infra#105: the first version of
+// this fix updated Required here but left uniqueKeyValue's own "applicable"
+// check on the old plain-"" rule, silently reopening the identical
+// same-logical-input-different-outcome bug uc-infra#81 already fixed
+// once (see that function's own doc comment), just for whitespace
+// instead of "". One definition, two callers, is how that stays fixed.
+func IsBlankString(v any) bool {
+	s, ok := v.(string)
+	return ok && strings.TrimSpace(s) == ""
 }

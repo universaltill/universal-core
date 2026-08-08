@@ -112,7 +112,7 @@ func TestResolveBaseCurrency_MultipleIsBaseSet_FallsBackToDefault(t *testing.T) 
 // exists to provide everywhere else. A malformed code must be treated
 // as no candidate at all, same as an empty one.
 func TestResolveBaseCurrency_MalformedCode_FallsBackToDefault(t *testing.T) {
-	for _, badCode := range []string{"US Dollar", "QA", "TOOLONG", "  "} {
+	for _, badCode := range []string{"US Dollar", "QA", "TOOLONG"} {
 		t.Run(badCode, func(t *testing.T) {
 			tenantDB := freshTenantDB(t)
 			ctx := context.Background()
@@ -143,6 +143,48 @@ func TestResolveBaseCurrency_MalformedCode_FallsBackToDefault(t *testing.T) {
 				t.Fatalf("expected fallback %q for malformed is_base code %q, got %q (would have broken saft.Build's 3-letter check)", DefaultGLCurrency, badCode, got)
 			}
 		})
+	}
+}
+
+// TestResolveBaseCurrency_WhitespaceOnlyCode_FallsBackToDefault is the
+// same regression as the malformed-code test above, for a code that is
+// whitespace-only rather than shape-wrong.
+//
+// uc-infra#105 made entity.ValidateRecord's Required check reject a
+// whitespace-only string the same as "", so engine.Create can no longer
+// create a NEW Currency with a whitespace-only code — that write-path
+// guard is entity.TestValidateRecord's job now, not this function's
+// (same split #86 established for the plain "" case — see
+// internal/api/saftexport_test.go's identical reasoning). But the guard
+// is write-path only: it does not touch rows written before it landed,
+// and this function's own TrimSpace (basecurrency.go) exists precisely
+// so an already-stored whitespace-only code still degrades gracefully
+// through ResolveBaseCurrency into saft.Build's strict 3-letter check
+// instead of 500ing a tenant's SAF-T export — the exact bug this whole
+// test function guards. Seeded directly through the repository (no
+// validation layer), because that is how such a row can still exist.
+func TestResolveBaseCurrency_WhitespaceOnlyCode_FallsBackToDefault(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	publishedCurrencyDef(t, tenantDB)
+
+	if _, err := data.NewRecordRepo(tenantDB).Create(ctx, "Currency", map[string]any{
+		"code": "  ", "name": "Bad Currency", "is_base": true,
+	}); err != nil {
+		t.Fatalf("seed a legacy whitespace-only-code Currency directly: %v", err)
+	}
+
+	got, err := ResolveBaseCurrency(ctx, tenantDB)
+	if err != nil {
+		t.Fatalf("ResolveBaseCurrency: %v", err)
+	}
+	if got != DefaultGLCurrency {
+		t.Fatalf("expected fallback %q for whitespace-only is_base code, got %q (would have broken saft.Build's 3-letter check)", DefaultGLCurrency, got)
 	}
 }
 

@@ -90,6 +90,17 @@ func TestUniqueKeyValue(t *testing.T) {
 			wantApplies: false,
 		},
 		{
+			// uc-infra#105 independent review: the first version of that
+			// fix widened entity.ValidateRecord's Required check to treat
+			// "   " the same as "", but left this function on its own
+			// plain s == "" copy — reopening the exact #81 bug above for
+			// whitespace instead of "". Both now call entity.IsBlankString.
+			name:        "a whitespace-only string value makes the constraint inapplicable",
+			fields:      []string{"employee_id", "entry_date"},
+			data:        map[string]any{"employee_id": "abc", "entry_date": "  \t\n "},
+			wantApplies: false,
+		},
+		{
 			name:        "a numeric field value",
 			fields:      []string{"quantity"},
 			data:        map[string]any{"quantity": float64(42)},

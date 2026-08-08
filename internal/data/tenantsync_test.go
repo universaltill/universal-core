@@ -148,19 +148,23 @@ func TestCountMissingField(t *testing.T) {
 	if n := count(); n != 3 {
 		t.Errorf("an empty string must count (see the method's doc comment and #86): got %d, want 3", n)
 	}
+	mk(map[string]any{"target": "  \t\n "})
+	if n := count(); n != 4 {
+		t.Errorf("a whitespace-only string must count (see the method's doc comment and #105 — entity.ValidateRecord's Required check now rejects this the same as \"\"): got %d, want 4", n)
+	}
 
 	for _, present := range []any{false, float64(0), "real"} {
 		mk(map[string]any{"target": present})
-		if n := count(); n != 3 {
-			t.Errorf("%#v is a present value and must not count: got %d, want 3", present, n)
+		if n := count(); n != 4 {
+			t.Errorf("%#v is a present value and must not count: got %d, want 4", present, n)
 		}
 	}
 
 	if _, err := records.Create(ctx, "Other", map[string]any{"other": "x"}); err != nil {
 		t.Fatalf("create Other: %v", err)
 	}
-	if n := count(); n != 3 {
-		t.Errorf("another entity type must not contribute: got %d, want 3", n)
+	if n := count(); n != 4 {
+		t.Errorf("another entity type must not contribute: got %d, want 4", n)
 	}
 
 	// Two, so dropping the soft-delete filter cannot coincidentally
@@ -171,8 +175,8 @@ func TestCountMissingField(t *testing.T) {
 			t.Fatalf("delete: %v", err)
 		}
 	}
-	if n := count(); n != 3 {
-		t.Errorf("soft-deleted rows must not contribute: got %d, want 3", n)
+	if n := count(); n != 4 {
+		t.Errorf("soft-deleted rows must not contribute: got %d, want 4", n)
 	}
 }
 

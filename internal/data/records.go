@@ -763,8 +763,8 @@ func (r *RecordRepo) DeleteTx(ctx context.Context, q querier, entityType, id str
 }
 
 // CountMissingField counts live records of entityType whose JSONB data
-// has no usable value for fieldName — absent, JSON null, or empty
-// string.
+// has no usable value for fieldName — absent, JSON null, empty string,
+// or a whitespace-only string.
 //
 // Used by cmd/sync-tenant-modules to report the data migrations a
 // publish just made necessary (ADR-0017 §5). Publishing a Definition
@@ -772,18 +772,31 @@ func (r *RecordRepo) DeleteTx(ctx context.Context, q querier, entityType, id str
 // so they stay readable and start failing on next edit — a silent state
 // this makes loud.
 //
-// Absent, JSON-null, and an empty string all fail entity.ValidateRecord's
-// Required check (#86) the same way, so this counts all three: a row
-// holding `"facility_id": ""` is stock at no location regardless of
-// which of the three shapes it's stored as, and it is exactly what a
+// Absent, JSON-null, an empty string, and a whitespace-only string all
+// fail entity.ValidateRecord's Required check (#86, widened by #105) the
+// same way, so this counts all four: a row holding `"facility_id": ""`
+// or `"facility_id": "   "` is stock at no location regardless of which
+// of the four shapes it's stored as, and it is exactly what a
 // half-finished migration leaves behind.
+//
+// The explicit second argument to btrim (space/tab/newline/CR/vertical
+// tab/form feed) is deliberate, not btrim's single-space default:
+// without it, `btrim('  ')` only strips plain spaces and this query
+// would silently miss a tab- or newline-only value even though
+// strings.TrimSpace (and therefore entity.isBlankString) treats it as
+// blank. This still isn't byte-for-byte identical to Go's Unicode-aware
+// unicode.IsSpace (a NBSP/U+00A0-only value, for instance, isn't ASCII
+// whitespace and won't match here) — an acknowledged, deliberately
+// out-of-scope gap for a vanishingly rare shape, not something this
+// migration-reporting query needs SQL-side Unicode class support to
+// close.
 func (r *RecordRepo) CountMissingField(ctx context.Context, entityType, fieldName string) (int, error) {
 	var n int
 	err := r.db.QueryRowContext(ctx,
 		`SELECT count(*) FROM records
 		 WHERE entity_type = $1
 		   AND deleted_at IS NULL
-		   AND coalesce(data->>$2, '') = ''`,
+		   AND btrim(coalesce(data->>$2, ''), E' \t\n\r\v\f') = ''`,
 		entityType, fieldName,
 	).Scan(&n)
 	if err != nil {

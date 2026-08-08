@@ -463,6 +463,29 @@ func TestAPI_CreateRecord_RequiredFieldAsEmptyStringIs400(t *testing.T) {
 	}
 }
 
+// TestAPI_CreateRecord_RequiredFieldAsWhitespaceOnlyStringIs400 is the
+// real-HTTP pin for uc-infra#105, the same shape as the empty-string
+// test above: a direct JSON POST can send a required field as "   "
+// rather than "" or omitting it. That must 400 the same way, with the
+// same localized "is required" message, not silently create the record.
+func TestAPI_CreateRecord_RequiredFieldAsWhitespaceOnlyStringIs400(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	req := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{"name": "   "}`))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "is required") {
+		t.Fatalf("expected a 400 required-field error for \"name\" submitted as \"   \", got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestAPI_CreateRecord_MalformedJSONIs400(t *testing.T) {
 	router := newTestRouter(t)
 	withDevAuthEnabled(t)

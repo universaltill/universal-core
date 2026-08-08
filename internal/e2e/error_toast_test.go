@@ -74,3 +74,53 @@ func TestErrorToast_RealBrowser(t *testing.T) {
 		t.Fatal("expected the form to remain on the page after a failed submission, not be swapped away")
 	}
 }
+
+// TestErrorToast_WhitespaceOnlyRequiredField_RealBrowser is
+// TestErrorToast_RealBrowser's sibling for uc-infra#105 (independent
+// review): unlike the "" case above, a whitespace-only required field
+// does NOT need `required` stripped to reach the server at all — the
+// browser's own native constraint validation is satisfied by "   "
+// (HTML5 `required` only rejects a truly empty value), so this is a
+// genuinely new, real-browser-reachable round trip that opened up the
+// moment entity.ValidateRecord started rejecting whitespace-only
+// server-side. Confirms the client/server gap this creates (ADR-0017
+// §5's "defined once" is now server-only for this one shape, by
+// deliberate scope decision — see validate.go's own comment) actually
+// resolves into the same toast, not a silently-accepted no-op submit.
+func TestErrorToast_WhitespaceOnlyRequiredField_RealBrowser(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, _ := testServer(t)
+	ctx := browserCtx(t, tenantID)
+
+	var skuIsRequired bool
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/forms/Item/new"),
+		chromedp.WaitVisible(`form.uc-form`, chromedp.ByQuery),
+		chromedp.SetValue(`input[name="sku"]`, "   ", chromedp.ByQuery),
+		chromedp.SetValue(`input[name="name"]`, "   ", chromedp.ByQuery),
+		// Deliberately NOT stripping `required` here (unlike the ""
+		// test above): the point of this test is that whitespace passes
+		// the browser's own native validation on its own, so
+		// checkValidity() must report true before the click even
+		// happens — if a future browser/HTML spec change made "   "
+		// fail native `required` validation too, this assertion is what
+		// would catch this test silently degrading into a copy of the
+		// "" one instead of covering the shape it says it does.
+		chromedp.Evaluate(`document.querySelector('input[name="sku"]').checkValidity()`, &skuIsRequired),
+		chromedp.Click(`form.uc-form button[type="submit"]`, chromedp.ByQuery),
+		chromedp.WaitVisible(`.uc-toast-visible`, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("submit a whitespace-only-required form and wait for the error toast: %v", err)
+	}
+	if !skuIsRequired {
+		t.Fatal("expected the browser's native required validation to accept whitespace-only input (that's the gap this test covers) — got checkValidity()=false, meaning this run no longer exercises the server round trip it claims to")
+	}
+
+	var toastText string
+	if err := chromedp.Run(ctx, chromedp.Text(`#uc-toast`, &toastText, chromedp.ByQuery)); err != nil {
+		t.Fatalf("read toast text: %v", err)
+	}
+	if !strings.Contains(toastText, `SKU is required.`) {
+		t.Fatalf(`expected the toast to show the real, translated server validation message (SKU is required.), got %q`, toastText)
+	}
+}

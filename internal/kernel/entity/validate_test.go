@@ -112,6 +112,68 @@ func TestValidateRecord(t *testing.T) {
 		}
 	})
 
+	// uc-infra#105: internal/kernel/csvimport.buildRowData already trims a
+	// cell's value before building the row, so a whitespace-only CSV cell
+	// is treated as blank/absent — but a direct JSON API call reaches this
+	// function with the raw "   " untouched. Required must reject that the
+	// same as "" (the #86 check above), or the two entry points disagree
+	// about what "blank" means for the identical Definition.
+	t.Run("required field submitted as whitespace-only string is rejected", func(t *testing.T) {
+		data := map[string]any{"name": "   "}
+		if err := ValidateRecord(def, data); err == nil {
+			t.Fatal("expected error for required field 'name' submitted as whitespace-only")
+		}
+	})
+
+	t.Run("required FieldReference submitted as whitespace-only string is rejected", func(t *testing.T) {
+		refDef := &Definition{
+			EntityType: "InventoryMovement",
+			Version:    1,
+			Fields: []Field{
+				{Name: "facility_id", Type: FieldReference, Target: "Facility", Required: true},
+			},
+		}
+		if err := ValidateRecord(refDef, map[string]any{"facility_id": " \t\n "}); err == nil {
+			t.Fatal("expected error for required reference field submitted as whitespace-only")
+		}
+	})
+
+	// A U+00A0 (NO-BREAK SPACE) is not ASCII whitespace, but
+	// strings.TrimSpace (via unicode.IsSpace) treats it as space anyway —
+	// the same rune csvimport.buildRowData's own TrimSpace would trim, so
+	// IsBlankString must agree rather than let this one Unicode shape
+	// slip through as "non-blank".
+	t.Run("required field submitted as a Unicode-whitespace-only string is rejected", func(t *testing.T) {
+		data := map[string]any{"name": "  "}
+		if err := ValidateRecord(def, data); err == nil {
+			t.Fatal("expected error for required field 'name' submitted as NBSP-only")
+		}
+	})
+
+	t.Run("required FieldEnum submitted as whitespace-only string is rejected as required, not enum-invalid", func(t *testing.T) {
+		enumDef := &Definition{
+			EntityType: "Vendor",
+			Version:    1,
+			Fields: []Field{
+				{Name: "payment_terms", Type: FieldEnum, EnumValues: []string{"prepaid", "LC"}, Required: true},
+			},
+		}
+		var verr *ValidationError
+		err := ValidateRecord(enumDef, map[string]any{"payment_terms": "   "})
+		if !errors.As(err, &verr) {
+			t.Fatalf("expected a *ValidationError, got %T: %v", err, err)
+		}
+		// isBlankString is checked before validateFieldValue's enum-
+		// membership check runs, so a whitespace-only value is reported
+		// as "the field is required" (actionable: fill it in), not
+		// "not a valid enum value" (which would be actionable-but-wrong,
+		// since "   " being absent from EnumValues is incidental here —
+		// the real problem is that nothing was meaningfully submitted).
+		if verr.Kind != KindRequired {
+			t.Fatalf("expected KindRequired, got %v", verr.Kind)
+		}
+	})
+
 	t.Run("required bool false and required number zero are not treated as empty", func(t *testing.T) {
 		// A naive rewrite of the Required check (e.g. reflect.IsZero, or
 		// fmt.Sprint(v) == "") would wrongly reject these; only "" itself
@@ -144,6 +206,23 @@ func TestValidateRecord(t *testing.T) {
 		data := map[string]any{"name": "Acme", "notes": ""}
 		if err := ValidateRecord(optDef, data); err != nil {
 			t.Fatalf("unexpected error for optional string field left blank: %v", err)
+		}
+	})
+
+	t.Run("optional string field submitted as whitespace-only still passes", func(t *testing.T) {
+		// Same scoping as the plain-empty-string case above: uc-infra#105
+		// tightens Required only, never an optional field's accepted values.
+		optDef := &Definition{
+			EntityType: "Vendor",
+			Version:    1,
+			Fields: []Field{
+				{Name: "name", Type: FieldString, Required: true},
+				{Name: "notes", Type: FieldString},
+			},
+		}
+		data := map[string]any{"name": "Acme", "notes": "   "}
+		if err := ValidateRecord(optDef, data); err != nil {
+			t.Fatalf("unexpected error for optional string field left whitespace-only: %v", err)
 		}
 	})
 }
@@ -608,6 +687,17 @@ func TestValidateRecord_ValidationErrorStructured(t *testing.T) {
 	t.Run("required", func(t *testing.T) {
 		def := &Definition{EntityType: "Vendor", Fields: []Field{{Name: "name", Type: FieldString, Required: true}}}
 		verr := asValidationError(t, ValidateRecord(def, map[string]any{}))
+		if verr.Kind != KindRequired || verr.EntityType != "Vendor" || verr.FieldName != "name" {
+			t.Fatalf("unexpected fields: %+v", verr)
+		}
+	})
+
+	// uc-infra#105: a whitespace-only required value must localize
+	// identically to the absent/"" cases above (same KindRequired), not
+	// leak through as some other Kind or an untyped error.
+	t.Run("required (whitespace-only)", func(t *testing.T) {
+		def := &Definition{EntityType: "Vendor", Fields: []Field{{Name: "name", Type: FieldString, Required: true}}}
+		verr := asValidationError(t, ValidateRecord(def, map[string]any{"name": "   "}))
 		if verr.Kind != KindRequired || verr.EntityType != "Vendor" || verr.FieldName != "name" {
 			t.Fatalf("unexpected fields: %+v", verr)
 		}
