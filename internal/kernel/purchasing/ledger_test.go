@@ -156,6 +156,53 @@ func setUpGoodsReceiptFixture(t *testing.T, unitPrice float64) goodsReceiptFixtu
 	}
 }
 
+// TestPurchaseOrder_DuplicatePONumberRejected is the real-Postgres
+// end-to-end case for uc-infra#121's Unique declaration (the Definition-
+// shape half is TestPurchaseOrder_UniqueOnPONumber in purchasing_test.go):
+// a second PurchaseOrder created with an already-used po_number must be
+// rejected by crud.Engine itself — record_unique_keys' real Postgres
+// UNIQUE index (ADR-0018 §3(c)), not an application-level convention a
+// caller could bypass.
+func TestPurchaseOrder_DuplicatePONumberRejected(t *testing.T) {
+	fx := setUpGoodsReceiptFixture(t, 10)
+	ctx := context.Background()
+	actor := humanActor()
+
+	vendor := createVendorParty(t, ctx, fx.engine, fx.tenantDB, "Beta Supplies", actor)
+	draftStatusID := statusIDByCode(t, fx.engine, fx.tenantDB, "purchase_order_status", "draft")
+
+	_, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "PurchaseOrder"), map[string]any{
+		"po_number": "PO-1", "vendor_id": vendor.ID, "order_date": "2026-01-02",
+		"status_id": draftStatusID,
+	}, actor)
+	if err == nil {
+		t.Fatal("expected the second PurchaseOrder with po_number \"PO-1\" to be rejected")
+	}
+	var uniqueErr *crud.UniqueConstraintError
+	if !errors.As(err, &uniqueErr) {
+		t.Fatalf("expected a *crud.UniqueConstraintError, got %T: %v", err, err)
+	}
+	if !errors.Is(err, crud.ErrUniqueConstraintViolation) {
+		t.Fatalf("expected errors.Is(err, crud.ErrUniqueConstraintViolation): %v", err)
+	}
+	if uniqueErr.EntityType != "PurchaseOrder" {
+		t.Errorf("UniqueConstraintError.EntityType = %q, want %q", uniqueErr.EntityType, "PurchaseOrder")
+	}
+	if len(uniqueErr.Fields) != 1 || uniqueErr.Fields[0] != "po_number" {
+		t.Errorf("UniqueConstraintError.Fields = %v, want [po_number]", uniqueErr.Fields)
+	}
+
+	// A DIFFERENT po_number for the same vendor must still succeed —
+	// this isn't "at most one PO per vendor," only "po_number itself
+	// must be distinct."
+	if _, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "PurchaseOrder"), map[string]any{
+		"po_number": "PO-2", "vendor_id": vendor.ID, "order_date": "2026-01-02",
+		"status_id": draftStatusID,
+	}, actor); err != nil {
+		t.Fatalf("expected a PurchaseOrder with a distinct po_number to succeed: %v", err)
+	}
+}
+
 // vendorInvoiceFixture bundles a real PurchaseOrder + POLine + one
 // GoodsReceipt/GoodsReceiptLine already received against it — everything
 // MatchVendorInvoiceOnUpdate's tests need to exercise the match itself,

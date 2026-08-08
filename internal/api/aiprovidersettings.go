@@ -33,14 +33,18 @@ import (
 
 // aiProviderConnectionRecord looks up tenantID's single AIProviderConnection
 // row, if any — nil, nil when none exists yet (the tenant is on the
-// platform default). AIProviderConnection has no unique constraint of its
-// own (same reasoning as PurchaseOrder.po_number's precedent, see
-// foundation.go): a tenant is only ever expected to have zero or one, and
-// this is the one place in the kernel that reads/writes it, so nothing
-// else could have created a second row to disagree with. If more than one
-// somehow exists, the first (List's own, unspecified-beyond-insertion-
-// order) is treated as authoritative rather than erroring — a settings
-// page must always be able to render something to fix the situation from,
+// platform default). AIProviderConnection still has no unique constraint
+// of its own — unlike PurchaseOrder.po_number, which gained one
+// (uc-infra#121); AIProviderConnection is a true singleton with no
+// natural-key field to declare Unique against, tracked separately as
+// uc-infra#180. A tenant is only ever EXPECTED to have zero or one, but
+// that is not yet enforced: this settings page is the only INTENDED
+// writer, not (today) the only ABLE writer — see foundation.go's own doc
+// comment on AIProviderConnection for why that gap is still open. If
+// more than one somehow exists, the first (List's own, unspecified-
+// beyond-insertion-order) is treated as authoritative rather than
+// erroring — a settings page must always be able to render something to
+// fix the situation from,
 // not 500.
 func (h *Handler) aiProviderConnectionRecord(w http.ResponseWriter, r *http.Request, ts tenantScope) (def *entity.Definition, id string, fields map[string]any, version int, ok bool) {
 	def, err := ts.entityDef(r.Context(), "AIProviderConnection")

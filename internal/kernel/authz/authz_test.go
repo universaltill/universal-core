@@ -123,6 +123,42 @@ func (f *fixture) create(entityType string, fields map[string]any) data.Record {
 	return rec
 }
 
+// createUnconstrained writes a record directly via data.RecordRepo,
+// skipping only crud.Engine's audit row and record_unique_keys bookkeeping
+// (uc-infra#121's SystemOfRecord.Unique is enforced by
+// crud.Engine.Create/Update, not by this lower layer) — named
+// "unconstrained," not "raw," because this package's OWN established
+// meaning of "raw" is the unguarded *crud.Engine itself (sorFixture's doc
+// comment: "seeds, via the RAW engine"; sor.go's "raw-engine side-
+// channel"), a different thing from bypassing crud.Engine entirely.
+//
+// This is exactly what a row written before that Definition version bump
+// reached a tenant looks like: the "most restrictive wins" fallback these
+// tests exercise exists FOR that pre-migration case (SystemOfRecord's own
+// doc comment), so simulating it here — rather than going through
+// f.create, which the real Unique constraint now correctly rejects for a
+// live duplicate — is the honest way to keep testing the fallback without
+// testing something the write path no longer allows to happen for real.
+//
+// Still runs entity.ValidateRecord first, even though crud.Engine.Create
+// would otherwise do that: skipping the audit/unique-key side effects is
+// the point, not skipping shape validation — an invalid fields map (e.g.
+// an unrecognized enum value) reaching record_unique_keys' bookkeeping
+// bypass would silently also bypass the shape check ordinary Create
+// would have caught, quietly weakening what these tests are actually
+// exercising (independent review, uc-infra#121 follow-up).
+func (f *fixture) createUnconstrained(entityType string, fields map[string]any) data.Record {
+	f.t.Helper()
+	if err := entity.ValidateRecord(f.def(entityType), fields); err != nil {
+		f.t.Fatalf("createUnconstrained %s: invalid fields: %v", entityType, err)
+	}
+	rec, err := data.NewRecordRepo(f.db).Create(context.Background(), entityType, fields)
+	if err != nil {
+		f.t.Fatalf("createUnconstrained %s: %v", entityType, err)
+	}
+	return rec
+}
+
 func (f *fixture) role(code string) data.Record {
 	return f.create("Role", map[string]any{"code": code, "name": code})
 }

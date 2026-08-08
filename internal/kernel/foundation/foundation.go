@@ -495,10 +495,22 @@ func IssueReport() *entity.Definition {
 // control) instead of the platform's shared one.
 //
 // One row per tenant (an upsert, not a list — internal/api's settings
-// handler enforces that; the generic entity/crud layer has no unique-
-// constraint concept, same "application-level convention, not a DB
-// constraint" limitation purchasing.PurchaseOrder.po_number's own doc
-// comment already documents for this kernel).
+// handler enforces that). Deliberately NOT migrated to a Unique
+// declaration alongside PurchaseOrder.po_number/SystemOfRecord/
+// ExternalIdentity (uc-infra#121): this is a true singleton with no
+// natural-key field — every tenant's row legitimately differs (provider,
+// model, base_url all vary) — and entity.Definition.Validate() rejects
+// an empty Unique field set outright, so the mechanism as built cannot
+// express "at most one row, full stop" the way it expresses "at most one
+// row per value." Also worth being honest about here rather than
+// asserting past it: AIProviderConnection is not in
+// authz.systemOnlyWriteTypes or controlPlaneTypes, so an ordinary user
+// with ordinary create permission can already POST directly to
+// /api/records/AIProviderConnection today and create a second row,
+// bypassing this settings handler's upsert-only logic — "the one place
+// that writes it" is this file's intent, not yet an enforced fact.
+// Tracked as uc-infra#180 (a marker-field mechanism, or closing the
+// authz gap, or both — Architect's call when picked up).
 //
 // api_key_encrypted is never the plaintext key: internal/kernel/
 // secretcrypt encrypts it before internal/api's handler ever calls
@@ -599,25 +611,36 @@ func ExternalSQLSource() *entity.Definition {
 // `audit_log` already store entity_type+record_id (CLAUDE.md's
 // generic-storage pattern), not a new mechanism.
 //
-// Uniqueness on (source_id, source_relation, entity_type, external_key)
-// is an application-level convention, not a DB constraint — the generic
-// entity/crud layer has no unique-constraint concept, the same
-// "application-level convention, not a DB constraint" limitation
-// AIProviderConnection's one-row-per-tenant convention already documents
-// for this kernel, pending the declarative-constraint work (board #81,
-// in flight elsewhere). What keeps the convention honest in the
-// meantime: user-driven WRITES are denied unconditionally
-// (authz.systemOnlyWriteTypes — even admins, even before a tenant
-// configures RBAC), so the import engine's raw-engine side-channel is
-// the only write path; a duplicate, should one ever appear, surfaces as
-// a per-row "ambiguous identity" import error rather than a silent
-// guess. Reads through the generic API remain possible — the
-// legacy-key→record map is not a secret, just not user-editable.
+// Uniqueness on (source_id, source_relation, entity_type, external_key) is
+// schema-enforced as of Version 2 (uc-infra#121) via this Definition's own
+// Unique declaration below, closed by crud.Engine/record_unique_keys
+// (ADR-0018 §3(c)) — see hr.AttendanceRecord's Unique doc comment for how
+// the mechanism itself works; #81 landed the mechanism this field cites as
+// "in flight elsewhere" 2026-08-05, after this doc comment was first
+// written. What keeps the convention honest independent of that: user-
+// driven WRITES are denied unconditionally (authz.systemOnlyWriteTypes —
+// even admins, even before a tenant configures RBAC), so the import
+// engine's raw-engine side-channel is the only write path — and that path
+// goes through the same crud.Engine.Create/Update this Unique declaration
+// enforces against (internal/kernel/sqlsource.CommitRowsUpserting's
+// RecordEngine interface matches crud.Engine's own signature, it is not a
+// true bypass of the generic engine, only of authz's permission check). A
+// duplicate now fails the write itself for a tenant whose sync has
+// reached this Version bump; the "ambiguous identity" import error path
+// (internal/kernel/sqlsource's identityTarget.ambiguous) still exists and
+// still matters for a pre-migration tenant, whose existing rows have no
+// record_unique_keys entry yet (ADR-0018's Consequences — same reasoning
+// as SystemOfRecord's fallback above), so it is not deleted or
+// superseded, only no longer the ONLY defense. Reads through the generic
+// API remain possible — the legacy-key→record map is not a secret, just
+// not user-editable.
 func ExternalIdentity() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "ExternalIdentity",
-		Version:    1,
-		Module:     "foundation",
+		// Version 2 (uc-infra#121): source_id+source_relation+entity_type+
+		// external_key gained a Unique declaration.
+		Version: 2,
+		Module:  "foundation",
 		Fields: []entity.Field{
 			{Name: "source_id", Type: entity.FieldReference, Required: true, Target: "ExternalSQLSource"},
 			// source_relation is part of the identity scope, not
@@ -631,6 +654,7 @@ func ExternalIdentity() *entity.Definition {
 			{Name: "record_id", Type: entity.FieldString, Required: true},
 			{Name: "external_key", Type: entity.FieldString, Required: true},
 		},
+		Unique: [][]string{{"source_id", "source_relation", "entity_type", "external_key"}},
 	}
 }
 
@@ -662,14 +686,39 @@ func ExternalIdentity() *entity.Definition {
 // can express (AIProviderConnection.api_key_encrypted documents the same
 // limitation).
 //
-// One row per entity_type is an app-level convention, not a DB constraint
-// — the generic entity/crud layer has no unique-constraint concept, the
-// same limitation ExternalIdentity's uniqueness convention already
-// documents for this kernel. If several rows exist for one entity_type,
-// the most restrictive wins: any read_only row makes the type read_only
-// for records identified against that row's source, regardless of what
-// other rows say. Fail-safe by design — conflicting ownership claims must
-// degrade to "don't let a hand-edit clobber a sync," never the reverse.
+// One DECLARATION per (entity_type, source) is schema-enforced as of
+// Version 2 (uc-infra#121) via this Definition's own Unique declaration
+// below, closed by crud.Engine/record_unique_keys (ADR-0018 §3(c)) — see
+// hr.AttendanceRecord's Unique doc comment for how the mechanism itself
+// works. Deliberately (entity_type, source_id) together, NOT entity_type
+// alone: authz.checkSoRReadOnly is explicitly written to accept SEVERAL
+// rows per entity_type, one per external source it mirrors from
+// (readOnlySources is a set, not a single value) — a tenant mirroring
+// Party from both a NAV instance and an old CRM legitimately declares
+// TWO read_only rows for "Party," one per source, and blocking that
+// configuration would have been a real capability loss an independent
+// review caught (uc-infra#121 follow-up) that this repo's own test
+// suite could not have detected on its own. What this constraint DOES
+// still close: the same (entity_type, source_id) pair declared twice —
+// a genuinely redundant/contradictory pair of rows, not a multi-source
+// configuration. A blank source_id (the "no owner named" fail-safe case
+// below) stays exempt from this constraint the same way any Unique
+// field's absence exempts a record (mirrors SQL NULL semantics) — more
+// than one blank-source row for the same entity_type can still exist,
+// same as before this Version bump; nothing here narrows that case.
+//
+// The "most restrictive wins" resolution below is NOT just a fallback
+// for pre-migration duplicate data — it is the ACTUAL mechanism this
+// multi-source configuration relies on going forward: any read_only row
+// (from a set of otherwise-legitimate, non-colliding rows) makes the
+// type read_only for records identified against that row's source,
+// regardless of what other rows for other sources say. It also still
+// covers pre-migration rows a tenant's sync hasn't reached yet
+// (cmd/sync-tenant-modules' generic uniqueConstraintWarnings flags a
+// tenant already holding an exact (entity_type, source_id) collision,
+// ADR-0018's Consequences) — deliberately not deleted either way.
+// Fail-safe by design — conflicting ownership claims must degrade to
+// "don't let a hand-edit clobber a sync," never the reverse.
 //
 // Enforcement lives in internal/kernel/authz (GuardedEngine's
 // system-of-record check), NOT here and NOT in crud/entity — the generic
@@ -679,8 +728,10 @@ func ExternalIdentity() *entity.Definition {
 func SystemOfRecord() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "SystemOfRecord",
-		Version:    1,
-		Module:     "foundation",
+		// Version 2 (uc-infra#121): (entity_type, source_id) gained a
+		// Unique declaration.
+		Version: 2,
+		Module:  "foundation",
 		Fields: []entity.Field{
 			// entity_type is a plain string for Attachment's reason: it
 			// must be able to name any entity type, including ones that
@@ -690,6 +741,7 @@ func SystemOfRecord() *entity.Definition {
 			{Name: "mode", Type: entity.FieldEnum, Required: true,
 				EnumValues: []string{"read_only", "bidirectional", "platform_owned"}},
 		},
+		Unique: [][]string{{"entity_type", "source_id"}},
 	}
 }
 

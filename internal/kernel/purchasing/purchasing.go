@@ -91,8 +91,8 @@ func Item() *entity.Definition {
 func PurchaseOrder() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "PurchaseOrder",
-		// Version 8 (uc-infra#80): total gained a Min:0 bound.
-		Version:        8,
+		// Version 9 (uc-infra#121): po_number gained a Unique declaration.
+		Version:        9,
 		Module:         "purchasing",
 		StatusTypeCode: "purchase_order_status",
 		Fields: []entity.Field{
@@ -101,10 +101,15 @@ func PurchaseOrder() *entity.Definition {
 			// buyer references it talking to the vendor) and the thing
 			// cmd/seed-demo-data's seedPurchaseOrders was working around
 			// with a coarse "skip if any exist" guard for lack of one
-			// (QUEUE.md, 2026-07-20). Not schema-enforced unique (no
-			// such constraint concept exists yet in entity.Field — same
-			// as Currency.code/Item.sku, which rely on the same
-			// application-level convention, not a DB constraint).
+			// (QUEUE.md, 2026-07-20). Schema-enforced unique as of
+			// Version 9 (uc-infra#121) via this Definition's own Unique
+			// declaration below, closed by crud.Engine/record_unique_keys
+			// (ADR-0018 §3(c)) — see hr.AttendanceRecord's Unique doc
+			// comment for how the mechanism itself works. Currency.code
+			// and Item.sku still rely on the same unenforced
+			// application-level convention this field used to — a
+			// separate, not-yet-filed follow-up, not closed by this
+			// change.
 			{Name: "po_number", Type: entity.FieldString, Required: true},
 			{Name: "vendor_id", Type: entity.FieldReference, Required: true, Target: "Party", TargetFilter: []entity.TargetFilterCondition{
 				{Entity: "PartyRole", EntityField: "party_id", Field: "role_type", Value: "vendor"},
@@ -156,6 +161,7 @@ func PurchaseOrder() *entity.Definition {
 			// (reference-data-model.md: "has many POLines").
 			{Name: "lines", Kind: entity.RelationComposition, Target: "POLine", ParentField: "purchase_order_id"},
 		},
+		Unique: [][]string{{"po_number"}},
 	}
 }
 
@@ -209,8 +215,9 @@ func Facility() *entity.Definition {
 		Fields: []entity.Field{
 			// The natural key a human quotes, and the handle
 			// cmd/backfill-inventory-facility resolves by. Not
-			// schema-unique — same application-level convention as
-			// Item.sku and po_number (#81).
+			// schema-unique — Item.sku is the same still-unenforced
+			// application-level convention (uc-infra#181); po_number
+			// no longer is, as of uc-infra#121.
 			{Name: "code", Type: entity.FieldString, Required: true},
 			{Name: "name", Type: entity.FieldString, Required: true},
 			// facility_type, not `type`: bare "type" reads as a kernel
@@ -585,10 +592,11 @@ func ReorderRule() *entity.Definition {
 // a vendor stays one Party record, not two, and every "vendor" reference
 // field in this module (here included) targets Party directly.
 //
-// rfq_number is the natural key, the same application-level convention
-// as PurchaseOrder.po_number (not schema-enforced unique — no such
-// constraint concept exists in entity.Field yet, see PurchaseOrder's own
-// doc comment on po_number).
+// rfq_number is a natural key, same shape as PurchaseOrder.po_number —
+// but NOT schema-enforced unique the way po_number now is (uc-infra#121):
+// this field is still the unenforced "application-level convention, not
+// a DB constraint" po_number's own doc comment used to describe, not yet
+// migrated to a Unique declaration itself.
 //
 // Relationships: "lines" (the items being quoted, composition child
 // RequestForQuotationLine) and "vendors" (the invited vendors,

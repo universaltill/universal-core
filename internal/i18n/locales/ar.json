@@ -824,6 +824,7 @@
   "sor.read_only_blocked_no_source": "هذا السجل مملوك لنظام سجل خارجي للقراءة فقط — ستُستبدل التعديلات عند الاستيراد التالي.",
   "sor.mode_reserved": "الوضع \"bidirectional\" محجوز لمحرك المزامنة القادم ولا يمكن حفظه بعد.",
   "crud.error.target_constraint_violation": "القيمة المحددة لـ {field} لا تستوفي الشرط المطلوب لهذا الحقل.",
+  "field.SystemOfRecord.entity_type": "نوع الكيان",
   "form.SystemOfRecord.section.details": "التفاصيل",
   "entity.validation.required": "{field} مطلوب.",
   "entity.validation.type_mismatch": "{field} يحتوي على قيمة غير صالحة.",
