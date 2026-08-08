@@ -368,6 +368,103 @@ func TestUniversalCore_ReportRoutes_RegisteredAndGated(t *testing.T) {
 	}
 }
 
+// TestUniversalCore_HelpRoutes_RegisteredAndGated is the smoke layer for
+// the in-product help manual viewer (ADR-0023, uc-infra#144): the real
+// compiled binary registers /help, /help/search, and the
+// /help/{topicID...} wildcard on the production mux (a 401 from the
+// auth wrapper, not the mux's own 404) — not just internal/api's
+// httptest mux. /help/search is asserted separately from a real topic
+// id specifically to catch a registration-order/specificity regression
+// that could route the literal "search" segment into the
+// {topicID...} wildcard instead of its own literal handler.
+func TestUniversalCore_HelpRoutes_RegisteredAndGated(t *testing.T) {
+	controlDSN := testexec.FreshDatabase(t, "uc_test_server_control")
+	baseURL := startServer(t, controlDSN, "INSECURE_DEV_AUTH=true")
+
+	for _, path := range []string{
+		"/help",
+		"/help/search",
+		"/help/entity/Item",
+	} {
+		resp, err := http.Get(baseURL + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		resp.Body.Close()
+		// No dev-auth headers sent: DevAuth fails closed with 401 — the
+		// route being registered (and reachable, not swallowed by the
+		// mux's default 404) is exactly what this proves.
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("GET %s: expected 401 (registered, auth-gated), got %d", path, resp.StatusCode)
+		}
+	}
+}
+
+// TestUniversalCore_HelpRoute_ServedByRealBinary is the "authenticated,
+// actually renders" counterpart to
+// TestUniversalCore_HelpRoutes_RegisteredAndGated above (which only
+// proves the route exists and is auth-gated, not that a real logged-in
+// request gets a real page back) — the same "RegisteredAndGated" vs.
+// "ServedByRealBinary" split this file already uses for SAF-T/UBL/stock
+// transfer. No real help content ships yet (internal/help/content/ is
+// still just its own README.md, uc-infra#147-152's scope), so this
+// confirms the honest content-free state renders correctly against a
+// real running process — the two-pane shell (topic tree container,
+// search box, detail pane) present with a 200, not just a 401 boundary
+// check or an in-process httptest.Server the way internal/api/help_test.go
+// already covers this.
+func TestUniversalCore_HelpRoute_ServedByRealBinary(t *testing.T) {
+	controlDSN := testexec.FreshDatabase(t, "uc_test_server_control")
+
+	control := testexec.Open(t, controlDSN)
+	ctx := context.Background()
+	if err := db.ApplyControl(ctx, control); err != nil {
+		t.Fatalf("ApplyControl: %v", err)
+	}
+	router, err := tenantdb.NewRouter(control, controlDSN)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+	defer router.Close()
+	tenantID, err := router.Create(ctx, "Help Smoke Test", "eu-west")
+	if err != nil {
+		t.Fatalf("router.Create: %v", err)
+	}
+	testexec.DropTenantDatabase(t, testexec.Open(t, controlDSN), tenantID)
+	tenantDB, err := router.Get(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("router.Get: %v", err)
+	}
+	if err := foundation.Publish(ctx, tenantDB, audit.Actor{Type: audit.ActorHuman, ID: "smoke-test-setup"}); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	router.Close()
+	control.Close()
+
+	baseURL := startServer(t, controlDSN, "INSECURE_DEV_AUTH=true")
+
+	req, err := http.NewRequest(http.MethodGet, baseURL+"/help", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("X-Tenant-ID", tenantID)
+	req.Header.Set("X-Actor-ID", "smoke-test")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /help: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from /help against the real running binary, got %d: %s", resp.StatusCode, body)
+	}
+	for _, want := range []string{`id="uc-help-topics"`, `id="uc-help-search"`, `id="uc-help-detail"`} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("expected %s in the real binary's /help response, got: %.500s", want, body)
+		}
+	}
+}
+
 // TestUniversalCore_SAFTExportRoutes_ServedByRealBinary is the smoke
 // layer for the SAF-T export (universaltill/uc-infra#28): the real
 // compiled binary registers GET /export/saft (an actual XML audit file

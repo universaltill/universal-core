@@ -665,3 +665,60 @@ th a.uc-sort:hover { text-decoration: underline; }
   color: var(--uc-muted); cursor: default; opacity: 0.5;
 }
 .uc-help-affordance[aria-disabled="true"]:hover { background: none; }
+
+/* The in-product help manual's two-pane viewer (ADR-0023, uc-infra#144
+   — internal/api/help.go). A left topic tree + search box, a right
+   detail panel — plain flexbox, not grid, specifically so it flips
+   sides correctly under dir="rtl" (layout.go's shellTmpl threads
+   <html dir="{{.Dir}}"> per-locale) for free: flexbox's row axis
+   already follows the document's writing direction, so Arabic/Farsi
+   sees the topic tree on the right and the detail panel on the left
+   with no [dir=rtl] override rule needed here, the same reasoning this
+   file's own margin-inline-start (not margin-left) already applies one
+   level down. */
+.uc-help-layout {
+  display: flex; gap: 1.5rem; align-items: flex-start;
+  margin-top: 1rem;
+}
+.uc-help-topics {
+  flex: 0 0 18rem; min-width: 0;
+  border: 1px solid var(--uc-border); border-radius: 6px;
+  padding: 0.75rem; background: #fff;
+}
+.uc-help-search {
+  width: 100%; margin-bottom: 0.75rem;
+}
+.uc-help-module-group + .uc-help-module-group { margin-top: 1rem; }
+.uc-help-module-label {
+  font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.03em;
+  color: var(--uc-muted); margin: 0 0 0.35rem;
+}
+.uc-help-topic-list { list-style: none; margin: 0; padding: 0; }
+.uc-help-topic-list li { margin: 0; }
+.uc-help-topic {
+  display: block; padding: 0.3rem 0.4rem; border-radius: 4px;
+  color: var(--uc-text); text-decoration: none; font-size: 0.9rem;
+}
+.uc-help-topic:hover { background: var(--uc-bg); }
+.uc-help-topic-active {
+  background: var(--uc-highlight); color: var(--uc-accent); font-weight: 600;
+}
+.uc-help-topic-admin {
+  display: inline-block; margin-inline-start: 0.35rem;
+  font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.03em;
+  padding: 0.05rem 0.35rem; border-radius: 3px;
+  background: var(--uc-nav-bg); color: var(--uc-nav-text);
+}
+.uc-help-empty { color: var(--uc-muted); font-size: 0.9rem; }
+.uc-help-detail {
+  flex: 1 1 auto; min-width: 0;
+  border: 1px solid var(--uc-border); border-radius: 6px;
+  padding: 1rem 1.25rem; background: #fff;
+}
+.uc-help-empty-state { color: var(--uc-muted); }
+.uc-help-not-found { padding: 1rem 0; }
+
+@media (max-width: 48rem) {
+  .uc-help-layout { flex-direction: column; }
+  .uc-help-topics { flex: 1 1 auto; width: 100%; }
+}

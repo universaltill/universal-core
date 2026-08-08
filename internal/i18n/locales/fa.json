@@ -833,5 +833,12 @@
   "entity.validation.below_minimum": "{field} از حداقل مجاز کمتر است.",
   "entity.validation.above_maximum": "{field} از حداکثر مجاز بیشتر است.",
   "entity.validation.invalid": "{field} نامعتبر است.",
-  "crud.error.unique_constraint_violation": "این ترکیب از {fields} قبلاً توسط رکورد دیگری استفاده شده است."
+  "crud.error.unique_constraint_violation": "این ترکیب از {fields} قبلاً توسط رکورد دیگری استفاده شده است.",
+  "help.viewer.title": "راهنما",
+  "help.viewer.search_placeholder": "جستجوی موضوعات راهنما…",
+  "help.viewer.no_results": "هیچ موضوعی با جستجوی شما مطابقت ندارد.",
+  "help.viewer.empty_state": "برای مطالعه، موضوعی را از فهرست انتخاب کنید.",
+  "help.viewer.admin_badge": "مدیر",
+  "help.viewer.not_found_title": "موضوع راهنما یافت نشد",
+  "help.viewer.not_found_body": "این موضوع راهنما وجود ندارد یا شما اجازهٔ مشاهدهٔ آن را ندارید."
 }

@@ -833,5 +833,12 @@
   "entity.validation.below_minimum": "{field} izin verilen en düşük değerin altında.",
   "entity.validation.above_maximum": "{field} izin verilen en yüksek değerin üstünde.",
   "entity.validation.invalid": "{field} geçersiz.",
-  "crud.error.unique_constraint_violation": "Bu {fields} kombinasyonu zaten başka bir kayıt tarafından kullanılıyor."
+  "crud.error.unique_constraint_violation": "Bu {fields} kombinasyonu zaten başka bir kayıt tarafından kullanılıyor.",
+  "help.viewer.title": "Yardım",
+  "help.viewer.search_placeholder": "Yardım konularında ara…",
+  "help.viewer.no_results": "Aramanızla eşleşen konu yok.",
+  "help.viewer.empty_state": "Burada okumak için listeden bir konu seçin.",
+  "help.viewer.admin_badge": "Yönetici",
+  "help.viewer.not_found_title": "Yardım konusu bulunamadı",
+  "help.viewer.not_found_body": "Bu yardım konusu mevcut değil veya görüntüleme izniniz yok."
 }

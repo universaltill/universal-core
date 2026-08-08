@@ -833,5 +833,12 @@
   "entity.validation.below_minimum": "{field} is below the allowed minimum.",
   "entity.validation.above_maximum": "{field} is above the allowed maximum.",
   "entity.validation.invalid": "{field} is invalid.",
-  "crud.error.unique_constraint_violation": "This combination of {fields} is already used by another record."
+  "crud.error.unique_constraint_violation": "This combination of {fields} is already used by another record.",
+  "help.viewer.title": "Help",
+  "help.viewer.search_placeholder": "Search help topics…",
+  "help.viewer.no_results": "No topics match your search.",
+  "help.viewer.empty_state": "Select a topic from the list to read it here.",
+  "help.viewer.admin_badge": "Admin",
+  "help.viewer.not_found_title": "Help topic not found",
+  "help.viewer.not_found_body": "This help topic doesn't exist, or you don't have access to view it."
 }
