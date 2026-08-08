@@ -1,6 +1,7 @@
 package formrender
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 
@@ -157,11 +158,7 @@ func TestRender_MasterDetailChildMoneyCellShowsMajorUnitDecimal(t *testing.T) {
 // cellText's own FieldMoney case on the top-level list page
 // (internal/api/listview.go) and this package's own sibling
 // FieldDate/FieldNumber fix (uc-infra#133,
-// TestRender_MasterDetailDateAndNumberCellsAreRegionallyFormatted). Uses
-// the same worked value (123456789 minor units == $1,234,567.89) as
-// internal/api's TestListPage_MoneyFieldDisplaysMajorUnitDecimal, so a
-// mismatch here would mean the two surfaces actually disagree, not just
-// that this test's own math is wrong.
+// TestRender_MasterDetailDateAndNumberCellsAreRegionallyFormatted).
 func TestRender_MasterDetailMoneyChildCellIsRegionallyFormatted(t *testing.T) {
 	r := testRenderer(t)
 	childDef := &entity.Definition{
@@ -171,28 +168,43 @@ func TestRender_MasterDetailMoneyChildCellIsRegionallyFormatted(t *testing.T) {
 			{Name: "parent_id", Type: entity.FieldReference, Target: "PurchaseOrder"},
 		},
 	}
-	baseData := Data{
-		Record: map[string]any{"payment_method": "Wire"},
-		Children: map[string][]map[string]any{
-			"POLine": {{"unit_price": float64(123456789)}},
-		},
-		ChildDefs: map[string]*entity.Definition{"POLine": childDef},
-	}
 
 	for name, tc := range map[string]struct {
-		regionTag string
-		wantAmt   string
+		minorUnits   int64
+		regionTag    string
+		wantAmt      string
+		rawUngrouped string
 	}{
-		"american": {"en-US", "1,234,567.89"},
-		"turkish":  {"tr-TR", "1.234.567,89"},
+		// 123456789 minor units == $1,234,567.89, the same worked value
+		// internal/api's TestListPage_MoneyFieldDisplaysMajorUnitDecimal
+		// pins for the top-level list page — a mismatch here would mean
+		// the two surfaces actually disagree, not just that this test's
+		// own math is wrong.
+		"american": {123456789, "en-US", "1,234,567.89", "1234567.89"},
+		"turkish":  {123456789, "tr-TR", "1.234.567,89", "1234567.89"},
+		// A WHOLE-dollar amount over 1000 (uc-infra#166 independent
+		// review, finding 1): FormatNumber(1234567.00, money.Decimals)
+		// and FormatNumber(1234567.00, -1) diverge only here — 2 always
+		// prints the fixed "1,234,567.00", -1 prints the shorter
+		// "1,234,567" (natural precision, no trailing zeros). The two
+		// amounts above both have a non-zero cents digit, so a wrong -1
+		// precision would happen to print identically and this bug would
+		// slip through undetected without this case.
+		"american, whole amount": {123456700, "en-US", "1,234,567.00", "1234567"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			loc, err := uclocale.Parse(tc.regionTag)
 			if err != nil {
 				t.Fatalf("uclocale.Parse(%q): %v", tc.regionTag, err)
 			}
-			data := baseData
-			data.RegionalLocale = loc
+			data := Data{
+				Record: map[string]any{"payment_method": "Wire"},
+				Children: map[string][]map[string]any{
+					"POLine": {{"unit_price": float64(tc.minorUnits)}},
+				},
+				ChildDefs:      map[string]*entity.Definition{"POLine": childDef},
+				RegionalLocale: loc,
+			}
 			var buf strings.Builder
 			if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
 				t.Fatalf("render: %v", err)
@@ -201,13 +213,51 @@ func TestRender_MasterDetailMoneyChildCellIsRegionallyFormatted(t *testing.T) {
 			if !strings.Contains(out, `data-field="unit_price">`+tc.wantAmt+`<`) {
 				t.Errorf("expected the regionally formatted amount %q in the unit_price cell, got:\n%s", tc.wantAmt, out)
 			}
-			if strings.Contains(out, `data-field="unit_price">1234567.89<`) {
+			if strings.Contains(out, `data-field="unit_price">`+tc.rawUngrouped+`<`) {
 				t.Errorf("ungrouped amount leaked into a %s-locale child cell, got:\n%s", name, out)
 			}
-			if strings.Contains(out, `data-field="unit_price">123456789<`) {
+			rawMinorUnits := strconv.FormatInt(tc.minorUnits, 10)
+			if strings.Contains(out, `data-field="unit_price">`+rawMinorUnits+`<`) {
 				t.Errorf("raw minor-units integer leaked into a %s-locale child cell, got:\n%s", name, out)
 			}
 		})
+	}
+}
+
+// TestRender_MasterDetailMoneyChildCellFallsBackForUnCoercibleValue
+// (uc-infra#166 independent review): the happy-path test above only
+// exercises a valid, whole-minor-units stored value. A real child row can
+// carry a legacy, not-yet-backfilled FRACTIONAL money value — the
+// ORDINARY, EXPECTED shape a FieldNumber->FieldMoney Version bump leaves
+// behind on rows written before it (rollup.go's own doc comment,
+// computeRollUp's isMoney branch), which money.FromAny rejects with an
+// error rather than silently rounding. Before this test, childCellValue's
+// FieldMoney case's un-coercible branch (`return nil`) had zero coverage.
+func TestRender_MasterDetailMoneyChildCellFallsBackForUnCoercibleValue(t *testing.T) {
+	r := testRenderer(t)
+	childDef := &entity.Definition{
+		EntityType: "POLine", Version: 1,
+		Fields: []entity.Field{{Name: "unit_price", Type: entity.FieldMoney}},
+	}
+	data := Data{
+		Record: map[string]any{"payment_method": "Wire"},
+		Children: map[string][]map[string]any{
+			// 10.5 is not a whole number of minor units — money.FromAny
+			// rejects it (money.go's own FromAny doc/implementation).
+			"POLine": {{"unit_price": float64(10.5)}},
+		},
+		ChildDefs: map[string]*entity.Definition{"POLine": childDef},
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, `data-field="unit_price"></td>`) {
+		t.Errorf("expected an un-coercible money value to render as a blank cell, got:\n%s", out)
+	}
+	if strings.Contains(out, "10.5<") || strings.Contains(out, "<nil>") {
+		t.Errorf("expected no raw value or Go formatting to leak for an un-coercible money value, got:\n%s", out)
 	}
 }
 

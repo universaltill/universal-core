@@ -1605,6 +1605,65 @@ func TestRender_MasterDetailRollUpTotalMatchesItsOwnRegionallyFormattedCells(t *
 	}
 }
 
+// TestRender_MasterDetailMoneyRollUpTotalMatchesItsOwnRegionallyFormattedCells
+// is TestRender_MasterDetailRollUpTotalMatchesItsOwnRegionallyFormattedCells's
+// FieldMoney counterpart (uc-infra#166 independent review, folded in
+// rather than queued separately as uc-infra#189): before this fix, a
+// MONEY-typed roll-up total was the one numeric display in this function
+// still on ungrouped money.String() after uc-infra#166 regionally grouped
+// childCellValue's own FieldMoney case — the exact same
+// cells-vs-total-disagree class TestRender_MasterDetailRollUpTotal
+// MatchesItsOwnRegionallyFormattedCells already fixed once for a
+// FieldNumber roll-up target.
+func TestRender_MasterDetailMoneyRollUpTotalMatchesItsOwnRegionallyFormattedCells(t *testing.T) {
+	r := testRenderer(t)
+	childDef := &entity.Definition{
+		EntityType: "POLine", Version: 1,
+		Fields: []entity.Field{{Name: "line_total", Type: entity.FieldMoney}},
+	}
+	loc, err := uclocale.Parse("tr-TR")
+	if err != nil {
+		t.Fatalf("uclocale.Parse: %v", err)
+	}
+	data := Data{
+		RecordID: "po-1",
+		Record:   map[string]any{"vendor_id": "vendor-1"},
+		Children: map[string][]map[string]any{
+			// 150050 + 250025 minor units = 400075 minor units = $4000.75.
+			"POLine": {{"line_total": 150050.0}, {"line_total": 250025.0}},
+		},
+		ChildDefs:      map[string]*entity.Definition{"POLine": childDef},
+		RegionalLocale: loc,
+	}
+	var buf strings.Builder
+	if err := r.Render(&buf, moneyRollUpForm(), moneyRollUpEntity(), data, "tr"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	// Turkish groups thousands with a dot, decimals with a comma:
+	// 150050 minor units -> "1.500,50", 250025 -> "2.500,25", their sum
+	// 400075 -> "4.000,75".
+	if !strings.Contains(out, `<td data-field="line_total">1.500,50</td>`) {
+		t.Errorf("expected the first regionally formatted line_total cell, got:\n%s", out)
+	}
+	if !strings.Contains(out, `<td data-field="line_total">2.500,25</td>`) {
+		t.Errorf("expected the second regionally formatted line_total cell, got:\n%s", out)
+	}
+	if !strings.Contains(out, `Toplam: 4.000,75`) {
+		t.Errorf("expected the money roll-up total regionally formatted (4.000,75), matching its own cells, got:\n%s", out)
+	}
+	if strings.Contains(out, "Toplam: 4000.75") {
+		t.Errorf("money roll-up total disagrees with its own regionally formatted cells (still raw), got:\n%s", out)
+	}
+	// The parent's own <input> for the roll-up target field must stay raw
+	// (money.String() major-unit decimal, round-trips through
+	// money.ParseString on submit) — same scope boundary the FieldNumber
+	// sibling test above pins.
+	if !strings.Contains(out, `id="total" name="total" value="4000.75"`) {
+		t.Errorf("expected the roll-up TARGET FIELD input to keep the raw, unformatted major-unit decimal, got:\n%s", out)
+	}
+}
+
 func TestRender_MasterDetailEmptyShowsI18nMessage(t *testing.T) {
 	r := testRenderer(t)
 	data := Data{Record: map[string]any{"payment_method": "Wire"}, Children: map[string][]map[string]any{}}

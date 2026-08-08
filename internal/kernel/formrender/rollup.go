@@ -63,10 +63,15 @@ func computeRollUp(children []map[string]any, field string, isMoney bool) (float
 			m, err := money.FromAny(v)
 			if err != nil {
 				// Skipped, not fatal — see this function's own doc
-				// comment. The child row itself is still rendered (with
-				// its own raw value, via childCellValue's existing
-				// fallback), so the legacy amount stays visible rather
-				// than silently vanishing along with the render error.
+				// comment. The child ROW itself is still rendered (every
+				// OTHER cell in it), avoiding a permanent 500 on the
+				// record's only editable screen — but this specific cell
+				// does NOT stay visible: childCellValue's own FieldMoney
+				// case (render.go) returns nil, not a raw-value fallback,
+				// for the identical money.FromAny failure, so the
+				// un-coercible amount renders blank (independent review
+				// of uc-infra#166; this comment previously claimed
+				// otherwise).
 				continue
 			}
 			total += m

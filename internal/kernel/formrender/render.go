@@ -782,16 +782,21 @@ func (r *Renderer) buildViewModel(def *form.Definition, ent *entity.Definition, 
 					// the major-unit decimal a human reads as money
 					// ("20.00").
 					//
-					// STILL ungrouped (m.String()) here, unlike
-					// childCellValue's own FieldMoney case, which is now
-					// regionally grouped (uc-infra#166) — this total sits
-					// directly below the child rows' line_total cells and
-					// as of #166 now visually DISAGREES with them for a
-					// grouped locale. Tracked, not fixed here, as
-					// uc-infra#189 (#166's own "Non-goals" deliberately
-					// deferred this rather than folding it into that diff).
+					// Regionally grouped via regionalLoc.FormatNumber
+					// (uc-infra#166, independent review) — matching BOTH
+					// this branch's own sibling below (the degraded/legacy
+					// fallback, already regionalLoc.FormatNumber) and
+					// childCellValue's own FieldMoney case (render.go's
+					// child-cell case, fixed by the same #166 diff): before
+					// this, a money-typed roll-up total was the only
+					// ungrouped numeric display left in this function,
+					// disagreeing with the very cells it sums directly
+					// above it for a grouped locale — folded in here
+					// rather than queued separately (was filed as
+					// uc-infra#189, closed as fixed by this commit instead
+					// of landing later).
 					if m, err := money.FromAny(rollUpTotals[s.RollUpTarget]); err == nil {
-						sv.RollUpTotal = m.String()
+						sv.RollUpTotal = regionalLoc.FormatNumber(m.Major(), money.Decimals)
 					} else {
 						// A PRESERVED value (DegradedSections/
 						// UnavailableSections above leave rollUpTotals at
