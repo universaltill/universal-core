@@ -186,8 +186,10 @@ func TestFieldPermission_MasterDetailChildColumnAbsentFromLiveDOM(t *testing.T) 
 	if err != nil {
 		t.Fatalf("seed Item: %v", err)
 	}
+	// unit_price is FieldMoney now (uc-infra#136): 4250 minor units =
+	// $42.50 — the redacted value the leak check below looks for.
 	if _, err := engine.Create(ctx, purchasing.POLine(), map[string]any{
-		"purchase_order_id": po.ID, "item_id": item.ID, "qty": 3, "unit_price": 42.5,
+		"purchase_order_id": po.ID, "item_id": item.ID, "qty": 3, "unit_price": 4250,
 	}, actor); err != nil {
 		t.Fatalf("seed POLine: %v", err)
 	}
@@ -216,9 +218,13 @@ func TestFieldPermission_MasterDetailChildColumnAbsentFromLiveDOM(t *testing.T) 
 	// handler, so this check alone would still pass with the fix
 	// reverted — the column identity (asserted above, via
 	// data-field="unit_price") was the actual leak uc-infra#127 closes.
+	// "42.50", not "42.5": unit_price is FieldMoney now (uc-infra#136) —
+	// the value this test seeded (4250 minor units) would render as the
+	// major-unit decimal "42.50" (money.Money.String()) were it not
+	// redacted, not a bare "42.5".
 	var leaks bool
 	if err := chromedp.Run(bctx, chromedp.EvaluateAsDevTools(
-		`document.documentElement.outerHTML.includes("42.5")`, &leaks,
+		`document.documentElement.outerHTML.includes("42.50")`, &leaks,
 	)); err != nil {
 		t.Fatalf("scan document for the redacted value: %v", err)
 	}

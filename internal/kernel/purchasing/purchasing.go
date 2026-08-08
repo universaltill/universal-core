@@ -91,8 +91,23 @@ func Item() *entity.Definition {
 func PurchaseOrder() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "PurchaseOrder",
-		// Version 8 (uc-infra#80): total gained a Min:0 bound.
-		Version:        8,
+		// Version 9 (uc-infra#136): total's TYPE changed (FieldNumber
+		// major-unit float -> FieldMoney minor-unit integer), the same
+		// class of change RequestForQuotationQuoteLine.unit_price's own
+		// v1->v2 bump made (uc-infra#68) — the mechanical migration that
+		// issue's own doc comment named this field as a follow-up for.
+		// PurchaseOrderForm's Lines section rolls POLine.line_total up
+		// into this field (RollUpTarget: "total"), so this bump lands in
+		// the same commit as POLine's own v3->v4 bump below — the two
+		// must migrate together or the roll-up sums a mix of major- and
+		// minor-unit values. A PurchaseOrder row written before this
+		// bump still holds a major-unit decimal until
+		// cmd/backfill-purchase-order-total converts it;
+		// internal/data/reporting.go's moneyMinorUnitsPattern guard (the
+		// same guard rfq_reporting.go already established) excludes an
+		// un-migrated row from the vendor-spend/status-breakdown sums
+		// rather than erroring the whole report in the meantime.
+		Version:        9,
 		Module:         "purchasing",
 		StatusTypeCode: "purchase_order_status",
 		Fields: []entity.Field{
@@ -127,7 +142,13 @@ func PurchaseOrder() *entity.Definition {
 			{Name: "promised_delivery_date", Type: entity.FieldDate, NotBefore: "order_date"},
 			{Name: "currency_id", Type: entity.FieldReference, Target: "Currency"},
 			{Name: "status_id", Type: entity.FieldReference, Required: true, Target: "Status"},
-			{Name: "total", Type: entity.FieldNumber, Default: float64(0), Min: entity.Float64Ptr(0)},
+			// FieldMoney (v9, uc-infra#136) — see this Definition's own
+			// doc comment. Min:0 is uc-infra#80's pre-existing bound, kept
+			// across the type change, in MINOR units now (0 is 0 either
+			// way, so this particular bound needed no conversion, same
+			// note RequestForQuotationQuoteLine.unit_price's own v1->v2
+			// bump made).
+			{Name: "total", Type: entity.FieldMoney, Default: float64(0), Min: entity.Float64Ptr(0)},
 			// Staged lead-time timestamps (#29) — reference-data-model.md
 			// §2's six stages, in order; the raw material for R10's
 			// P50/P90 lead-time forecast (#30). All optional (an
@@ -168,16 +189,35 @@ func PurchaseOrder() *entity.Definition {
 func POLine() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "POLine",
-		// Version 3 (uc-infra#80): qty, unit_price and line_total gained
-		// Min:0 bounds.
-		Version: 3,
+		// Version 4 (uc-infra#136): unit_price and line_total's TYPE
+		// changed (FieldNumber major-unit float -> FieldMoney minor-unit
+		// integer), the same class of change
+		// RequestForQuotationQuoteLine.unit_price's own v1->v2 bump made
+		// (uc-infra#68) — this is the mechanical follow-up migration that
+		// issue's own doc comment named PurchaseOrder.total/POLine's
+		// fields as. Both fields bump together in this one commit: qty
+		// stays FieldNumber (a quantity, not an amount). A POLine row
+		// written before this bump still holds major-unit decimals for
+		// both fields until cmd/backfill-poline-money converts them;
+		// purchasing.PostGoodsReceiptLineToLedger and
+		// receivedValueForPurchaseOrder (ledger.go) both read unit_price
+		// as minor units now — a not-yet-backfilled row would silently
+		// post/compare a value 100x too small until that backfill runs
+		// against it, the same class of hazard rfq_reporting.go's
+		// moneyMinorUnitsPattern guard exists for on the report-reading
+		// side (this write-side ledger code has no equivalent guard to
+		// degrade gracefully, so the backfill is not optional the way a
+		// report's own guard can make a UI degradation feel).
+		// Min:0 is uc-infra#80's pre-existing bound on both fields, kept
+		// across the type change, in MINOR units now (0 is 0 either way).
+		Version: 4,
 		Module:  "purchasing",
 		Fields: []entity.Field{
 			{Name: "purchase_order_id", Type: entity.FieldReference, Required: true, Target: "PurchaseOrder"},
 			{Name: "item_id", Type: entity.FieldReference, Required: true, Target: "Item"},
 			{Name: "qty", Type: entity.FieldNumber, Required: true, Min: entity.Float64Ptr(0)},
-			{Name: "unit_price", Type: entity.FieldNumber, Required: true, Min: entity.Float64Ptr(0)},
-			{Name: "line_total", Type: entity.FieldNumber, Default: float64(0), Min: entity.Float64Ptr(0)},
+			{Name: "unit_price", Type: entity.FieldMoney, Required: true, Min: entity.Float64Ptr(0)},
+			{Name: "line_total", Type: entity.FieldMoney, Default: float64(0), Min: entity.Float64Ptr(0)},
 		},
 	}
 }

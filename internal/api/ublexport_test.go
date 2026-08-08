@@ -128,20 +128,25 @@ func setupUBLTenant(t *testing.T) *ublFixture {
 		"sku": "SKU-2", "name": "Gadget", "item_type": "stock",
 	})
 
+	// PurchaseOrder.total/POLine.unit_price/line_total are FieldMoney now
+	// (uc-infra#136) — minor units (cents), not major-unit decimals:
+	// 145.00 -> 14500, 12.50 -> 1250, 125.00 -> 12500, 8.00 -> 800,
+	// 20.00 -> 2000. SalesOrder/SOLine/CustomerInvoice below are
+	// unaffected by this migration and stay major-unit decimals.
 	poDraft := statusID("purchase_order_status", "draft")
 	f.poID = create("PurchaseOrder", map[string]any{
 		"po_number": "PO-1042", "vendor_id": f.vendorID, "order_date": "2026-07-01",
-		"currency_id": f.currencyID, "status_id": poDraft, "total": 145.0,
+		"currency_id": f.currencyID, "status_id": poDraft, "total": 14500,
 	})
 	create("POLine", map[string]any{
-		"purchase_order_id": f.poID, "item_id": widgetID, "qty": 10.0, "unit_price": 12.5, "line_total": 125.0,
+		"purchase_order_id": f.poID, "item_id": widgetID, "qty": 10.0, "unit_price": 1250, "line_total": 12500,
 	})
 	create("POLine", map[string]any{
-		"purchase_order_id": f.poID, "item_id": gadgetID, "qty": 2.5, "unit_price": 8.0, "line_total": 20.0,
+		"purchase_order_id": f.poID, "item_id": gadgetID, "qty": 2.5, "unit_price": 800, "line_total": 2000,
 	})
 	f.noLinesPOID = create("PurchaseOrder", map[string]any{
 		"po_number": "PO-EMPTY", "vendor_id": f.vendorID, "order_date": "2026-07-02",
-		"currency_id": f.currencyID, "status_id": poDraft, "total": 0.0,
+		"currency_id": f.currencyID, "status_id": poDraft, "total": 0,
 	})
 
 	soDraft := statusID("sales_order_status", "draft")

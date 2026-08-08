@@ -87,15 +87,20 @@ func TestUBLDownloadLink_RealBrowser(t *testing.T) {
 	}
 
 	poDraft := publishedStatusID(t, tenantDB, "purchase_order_status", "draft")
+	// PurchaseOrder.total/POLine.unit_price/line_total are FieldMoney now
+	// (uc-infra#136): 10000 minor units = $100.00, 1000 = $10.00. This
+	// test doesn't assert a rendered dollar figure — only that the export
+	// downloads with the right filename/content-type — but the values
+	// should still mean what they look like.
 	po, err := engine.Create(ctx, purchasing.PurchaseOrder(), map[string]any{
 		"po_number": "PO-E2E-UBL-1", "vendor_id": vendor.ID, "order_date": "2026-08-01",
-		"currency_id": currency.ID, "status_id": poDraft, "total": 100.0,
+		"currency_id": currency.ID, "status_id": poDraft, "total": 10000,
 	}, actor)
 	if err != nil {
 		t.Fatalf("seed PurchaseOrder: %v", err)
 	}
 	if _, err := engine.Create(ctx, purchasing.POLine(), map[string]any{
-		"purchase_order_id": po.ID, "item_id": item.ID, "qty": 10.0, "unit_price": 10.0, "line_total": 100.0,
+		"purchase_order_id": po.ID, "item_id": item.ID, "qty": 10.0, "unit_price": 1000, "line_total": 10000,
 	}, actor); err != nil {
 		t.Fatalf("seed POLine: %v", err)
 	}

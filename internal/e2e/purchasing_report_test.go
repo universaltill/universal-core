@@ -96,8 +96,9 @@ func TestPurchasingReport_LeadTimeAndReorderSections_RealBrowser(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed open PO: %v", err)
 	}
+	// unit_price is FieldMoney now (uc-infra#136): 150 minor units = $1.50.
 	if _, err := engine.Create(ctx, purchasing.POLine(), map[string]any{
-		"purchase_order_id": openPO.ID, "item_id": item.ID, "qty": 20, "unit_price": 1.5,
+		"purchase_order_id": openPO.ID, "item_id": item.ID, "qty": 20, "unit_price": 150,
 	}, actor); err != nil {
 		t.Fatalf("seed POLine: %v", err)
 	}

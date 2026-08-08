@@ -12,6 +12,7 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/ledger"
+	"github.com/universaltill/universal-core/internal/kernel/money"
 )
 
 // ErrVendorInvoiceMatchFailed wraps vendorInvoiceMatchDetail's two
@@ -161,7 +162,31 @@ func PostGoodsReceiptLineToLedger(ctx context.Context, tx *sql.Tx, _ *entity.Def
 	if err != nil {
 		return fmt.Errorf("resolve POLine %s: %w", poLineID, err)
 	}
-	unitPrice, _ := poLine.Data["unit_price"].(float64)
+	// money.FromAny, and its ERROR is NOT discarded (independent review
+	// of uc-infra#136's first pass, which did `_, _ :=` here): a first
+	// draft matched this file's existing "unreadable value silently reads
+	// as zero" posture (numberFieldValue's own doc comment), but that
+	// posture exists for a Go-*type* leniency (int vs int64 vs float64,
+	// all genuinely valid), not for a value that fails FieldMoney's own
+	// whole-number invariant. A legacy POLine written before the
+	// unit_price FieldNumber->FieldMoney Version bump still holds a
+	// fractional major-unit decimal (e.g. 12.5) until cmd/backfill-
+	// poline-money converts it — money.FromAny correctly rejects that,
+	// and discarding the error would silently fall through to
+	// unitPriceMinor==0, which the amountMinor==0 branch below treats as
+	// "nothing to post" — i.e. a real, physically-received line credits
+	// inventory (numberFieldValue on qty, unaffected) but posts NO
+	// journal entry at all: an understated AP liability with no error
+	// and no log line (confirmed by independent review, reproduced
+	// against real Postgres). The ledger is a deterministic core
+	// (universal-core/CLAUDE.md) — failing this receipt closed and
+	// telling the operator to run the backfill is the correct posture
+	// here, not the generic-field-read leniency this file uses
+	// elsewhere for read-only reporting hooks.
+	unitPriceMinor, err := money.FromAny(poLine.Data["unit_price"])
+	if err != nil {
+		return fmt.Errorf("POLine %s has an invalid unit_price for ledger posting (%w) — if this PurchaseOrder predates uc-infra#136's FieldMoney migration, run cmd/backfill-poline-money against this tenant before receiving against it", poLineID, err)
+	}
 
 	goodsReceipt, err := records.GetTx(ctx, tx, "GoodsReceipt", goodsReceiptID)
 	if err != nil {
@@ -179,7 +204,16 @@ func PostGoodsReceiptLineToLedger(ctx context.Context, tx *sql.Tx, _ *entity.Def
 		}
 	}
 
-	amountMinor := ledger.ToMinorUnits(qty * unitPrice)
+	// NOT ledger.ToMinorUnits(qty * unitPrice) — that helper converts a
+	// MAJOR-unit amount to minor units (×100); unitPriceMinor is already
+	// in minor units (uc-infra#136), so running it through ToMinorUnits
+	// too would double-convert and post 100x the real value. qty is a
+	// plain FieldNumber float (a receiving clerk's typed, possibly
+	// fractional, quantity), so the product itself is rounded to the
+	// nearest whole minor unit — see ledger.ToMinorUnits's own identical
+	// math.Round(...*100) shape, just without the extra ×100 here since
+	// unitPriceMinor already carries that scale.
+	amountMinor := int64(math.Round(qty * float64(unitPriceMinor)))
 	if amountMinor == 0 {
 		// A zero-value line (no price on the POLine yet, a free-of-
 		// charge sample) has nothing to post — Entry.Validate would
@@ -831,19 +865,29 @@ func vendorInvoiceMatchDetail(ctx context.Context, tx *sql.Tx, records *data.Rec
 			vendorID, poID, poVendorID), nil
 	}
 
-	receivedValue, hasLines, err := receivedValueForPurchaseOrder(ctx, tx, records, poID)
+	receivedMinor, hasLines, err := receivedValueForPurchaseOrder(ctx, tx, records, poID)
 	if err != nil {
 		return "", fmt.Errorf("%w: compute received value for PurchaseOrder %s: %w", ErrVendorInvoiceMatchFailed, poID, err)
 	}
 	if !hasLines {
 		return fmt.Sprintf("PurchaseOrder %s has no POLines yet", poID), nil
 	}
-	if receivedValue == 0 {
+	if receivedMinor == 0 {
 		return fmt.Sprintf("PurchaseOrder %s has nothing received against it yet", poID), nil
 	}
-	if receivedMinor, totalMinor := ledger.ToMinorUnits(receivedValue), ledger.ToMinorUnits(total); receivedMinor != totalMinor {
+	// total is VendorInvoice.total, still FieldNumber (major-unit float)
+	// — that field is NOT part of uc-infra#136's migration, so
+	// ledger.ToMinorUnits(total) is still the correct conversion here.
+	// receivedMinor, by contrast, already comes back in minor units from
+	// receivedValueForPurchaseOrder below (which sums POLine.unit_price,
+	// now FieldMoney) — no ToMinorUnits call on that side, since it's
+	// already at the right scale (uc-infra#136; running it through
+	// ToMinorUnits too would double-convert and compare 100x the real
+	// value, the identical hazard PostGoodsReceiptLineToLedger's own
+	// amountMinor computation above just fixed).
+	if totalMinor := ledger.ToMinorUnits(total); receivedMinor != totalMinor {
 		return fmt.Sprintf("total %.2f (%d minor units) does not match received value %.2f (%d minor units) for PurchaseOrder %s",
-			total, totalMinor, receivedValue, receivedMinor, poID), nil
+			total, totalMinor, money.Money(receivedMinor).Major(), receivedMinor, poID), nil
 	}
 	return "", nil
 }
@@ -851,30 +895,40 @@ func vendorInvoiceMatchDetail(ctx context.Context, tx *sql.Tx, records *data.Rec
 // receivedValueForPurchaseOrder sums qty_received x unit_price across
 // every GoodsReceiptLine posted against one of poID's own POLines — the
 // "how much has actually been received, and at what value" side of the
-// 3-way match. hasLines reports whether poID has any POLine at all (a PO
-// header can legitimately exist with none yet — POLine is its own
-// separate CRUD-able entity, created after the header, per POLine's own
-// doc comment — so "no lines" is a normal in-progress state for
-// vendorInvoiceMatchDetail to redirect on, not this function's own
-// concern to fail over). No SQL filter exists for this (this kernel's
-// generic records table has no per-field query today, same known gap
-// erp/BACKLOG-TASKS.md's list-page pagination item names) — both lists
-// are read in full and filtered in Go, the same shape
-// ledger.checkPeriodOpen already established for "no field-level query,
-// filter every row of a bounded entity type in application code."
-func receivedValueForPurchaseOrder(ctx context.Context, tx *sql.Tx, records *data.RecordRepo, poID string) (total float64, hasLines bool, err error) {
+// 3-way match. Returns the sum in MINOR units (uc-infra#136:
+// POLine.unit_price is FieldMoney now, so a per-line qty*price product
+// is already minor-unit-scaled — see this function's own body for why
+// that means plain int64(math.Round(...)) at the end, not
+// ledger.ToMinorUnits, the same distinction PostGoodsReceiptLineToLedger's
+// own amountMinor computation draws). hasLines reports whether poID has
+// any POLine at all (a PO header can legitimately exist with none yet —
+// POLine is its own separate CRUD-able entity, created after the
+// header, per POLine's own doc comment — so "no lines" is a normal
+// in-progress state for vendorInvoiceMatchDetail to redirect on, not
+// this function's own concern to fail over). No SQL filter exists for
+// this (this kernel's generic records table has no per-field query
+// today, same known gap erp/BACKLOG-TASKS.md's list-page pagination
+// item names) — both lists are read in full and filtered in Go, the
+// same shape ledger.checkPeriodOpen already established for "no
+// field-level query, filter every row of a bounded entity type in
+// application code."
+func receivedValueForPurchaseOrder(ctx context.Context, tx *sql.Tx, records *data.RecordRepo, poID string) (receivedMinor int64, hasLines bool, err error) {
 	poLines, err := records.ListTx(ctx, tx, "POLine")
 	if err != nil {
 		return 0, false, fmt.Errorf("list POLine: %w", err)
 	}
-	unitPriceByLineID := make(map[string]float64)
+	unitPriceMinorByLineID := make(map[string]money.Money)
 	for _, l := range poLines {
 		if pid, _ := l.Data["purchase_order_id"].(string); pid == poID {
-			price, _ := l.Data["unit_price"].(float64)
-			unitPriceByLineID[l.ID] = price
+			// money.FromAny, not a bare `.(float64)` assertion — same
+			// permissive-on-error posture as PostGoodsReceiptLineToLedger's
+			// own unitPriceMinor read above (an unreadable value degrades
+			// to Money(0) rather than aborting the whole match).
+			price, _ := money.FromAny(l.Data["unit_price"])
+			unitPriceMinorByLineID[l.ID] = price
 		}
 	}
-	if len(unitPriceByLineID) == 0 {
+	if len(unitPriceMinorByLineID) == 0 {
 		return 0, false, nil
 	}
 
@@ -882,15 +936,36 @@ func receivedValueForPurchaseOrder(ctx context.Context, tx *sql.Tx, records *dat
 	if err != nil {
 		return 0, false, fmt.Errorf("list GoodsReceiptLine: %w", err)
 	}
+	// Accumulated as float64 and rounded to int64 only ONCE at the end,
+	// not per-line: qty is a fractional FieldNumber, so each line's own
+	// qty*priceMinor product can itself be fractional (e.g. 2.5 units at
+	// 1050 minor units = 2625.0, already exact, but a less round qty
+	// wouldn't be), and rounding once after summing avoids compounding a
+	// separate rounding error into every individual line before they're
+	// added together.
+	//
+	// NOT the same strategy PostGoodsReceiptLineToLedger's own
+	// amountMinor computation uses (independent review, uc-infra#136:
+	// an earlier version of this comment claimed sameness — it isn't):
+	// that function rounds PER LINE, once per GoodsReceiptLine, since
+	// each line posts its own independent journal entry the moment it's
+	// created. The two CAN disagree by a minor unit on genuinely
+	// fractional quantities — two GoodsReceiptLines of qty 1.5 against a
+	// 1-minor-unit price post round(1.5)+round(1.5)=4 to the ledger
+	// across those two entries, while this function's own sum-then-round
+	// computes round(3.0)=3 for the match — a real, pre-existing
+	// (not introduced by this migration) rounding-strategy mismatch
+	// between "what got posted" and "what this match compares against",
+	// tracked as its own gap rather than papered over here.
 	var sum float64
 	for _, l := range grLines {
 		poLineID, _ := l.Data["po_line_id"].(string)
-		price, ok := unitPriceByLineID[poLineID]
+		priceMinor, ok := unitPriceMinorByLineID[poLineID]
 		if !ok {
 			continue
 		}
 		qty, _ := l.Data["qty_received"].(float64)
-		sum += qty * price
+		sum += qty * float64(priceMinor)
 	}
-	return sum, true, nil
+	return int64(math.Round(sum)), true, nil
 }

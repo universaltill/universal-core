@@ -16,6 +16,7 @@ import (
 	"github.com/universaltill/universal-core/internal/httpx"
 	"github.com/universaltill/universal-core/internal/kernel/forecast"
 	"github.com/universaltill/universal-core/internal/kernel/formrender"
+	"github.com/universaltill/universal-core/internal/kernel/money"
 )
 
 // reportTopVendorLimit and reportStockoutLimit cap the two ranked tables
@@ -133,12 +134,12 @@ func (h *Handler) renderPurchasingReport(w http.ResponseWriter, r *http.Request)
 	}
 	byStatus := make(map[string]struct {
 		Count int
-		Value float64
+		Value money.Money
 	}, len(statusRows))
 	for _, row := range statusRows {
 		byStatus[row.Status] = struct {
 			Count int
-			Value float64
+			Value money.Money
 		}{row.Count, row.Value}
 	}
 
@@ -250,14 +251,19 @@ func (h *Handler) renderPurchasingReport(w http.ResponseWriter, r *http.Request)
 		view.StatusCards = append(view.StatusCards, statusCardView{
 			Label: h.catalog.TOrDefault(locale, "field.PurchaseOrder.status."+status, status),
 			Count: strconv.Itoa(row.Count),
-			Value: formrender.FormatFieldValue(row.Value),
+			// row.Value is money.Money (minor units, uc-infra#136) — a
+			// plain FormatFieldValue call would print the raw integer
+			// ("9500") instead of the major-unit decimal a human reads as
+			// money ("95.00"), the same fix formrender's own FieldMoney
+			// cases already apply (uc-infra#68).
+			Value: row.Value.String(),
 		})
 	}
 	for _, v := range vendors {
 		view.Vendors = append(view.Vendors, vendorRowView{
 			Name:   v.VendorName,
 			Orders: strconv.Itoa(v.OrderCount),
-			Spend:  formrender.FormatFieldValue(v.Total),
+			Spend:  v.Total.String(),
 		})
 	}
 	for _, item := range stockouts {

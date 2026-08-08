@@ -65,8 +65,13 @@ func TestAPI_PurchasingReport_TenantScopedAndEscapesRecordData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create Party for tenant A: %v", err)
 	}
+	// total is FieldMoney now (uc-infra#136): 123450 minor units = $1234.50
+	// — stored directly (this test bypasses entity.ValidateRecord via
+	// data.NewRecordRepo, but internal/data/reporting.go's own
+	// moneyMinorUnitsPattern guard would exclude a fractional legacy
+	// value like the old "1234.5" from the sum entirely).
 	if _, err := recordsA.Create(ctx, "PurchaseOrder", map[string]any{
-		"po_number": "PO-A1", "vendor_id": vendorA.ID, "status_id": statusA.ID, "total": 1234.5,
+		"po_number": "PO-A1", "vendor_id": vendorA.ID, "status_id": statusA.ID, "total": 123450,
 	}); err != nil {
 		t.Fatalf("create PurchaseOrder for tenant A: %v", err)
 	}
@@ -75,8 +80,13 @@ func TestAPI_PurchasingReport_TenantScopedAndEscapesRecordData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create Party for tenant B: %v", err)
 	}
+	// 999999 minor units = $9999.99 — total is FieldMoney now (uc-infra
+	// #136); the leak check below must grep for the RENDERED major-unit
+	// decimal ("9999.99"), not the raw stored integer, or a real leak
+	// would silently stop being caught (independent review: money.Money
+	// (999999).String() is "9999.99", which does not contain "999999").
 	if _, err := recordsB.Create(ctx, "PurchaseOrder", map[string]any{
-		"po_number": "PO-B1", "vendor_id": vendorB.ID, "status_id": statusB.ID, "total": 999999.0,
+		"po_number": "PO-B1", "vendor_id": vendorB.ID, "status_id": statusB.ID, "total": 999999,
 	}); err != nil {
 		t.Fatalf("create PurchaseOrder for tenant B: %v", err)
 	}
@@ -91,11 +101,13 @@ func TestAPI_PurchasingReport_TenantScopedAndEscapesRecordData(t *testing.T) {
 	}
 	body := rec.Body.String()
 
-	if strings.Contains(body, "999999") || strings.Contains(body, "Tenant B Vendor") {
+	if strings.Contains(body, "9999.99") || strings.Contains(body, "Tenant B Vendor") {
 		t.Errorf("tenant B's data leaked into tenant A's report:\n%s", body)
 	}
-	if !strings.Contains(body, "1234.5") {
-		t.Errorf("expected tenant A's own PurchaseOrder total (1234.5) in the report:\n%s", body)
+	// 123450 minor units renders as the major-unit decimal "1234.50"
+	// (money.Money.String(), uc-infra#136) — not the raw stored integer.
+	if !strings.Contains(body, "1234.50") {
+		t.Errorf("expected tenant A's own PurchaseOrder total (1234.50) in the report:\n%s", body)
 	}
 	if strings.Contains(body, "<script>alert(2)</script>") {
 		t.Errorf("vendor name rendered as raw, unescaped HTML — XSS: %s", body)
@@ -861,8 +873,10 @@ func TestAPI_PurchasingReport_DeniedOnUnrelatedTypeStillSeesReport(t *testing.T)
 	if err != nil {
 		t.Fatalf("create Party: %v", err)
 	}
+	// total is FieldMoney now (uc-infra#136): 314 minor units = $3.14,
+	// rendered as "3.14" (money.Money.String()), not the raw "314".
 	if _, err := records.Create(ctx, "PurchaseOrder", map[string]any{
-		"po_number": "PO-UNRELATED", "vendor_id": vendor.ID, "status_id": st.ID, "total": 314.0,
+		"po_number": "PO-UNRELATED", "vendor_id": vendor.ID, "status_id": st.ID, "total": 314,
 	}); err != nil {
 		t.Fatalf("create PurchaseOrder: %v", err)
 	}
@@ -878,7 +892,7 @@ func TestAPI_PurchasingReport_DeniedOnUnrelatedTypeStillSeesReport(t *testing.T)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("role denied on an unrelated type (SalariedStaff): expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "314") {
+	if !strings.Contains(rec.Body.String(), "3.14") {
 		t.Fatalf("expected the seeded PurchaseOrder total in the report:\n%s", rec.Body.String())
 	}
 }
@@ -901,8 +915,9 @@ func TestAPI_PurchasingReport_AdminAndUnrestrictedRolesStillSeeIt(t *testing.T) 
 	if err != nil {
 		t.Fatalf("create Party: %v", err)
 	}
+	// total is FieldMoney now (uc-infra#136): 42 minor units = $0.42.
 	if _, err := data.NewRecordRepo(db).Create(ctx, "PurchaseOrder", map[string]any{
-		"po_number": "PO-1", "vendor_id": vendor.ID, "status_id": statusRow.ID, "total": 42.0,
+		"po_number": "PO-1", "vendor_id": vendor.ID, "status_id": statusRow.ID, "total": 42,
 	}); err != nil {
 		t.Fatalf("create PurchaseOrder: %v", err)
 	}
@@ -923,7 +938,7 @@ func TestAPI_PurchasingReport_AdminAndUnrestrictedRolesStillSeeIt(t *testing.T) 
 		if rec.Code != http.StatusOK {
 			t.Fatalf("%s: expected 200, got %d: %s", actor, rec.Code, rec.Body.String())
 		}
-		if !strings.Contains(rec.Body.String(), "42") {
+		if !strings.Contains(rec.Body.String(), "0.42") {
 			t.Fatalf("%s: expected the seeded PurchaseOrder total in the report:\n%s", actor, rec.Body.String())
 		}
 	}

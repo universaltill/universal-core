@@ -517,12 +517,14 @@ func TestUniversalCore_UBLExportRoute_ServedByRealBinary(t *testing.T) {
 	if err != nil || len(statuses) == 0 {
 		t.Fatalf("list Status: %v (n=%d)", err, len(statuses))
 	}
+	// total/unit_price/line_total are FieldMoney now (uc-infra#136): 1000
+	// minor units = $10.00.
 	poID := create("PurchaseOrder", map[string]any{
 		"po_number": "PO-SMOKE-1", "vendor_id": vendorID, "order_date": "2026-07-01",
-		"currency_id": currencyID, "status_id": statuses[0].ID, "total": 10.0,
+		"currency_id": currencyID, "status_id": statuses[0].ID, "total": 1000,
 	})
 	create("POLine", map[string]any{
-		"purchase_order_id": poID, "item_id": itemID, "qty": 1.0, "unit_price": 10.0, "line_total": 10.0,
+		"purchase_order_id": poID, "item_id": itemID, "qty": 1.0, "unit_price": 1000, "line_total": 1000,
 	})
 	router.Close()
 	control.Close()
