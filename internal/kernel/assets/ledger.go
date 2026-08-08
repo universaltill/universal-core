@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"math"
 	"time"
 
 	"github.com/universaltill/universal-core/internal/data"
@@ -51,14 +52,23 @@ func SchedulerActor() audit.Actor {
 // from internal/worker.Runner.tickTenant rather than a workflow
 // StepKind, and uc-infra#76 for the originating requirement.
 //
+// This is the unbounded convenience form — every due row, one call,
+// no resume needed — for tests and one-off/administrative use.
+// internal/worker.Runner itself calls PostDueDepreciationBatch instead,
+// capped by Config.DepreciationPostBatchSize: see that function's own
+// doc comment and ADR-0025 (uc-infra/docs/adr/0025-...) for why an
+// unbounded per-tenant run is a hazard in the worker's own sequential
+// per-tenant tick loop specifically, not here.
+//
 // "Due" means period_end <= today and posted_at is still empty.
 // Deliberately catch-up, not skip: a posting run that missed several
 // periods (the worker was down, or a tenant licensed Assets after
-// periods had already accrued) posts every one of them on the next run
-// rather than silently understating expense — unlike
-// workflow.Scheduler's "at least this often" semantics for a
-// user-facing trigger, a financial posting that never happens is a real
-// accounting error, not a merely-late notification.
+// periods had already accrued) posts every one of them (across as many
+// calls as it takes — see PostDueDepreciationBatch) rather than silently
+// understating expense — unlike workflow.Scheduler's "at least this
+// often" semantics for a user-facing trigger, a financial posting that
+// never happens is a real accounting error, not a merely-late
+// notification.
 //
 // Only posts for a FixedAsset currently "in_service": draft (not yet
 // depreciating, per PublishStatuses' own doc comment), disposed and
@@ -84,6 +94,53 @@ func SchedulerActor() audit.Actor {
 // accumulated set but not asset_account_id) is far more likely a data
 // entry mistake than an intentional state.
 func PostDueDepreciation(ctx context.Context, db *sql.DB, actor audit.Actor) (posted int, err error) {
+	return PostDueDepreciationBatch(ctx, db, actor, math.MaxInt)
+}
+
+// PostDueDepreciationBatch is PostDueDepreciation, bounded to attempting
+// at most maxRows schedule rows in this one call (spent on rows
+// attempted, not rows successfully posted — a row a concurrent run
+// already got to first still costs a real transaction here, and
+// budgeting only on successes would let that case blow through the cap;
+// see postAssetDepreciation's own doc comment). maxRows must be positive
+// (PostDueDepreciation's own unbounded convenience form is the way to
+// say "no cap" — this function treats maxRows <= 0 as a caller error,
+// not a synonym for unlimited, so a config value that was accidentally
+// left unset fails loudly instead of silently reintroducing the
+// unbounded-run hazard this function exists to prevent).
+//
+// uc-infra#137 / ADR-0025 (uc-infra/docs/adr/0025-...): internal/worker.
+// Runner.tick() drains tenants sequentially, so one tenant's
+// PostDueDepreciation call running long (a large catch-up backlog —
+// exactly the scenario this function's own "catch-up, not skip" design
+// intentionally supports) delays every OTHER tenant's tick, including
+// the queued-job work a user is actually waiting on. Capping how much
+// posting work one call can do bounds the transactional/lock-holding
+// portion of that delay; the tenant's own remaining backlog simply
+// resumes on its next throttle-interval tick, the same "a period that
+// came due mid-interval waits at most this long to post" latency
+// ADR-0022 already accepts for the sync-vs-fire split — this just
+// extends that tolerance to cover one run's own posting duration, not
+// only how often a run starts. This does NOT bound the initial
+// records.List scan below, which still reads every DepreciationSchedule
+// row in the tenant on every call regardless of maxRows — tracked as
+// uc-infra#182, not fixed here.
+//
+// Once maxRows rows have been attempted, remaining assets (and
+// remaining due rows within the asset a cap boundary fell inside) are
+// left completely untouched this call — same "steady state, not a bug"
+// treatment already given to every other skip case in this file. A
+// FixedAsset whose due rows straddle more than one capped call is safe:
+// postAssetDepreciation tracks whether ITS OWN due-rows loop was cut
+// short by the cap and, if so, skips its fully_depreciated eligibility
+// check entirely for that call — see that function's own doc comment
+// for why the check alone (counting posted_at rows against
+// useful_life_months) isn't sufficient once a call can stop mid-asset.
+func PostDueDepreciationBatch(ctx context.Context, db *sql.DB, actor audit.Actor, maxRows int) (posted int, err error) {
+	if maxRows <= 0 {
+		return 0, fmt.Errorf("assets: PostDueDepreciationBatch: maxRows must be positive, got %d", maxRows)
+	}
+
 	records := data.NewRecordRepo(db)
 	schedules, err := records.List(ctx, "DepreciationSchedule")
 	if err != nil {
@@ -112,9 +169,19 @@ func PostDueDepreciation(ctx context.Context, db *sql.DB, actor audit.Actor) (po
 		rowsByAsset[assetID] = append(rowsByAsset[assetID], s)
 	}
 
+	remaining := maxRows
 	for assetID, rows := range rowsByAsset {
 		if ctx.Err() != nil {
 			return posted, ctx.Err()
+		}
+		if remaining <= 0 {
+			// Budget spent — this asset, and every other not-yet-visited
+			// asset in this run, is left untouched and resumes on the
+			// tenant's next throttle-interval tick. Break rather than
+			// continue: map iteration order is unspecified, but every
+			// remaining asset is equally "not due yet this call" once the
+			// budget is gone, so there is nothing left this call can do.
+			break
 		}
 		// posted += n unconditionally, even on error: postAssetDepreciation
 		// returns real partial progress (it posts each due row in its own
@@ -123,8 +190,18 @@ func PostDueDepreciation(ctx context.Context, db *sql.DB, actor audit.Actor) (po
 		// this run's actual work and could suppress the "posted N rows"
 		// log line below even though N rows really were posted (independent
 		// review's finding: this was previously discarded here).
-		n, err := postAssetDepreciation(ctx, db, records, assetID, rows, today, actor)
+		//
+		// remaining is spent by attempted, not n (posted): a row a
+		// concurrent run already posted first costs a real BeginTx +
+		// ExistsForSource round trip here (postDepreciationRow) but
+		// contributes 0 to n — spending budget only on n would let a
+		// tenant with a large already-posted-by-someone-else backlog
+		// blow straight through the cap re-discovering that, defeating
+		// the whole point of this function (independent review's
+		// finding, uc-infra#137).
+		n, attempted, err := postAssetDepreciation(ctx, db, records, assetID, rows, today, actor, remaining)
 		posted += n
+		remaining -= attempted
 		if err != nil {
 			log.Printf("assets: post depreciation for FixedAsset %s: %v", assetID, err)
 		}
@@ -132,30 +209,39 @@ func PostDueDepreciation(ctx context.Context, db *sql.DB, actor audit.Actor) (po
 	return posted, nil
 }
 
-// postAssetDepreciation posts every due, unposted row in rows (a
-// snapshot of one FixedAsset's own DepreciationSchedule rows, taken at
-// the top of this run) and, if the asset's full useful life has now
-// been posted, advances its status to fully_depreciated. Returns how
-// many rows it posted; a non-nil error means the rest of the asset's
-// due rows this run were skipped (bad status read, missing account
-// wiring, an unresolvable account, or a mid-loop posting failure) —
-// PostDueDepreciation logs it, keeps whatever was posted before the
-// error, and moves on to the next asset.
-func postAssetDepreciation(ctx context.Context, db *sql.DB, records *data.RecordRepo, assetID string, rows []data.Record, today string, actor audit.Actor) (int, error) {
+// postAssetDepreciation attempts up to maxRows of the due, unposted rows
+// in rows (a snapshot of one FixedAsset's own DepreciationSchedule rows,
+// taken at the top of this run; maxRows is always >= 1 — the caller
+// never invokes this once its own budget is exhausted) and, if the
+// asset's full useful life has now been posted, advances its status to
+// fully_depreciated. Returns (posted, attempted, err): posted is how
+// many rows this call actually wrote a journal entry for; attempted is
+// how many due rows this call spent its budget on, including ones that
+// turned out to already be posted by a concurrent run (postDepreciationRow
+// returning ok=false, nil) — see PostDueDepreciationBatch's own doc
+// comment on why the budget is spent on attempts, not successes. A
+// non-nil error means the rest of the asset's due rows this run were
+// skipped (bad status read, missing account wiring, an unresolvable
+// account, or a mid-loop posting failure) — PostDueDepreciationBatch
+// logs it, keeps whatever was posted before the error, and moves on to
+// the next asset. Due rows left over because maxRows was reached (not an
+// error) are left unposted the same way and simply picked up on a later
+// call — see PostDueDepreciationBatch's own doc comment.
+func postAssetDepreciation(ctx context.Context, db *sql.DB, records *data.RecordRepo, assetID string, rows []data.Record, today string, actor audit.Actor, maxRows int) (posted, attempted int, err error) {
 	asset, err := records.Get(ctx, "FixedAsset", assetID)
 	if err != nil {
-		return 0, fmt.Errorf("resolve FixedAsset %s: %w", assetID, err)
+		return 0, 0, fmt.Errorf("resolve FixedAsset %s: %w", assetID, err)
 	}
 
 	inService, err := assetStatusIs(ctx, records, asset, statusCodeInService)
 	if err != nil {
-		return 0, fmt.Errorf("resolve FixedAsset %s status: %w", assetID, err)
+		return 0, 0, fmt.Errorf("resolve FixedAsset %s status: %w", assetID, err)
 	}
 	if !inService {
 		// draft / disposed / written_off / fully_depreciated — an
 		// ordinary steady state, not an error. See this function's own
 		// doc comment on PostDueDepreciation.
-		return 0, nil
+		return 0, 0, nil
 	}
 
 	// Filter to due rows BEFORE resolving/validating account wiring.
@@ -179,27 +265,35 @@ func postAssetDepreciation(ctx context.Context, db *sql.DB, records *data.Record
 		due = append(due, r)
 	}
 
-	posted := 0
+	// truncated marks whether this asset's OWN due-row loop below stopped
+	// because the budget ran out mid-asset, as opposed to running every
+	// due row to completion. Gates the completion check further down:
+	// see that check's own doc comment for why a truncated asset must
+	// never be allowed to attempt the fully_depreciated transition, even
+	// though postedCount alone can no longer distinguish "genuinely
+	// finished" from "just happened to reach the life count with rows
+	// still left unattempted" once a cap can stop this loop early.
+	truncated := false
 	if len(due) > 0 {
 		expenseAccountID, _ := asset.Data["depreciation_expense_account_id"].(string)
 		accumAccountID, _ := asset.Data["accumulated_depreciation_account_id"].(string)
 		assetAccountID, _ := asset.Data["asset_account_id"].(string)
 		if expenseAccountID == "" || accumAccountID == "" || assetAccountID == "" {
-			return 0, fmt.Errorf("FixedAsset %s is in_service with due depreciation but missing one or more of asset_account_id/depreciation_expense_account_id/accumulated_depreciation_account_id", assetID)
+			return 0, 0, fmt.Errorf("FixedAsset %s is in_service with due depreciation but missing one or more of asset_account_id/depreciation_expense_account_id/accumulated_depreciation_account_id", assetID)
 		}
 		expenseCode, err := accountCode(ctx, records, expenseAccountID)
 		if err != nil {
-			return 0, fmt.Errorf("resolve depreciation_expense_account_id: %w", err)
+			return 0, 0, fmt.Errorf("resolve depreciation_expense_account_id: %w", err)
 		}
 		accumCode, err := accountCode(ctx, records, accumAccountID)
 		if err != nil {
-			return 0, fmt.Errorf("resolve accumulated_depreciation_account_id: %w", err)
+			return 0, 0, fmt.Errorf("resolve accumulated_depreciation_account_id: %w", err)
 		}
 		// asset_account_id itself is validated present and resolvable
 		// above but not otherwise used — see PostDueDepreciation's own
 		// doc comment.
 		if _, err := accountCode(ctx, records, assetAccountID); err != nil {
-			return 0, fmt.Errorf("resolve asset_account_id: %w", err)
+			return 0, 0, fmt.Errorf("resolve asset_account_id: %w", err)
 		}
 
 		minorUnit := defaultCurrencyMinorUnit
@@ -216,11 +310,23 @@ func postAssetDepreciation(ctx context.Context, db *sql.DB, records *data.Record
 
 		for _, r := range due {
 			if ctx.Err() != nil {
-				return posted, ctx.Err()
+				return posted, attempted, ctx.Err()
 			}
+			if attempted >= maxRows {
+				// Budget reached — the rest of this asset's due rows stay
+				// unposted (posted_at still empty) and resume on a later
+				// call, same as an untouched asset below the outer loop's
+				// own budget cutoff. Not an error: see
+				// PostDueDepreciationBatch's own doc comment. Spent on
+				// attempts, not successful posts — see this function's own
+				// doc comment on why.
+				truncated = true
+				break
+			}
+			attempted++
 			ok, err := postDepreciationRow(ctx, db, records, asset, r, expenseCode, accumCode, minorUnit, actor)
 			if err != nil {
-				return posted, fmt.Errorf("post DepreciationSchedule %s: %w", r.ID, err)
+				return posted, attempted, fmt.Errorf("post DepreciationSchedule %s: %w", r.ID, err)
 			}
 			if ok {
 				posted++
@@ -228,37 +334,52 @@ func postAssetDepreciation(ctx context.Context, db *sql.DB, records *data.Record
 		}
 	}
 
-	// Retry-safe, life-aware completion check. Runs every call, whether
-	// or not this call itself posted anything — NOT gated on "this run
-	// posted the exhausting row" (the previous shape: `posted > 0 &&
-	// posted == totalUnpostedBefore`), which independent review showed
-	// is a fire-once-or-never condition: once every entered row is
-	// already posted, `posted` is 0 on every later call and the
-	// transition can never be retried — a transient error, a version
-	// conflict from a concurrent edit, or an overlapping second poller
-	// (worker.go's own throttle records a start time, not an exclusive
-	// lock across the run) all leave the asset stuck reading in_service
-	// forever. Recomputing "is this asset's schedule actually finished"
-	// from scratch on every call, independent of what (if anything) this
-	// specific call posted, makes a previously-stuck asset heal itself
-	// on its very next tick instead.
+	// Retry-safe, life-aware completion check. Runs every call that
+	// wasn't truncated by the budget (see truncated's own doc comment
+	// just above), whether or not this call itself posted anything —
+	// NOT gated on "this run posted the exhausting row" (the previous
+	// shape: `posted > 0 && posted == totalUnpostedBefore`), which
+	// independent review showed is a fire-once-or-never condition: once
+	// every entered row is already posted, `posted` is 0 on every later
+	// call and the transition can never be retried — a transient error,
+	// a version conflict from a concurrent edit, or an overlapping
+	// second poller (worker.go's own throttle records a start time, not
+	// an exclusive lock across the run) all leave the asset stuck
+	// reading in_service forever. Recomputing "is this asset's schedule
+	// actually finished" from scratch on every untruncated call,
+	// independent of what (if anything) this specific call posted,
+	// makes a previously-stuck asset heal itself on a later tick instead.
 	//
-	// "Finished" is also now life-aware, not just "every entered row is
+	// Gating on !truncated (uc-infra#137/ADR-0025's own review): once a
+	// budget cap can stop this asset's own due-row loop partway through,
+	// postedCount alone can no longer tell "every due row is genuinely
+	// posted" apart from "the life-month count happened to be reached
+	// while rows this asset still has due were merely never attempted
+	// this call" — e.g. an asset whose useful_life_months was edited
+	// down after more schedule rows than that already existed. Skipping
+	// the check on a truncated call costs nothing (it simply re-checks,
+	// cheaply, on whichever later call finally finishes this asset's
+	// due rows without being cut off) and closes what would otherwise be
+	// a silent, unrecoverable early transition — the status graph has no
+	// fully_depreciated -> in_service edge, so posting the remaining due
+	// rows after a premature transition would be impossible, not just
+	// late.
+	//
+	// "Finished" is also life-aware, not just "every entered row is
 	// posted": rows is compared against the asset's own
 	// useful_life_months, not merely its own length. cmd/seed-demo-data
 	// deliberately seeds only the first 12 of a 60-period schedule ("60
 	// rows would bury the rest of the demo data") — reading "no unposted
 	// rows currently exist" as "life complete" would flip that asset to
 	// fully_depreciated after 12 months with 48 unbooked periods and
-	// ~$39,600 of undepreciated cost, a state with no way back (the
-	// status graph has no fully_depreciated -> in_service edge). This
+	// ~$39,600 of undepreciated cost, a state with no way back. This
 	// count also folds in `posted` — the rows this very call just
 	// posted, which the stale `rows` snapshot's own posted_at fields
 	// don't yet reflect — without a second database round trip, since
 	// `rows` was already loaded fresh (this run's own top-level List) by
 	// the caller.
 	usefulLifeMonths, _ := asset.Data["useful_life_months"].(float64)
-	if usefulLifeMonths > 0 {
+	if usefulLifeMonths > 0 && !truncated {
 		postedCount := posted
 		for _, r := range rows {
 			if postedAt, _ := r.Data["posted_at"].(string); postedAt != "" {
@@ -267,11 +388,11 @@ func postAssetDepreciation(ctx context.Context, db *sql.DB, records *data.Record
 		}
 		if postedCount >= int(usefulLifeMonths) {
 			if err := transitionToFullyDepreciated(ctx, db, records, assetID, actor); err != nil {
-				return posted, fmt.Errorf("transition FixedAsset %s to fully_depreciated: %w", assetID, err)
+				return posted, attempted, fmt.Errorf("transition FixedAsset %s to fully_depreciated: %w", assetID, err)
 			}
 		}
 	}
-	return posted, nil
+	return posted, attempted, nil
 }
 
 // postDepreciationRow posts one schedule row's journal entry and marks

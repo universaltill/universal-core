@@ -3,6 +3,7 @@ package assets
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -142,6 +143,29 @@ func (fx depreciationFixture) createAssetNumbered(t *testing.T, assetNumber, sta
 	rec, err := fx.engine.Create(context.Background(), publishedDef(t, fx.tenantDB, "FixedAsset"), fields, humanActor())
 	if err != nil {
 		t.Fatalf("create FixedAsset: %v", err)
+	}
+	return rec.ID
+}
+
+// createAssetWithLife is createAssetNumbered's "in_service, fully wired"
+// case with an explicit useful_life_months, for the one class of test
+// createAssetNumbered's own fixed 3-month life can't express: a schedule
+// long enough to span more than one PostDueDepreciationBatch call
+// (TestPostDueDepreciationBatch_* below).
+func (fx depreciationFixture) createAssetWithLife(t *testing.T, assetNumber string, usefulLifeMonths float64) string {
+	t.Helper()
+	rec, err := fx.engine.Create(context.Background(), publishedDef(t, fx.tenantDB, "FixedAsset"), map[string]any{
+		"asset_number": assetNumber, "name": map[string]any{"en": "Test Asset"},
+		"acquisition_date": "2020-01-01", "cost": 6000.0, "salvage_value": 0.0,
+		"useful_life_months": usefulLifeMonths, "depreciation_method": "straight_line",
+		"currency_id":                         fx.currencyID,
+		"asset_account_id":                    fx.assetAcct,
+		"depreciation_expense_account_id":     fx.expAcct,
+		"accumulated_depreciation_account_id": fx.accumAcct,
+		"status_id":                           fx.statusID["in_service"],
+	}, humanActor())
+	if err != nil {
+		t.Fatalf("create FixedAsset %s: %v", assetNumber, err)
 	}
 	return rec.ID
 }
@@ -758,5 +782,304 @@ func TestStatusIDByCodeTx_NotSeeded(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "not seeded") {
 		t.Errorf("error should say the status wasn't seeded, got: %v", err)
+	}
+}
+
+// TestPostDueDepreciationBatch_CapsPerCallAndResumesAcrossCalls is the
+// direct regression test for uc-infra#137/ADR-0025: a backlog bigger
+// than one call's cap must post only up to the cap per call, must never
+// flip the asset to fully_depreciated before its actual last row posts
+// (a premature transition here would be silent, unrecoverable data
+// corruption — the status graph has no fully_depreciated -> in_service
+// edge, per transitionToFullyDepreciated's own doc comment), and must
+// finish posting everything once enough calls have run — proving both
+// the cap (acceptance criteria 2/5) and partial-batch correctness
+// (acceptance criterion 3) in one realistic resumable-catch-up scenario.
+func TestPostDueDepreciationBatch_CapsPerCallAndResumesAcrossCalls(t *testing.T) {
+	fx := setUpDepreciationFixture(t)
+	ctx := context.Background()
+
+	const usefulLifeMonths = 6
+	assetID := fx.createAssetWithLife(t, "FA-catchup", usefulLifeMonths)
+	rowIDs := make([]string, usefulLifeMonths)
+	for i := range usefulLifeMonths {
+		seq := i + 1
+		periodEnd := fmt.Sprintf("2020-%02d-28", seq) // all comfortably in the past — all due at once
+		rowIDs[i] = fx.createScheduleRow(t, assetID, seq, periodEnd, 1000.00, float64(usefulLifeMonths-seq)*1000.00)
+	}
+
+	const cap = 2
+	wantPerCall := []int{cap, cap, cap} // 6 due rows / cap 2 = exactly 3 calls
+	for i, want := range wantPerCall {
+		posted, err := PostDueDepreciationBatch(ctx, fx.tenantDB, SchedulerActor(), cap)
+		if err != nil {
+			t.Fatalf("call %d: PostDueDepreciationBatch: %v", i+1, err)
+		}
+		if posted != want {
+			t.Fatalf("call %d: posted = %d, want %d", i+1, posted, want)
+		}
+
+		wantStatus := "in_service"
+		if i == len(wantPerCall)-1 {
+			wantStatus = "fully_depreciated"
+		}
+		if code := fx.statusCode(t, "FixedAsset", assetID); code != wantStatus {
+			t.Fatalf("call %d: asset status = %q, want %q", i+1, code, wantStatus)
+		}
+	}
+
+	// Every row now posted, in order — the batch cap must not have
+	// skipped or reordered any of them.
+	for i, rowID := range rowIDs {
+		row, err := fx.engine.Get(ctx, publishedDef(t, fx.tenantDB, "DepreciationSchedule"), rowID)
+		if err != nil {
+			t.Fatalf("Get row %d: %v", i+1, err)
+		}
+		if postedAt, _ := row.Data["posted_at"].(string); postedAt == "" {
+			t.Errorf("row %d (sequence %d) still unposted after enough calls to cover its whole schedule", i, i+1)
+		}
+	}
+
+	entries := data.NewJournalEntryRepo(fx.tenantDB)
+	list, err := entries.List(ctx)
+	if err != nil {
+		t.Fatalf("List journal entries: %v", err)
+	}
+	if len(list) != usefulLifeMonths {
+		t.Fatalf("journal entries = %d, want %d (one per schedule row, no double-posting across the capped calls)", len(list), usefulLifeMonths)
+	}
+
+	// A further call has nothing left to do.
+	posted, err := PostDueDepreciationBatch(ctx, fx.tenantDB, SchedulerActor(), cap)
+	if err != nil {
+		t.Fatalf("final call: PostDueDepreciationBatch: %v", err)
+	}
+	if posted != 0 {
+		t.Errorf("final call posted = %d, want 0 (nothing left due)", posted)
+	}
+}
+
+// TestPostDueDepreciationBatch_RejectsNonPositiveMaxRows confirms
+// maxRows <= 0 is a caller error, not a silent "unlimited" — see
+// PostDueDepreciationBatch's own doc comment on why that distinction
+// matters (a config value left unset by accident must fail loudly, not
+// reintroduce the unbounded-run hazard this function exists to avoid).
+func TestPostDueDepreciationBatch_RejectsNonPositiveMaxRows(t *testing.T) {
+	fx := setUpDepreciationFixture(t)
+	ctx := context.Background()
+	for _, maxRows := range []int{0, -1} {
+		if _, err := PostDueDepreciationBatch(ctx, fx.tenantDB, SchedulerActor(), maxRows); err == nil {
+			t.Errorf("maxRows=%d: expected an error, got nil", maxRows)
+		}
+	}
+}
+
+// TestPostDueDepreciation_DelegatesToBatchUnbounded confirms
+// PostDueDepreciation's own unbounded convenience form still posts an
+// entire backlog in one call, regardless of size — the guarantee every
+// other TestPostDueDepreciation_* test in this file already relies on
+// implicitly; this test is the direct one, using a backlog bigger than
+// PostDueDepreciationBatch's own realistic caps to make sure
+// PostDueDepreciation's math.MaxInt delegation isn't accidentally a
+// smaller hardcoded number that would just happen to cover every other
+// test's small fixture sizes.
+func TestPostDueDepreciation_DelegatesToBatchUnbounded(t *testing.T) {
+	fx := setUpDepreciationFixture(t)
+	ctx := context.Background()
+
+	const usefulLifeMonths = 6
+	assetID := fx.createAssetWithLife(t, "FA-unbounded", usefulLifeMonths)
+	for i := range usefulLifeMonths {
+		seq := i + 1
+		fx.createScheduleRow(t, assetID, seq, fmt.Sprintf("2020-%02d-28", seq), 1000.00, float64(usefulLifeMonths-seq)*1000.00)
+	}
+
+	posted, err := PostDueDepreciation(ctx, fx.tenantDB, SchedulerActor())
+	if err != nil {
+		t.Fatalf("PostDueDepreciation: %v", err)
+	}
+	if posted != usefulLifeMonths {
+		t.Fatalf("posted = %d, want %d (every due row in one call)", posted, usefulLifeMonths)
+	}
+	if code := fx.statusCode(t, "FixedAsset", assetID); code != "fully_depreciated" {
+		t.Fatalf("asset status = %q, want fully_depreciated", code)
+	}
+}
+
+// TestPostDueDepreciationBatch_OuterBudgetLeavesUnvisitedAssetUntouched is
+// the direct regression test for independent review's coverage finding
+// on uc-infra#137/ADR-0025: TestPostDueDepreciationBatch_
+// CapsPerCallAndResumesAcrossCalls above uses a single asset, so the
+// budget always runs out INSIDE postAssetDepreciation's own due-rows
+// loop — the outer per-asset loop's own `remaining <= 0` break
+// (PostDueDepreciationBatch) never actually fires in that test. This
+// test uses two assets, each with more due rows than the whole cap, so
+// the budget is guaranteed to be exhausted entirely within ONE asset,
+// proving the OTHER asset — never even visited by postAssetDepreciation
+// this call — is left completely untouched: no posted_at set on any of
+// its rows, no journal entries for it, status still in_service. Map
+// iteration order is unspecified, so this asserts the order-independent
+// invariant (exactly one asset fully drained to the cap, the other
+// entirely untouched) rather than which specific asset goes first.
+func TestPostDueDepreciationBatch_OuterBudgetLeavesUnvisitedAssetUntouched(t *testing.T) {
+	fx := setUpDepreciationFixture(t)
+	ctx := context.Background()
+
+	const rowsPerAsset = 3
+	const cap = rowsPerAsset // exhausted entirely within whichever asset is visited first
+
+	assetA := fx.createAssetWithLife(t, "FA-two-asset-a", rowsPerAsset)
+	assetB := fx.createAssetWithLife(t, "FA-two-asset-b", rowsPerAsset)
+	rowsFor := map[string][]string{}
+	for _, assetID := range []string{assetA, assetB} {
+		for i := 0; i < rowsPerAsset; i++ {
+			seq := i + 1
+			rowsFor[assetID] = append(rowsFor[assetID], fx.createScheduleRow(t, assetID, seq, fmt.Sprintf("2020-%02d-28", seq), 1000.00, 0))
+		}
+	}
+
+	posted, err := PostDueDepreciationBatch(ctx, fx.tenantDB, SchedulerActor(), cap)
+	if err != nil {
+		t.Fatalf("PostDueDepreciationBatch: %v", err)
+	}
+	if posted != cap {
+		t.Fatalf("posted = %d, want %d (exactly one asset's worth, the budget for a second)", posted, cap)
+	}
+
+	rowPosted := func(rowID string) bool {
+		row, err := fx.engine.Get(ctx, publishedDef(t, fx.tenantDB, "DepreciationSchedule"), rowID)
+		if err != nil {
+			t.Fatalf("Get row %s: %v", rowID, err)
+		}
+		postedAt, _ := row.Data["posted_at"].(string)
+		return postedAt != ""
+	}
+	assetFullyPosted := func(assetID string) bool {
+		for _, rowID := range rowsFor[assetID] {
+			if !rowPosted(rowID) {
+				return false
+			}
+		}
+		return true
+	}
+	assetUntouched := func(assetID string) bool {
+		for _, rowID := range rowsFor[assetID] {
+			if rowPosted(rowID) {
+				return false
+			}
+		}
+		return true
+	}
+
+	aFull, bFull := assetFullyPosted(assetA), assetFullyPosted(assetB)
+	if aFull == bFull {
+		t.Fatalf("expected exactly one of the two assets fully posted, got assetA fully posted=%v assetB fully posted=%v", aFull, bFull)
+	}
+	visited, untouched := assetA, assetB
+	if bFull {
+		visited, untouched = assetB, assetA
+	}
+	if !assetFullyPosted(visited) {
+		t.Errorf("visited asset %s: expected all %d rows posted", visited, rowsPerAsset)
+	}
+	if !assetUntouched(untouched) {
+		t.Errorf("untouched asset %s: expected zero rows posted (outer budget break must leave a not-yet-visited asset completely alone)", untouched)
+	}
+	if code := fx.statusCode(t, "FixedAsset", untouched); code != "in_service" {
+		t.Errorf("untouched asset status = %q, want in_service", code)
+	}
+
+	entries := data.NewJournalEntryRepo(fx.tenantDB)
+	list, err := entries.List(ctx)
+	if err != nil {
+		t.Fatalf("List journal entries: %v", err)
+	}
+	if len(list) != cap {
+		t.Fatalf("journal entries = %d, want %d (only the visited asset's rows)", len(list), cap)
+	}
+}
+
+// TestPostDueDepreciationBatch_TruncatedCallDoesNotTransitionEarly is the
+// direct regression test for independent review's finding that capping
+// introduced a NEW way to reach a premature fully_depreciated transition
+// that the pre-existing (unbounded) completion check alone did not have
+// to guard against: an asset whose useful_life_months was edited down
+// AFTER its DepreciationSchedule already had more rows than that. Under
+// the unbounded PostDueDepreciation, all such rows post in the very same
+// call before the completion check ever runs, so the check's
+// postedCount always reflects every one of them — never early. Under a
+// cap small enough to stop this ONE asset's own due-rows loop partway
+// through, postedCount could reach useful_life_months while due rows
+// this same asset still has are simply unattempted yet — which, without
+// the truncated-gate fix, would flip the asset to fully_depreciated with
+// due rows unposted and no way back (the status graph has no
+// fully_depreciated -> in_service edge).
+func TestPostDueDepreciationBatch_TruncatedCallDoesNotTransitionEarly(t *testing.T) {
+	fx := setUpDepreciationFixture(t)
+	ctx := context.Background()
+
+	// Schedule built (and, in a real product flow, mostly posted) against
+	// a 12-month life; useful_life_months is then edited down to 6 by a
+	// later data correction — deliberately more entered/due rows than the
+	// asset's current useful_life_months, the exact precondition
+	// independent review's finding needs.
+	assetID := fx.createAssetWithLife(t, "FA-life-edited-down", 12)
+	const totalRows = 12
+	rowIDs := make([]string, totalRows)
+	for i := 0; i < totalRows; i++ {
+		seq := i + 1
+		rowIDs[i] = fx.createScheduleRow(t, assetID, seq, fmt.Sprintf("2020-%02d-28", seq), 1000.00, 0)
+	}
+	asset, err := fx.engine.Get(ctx, publishedDef(t, fx.tenantDB, "FixedAsset"), assetID)
+	if err != nil {
+		t.Fatalf("Get FixedAsset: %v", err)
+	}
+	newData := map[string]any{}
+	for k, v := range asset.Data {
+		newData[k] = v
+	}
+	newData["useful_life_months"] = 6.0
+	expectedVersion := asset.Version
+	if _, err := fx.engine.Update(ctx, publishedDef(t, fx.tenantDB, "FixedAsset"), assetID, newData, &expectedVersion, humanActor()); err != nil {
+		t.Fatalf("edit useful_life_months down to 6: %v", err)
+	}
+
+	// Cap of 6 is reached entirely within this one asset's own due-rows
+	// loop (postAssetDepreciation's inner break, not the outer per-asset
+	// one) — postedCount would read exactly 6, equal to the edited-down
+	// life, on this very call.
+	const cap = 6
+	posted, err := PostDueDepreciationBatch(ctx, fx.tenantDB, SchedulerActor(), cap)
+	if err != nil {
+		t.Fatalf("PostDueDepreciationBatch: %v", err)
+	}
+	if posted != cap {
+		t.Fatalf("posted = %d, want %d", posted, cap)
+	}
+	if code := fx.statusCode(t, "FixedAsset", assetID); code != "in_service" {
+		t.Fatalf("asset status = %q, want in_service — a truncated call must not transition the asset even though postedCount reached the (edited-down) useful_life_months, because 6 due rows are still genuinely unposted", code)
+	}
+
+	// The remaining 6 due rows must still be postable — the asset must
+	// not have been locked out of ever posting them by an early
+	// transition (there is no fully_depreciated -> in_service edge).
+	posted2, err := PostDueDepreciationBatch(ctx, fx.tenantDB, SchedulerActor(), totalRows)
+	if err != nil {
+		t.Fatalf("second PostDueDepreciationBatch: %v", err)
+	}
+	if posted2 != cap {
+		t.Fatalf("second call posted = %d, want %d (the remaining 6 rows)", posted2, cap)
+	}
+	if code := fx.statusCode(t, "FixedAsset", assetID); code != "fully_depreciated" {
+		t.Fatalf("asset status = %q, want fully_depreciated once every due row is genuinely posted", code)
+	}
+	for i, rowID := range rowIDs {
+		row, err := fx.engine.Get(ctx, publishedDef(t, fx.tenantDB, "DepreciationSchedule"), rowID)
+		if err != nil {
+			t.Fatalf("Get row %d: %v", i+1, err)
+		}
+		if postedAt, _ := row.Data["posted_at"].(string); postedAt == "" {
+			t.Errorf("row %d still unposted after both calls", i+1)
+		}
 	}
 }
