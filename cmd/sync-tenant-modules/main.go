@@ -359,17 +359,17 @@ func syncTenant(
 			name, id, failure)
 	}
 
-	defFor := func(t string) (*entity.Definition, bool) {
-		v, err := entityDefs.GetPublished(ctx, t)
-		if err != nil {
-			return nil, false
-		}
-		var def entity.Definition
-		if err := json.Unmarshal(v.Definition, &def); err != nil {
-			return nil, false
-		}
-		return &def, true
-	}
+	// Named coverage gap (independent review of uc-infra#159): no test
+	// drives a real syncTenant call through publishedDefFor's own error
+	// branches — entityDefs is a concrete *data.EntityDefinitionRepo, not
+	// an interface, so nothing can be substituted here to fail GetPublished
+	// mid-run after the earlier, successful publishedVersions call above,
+	// and forcing that exact race against a real Postgres isn't practical.
+	// publishedDefFor's own unit tests (published_deffor_test.go) exercise
+	// both error branches directly and are what actually cover this
+	// behavior; this line's wiring to that function is otherwise
+	// unverified by an automated test.
+	defFor := publishedDefFor(ctx, entityDefs, name, id)
 	warnings := requiredFieldWarnings(ctx, tenantDB, name, changes, defFor)
 	warnings = append(warnings, targetConstraintWarnings(ctx, tenantDB, entityDefs, name, changes, defFor)...)
 	warnings = append(warnings, numericBoundWarnings(ctx, tenantDB, entityDefs, name, changes, defFor)...)
@@ -379,6 +379,87 @@ func syncTenant(
 	// sibling above holds for entity/form definitions.
 	backfillNewUniqueConstraints(ctx, tenantDB, entityDefs, name, changes, defFor)
 	return warnings, result
+}
+
+// publishedDefFor returns the real-run defFor closure shared by
+// requiredFieldWarnings, targetConstraintWarnings, numericBoundWarnings,
+// uniqueConstraintWarnings and backfillNewUniqueConstraints: it re-reads
+// each changed entity type's now-published Definition so those five can
+// check/backfill against what is actually live, not what this binary's
+// code would have published (that's the dry-run defFor's job, above).
+//
+// Every entityType this is ever called with is already known-published as
+// of the moment `after` (main.go's syncTenant, above) was captured:
+// `changes` is built from `after`, and `after` came from
+// publishedVersions, which only ever adds an entity type to its map once
+// GetPublished has already succeeded for it earlier in this same
+// syncTenant call. So a !ok result here overwhelmingly means a transient
+// failure between that first successful read and this one — a DB error
+// (dropped connection, canceled context) or a corrupt/unexpected stored
+// definition that fails to unmarshal — rather than "genuinely not
+// published." (Not an absolute guarantee: a concurrent operator rolling
+// that exact version back in the narrow window between the two reads
+// would make GetPublished legitimately return no-rows here too. Harmless
+// either way — this logs and the caller skips the check regardless of
+// which of the two actually happened — but worth naming so "genuinely
+// not published" isn't read as impossible, only vanishingly unlikely and
+// not the case this WARNING is written for.)
+//
+// Every one of the five callers above silently `continue`s past a !ok
+// result (correctly — a missing Definition means the check for that
+// entity type is simply skipped, same as this file's other Count*-error
+// handling), so without a WARNING logged from here, that transient
+// failure vanishes with no operator-visible trace at all: the sync
+// still reports success, and whichever data-migration check invoked
+// defFor this time — required-field, reference-constraint, numeric-bound,
+// unique-constraint, or the unique-constraint backfill itself — silently
+// does not run (uc-infra#159, a wider version of the single-Count*-call
+// gap uc-infra#116/#158 closed). Logging once here, rather than
+// duplicating the same WARNING at all five call sites, is what the
+// issue's own suggested fix asked for: defFor is shared, so the fix
+// belongs in defFor.
+//
+// The WARNING deliberately says "at least one ... check ... may be
+// incomplete", not "every check for this entity type is skipped" — the
+// same entityType reaches this closure once per caller (up to five times
+// per syncTenant call, one per consumer above), and *sql.DB pools
+// reconnect, so a failure on the first call and a recovery on the second
+// through fifth is a real, ordinary case: claiming all five failed here
+// would be actively wrong for it, not just imprecise. warned dedupes by
+// entity type so a *persistent* failure (a genuinely dead connection, a
+// stored definition that never becomes valid) still logs once per
+// syncTenant call rather than once per caller — up to five near-identical
+// multi-line WARNINGs for the same entity type would bury the signal this
+// fix exists to surface, working against the operator-visibility this
+// whole file's header comment is about. dedup is safe unsynchronized:
+// syncTenant and this closure never run this map from more than one
+// goroutine.
+func publishedDefFor(ctx context.Context, entityDefs *data.EntityDefinitionRepo, tenantName, tenantID string) func(string) (*entity.Definition, bool) {
+	warned := make(map[string]bool)
+	warnOnce := func(t, msg string) {
+		if warned[t] {
+			return
+		}
+		warned[t] = true
+		log.Print(msg)
+	}
+	return func(t string) (*entity.Definition, bool) {
+		v, err := entityDefs.GetPublished(ctx, t)
+		if err != nil {
+			warnOnce(t, fmt.Sprintf(
+				"WARNING: %s (%s): %s — could not re-read the just-published definition to check for data-migration warnings this run; at least one required-field/reference/bound/unique-constraint check (or a unique-constraint backfill) for this entity type may be incomplete: %v",
+				tenantName, tenantID, t, err))
+			return nil, false
+		}
+		var def entity.Definition
+		if err := json.Unmarshal(v.Definition, &def); err != nil {
+			warnOnce(t, fmt.Sprintf(
+				"WARNING: %s (%s): %s — the just-published definition could not be decoded to check for data-migration warnings this run; at least one required-field/reference/bound/unique-constraint check (or a unique-constraint backfill) for this entity type may be incomplete: %v",
+				tenantName, tenantID, t, err))
+			return nil, false
+		}
+		return &def, true
+	}
 }
 
 // outcome is how one tenant fared. Partial is deliberately distinct
