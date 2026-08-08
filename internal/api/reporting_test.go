@@ -317,6 +317,82 @@ func TestAPI_PurchasingReport_LeadTimeAndReorderSections(t *testing.T) {
 	}
 }
 
+// TestAPI_PurchasingReport_ReorderSignalsDegradeWhenItemDefinitionUnavailable
+// (uc-infra#157) covers the asymmetry independent review found in
+// buildReorderSignals: the ReorderRule lookup already treats
+// data.ErrNotFound as "nothing to show" (see the empty-state case in
+// TestAPI_PurchasingReport_StockoutRiskAndEmptyStates), but the Item
+// lookup three lines below it did not, so a tenant with real ReorderRule
+// records but no published Item Definition got a full-page 500 instead
+// of the reorder section degrading like every other missing-Definition
+// case on this report. Reproduced here by publishing the purchasing
+// module (so ReorderRule/InventoryItem/etc. are all available and a rule
+// can genuinely fire), seeding a real ReorderRule against a real Item,
+// then rolling back only the Item entity Definition — simulating the
+// inconsistent-publish-state the independent review flagged as the live
+// trigger (uc-infra#157's own originally-reported RBAC-denial scenario
+// does not reproduce: the whole-page requireReportRead gate already
+// covers ReorderRule/Item denial with a 403, see
+// TestAPI_PurchasingReport_DeniedWhenAnyUnderlyingTypeIsRestricted).
+func TestAPI_PurchasingReport_ReorderSignalsDegradeWhenItemDefinitionUnavailable(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	actor := humanActor()
+	if err := purchasing.Publish(ctx, db, actor); err != nil {
+		t.Fatalf("purchasing.Publish: %v", err)
+	}
+	records := data.NewRecordRepo(db)
+
+	mustCreate := func(entityType string, fields map[string]any) string {
+		t.Helper()
+		rec, err := records.Create(ctx, entityType, fields)
+		if err != nil {
+			t.Fatalf("create %s: %v", entityType, err)
+		}
+		return rec.ID
+	}
+
+	// qty_available_to_promise 1 (not 0) deliberately keeps this Item off
+	// the stockout-risk list below — that list reads Item/InventoryItem
+	// straight off the records table by raw SQL, independent of the Item
+	// Definition (internal/data/reporting.go's StockoutRiskItems), so it
+	// would still render this Item's name even with its Definition
+	// rolled back. Only the reorder-signal path (buildReorderSignals,
+	// gated on the Definition lookup this test exercises) is under test.
+	item := mustCreate("Item", map[string]any{"sku": "SKU-GONE", "name": "Vanishing Widget", "item_type": "stock"})
+	mustCreate("InventoryItem", map[string]any{"item_id": item, "qty_on_hand": 1, "qty_available_to_promise": 1})
+	mustCreate("ReorderRule", map[string]any{
+		"item_id": item, "reorder_point": 10, "safety_stock": 0, "target_lead_time_confidence": "p90",
+	})
+
+	// Item's Definition version is fixed by purchasing.Item()'s own
+	// declaration; rolling it back leaves the already-created
+	// Item/InventoryItem/ReorderRule records untouched (they're plain
+	// rows in the records table) but makes ts.entityDef(ctx, "Item")
+	// return data.ErrNotFound, same as any other tenant that never
+	// published Item at all.
+	entDefs := data.NewEntityDefinitionRepo(db)
+	if err := entDefs.Rollback(ctx, "Item", purchasing.Item().Version, actor); err != nil {
+		t.Fatalf("roll back Item entity definition: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+	rec := getAs(t, mux, "/reports/purchasing", tenantID, "farshid")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 (reorder section degraded, not a page-wide failure), got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "No reorder signals right now.") {
+		t.Errorf("expected the reorder-signal empty state once Item's Definition is unavailable, not a partial/broken render:\n%s", body)
+	}
+	if strings.Contains(body, "Vanishing Widget") {
+		t.Errorf("no reorder signal for an unpublished Item may render:\n%s", body)
+	}
+}
+
 // TestAPI_PurchasingReport_InsufficientHistoryStates (#30, BA R1's
 // minimum-sample rule at the surface): with a single completed PO the
 // vendor and overall rows must say "insufficient" rather than fabricate
