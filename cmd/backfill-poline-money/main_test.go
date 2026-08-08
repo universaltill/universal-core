@@ -228,6 +228,38 @@ func TestBackfill_MissingActorID_FailsFast(t *testing.T) {
 	}
 }
 
+// TestBackfill_ActorTypeValidation was missing from this binary's test
+// file even though every one of its 9 siblings has the equivalent case
+// (independent review of uc-infra#167, finding 2) — closed as debt in
+// the same change that centralized the validation logic itself into
+// audit.ResolveCLIActor. DATABASE_URL points at an unreachable-but-
+// parseable address, so a rejection reaching the actor-validation error
+// (not a "open database" connection error) proves validation runs
+// before any database work, the same way
+// cmd/sync-tenant-modules's TestSync_ActorTypeValidation does.
+func TestBackfill_ActorTypeValidation(t *testing.T) {
+	const unreachableDSN = "postgres://postgres:postgres@127.0.0.1:1/nonexistent?sslmode=disable"
+
+	_, stderr, code := run(t, []string{"DATABASE_URL=" + unreachableDSN}, "-actor-id=pipeline", "-actor-type=ai_agent")
+	if code == 0 || !strings.Contains(stderr, "model_version") {
+		t.Errorf("expected ai_agent to require -model-version, got code %d: %s", code, stderr)
+	}
+
+	_, stderr, code = run(t, []string{"DATABASE_URL=" + unreachableDSN}, "-actor-id=pipeline", "-actor-type=wizard")
+	if code == 0 || !strings.Contains(stderr, "invalid actor") {
+		t.Errorf("expected an unknown actor type to be rejected, got code %d: %s", code, stderr)
+	}
+
+	// The other half of the same falsification, the other direction —
+	// a human row carrying a model version (uc-infra#72 independent
+	// review, finding 4): Validate() alone only rejects an EMPTY
+	// ModelVersion on an agent, never a populated one on a human.
+	_, stderr, code = run(t, []string{"DATABASE_URL=" + unreachableDSN}, "-actor-id=pipeline", "-model-version=claude-x")
+	if code == 0 || !strings.Contains(stderr, "-model-version is only meaningful") {
+		t.Errorf("expected a human actor with -model-version set to be rejected, got code %d: %s", code, stderr)
+	}
+}
+
 // TestBackfill_ActorTypeAI_WritesRealAuditRow proves a successful
 // ai_agent run reaches the migrated record's own audit_log row with the
 // right values — not just that the guardrail exists.

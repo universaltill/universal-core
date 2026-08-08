@@ -68,10 +68,8 @@ func main() {
 		log.Fatal("DATABASE_URL is required")
 	}
 	actorID := flag.String("actor-id", "", "audit actor id for every record this updates (required)")
-	// Same ADR-0001 §14 reasoning as every other backfill command: an
-	// unattended pipeline run is an ai_agent actor, and hard-coding
-	// ActorHuman would falsify actor_type on every migrated record
-	// (uc-infra#72).
+	// See audit.ResolveCLIActor for why this can't just hard-code
+	// ActorHuman (uc-infra#72/#123/#124, uc-infra#167).
 	actorType := flag.String("actor-type", string(audit.ActorHuman), "audit actor type: human | ai_agent")
 	modelVersion := flag.String("model-version", "", "model version, required when -actor-type is ai_agent")
 	dryRun := flag.Bool("dry-run", false, "report what would change without writing anything")
@@ -84,23 +82,8 @@ func main() {
 	if *actorID == "" {
 		log.Fatal("-actor-id is required")
 	}
-	actor := audit.Actor{Type: audit.ActorType(*actorType), ID: *actorID, ModelVersion: *modelVersion}
-	switch actor.Type {
-	case audit.ActorHuman, audit.ActorAgent:
-	default:
-		log.Fatalf("invalid actor: -actor-type must be %q or %q, got %q", audit.ActorHuman, audit.ActorAgent, *actorType)
-	}
-	// An ai_agent actor has no natural-language prompt of its own here —
-	// the resolved invocation is the closest analogue, and ADR-0001 §14
-	// requires input_hash for every ai_agent audit row, not just
-	// model_version (uc-infra#124).
-	if actor.Type == audit.ActorAgent {
-		actor.Input = audit.CLIInvocationInput(os.Args[1:])
-	}
-	if actor.Type == audit.ActorHuman && *modelVersion != "" {
-		log.Fatalf("invalid actor: -model-version is only meaningful when -actor-type is %q", audit.ActorAgent)
-	}
-	if err := actor.Validate(); err != nil {
+	actor, err := audit.ResolveCLIActor(*actorID, *actorType, *modelVersion, os.Args[1:])
+	if err != nil {
 		log.Fatalf("invalid actor: %v", err)
 	}
 

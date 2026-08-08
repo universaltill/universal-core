@@ -247,6 +247,22 @@ func TestActorTypeValidation(t *testing.T) {
 	if code == 0 || !strings.Contains(stderr, "invalid actor") {
 		t.Errorf("expected an unknown actor type to be rejected, got code %d: %s", code, stderr)
 	}
+
+	// The other half of the same falsification, the other direction —
+	// a human row carrying a model version (uc-infra#72 independent
+	// review, finding 4, same as every other actor-flagged cmd/
+	// binary's own version of this test): Validate() alone only rejects
+	// an EMPTY ModelVersion on an agent, never a populated one on a
+	// human. This binary was the one instance where the copy-pasted
+	// actor-resolution block had actually drifted and was missing this
+	// guard entirely (uc-infra#167) — this case is what would have
+	// caught that.
+	_, stderr, code = run(t, []string{"DATABASE_URL=" + controlDSN},
+		"-bundle", fixturePath(t), "-tenant-id", "00000000-0000-0000-0000-000000000000",
+		"-actor-id", "pipeline", "-model-version", "claude-x")
+	if code == 0 || !strings.Contains(stderr, "-model-version is only meaningful") {
+		t.Errorf("expected a human actor with -model-version set to be rejected, got code %d: %s", code, stderr)
+	}
 }
 
 // TestInstall_ActorTypeAI_WritesRealAuditRows is the positive half
