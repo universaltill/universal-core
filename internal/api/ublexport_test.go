@@ -698,3 +698,282 @@ func TestUBLInputError_Error(t *testing.T) {
 		t.Fatalf("%%v of ublInputError = %q, want %q", got, "missing currency")
 	}
 }
+
+// TestUBLExport_OwnOrganizationSetsTenantTaxID is uc-infra#119's core
+// acceptance case: a Party holding the own_organization PartyRole
+// (uc-infra#63) flows its tax_id into the tenant's own side of every
+// document type — the buyer on a PurchaseOrder, the seller on a
+// SalesOrder, and the supplier on a CustomerInvoice — the same
+// role→Party resolution saftCompanyProfile already proved for SAF-T,
+// now shared via ownOrganizationParty. Name resolution is deliberately
+// untouched: the org Party's own "name" never overrides the tenant
+// display name (see ublTenantParty's doc comment), so this only
+// asserts TaxID. Also asserts each document's counterparty TaxID is
+// unchanged (still the vendor's/customer's own S-999/C-111, not the
+// tenant's TENANT-TAX-1) — this fixture is the first one where BOTH
+// sides of a document carry a PartyTaxScheme, so a tax-id cross-wire
+// between the two sides would otherwise go uncaught (independent
+// review finding).
+func TestUBLExport_OwnOrganizationSetsTenantTaxID(t *testing.T) {
+	f := setupUBLTenant(t)
+	ctx := context.Background()
+	engine := crud.NewEngine(f.db)
+	defs := entityDefLookup(t, f.db)
+	actor := humanActor()
+
+	org, err := engine.Create(ctx, defs("Party"), map[string]any{
+		"party_type": "organization", "name": "Demo Organization", "tax_id": "TENANT-TAX-1",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create own-organization Party: %v", err)
+	}
+	if _, err := engine.Create(ctx, defs("PartyRole"), map[string]any{
+		"party_id": org.ID, "role_type": "own_organization",
+	}, actor); err != nil {
+		t.Fatalf("create own_organization PartyRole: %v", err)
+	}
+
+	poRec := f.get(t, "/export/PurchaseOrder/"+f.poID+"/ubl")
+	if poRec.Code != http.StatusOK {
+		t.Fatalf("PurchaseOrder export: expected 200, got %d: %s", poRec.Code, poRec.Body.String())
+	}
+	var po ublTestOrder
+	if err := xml.Unmarshal(poRec.Body.Bytes(), &po); err != nil {
+		t.Fatalf("PurchaseOrder response is not parseable UBL XML: %v\n%s", err, poRec.Body.String())
+	}
+	if po.Buyer.TaxID != "TENANT-TAX-1" {
+		t.Errorf("PurchaseOrder buyer (tenant) TaxID = %q, want TENANT-TAX-1", po.Buyer.TaxID)
+	}
+	if po.Seller.TaxID != "S-999" {
+		t.Errorf("PurchaseOrder seller (vendor) TaxID = %q, want S-999 (unchanged by the tenant's own profile)", po.Seller.TaxID)
+	}
+
+	soRec := f.get(t, "/export/SalesOrder/"+f.soID+"/ubl")
+	if soRec.Code != http.StatusOK {
+		t.Fatalf("SalesOrder export: expected 200, got %d: %s", soRec.Code, soRec.Body.String())
+	}
+	var so ublTestOrder
+	if err := xml.Unmarshal(soRec.Body.Bytes(), &so); err != nil {
+		t.Fatalf("SalesOrder response is not parseable UBL XML: %v\n%s", err, soRec.Body.String())
+	}
+	if so.Seller.TaxID != "TENANT-TAX-1" {
+		t.Errorf("SalesOrder seller (tenant) TaxID = %q, want TENANT-TAX-1", so.Seller.TaxID)
+	}
+	if so.Buyer.TaxID != "C-111" {
+		t.Errorf("SalesOrder buyer (customer) TaxID = %q, want C-111 (unchanged by the tenant's own profile)", so.Buyer.TaxID)
+	}
+
+	invRec := f.get(t, "/export/CustomerInvoice/"+f.invoiceID+"/ubl")
+	if invRec.Code != http.StatusOK {
+		t.Fatalf("CustomerInvoice export: expected 200, got %d: %s", invRec.Code, invRec.Body.String())
+	}
+	var inv ublTestInvoice
+	if err := xml.Unmarshal(invRec.Body.Bytes(), &inv); err != nil {
+		t.Fatalf("CustomerInvoice response is not parseable UBL XML: %v\n%s", err, invRec.Body.String())
+	}
+	if inv.Supplier.TaxID != "TENANT-TAX-1" {
+		t.Errorf("CustomerInvoice supplier (tenant) TaxID = %q, want TENANT-TAX-1", inv.Supplier.TaxID)
+	}
+	if inv.Customer.TaxID != "C-111" {
+		t.Errorf("CustomerInvoice customer TaxID = %q, want C-111 (unchanged by the tenant's own profile)", inv.Customer.TaxID)
+	}
+
+	validateUBLAgainstXSD(t, "UBL-Order-2.1.xsd", poRec.Body.Bytes())
+	validateUBLAgainstXSD(t, "UBL-Invoice-2.1.xsd", invRec.Body.Bytes())
+}
+
+// TestUBLExport_NoOwnOrganizationLeavesTenantTaxIDEmpty is the
+// regression case for every tenant that predates uc-infra#119 (and
+// #63): no Party holds the own_organization role — setupUBLTenant's
+// fixture never creates one — so the tenant's own PartyTaxScheme stays
+// omitted entirely, the exact pre-#119 behavior, never a false empty
+// CompanyID element.
+func TestUBLExport_NoOwnOrganizationLeavesTenantTaxIDEmpty(t *testing.T) {
+	f := setupUBLTenant(t)
+
+	poRec := f.get(t, "/export/PurchaseOrder/"+f.poID+"/ubl")
+	if poRec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", poRec.Code, poRec.Body.String())
+	}
+	var po ublTestOrder
+	if err := xml.Unmarshal(poRec.Body.Bytes(), &po); err != nil {
+		t.Fatalf("response is not parseable UBL XML: %v\n%s", err, poRec.Body.String())
+	}
+	if po.Buyer.TaxID != "" {
+		t.Errorf("buyer (tenant) TaxID = %q, want empty (no own_organization Party configured)", po.Buyer.TaxID)
+	}
+	if po.Buyer.Name == "" {
+		t.Errorf("tenant party should still carry a display name, got empty")
+	}
+	// The vendor (seller) side legitimately has its own PartyTaxScheme
+	// (S-999, from setupUBLTenant's fixture) — xmlParty's own omitempty
+	// behavior for a zero-value TaxID is already covered by ubl_test.go
+	// at the package level; po.Buyer.TaxID == "" above is the correct,
+	// element-scoped assertion for the tenant side specifically.
+}
+
+// TestUBLExport_AmbiguousOwnOrganizationLeavesTenantTaxIDEmpty is UBL's
+// own instance of the ambiguity-degrade case
+// TestSAFTExport_AmbiguousOwnOrganizationFallsBackToNA already proves
+// for the shared ownOrganizationParty helper: two Parties both holding
+// own_organization is a data-quality problem this export has no
+// business guessing at, so it must degrade exactly like the zero-match
+// case, never pick one — asserted here at the UBL layer specifically
+// (not just inherited from the shared function's own SAF-T coverage),
+// since UBL's degrade is a silently-omitted element rather than SAF-T's
+// visible NA marker (independent review finding, uc-infra#119).
+func TestUBLExport_AmbiguousOwnOrganizationLeavesTenantTaxIDEmpty(t *testing.T) {
+	f := setupUBLTenant(t)
+	ctx := context.Background()
+	engine := crud.NewEngine(f.db)
+	defs := entityDefLookup(t, f.db)
+	actor := humanActor()
+
+	for i, taxID := range []string{"AMBIG-TAX-1", "AMBIG-TAX-2"} {
+		org, err := engine.Create(ctx, defs("Party"), map[string]any{
+			"party_type": "organization", "name": "Demo Organization", "tax_id": taxID,
+		}, actor)
+		if err != nil {
+			t.Fatalf("create own-organization Party %d: %v", i, err)
+		}
+		if _, err := engine.Create(ctx, defs("PartyRole"), map[string]any{
+			"party_id": org.ID, "role_type": "own_organization",
+		}, actor); err != nil {
+			t.Fatalf("create own_organization PartyRole %d: %v", i, err)
+		}
+	}
+
+	rec := f.get(t, "/export/PurchaseOrder/"+f.poID+"/ubl")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var po ublTestOrder
+	if err := xml.Unmarshal(rec.Body.Bytes(), &po); err != nil {
+		t.Fatalf("response is not parseable UBL XML: %v\n%s", err, rec.Body.String())
+	}
+	if po.Buyer.TaxID != "" {
+		t.Errorf("buyer (tenant) TaxID = %q, want empty (ambiguous: two own_organization Parties)", po.Buyer.TaxID)
+	}
+}
+
+// TestUBLExport_OwnOrganizationBlankTaxIDOmitsPartyTaxScheme covers the
+// state ublTenantParty's own doc comment doesn't mention: an
+// own_organization Party that resolves unambiguously but was never
+// given a tax_id (the single most likely real-world misconfiguration —
+// the operator marked their own organization but left the statutory
+// field blank). ownOrganizationParty returns ok=true here, unlike the
+// zero/ambiguous/dangling cases; the empty string still flows through
+// to TaxID and xmlParty still omits PartyTaxScheme for it, producing
+// the same schema-valid document as no profile at all (independent
+// review finding, uc-infra#119).
+func TestUBLExport_OwnOrganizationBlankTaxIDOmitsPartyTaxScheme(t *testing.T) {
+	f := setupUBLTenant(t)
+	ctx := context.Background()
+	engine := crud.NewEngine(f.db)
+	defs := entityDefLookup(t, f.db)
+	actor := humanActor()
+
+	org, err := engine.Create(ctx, defs("Party"), map[string]any{
+		"party_type": "organization", "name": "Demo Organization",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create own-organization Party: %v", err)
+	}
+	if _, err := engine.Create(ctx, defs("PartyRole"), map[string]any{
+		"party_id": org.ID, "role_type": "own_organization",
+	}, actor); err != nil {
+		t.Fatalf("create own_organization PartyRole: %v", err)
+	}
+
+	rec := f.get(t, "/export/PurchaseOrder/"+f.poID+"/ubl")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var po ublTestOrder
+	if err := xml.Unmarshal(rec.Body.Bytes(), &po); err != nil {
+		t.Fatalf("response is not parseable UBL XML: %v\n%s", err, rec.Body.String())
+	}
+	if po.Buyer.TaxID != "" {
+		t.Errorf("buyer (tenant) TaxID = %q, want empty (own_organization Party configured with no tax_id)", po.Buyer.TaxID)
+	}
+	validateUBLAgainstXSD(t, "UBL-Order-2.1.xsd", rec.Body.Bytes())
+}
+
+// TestUBLExport_OwnOrganizationRoleReadDeniedRefused403 proves
+// ublDocReads' new PartyRole declaration (uc-infra#119) actually gates,
+// for all three exportable document types (not just PurchaseOrder — a
+// typo in either of the other two entries would otherwise pass CI
+// unnoticed, independent review finding): an actor without PartyRole
+// read access must be refused the whole document, not silently served
+// one with the tenant's own tax registration quietly dropped (the
+// "silently dropped" failure shape, same as saftFieldReads' own
+// reasoning for its PartyRole entry) — the class of gap #67's
+// independent review found on this export originally.
+func TestUBLExport_OwnOrganizationRoleReadDeniedRefused403(t *testing.T) {
+	cases := []struct {
+		name       string
+		path       string
+		extraPerms []map[string]any
+	}{
+		{
+			name: "PurchaseOrder",
+			extraPerms: []map[string]any{
+				{"entity_type": "PurchaseOrder", "can_read": true, "can_write": false},
+				{"entity_type": "POLine", "can_read": true, "can_write": false},
+				{"entity_type": "Item", "can_read": true, "can_write": false},
+			},
+		},
+		{
+			name: "SalesOrder",
+			extraPerms: []map[string]any{
+				{"entity_type": "SalesOrder", "can_read": true, "can_write": false},
+				{"entity_type": "SOLine", "can_read": true, "can_write": false},
+				{"entity_type": "Item", "can_read": true, "can_write": false},
+			},
+		},
+		{
+			name: "CustomerInvoice",
+			extraPerms: []map[string]any{
+				{"entity_type": "CustomerInvoice", "can_read": true, "can_write": false},
+				{"entity_type": "SalesOrder", "can_read": true, "can_write": false},
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := setupUBLTenant(t)
+			role := "role-" + strings.ToLower(c.name)
+			userID := "user-" + strings.ToLower(c.name)
+			perms := append([]map[string]any{
+				{"entity_type": "Party", "can_read": true, "can_write": false},
+				{"entity_type": "Currency", "can_read": true, "can_write": false},
+				// No PartyRole permission: with rules present for the
+				// type, absence of a grant is a deny (ADR-0006).
+				{"entity_type": "PartyRole", "can_read": false, "can_write": false},
+			}, c.extraPerms...)
+			for i := range perms {
+				perms[i]["role"] = role
+			}
+			seedRBAC(t, f.db, map[string][]string{role: {userID}}, perms)
+
+			var recordID string
+			switch c.name {
+			case "PurchaseOrder":
+				recordID = f.poID
+			case "SalesOrder":
+				recordID = f.soID
+			case "CustomerInvoice":
+				recordID = f.invoiceID
+			}
+			req := newRequest("GET", "/export/"+c.name+"/"+recordID+"/ubl", f.tenantID, userID, nil)
+			rec := httptest.NewRecorder()
+			f.mux.ServeHTTP(rec, req)
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("expected 403 for user without PartyRole read, got %d: %s", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), "PartyRole") {
+				t.Errorf("403 body should name the missing entity type: %s", rec.Body.String())
+			}
+		})
+	}
+}
