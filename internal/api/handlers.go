@@ -950,12 +950,33 @@ func isHTMXRequest(r *http.Request) bool {
 // Content-Type explicitly today.
 func parseRecordFields(r *http.Request, entDef *entity.Definition) (map[string]any, error) {
 	ct := r.Header.Get("Content-Type")
-	if strings.HasPrefix(ct, "application/x-www-form-urlencoded") || strings.HasPrefix(ct, "multipart/form-data") {
-		// ParseMultipartForm calls ParseForm first regardless of content
-		// type, so r.PostForm ends up populated either way; the
-		// ErrNotMultipart it returns for a plain urlencoded body is
-		// expected and safely ignored.
-		if err := r.ParseMultipartForm(32 << 20); err != nil && !errors.Is(err, http.ErrNotMultipart) {
+	isMultipart := strings.HasPrefix(ct, "multipart/form-data")
+	if isMultipart || strings.HasPrefix(ct, "application/x-www-form-urlencoded") {
+		// Branch on Content-Type explicitly instead of calling
+		// ParseMultipartForm unconditionally and ignoring the
+		// http.ErrNotMultipart it returns (uc-infra#172, the same bug
+		// independent review already found and fixed at issueReportSubmit's
+		// own call site — uc-infra#92 — and at cmd/sync-tenant-modules's
+		// call sites — uc-infra#159/#188). ParseMultipartForm calls
+		// ParseForm internally but only surfaces ParseForm's OWN error on
+		// ParseMultipartForm's success path (net/http/request.go's
+		// parseFormErr is returned only once mr.ReadForm has already
+		// succeeded); if the body isn't multipart at all, ParseMultipartForm
+		// returns ErrNotMultipart instead and discards whatever ParseForm
+		// itself found. Blindly ignoring ErrNotMultipart therefore also
+		// ignores a REAL ParseForm failure on a genuinely malformed
+		// urlencoded body (e.g. a bare semicolon — rejected by net/url's
+		// ParseQuery since Go 1.17 — in a pasted stack trace) and proceeds
+		// on url.Values ParseQuery still partially populates despite the
+		// error, silently dropping the offending field instead of 400ing
+		// like every other malformed submission.
+		var err error
+		if isMultipart {
+			err = r.ParseMultipartForm(32 << 20)
+		} else {
+			err = r.ParseForm()
+		}
+		if err != nil {
 			return nil, fmt.Errorf("parse form: %w", err)
 		}
 		fields := make(map[string]any, len(entDef.Fields))

@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -532,6 +533,230 @@ func TestAPI_CreateRecord_FormURLEncodedBody(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "Acme Textiles") {
 		t.Fatalf("expected the form-encoded name to round-trip, got %s", rec.Body.String())
 	}
+}
+
+// TestAPI_CreateRecord_MalformedUrlencodedBodyIs400 is the regression
+// test for uc-infra#172: parseRecordFields used to call
+// r.ParseMultipartForm unconditionally for any form-shaped Content-Type
+// and swallow any http.ErrNotMultipart it returned, treating that as "just
+// a plain urlencoded submission, safe to proceed" — the same bug
+// independent review already found and fixed at issueReportSubmit's own
+// call site (uc-infra#92, TestIssueReport_Submit_MalformedUrlencodedBodyIs400).
+// But Go's ParseMultipartForm returns ErrNotMultipart whenever the content
+// type isn't multipart/form-data REGARDLESS of whether its own internal
+// ParseForm call succeeded — it only surfaces ParseForm's own error on
+// ParseMultipartForm's success path. So a genuinely malformed urlencoded
+// body (a bare semicolon — rejected by net/url's ParseQuery since Go 1.17
+// as an invalid separator, and a real character a pasted stack trace can
+// easily contain) used to be silently accepted with the offending field
+// just dropped from r.PostForm, rather than 400ing like every other
+// malformed submission. The fix branches on Content-Type explicitly
+// instead of relying on ParseMultipartForm's dual-purpose error.
+//
+// Uses itemWithFlagEntityDef, not vendorEntityDef: internal_note is an
+// OPTIONAL field, so before the fix this doesn't fail Required validation
+// either — it 201s with internal_note silently dropped from the stored
+// record (independent review's finding: a plain unknown form key would
+// have been dropped either way and wouldn't actually demonstrate the
+// bug). Asserting on the error body, not just the status code, pins this
+// to parseRecordFields's own "parse form" wrapped error rather than some
+// unrelated 400 upstream (auth/tenant/definition lookup) keeping the test
+// green while the real regression comes back.
+func TestAPI_CreateRecord_MalformedUrlencodedBodyIs400(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, itemWithFlagEntityDef(), itemWithFlagFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	req := httptest.NewRequest("POST", "/api/records/ItemWithFlag", strings.NewReader("sku=WIDGET-1&internal_note=a;b"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-Tenant-ID", tenantID)
+	req.Header.Set("X-Actor-ID", "farshid")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a malformed urlencoded body (bare semicolon), got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "parse form") {
+		t.Fatalf("expected the error to be parseRecordFields's own \"parse form\" failure, got: %s", rec.Body.String())
+	}
+
+	// No record must have been created — the harm this bug caused wasn't
+	// just "the wrong status code," it was "internal_note silently
+	// vanished and the record was created anyway."
+	listReq := newRequest("GET", "/api/records/ItemWithFlag", tenantID, "farshid", nil)
+	listRec := httptest.NewRecorder()
+	mux.ServeHTTP(listRec, listReq)
+	if strings.Contains(listRec.Body.String(), "WIDGET-1") {
+		t.Fatalf("expected no ItemWithFlag record created from the rejected submission, got: %s", listRec.Body.String())
+	}
+}
+
+// TestAPI_UpdateRecord_MalformedUrlencodedBodyIs400 is
+// TestAPI_CreateRecord_MalformedUrlencodedBodyIs400's update-path
+// counterpart (independent review's finding on uc-infra#172: this is the
+// WORSE half of the bug, not just an untested duplicate). parseRecordFields
+// is the exact same shared call site (handlers.go's updateRecord), but on
+// update the harm is worse in two ways this test pins down: (a) a dropped
+// field reads back as "absent" and updateRecord treats an absent field as
+// "leave the stored value alone" (see EffectiveWriteFields's restore
+// behaviour), so the user's edit silently vanishes with a 200, not even a
+// missing-field symptom; (b) if the malformed segment had landed in
+// _version, extractVersion would read "" and skip the optimistic-lock
+// check entirely — reopening the stale-write race the 409 path exists to
+// close. This test only pins (a): a genuine edit to internal_note must
+// either be rejected (400) or land — it must never silently no-op.
+func TestAPI_UpdateRecord_MalformedUrlencodedBodyIs400(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, itemWithFlagEntityDef(), itemWithFlagFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	createReq := newRequest("POST", "/api/records/ItemWithFlag", tenantID, "farshid", []byte(`{"sku":"WIDGET-1","internal_note":"original"}`))
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("setup: expected 201 creating the record, got %d: %s", createRec.Code, createRec.Body.String())
+	}
+	var created struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("setup: decode create response: %v", err)
+	}
+
+	req := httptest.NewRequest("POST", "/api/records/ItemWithFlag/"+created.Data.ID, strings.NewReader("sku=WIDGET-1&internal_note=updated;more"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-Tenant-ID", tenantID)
+	req.Header.Set("X-Actor-ID", "farshid")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a malformed urlencoded body (bare semicolon), got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "parse form") {
+		t.Fatalf("expected the error to be parseRecordFields's own \"parse form\" failure, got: %s", rec.Body.String())
+	}
+
+	// The stored value must be untouched by the rejected update — not
+	// silently left as "original" while the client believes a 400 meant
+	// nothing was saved (that part is correct) NOR silently changed to a
+	// truncated "updated" (which the old swallowed-error bug would have
+	// done: url.ParseQuery partially populates PostForm despite its error).
+	getReq := newRequest("GET", "/api/records/ItemWithFlag/"+created.Data.ID, tenantID, "farshid", nil)
+	getRec := httptest.NewRecorder()
+	mux.ServeHTTP(getRec, getReq)
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 reading the record back, got %d: %s", getRec.Code, getRec.Body.String())
+	}
+	if !strings.Contains(getRec.Body.String(), `"original"`) {
+		t.Fatalf("expected internal_note to remain \"original\" after the rejected update, got: %s", getRec.Body.String())
+	}
+	if strings.Contains(getRec.Body.String(), "updated") {
+		t.Fatalf("expected the rejected update to leave no trace of \"updated\", got: %s", getRec.Body.String())
+	}
+}
+
+// TestParseRecordFields is a pure, Postgres-free unit test of
+// parseRecordFields itself (independent review's finding on
+// uc-infra#172: the only test the fix originally shipped with was
+// integration-gated on TEST_DATABASE_URL and skips wherever that isn't
+// set — including the new isMultipart branch, which had no test
+// exercising it at all). parseRecordFields takes only
+// (*http.Request, *entity.Definition) and touches no database, so every
+// case below runs with plain httptest.NewRequest, no router/tenant/DB
+// setup required.
+func TestParseRecordFields(t *testing.T) {
+	def := itemWithFlagEntityDef()
+
+	newMultipartRequest := func(t *testing.T, fields map[string]string) *http.Request {
+		t.Helper()
+		var buf bytes.Buffer
+		w := multipart.NewWriter(&buf)
+		for k, v := range fields {
+			if err := w.WriteField(k, v); err != nil {
+				t.Fatalf("write multipart field %q: %v", k, err)
+			}
+		}
+		if err := w.Close(); err != nil {
+			t.Fatalf("close multipart writer: %v", err)
+		}
+		req := httptest.NewRequest("POST", "/api/records/ItemWithFlag", &buf)
+		req.Header.Set("Content-Type", w.FormDataContentType())
+		return req
+	}
+
+	t.Run("multipart happy path", func(t *testing.T) {
+		req := newMultipartRequest(t, map[string]string{"sku": "WIDGET-1", "internal_note": "hello"})
+		fields, err := parseRecordFields(req, def)
+		if err != nil {
+			t.Fatalf("parseRecordFields: %v", err)
+		}
+		if fields["sku"] != "WIDGET-1" || fields["internal_note"] != "hello" {
+			t.Fatalf("expected sku/internal_note to round-trip, got %#v", fields)
+		}
+	})
+
+	t.Run("multipart missing boundary", func(t *testing.T) {
+		req := httptest.NewRequest("POST", "/api/records/ItemWithFlag", strings.NewReader("garbage"))
+		req.Header.Set("Content-Type", "multipart/form-data")
+		if _, err := parseRecordFields(req, def); err == nil {
+			t.Fatal("expected an error for multipart/form-data with no boundary parameter, got nil")
+		}
+	})
+
+	t.Run("urlencoded with charset parameter", func(t *testing.T) {
+		req := httptest.NewRequest("POST", "/api/records/ItemWithFlag", strings.NewReader("sku=WIDGET-1&internal_note=hello"))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+		fields, err := parseRecordFields(req, def)
+		if err != nil {
+			t.Fatalf("parseRecordFields: %v", err)
+		}
+		if fields["sku"] != "WIDGET-1" || fields["internal_note"] != "hello" {
+			t.Fatalf("expected sku/internal_note to round-trip despite the charset parameter, got %#v", fields)
+		}
+	})
+
+	t.Run("urlencoded with bare semicolon is rejected, not silently dropped", func(t *testing.T) {
+		req := httptest.NewRequest("POST", "/api/records/ItemWithFlag", strings.NewReader("sku=WIDGET-1&internal_note=a;b"))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		if _, err := parseRecordFields(req, def); err == nil {
+			t.Fatal("expected an error for a bare semicolon in an urlencoded body (uc-infra#172), got nil")
+		}
+	})
+
+	t.Run("JSON fallback, no Content-Type", func(t *testing.T) {
+		req := httptest.NewRequest("POST", "/api/records/ItemWithFlag", strings.NewReader(`{"sku":"WIDGET-1"}`))
+		fields, err := parseRecordFields(req, def)
+		if err != nil {
+			t.Fatalf("parseRecordFields: %v", err)
+		}
+		if fields["sku"] != "WIDGET-1" {
+			t.Fatalf("expected the JSON body decoded, got %#v", fields)
+		}
+	})
+
+	t.Run("JSON fallback, explicit Content-Type", func(t *testing.T) {
+		req := httptest.NewRequest("POST", "/api/records/ItemWithFlag", strings.NewReader(`{"sku":"WIDGET-1"}`))
+		req.Header.Set("Content-Type", "application/json")
+		fields, err := parseRecordFields(req, def)
+		if err != nil {
+			t.Fatalf("parseRecordFields: %v", err)
+		}
+		if fields["sku"] != "WIDGET-1" {
+			t.Fatalf("expected the JSON body decoded, got %#v", fields)
+		}
+	})
 }
 
 // TestAPI_CreateRecord_HTMXRequest_ReturnsHTMLFragment confirms an
