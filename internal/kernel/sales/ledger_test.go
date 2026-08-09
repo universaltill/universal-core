@@ -3,6 +3,7 @@ package sales
 import (
 	"context"
 	"database/sql"
+	"math"
 	"testing"
 
 	"github.com/universaltill/universal-core/internal/data"
@@ -233,5 +234,98 @@ func TestPostCustomerInvoiceToLedger_CreateAction_IsNoOp(t *testing.T) {
 	rec := data.Record{ID: "x", Data: map[string]any{"status_id": "y", "total": float64(100)}}
 	if err := PostCustomerInvoiceToLedger(context.Background(), nil, nil, rec, audit.ActionCreate, humanActor()); err != nil {
 		t.Fatalf("expected Create action to no-op without even touching tx, got: %v", err)
+	}
+}
+
+// TestPostCustomerInvoiceToLedger_CurrencyIDDoesNotChangePostedScale pins
+// the deliberate non-currency-awareness this hook keeps (uc-infra#163
+// investigated making the posted amount scale by the invoice's own
+// currency_id, and independent review caught why that's unsafe:
+// journal_lines has no per-line currency/scale column, and every other
+// reader of a posted minor-unit amount — internal/kernel/saft's
+// formatMinor, money.Money.Major/String — unconditionally assumes
+// money.Decimals. Posting a real 0dp-scaled amount there would post a
+// technically-correct minor-unit count that every one of those readers
+// then silently misinterprets by up to 100x). This test sets a
+// non-default-scale (0dp JPY-style) currency_id and asserts the posted
+// amount is UNCHANGED by it — still money.Decimals-scaled — so a future
+// change that re-introduces currency-aware posting here without also
+// fixing the GL's own scale-blindness fails this test rather than
+// silently reintroducing the misstatement the review caught.
+func TestPostCustomerInvoiceToLedger_CurrencyIDDoesNotChangePostedScale(t *testing.T) {
+	fx := setUpCustomerInvoiceFixture(t)
+	fx.engine.SetHook("CustomerInvoice", PostCustomerInvoiceToLedger)
+	ctx := context.Background()
+	actor := humanActor()
+
+	jpy, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "Currency"), map[string]any{
+		"code": "JPY", "name": "Japanese Yen", "minor_unit": float64(0),
+	}, actor)
+	if err != nil {
+		t.Fatalf("create JPY Currency: %v", err)
+	}
+
+	id, fields, version := fx.createDraftInvoice(t, 1000.00)
+	fields["currency_id"] = jpy.ID
+	fields["status_id"] = fx.statusID["issued"]
+	if _, err := fx.engine.Update(ctx, defFor(t, fx.tenantDB, "CustomerInvoice"), id, fields, &version, actor); err != nil {
+		t.Fatalf("update to issued: %v", err)
+	}
+
+	entries := data.NewJournalEntryRepo(fx.tenantDB)
+	list, err := entries.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected exactly 1 journal entry, got %d", len(list))
+	}
+	wantMinor := int64(1000 * 100) // money.Decimals scale, NOT the JPY currency's own 0dp scale
+	byCode := map[string]data.JournalLine{}
+	for _, l := range list[0].Lines {
+		byCode[l.AccountCode] = l
+	}
+	if ar := byCode["1200"]; ar.DebitMinor != wantMinor {
+		t.Fatalf("AR debit = %d minor units, want %d — a 0dp currency_id must NOT change the posted scale (journal_lines has no per-line scale column)", ar.DebitMinor, wantMinor)
+	}
+	if rev := byCode["4100"]; rev.CreditMinor != wantMinor {
+		t.Fatalf("Revenue credit = %d minor units, want %d — a 0dp currency_id must NOT change the posted scale (journal_lines has no per-line scale column)", rev.CreditMinor, wantMinor)
+	}
+}
+
+// TestPostCustomerInvoiceToLedger_CorruptTotal_HardFails (uc-infra#163):
+// unlike the old hardcoded-2dp ledger.ToMinorUnits (which never returned
+// an error), money.FromMajorUnits validates its input and can reject a
+// corrupt total (NaN/±Inf/overflow). That must fail the posting outright
+// rather than silently posting a zero or garbage amount — entity.
+// ValidateRecord would normally reject a NaN FieldNumber before this
+// hook ever runs, so this calls the hook directly to exercise the
+// defensive path a hook invoked directly, bypassing that validation,
+// would still need.
+//
+// rec.ID must be a syntactically valid UUID, NOT an arbitrary string
+// like "does-not-matter": ExistsForSource's own SQL runs BEFORE the
+// total conversion this test means to exercise, and journal_entries.
+// source_id is a Postgres UUID column — a non-UUID id fails there first
+// (independent review caught this: the first version of this test used
+// a non-UUID id, which meant it never actually reached
+// money.FromMajorUnits and would have passed identically with that
+// whole branch deleted). The nil UUID is syntactically valid and never
+// a real row's id, so ExistsForSource cleanly returns false and
+// execution reaches the total conversion this test is actually for.
+func TestPostCustomerInvoiceToLedger_CorruptTotal_HardFails(t *testing.T) {
+	fx := setUpCustomerInvoiceFixture(t)
+
+	tx, err := fx.tenantDB.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	rec := data.Record{ID: "00000000-0000-0000-0000-000000000000", Data: map[string]any{
+		"status_id": fx.statusID["issued"], "total": math.NaN(),
+	}}
+	if err := PostCustomerInvoiceToLedger(context.Background(), tx, nil, rec, audit.ActionUpdate, humanActor()); err == nil {
+		t.Fatal("expected an error for a NaN total, got nil")
 	}
 }

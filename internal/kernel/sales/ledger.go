@@ -9,6 +9,7 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/audit"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/ledger"
+	"github.com/universaltill/universal-core/internal/kernel/money"
 )
 
 // glAccountAR/glAccountRevenue are the chart-of-accounts codes this
@@ -48,11 +49,12 @@ func PostCustomerInvoiceToLedger(ctx context.Context, tx *sql.Tx, _ *entity.Defi
 		return nil
 	}
 
+	records := data.NewRecordRepo(nil)
 	statusID, _ := rec.Data["status_id"].(string)
 	if statusID == "" {
 		return nil
 	}
-	status, err := data.NewRecordRepo(nil).GetTx(ctx, tx, "Status", statusID)
+	status, err := records.GetTx(ctx, tx, "Status", statusID)
 	if err != nil {
 		return fmt.Errorf("resolve Status %s: %w", statusID, err)
 	}
@@ -69,8 +71,41 @@ func PostCustomerInvoiceToLedger(ctx context.Context, tx *sql.Tx, _ *entity.Defi
 		return nil
 	}
 
+	// total is CustomerInvoice.total, still FieldNumber (major-unit float)
+	// — converted here at this package's fixed money.Decimals scale, NOT
+	// this invoice's own currency_id (uc-infra#163 investigated making
+	// this currency-aware and independent review caught why that's
+	// unsafe today: journal_lines (internal/db/migrations/tenant/
+	// 0001_init.sql) has no per-line currency/scale column at all —
+	// debit_minor/credit_minor are bare integers with no way to record
+	// which decimal scale produced them — and this kernel's GL is a
+	// single base currency (finance.ResolveBaseCurrency) with every
+	// other reader of a posted minor-unit amount (internal/kernel/saft's
+	// formatMinor, money.Money.Major/String) unconditionally dividing by
+	// 100. Posting a real 0dp-JPY-scaled minor-unit count into that same
+	// column would post a technically-correct minor-unit value that
+	// every one of those readers then silently misinterprets by up to
+	// 100x (a ¥1000 invoice would post as 1000, then read back and
+	// export via SAF-T as "10.00" — a real financial misstatement, not a
+	// display quirk). Fixing this for real needs the GL itself to become
+	// currency-scale-aware (a schema change, likely journal_lines
+	// gaining its own scale/currency column) — tracked as a new,
+	// separately-scoped issue rather than attempted here. Same
+	// conclusion, same reasoning, as purchasing's own
+	// vendorInvoiceMatchDetail (internal/kernel/purchasing/ledger.go),
+	// which independently hit the identical constraint from the
+	// receivedValueForPurchaseOrder side.
 	total, _ := rec.Data["total"].(float64)
-	amountMinor := ledger.ToMinorUnits(total)
+	amountMinorMoney, err := money.FromMajorUnits(total, money.Decimals)
+	if err != nil {
+		// Unlike the old hardcoded-2dp ledger.ToMinorUnits (which never
+		// returned an error), money.FromMajorUnits validates its input
+		// and can reject a corrupt total (NaN/±Inf/overflow) — that must
+		// fail the posting loudly, never silently post a zero or
+		// fabricated amount.
+		return fmt.Errorf("CustomerInvoice %s: convert total to minor units: %w", rec.ID, err)
+	}
+	amountMinor := int64(amountMinorMoney)
 	if amountMinor == 0 {
 		// A zero-total invoice (data-entry in progress, a fully-
 		// discounted order) has nothing to post — same reasoning

@@ -15,22 +15,41 @@
 // (String/Major) — both single, deliberate, well-tested conversions, not
 // a repeated accumulation.
 //
-// Scope of this package (first increment, uc-infra#68): a currency-
-// agnostic 2-decimal-place minor unit, matching this kernel's
-// pre-existing simplification (foundation.Currency.minor_unit defaults
-// to 2; internal/kernel/ledger.ToMinorUnits carries the identical
-// assumption already). A real 0-decimal (JPY) or 3-decimal (KWD/BHD)
-// currency needs a currency-aware decimal count — deliberately deferred
-// (uc-infra#136 tracks the remaining FieldNumber money fields, including
-// this gap) rather than guessed at without a currency actually flowing
-// through any Definition that would exercise it yet.
+// Scope of this package (first increment, uc-infra#68): Money itself is
+// a currency-agnostic 2-decimal-place minor unit, matching this
+// kernel's pre-existing simplification (foundation.Currency.minor_unit
+// defaults to 2; internal/kernel/ledger.ToMinorUnits carries the
+// identical assumption already). A real 0-decimal (JPY) or 3-decimal
+// (KWD/BHD) currency needed a currency-aware decimal count — originally
+// deferred "until a real currency-aware Definition needs it"
+// (ADR-0021's own "Alternatives rejected"), a condition
+// internal/kernel/assets hit first (depreciation valuation, its own
+// currency_id-scoped Currency.minor_unit) and solved locally as
+// assets.MinorUnits. uc-infra#163 promotes that proven logic here as
+// FromMajorUnits, once a second, independent call site (sales/
+// purchasing invoice posting) needed the identical conversion — see
+// FromMajorUnits' own doc comment.
 package money
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
+
+// MaxMinorUnitScale bounds the currency minor-unit scale FromMajorUnits
+// accepts. No real-world ISO 4217 currency needs more than 4 decimal
+// places (3 is already the practical maximum — KWD/BHD/OMR); this stays
+// at 6 rather than tightening to 4 to leave headroom for a currency this
+// kernel hasn't seen yet without another change here, while still
+// bounding well short of where math.Pow(10, minorUnit) risks floating-
+// point precision loss. A minor_unit outside [0, 6] is a corrupt
+// Currency record, not an exotic one. Matches internal/kernel/assets'
+// identical bound (assets.MaxMinorUnitScale is now an alias of this
+// constant — see that package for why the name stayed for its own
+// callers).
+const MaxMinorUnitScale = 6
 
 // Decimals is this package's current, documented minor-unit scale: 2
 // decimal places for every amount, regardless of currency. See the
@@ -72,6 +91,68 @@ func FromAny(v any) (Money, error) {
 	default:
 		return 0, fmt.Errorf("money: expected a number, got %T", v)
 	}
+}
+
+// FromMajorUnits converts a major-unit float64 amount (what a plain
+// entity.FieldNumber price/total field stores) into an exact Money
+// value at an explicit minor-unit scale — a validated replacement for
+// hand-rolled `int64(math.Round(v * 100))`-style conversions wherever
+// this package's own fixed Decimals=2 assumption isn't the right scale
+// to convert AT (uc-infra#163).
+//
+// Passing a real per-record Currency.minor_unit here is NOT
+// automatically safe just because the value is available — check what
+// the CONVERTED result is stored into and read back by before doing
+// that. uc-infra#163 originally wired this straight to CustomerInvoice/
+// VendorInvoice's own currency_id, and independent review caught why
+// that was wrong for both: the value each was about to feed
+// (journal_lines.debit_minor/credit_minor, and a receivedMinor summed
+// from money.Money-typed POLine.unit_price) has no per-value scale of
+// its own recorded anywhere, and every other reader of it — internal/
+// kernel/saft's formatMinor, Money.Major/String, a plain int64 sum on
+// the other side of a comparison — unconditionally assumes this
+// package's fixed Decimals. Converting at a real currency's own scale
+// there would produce a technically-correct minor-unit count that
+// every one of those readers then silently misreads by up to 100x. Only
+// call this with a non-Decimals minorUnit when the value's eventual
+// storage and every reader of it are ALL scale-aware together, not just
+// the write path — internal/kernel/assets' depreciation postings are
+// the one place in this kernel that's actually true today.
+//
+
+// The float is the entity engine's storage type, not a choice made
+// here; this function is the boundary where it stops being one, which
+// is exactly why it validates rather than trusting its input.
+// FieldNumber accepts ANY float64, including NaN, ±Inf and values far
+// beyond int64 — and Go makes an out-of-range float→int conversion
+// *implementation-dependent*: originally found (as assets.MinorUnits,
+// before this logic moved here) compiling identically for both
+// architectures of this product's mixed arm64/amd64 cluster and getting
+// MaxInt64 on one, MinInt64 on the other, for the same input. An error
+// return is the only honest answer.
+//
+// Rounding caveat: "ties away from zero" is exact only when the decimal
+// is exactly representable. 0.145 is stored as 0.14499999…, so it
+// converts to 14, not the 15 a person would write on paper. That is
+// inherent to a float64 input and disappears once a caller's amount
+// starts as Money already; it is not something this function can fix,
+// so it is documented and pinned by a test rather than papered over.
+func FromMajorUnits(v float64, minorUnit int) (Money, error) {
+	if minorUnit < 0 || minorUnit > MaxMinorUnitScale {
+		return 0, fmt.Errorf("money: currency minor unit %d is out of range 0..%d", minorUnit, MaxMinorUnitScale)
+	}
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0, fmt.Errorf("money: amount %v is not a finite number", v)
+	}
+	scaled := math.Round(v * math.Pow(10, float64(minorUnit)))
+	// The bound is exclusive because float64 cannot represent MaxInt64
+	// exactly — the nearest double is 2^63, one above it — so comparing
+	// against the float form of MaxInt64 would admit a value that
+	// overflows on conversion.
+	if math.Abs(scaled) >= math.Pow(2, 63) {
+		return 0, fmt.Errorf("money: amount %v exceeds what %d minor units can represent", v, minorUnit)
+	}
+	return Money(int64(scaled)), nil
 }
 
 // ParseString parses a human-typed major-unit decimal amount — "10.50",

@@ -2073,3 +2073,32 @@ func TestMatchVendorInvoiceOnUpdate_CreateAction_IsNoOp(t *testing.T) {
 		t.Fatalf("expected Create action to no-op without even touching tx, got: %v", err)
 	}
 }
+
+// TestMatchVendorInvoiceOnUpdate_CorruptTotal_HardFails (uc-infra#163):
+// unlike the old hardcoded-2dp ledger.ToMinorUnits (which never returned
+// an error), money.FromMajorUnits validates its input and can reject a
+// corrupt total (NaN/±Inf/overflow). That must fail the whole match
+// hook (ErrVendorInvoiceMatchFailed, same as a missing purchase_order_id
+// or a genuine DB error) rather than being treated as an ordinary
+// business disagreement routed to match_exception — a NaN total isn't
+// something a human corrects by re-entering a number in the same field
+// and retrying the way a wrong total or wrong vendor is.
+func TestMatchVendorInvoiceOnUpdate_CorruptTotal_HardFails(t *testing.T) {
+	fx := setUpVendorInvoiceFixture(t, 10, 12.50, 10)
+	matchedStatusID := statusIDByCode(t, fx.engine, fx.tenantDB, "vendor_invoice_status", "matched")
+
+	tx, err := fx.tenantDB.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	rec := data.Record{ID: "does-not-matter", Data: map[string]any{
+		"status_id": matchedStatusID, "purchase_order_id": fx.poID, "vendor_id": fx.vendorID,
+		"total": math.NaN(),
+	}}
+	err = MatchVendorInvoiceOnUpdate(context.Background(), tx, nil, rec, audit.ActionUpdate, humanActor())
+	if !errors.Is(err, ErrVendorInvoiceMatchFailed) {
+		t.Fatalf("expected ErrVendorInvoiceMatchFailed for a NaN total, got: %v", err)
+	}
+}
