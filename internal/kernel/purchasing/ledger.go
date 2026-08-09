@@ -290,25 +290,70 @@ const creditInventoryOnReceiptMaxRetries = 20
 // nothing about this transaction changes what GetByFieldsQ sees. That
 // branch returns a clear, actionable error instead of looping.
 //
-// Still validates against the compiled-in InventoryItem() Definition,
-// not the tenant's own published one (contrast every write in
-// internal/kernel/crud.Engine, which always validates against
-// data.EntityDefinitionRepo.GetPublished) — a real, disclosed gap, not
-// an oversight, and NOT fixed by this function's upsert change:
-// crud.Hook's signature hands this function a *sql.Tx and nothing else,
-// and EntityDefinitionRepo has no Tx-taking read method to fetch the
-// published Definition consistently within the same transaction (see
-// data.EntityDefinitionRepo — every method takes only *sql.DB). Given
+// Validates the InventoryItem credit against the tenant's own PUBLISHED
+// Definition (uc-infra#165), not the binary's compiled-in InventoryItem()
+// — matching every other write in internal/kernel/crud.Engine, which
+// always validates against data.EntityDefinitionRepo.GetPublished. Given
 // #70 (existing tenants don't auto-adopt new Definitions), a tenant
 // whose published InventoryItem Definition hasn't caught up, or one with
-// a genuinely customized Definition, would have this credit validate
-// against a shape that isn't what that tenant's own registry declares.
-// Fixing this properly means either a Tx-capable GetPublished or
-// threading the published Definition through crud.Hook's own signature
-// — both real, separable changes, split out as uc-infra#165 rather than
-// folded into this upsert fix.
+// a genuinely customized Definition, must have this credit validate
+// against the shape that tenant's own registry actually declares, not
+// whatever version happens to be compiled into this binary. Fetched once
+// via EntityDefinitionRepo.GetPublishedTx — a Tx-capable read added
+// specifically for this caller, since crud.Hook's own signature hands
+// this function a *sql.Tx and nothing else (see GetPublishedTx's own doc
+// comment in internal/data/definitions.go) — and reused for every
+// validation/unique-key call below rather than re-fetched per retry.
+// This is about giving the credit a stable, self-consistent view for its
+// own duration, not a claim that the registry itself is frozen: under
+// Postgres READ COMMITTED (this repo's default, crud.Engine's own
+// BeginTx), a concurrent Publish committing mid-transaction genuinely
+// could be visible to a fresh read issued later in this same tx — this
+// function simply chooses not to take that fresh read.
+//
+// A tenant reaching this path without InventoryItem published at all is
+// a real error, not a silent fallback to compiled-in: Publish always
+// seeds InventoryItem before a GoodsReceiptLine can ever be created
+// (same posture finance.ResolveBaseCurrency takes for a missing Currency
+// Definition).
+//
+// The published Definition must also still declare Unique(item_id,
+// facility_id) — checked explicitly below, not assumed. This function's
+// whole upsert/retry design (the SAVEPOINT dance around CreateTx, the
+// "exceeded N retries on create race" path) depends on a real Postgres
+// UNIQUE violation existing to detect a concurrent create; WriteUnique
+// ConstraintKeys/UpdateUniqueConstraintKeys silently no-op when a
+// Definition's Unique is empty (independent review caught this: routing
+// the tenant's actual published Definition into those calls means a
+// tenant still on InventoryItem < v5 — precisely the #70 state that
+// motivates reading the published Definition in the first place — would
+// otherwise silently lose this constraint and could accumulate duplicate
+// live rows for one (item, facility) with no error and no test ever
+// catching it). Failing loudly here is deliberate: a tenant customizing
+// InventoryItem must keep this constraint, and a tenant simply lagging
+// needs a clear, actionable error telling it to republish, not a quiet
+// data-integrity gap discovered later as unexplained duplicate rows.
 func creditInventoryOnReceipt(ctx context.Context, tx *sql.Tx, records *data.RecordRepo, itemID, facilityID string, qty float64, goodsReceiptLineID string, actor audit.Actor) error {
-	def := InventoryItem()
+	publishedDef, err := data.NewEntityDefinitionRepo(nil).GetPublishedTx(ctx, tx, "InventoryItem")
+	if err != nil {
+		return fmt.Errorf("look up published InventoryItem definition for GoodsReceiptLine %s: %w", goodsReceiptLineID, err)
+	}
+	def, err := entity.Unmarshal(publishedDef.Definition)
+	if err != nil {
+		return fmt.Errorf("unmarshal published InventoryItem definition for GoodsReceiptLine %s: %w", goodsReceiptLineID, err)
+	}
+	requiredUnique := entity.UniqueConstraintName([]string{"item_id", "facility_id"})
+	hasRequiredUnique := false
+	for _, set := range def.Unique {
+		if entity.UniqueConstraintName(set) == requiredUnique {
+			hasRequiredUnique = true
+			break
+		}
+	}
+	if !hasRequiredUnique {
+		return fmt.Errorf("credit InventoryItem for GoodsReceiptLine %s: tenant's published InventoryItem definition (version %d) does not declare Unique(item_id, facility_id) — this function's upsert/concurrency-safety guarantee depends on it; republish InventoryItem at version %d or later", goodsReceiptLineID, publishedDef.Version, InventoryItem().Version)
+	}
+
 	keys := data.NewRecordUniqueKeyRepo(nil)
 	equals := map[string]string{"item_id": itemID, "facility_id": facilityID}
 

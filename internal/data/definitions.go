@@ -198,7 +198,22 @@ func (r *definitionRepo) transition(ctx context.Context, key string, version int
 // being "current" once a higher version exists), and rolling back the
 // current version naturally falls back to the next-highest published one.
 func (r *definitionRepo) getPublished(ctx context.Context, key string) (DefinitionVersion, error) {
-	return r.getOne(ctx,
+	return r.getPublishedTx(ctx, r.db, key)
+}
+
+// getPublishedTx is getPublished against a caller-supplied querier/tx
+// instead of r.db — needed by a hook that must read a Definition OTHER
+// than the one whose write triggered it (crud.Hook's own signature only
+// hands it the triggering record's Definition) within the SAME
+// transaction as that write, not a separate connection. First real
+// caller: purchasing.creditInventoryOnReceipt (uc-infra#165), which
+// needs InventoryItem's own published Definition from inside a
+// GoodsReceiptLine write's transaction. getPublished (above) is just
+// this with r.db as the querier — one query string, not two near-
+// identical copies that could silently drift apart (this type's own
+// doc comment's whole reason for existing).
+func (r *definitionRepo) getPublishedTx(ctx context.Context, q querier, key string) (DefinitionVersion, error) {
+	return r.getOne(ctx, q,
 		fmt.Sprintf(
 			`SELECT id, version, status, definition, created_by_type, created_by, approved_by
 			 FROM %s
@@ -239,7 +254,7 @@ func (r *definitionRepo) listPublishedKeys(ctx context.Context) ([]string, error
 }
 
 func (r *definitionRepo) getVersion(ctx context.Context, key string, version int) (DefinitionVersion, error) {
-	return r.getOne(ctx,
+	return r.getOne(ctx, r.db,
 		fmt.Sprintf(
 			`SELECT id, version, status, definition, created_by_type, created_by, approved_by
 			 FROM %s
@@ -248,10 +263,15 @@ func (r *definitionRepo) getVersion(ctx context.Context, key string, version int
 	)
 }
 
-func (r *definitionRepo) getOne(ctx context.Context, query string, args ...any) (DefinitionVersion, error) {
+// getOne takes a querier rather than always reading through r.db so that
+// getPublishedTx (below) can share this same scan/error-handling logic
+// while running inside a caller-supplied transaction — the same
+// "querier satisfies both *sql.DB and *sql.Tx" reasoning records.go's
+// RecordRepo already established (see querier's own doc comment there).
+func (r *definitionRepo) getOne(ctx context.Context, q querier, query string, args ...any) (DefinitionVersion, error) {
 	var v DefinitionVersion
 	var approvedBy sql.NullString
-	err := r.db.QueryRowContext(ctx, query, args...).Scan(
+	err := q.QueryRowContext(ctx, query, args...).Scan(
 		&v.ID, &v.Version, &v.Status, &v.Definition, &v.CreatedByType, &v.CreatedBy, &approvedBy,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -291,6 +311,17 @@ func (e *EntityDefinitionRepo) Rollback(ctx context.Context, entityType string, 
 
 func (e *EntityDefinitionRepo) GetPublished(ctx context.Context, entityType string) (DefinitionVersion, error) {
 	return e.r.getPublished(ctx, entityType)
+}
+
+// GetPublishedTx is GetPublished against a caller-supplied transaction —
+// see definitionRepo.getPublishedTx's own doc comment for why this
+// exists and its first caller. Only exposed on EntityDefinitionRepo for
+// now: nothing calls the Form/Workflow equivalents yet, and this
+// repository's methods are otherwise kept in lockstep across all three
+// definition kinds, so this is a deliberate, narrow exception rather
+// than an oversight.
+func (e *EntityDefinitionRepo) GetPublishedTx(ctx context.Context, tx *sql.Tx, entityType string) (DefinitionVersion, error) {
+	return e.r.getPublishedTx(ctx, tx, entityType)
 }
 
 func (e *EntityDefinitionRepo) GetVersion(ctx context.Context, entityType string, version int) (DefinitionVersion, error) {

@@ -3,6 +3,7 @@ package purchasing
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"math"
 	"strings"
@@ -467,6 +468,271 @@ func TestPostGoodsReceiptLineToLedger_PostsInventoryAndAP(t *testing.T) {
 	}
 	if auditCount != 1 {
 		t.Fatalf("expected exactly 1 audit row for the credited InventoryItem, got %d", auditCount)
+	}
+}
+
+// TestPostGoodsReceiptLineToLedger_CreditValidatesAgainstPublishedNotCompiledIn
+// is uc-infra#165's regression test: creditInventoryOnReceipt used to
+// validate the InventoryItem credit against the binary's compiled-in
+// InventoryItem() Definition, never the tenant's own PUBLISHED one. This
+// publishes a newer InventoryItem version — adding a Required
+// "lot_number" field the credit's own fields map never sets — on top of
+// what setUpGoodsReceiptFixture already published via Publish(), then
+// receives against it. Before the fix, the credit would validate against
+// compiled-in v5 (no lot_number) and silently succeed despite the
+// tenant's actual published Definition demanding the field; after the
+// fix, it must fail with exactly the *entity.ValidationError this
+// diverging published shape requires.
+func TestPostGoodsReceiptLineToLedger_CreditValidatesAgainstPublishedNotCompiledIn(t *testing.T) {
+	fx := setUpGoodsReceiptFixture(t, 12.50)
+	fx.engine.SetHook("GoodsReceiptLine", PostGoodsReceiptLineToLedger)
+	ctx := context.Background()
+	actor := humanActor()
+
+	compiledIn := InventoryItem()
+	diverged := *compiledIn
+	diverged.Version = compiledIn.Version + 1
+	diverged.Fields = append(append([]entity.Field{}, compiledIn.Fields...),
+		entity.Field{Name: "lot_number", Type: entity.FieldString, Required: true},
+	)
+	raw, err := json.Marshal(&diverged)
+	if err != nil {
+		t.Fatalf("marshal diverged InventoryItem: %v", err)
+	}
+	repo := data.NewEntityDefinitionRepo(fx.tenantDB)
+	if _, err := repo.CreateDraft(ctx, diverged.EntityType, diverged.Version, raw, actor); err != nil {
+		t.Fatalf("CreateDraft: %v", err)
+	}
+	if err := repo.Approve(ctx, diverged.EntityType, diverged.Version, actor); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	if err := repo.Publish(ctx, diverged.EntityType, diverged.Version, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	gr, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceipt"), map[string]any{
+		"purchase_order_id": fx.poID, "received_date": "2026-01-10", "facility_id": fx.facilityID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create GoodsReceipt: %v", err)
+	}
+
+	_, err = fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"), map[string]any{
+		"goods_receipt_id": gr.ID, "po_line_id": fx.poLineID,
+		"item_id": fx.itemID, "qty_received": float64(4),
+	}, actor)
+	if err == nil {
+		t.Fatal("expected the GoodsReceiptLine create to fail: the tenant's published InventoryItem now requires lot_number, which the credit never sets")
+	}
+	var verr *entity.ValidationError
+	if !errors.As(err, &verr) {
+		t.Fatalf("expected a *entity.ValidationError, got %T: %v", err, err)
+	}
+	if verr.FieldName != "lot_number" {
+		t.Fatalf("expected the validation failure to name lot_number, got %+v", verr)
+	}
+
+	// The whole write must have rolled back — no InventoryItem row, no
+	// GoodsReceiptLine, no journal entry — same all-or-nothing posture
+	// every other in-hook failure in this file already enforces.
+	invRecs, err := fx.engine.List(ctx, defFor(t, fx.tenantDB, "InventoryItem"))
+	if err != nil {
+		t.Fatalf("list InventoryItem: %v", err)
+	}
+	if len(invRecs) != 0 {
+		t.Fatalf("expected no InventoryItem row after a rolled-back credit, got %d", len(invRecs))
+	}
+	lineRecs, err := fx.engine.List(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"))
+	if err != nil {
+		t.Fatalf("list GoodsReceiptLine: %v", err)
+	}
+	if len(lineRecs) != 0 {
+		t.Fatalf("expected no GoodsReceiptLine row after a rolled-back credit, got %d", len(lineRecs))
+	}
+	entries, err := data.NewJournalEntryRepo(fx.tenantDB).List(ctx)
+	if err != nil {
+		t.Fatalf("List journal entries: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("expected no journal entry after a rolled-back credit, got %d", len(entries))
+	}
+}
+
+// TestPostGoodsReceiptLineToLedger_PublishedWithoutUniqueConstraint_FailsLoudly
+// is the independent review's finding on uc-infra#165: routing the
+// tenant's actual published InventoryItem Definition into
+// Write/UpdateUniqueConstraintKeys means a tenant whose published version
+// predates v5 (uc-infra#126, which is the version that first declared
+// Unique(item_id, facility_id) — before that, nothing did) would
+// otherwise silently lose this credit's concurrency-safety guarantee:
+// WriteUniqueConstraintKeys/UpdateUniqueConstraintKeys are a no-op when
+// Definition.Unique is empty, so no record_unique_keys row gets written
+// and a concurrent create race becomes undetectable. This publishes a
+// v4-shaped InventoryItem (all the same fields, deliberately no Unique)
+// and asserts the credit now fails with a clear, actionable error
+// instead of silently proceeding without the constraint it depends on.
+func TestPostGoodsReceiptLineToLedger_PublishedWithoutUniqueConstraint_FailsLoudly(t *testing.T) {
+	fx := setUpGoodsReceiptFixture(t, 12.50)
+	fx.engine.SetHook("GoodsReceiptLine", PostGoodsReceiptLineToLedger)
+	ctx := context.Background()
+	actor := humanActor()
+
+	// getPublished/GetPublishedTx return the HIGHEST published version,
+	// and setUpGoodsReceiptFixture's own Publish() already published the
+	// compiled-in v5 (which DOES declare Unique) — so v5 must be rolled
+	// back first, or the v4 draft below would just coexist unused and
+	// this test would validate nothing.
+	repoForRollback := data.NewEntityDefinitionRepo(fx.tenantDB)
+	if err := repoForRollback.Rollback(ctx, "InventoryItem", InventoryItem().Version, actor); err != nil {
+		t.Fatalf("Rollback compiled-in InventoryItem: %v", err)
+	}
+
+	preUniqueVersion := &entity.Definition{
+		EntityType: "InventoryItem",
+		Version:    4,
+		Module:     "purchasing",
+		Fields: []entity.Field{
+			{Name: "item_id", Type: entity.FieldReference, Required: true, Target: "Item"},
+			{Name: "facility_id", Type: entity.FieldReference, Required: true, Target: "Facility"},
+			{Name: "qty_on_hand", Type: entity.FieldNumber, Required: true, Default: float64(0), Min: entity.Float64Ptr(0)},
+			{Name: "qty_available_to_promise", Type: entity.FieldNumber, Required: true, Default: float64(0)},
+		},
+		// Deliberately no Unique — matching real pre-v5 InventoryItem.
+	}
+	raw, err := json.Marshal(preUniqueVersion)
+	if err != nil {
+		t.Fatalf("marshal pre-unique InventoryItem: %v", err)
+	}
+	repo := data.NewEntityDefinitionRepo(fx.tenantDB)
+	if _, err := repo.CreateDraft(ctx, preUniqueVersion.EntityType, preUniqueVersion.Version, raw, actor); err != nil {
+		t.Fatalf("CreateDraft: %v", err)
+	}
+	if err := repo.Approve(ctx, preUniqueVersion.EntityType, preUniqueVersion.Version, actor); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	if err := repo.Publish(ctx, preUniqueVersion.EntityType, preUniqueVersion.Version, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	gr, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceipt"), map[string]any{
+		"purchase_order_id": fx.poID, "received_date": "2026-01-10", "facility_id": fx.facilityID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create GoodsReceipt: %v", err)
+	}
+
+	_, err = fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"), map[string]any{
+		"goods_receipt_id": gr.ID, "po_line_id": fx.poLineID,
+		"item_id": fx.itemID, "qty_received": float64(4),
+	}, actor)
+	if err == nil {
+		t.Fatal("expected the GoodsReceiptLine create to fail: the tenant's published InventoryItem (v4) doesn't declare Unique(item_id, facility_id)")
+	}
+	if !strings.Contains(err.Error(), "does not declare Unique(item_id, facility_id)") {
+		t.Fatalf("expected a clear missing-Unique-constraint error, got %q", err.Error())
+	}
+
+	// Confirm this fails BEFORE any partial write, not mid-way through —
+	// same all-or-nothing posture as every other rejection in this file.
+	invRecs, err := fx.engine.List(ctx, defFor(t, fx.tenantDB, "InventoryItem"))
+	if err != nil {
+		t.Fatalf("list InventoryItem: %v", err)
+	}
+	if len(invRecs) != 0 {
+		t.Fatalf("expected no InventoryItem row, got %d", len(invRecs))
+	}
+}
+
+// TestPostGoodsReceiptLineToLedger_InventoryItemNotPublished_FailsWithWrappedError
+// covers the other side of uc-infra#165's fix: a tenant that somehow
+// reaches this path with InventoryItem NOT published (its only published
+// version explicitly rolled back here, since Publish() always publishes
+// every module Definition together and nothing else can un-publish just
+// one) must get a real, wrapped error — not a panic, not a silent
+// fallback to the compiled-in Definition.
+func TestPostGoodsReceiptLineToLedger_InventoryItemNotPublished_FailsWithWrappedError(t *testing.T) {
+	fx := setUpGoodsReceiptFixture(t, 12.50)
+	fx.engine.SetHook("GoodsReceiptLine", PostGoodsReceiptLineToLedger)
+	ctx := context.Background()
+	actor := humanActor()
+
+	repo := data.NewEntityDefinitionRepo(fx.tenantDB)
+	if err := repo.Rollback(ctx, "InventoryItem", InventoryItem().Version, actor); err != nil {
+		t.Fatalf("Rollback InventoryItem: %v", err)
+	}
+
+	gr, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceipt"), map[string]any{
+		"purchase_order_id": fx.poID, "received_date": "2026-01-10", "facility_id": fx.facilityID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create GoodsReceipt: %v", err)
+	}
+
+	_, err = fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"), map[string]any{
+		"goods_receipt_id": gr.ID, "po_line_id": fx.poLineID,
+		"item_id": fx.itemID, "qty_received": float64(4),
+	}, actor)
+	if err == nil {
+		t.Fatal("expected the GoodsReceiptLine create to fail: InventoryItem has no published Definition")
+	}
+	if !errors.Is(err, data.ErrNotFound) {
+		t.Fatalf("expected errors.Is(err, data.ErrNotFound), got %v", err)
+	}
+	if !strings.Contains(err.Error(), "look up published InventoryItem definition") {
+		t.Fatalf("expected a clearly-wrapped lookup error, got %q", err.Error())
+	}
+}
+
+// TestPostGoodsReceiptLineToLedger_PublishedDefinitionUnmarshalFails_WrapsTheError
+// covers creditInventoryOnReceipt's entity.Unmarshal error branch —
+// independent review, uc-infra#165: EntityDefinitionRepo.CreateDraft only
+// json.Unmarshals a definition into a bare map[string]any to build its
+// audit diff (definitions.go's createDraft); it never calls
+// entity.Definition.Validate(), so structurally-valid-JSON-but-invalid-
+// Definition content (here, a field with an unknown type — the exact
+// "hand-edited in the database" case entity.Unmarshal's own doc comment
+// exists to catch) can be drafted, approved, and published. This proves
+// creditInventoryOnReceipt surfaces that as a real, wrapped error rather
+// than panicking or silently falling back to compiled-in.
+func TestPostGoodsReceiptLineToLedger_PublishedDefinitionUnmarshalFails_WrapsTheError(t *testing.T) {
+	fx := setUpGoodsReceiptFixture(t, 12.50)
+	fx.engine.SetHook("GoodsReceiptLine", PostGoodsReceiptLineToLedger)
+	ctx := context.Background()
+	actor := humanActor()
+
+	invalidRaw := []byte(`{
+		"entity_type": "InventoryItem",
+		"version": 6,
+		"module": "purchasing",
+		"fields": [{"name": "item_id", "type": "not_a_real_field_type"}]
+	}`)
+	repo := data.NewEntityDefinitionRepo(fx.tenantDB)
+	if _, err := repo.CreateDraft(ctx, "InventoryItem", 6, invalidRaw, actor); err != nil {
+		t.Fatalf("CreateDraft: %v", err)
+	}
+	if err := repo.Approve(ctx, "InventoryItem", 6, actor); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	if err := repo.Publish(ctx, "InventoryItem", 6, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	gr, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceipt"), map[string]any{
+		"purchase_order_id": fx.poID, "received_date": "2026-01-10", "facility_id": fx.facilityID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create GoodsReceipt: %v", err)
+	}
+
+	_, err = fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"), map[string]any{
+		"goods_receipt_id": gr.ID, "po_line_id": fx.poLineID,
+		"item_id": fx.itemID, "qty_received": float64(4),
+	}, actor)
+	if err == nil {
+		t.Fatal("expected the GoodsReceiptLine create to fail: the published InventoryItem definition is structurally invalid")
+	}
+	if !strings.Contains(err.Error(), "unmarshal published InventoryItem definition") {
+		t.Fatalf("expected a clearly-wrapped unmarshal error, got %q", err.Error())
 	}
 }
 
