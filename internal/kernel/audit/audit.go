@@ -84,22 +84,23 @@ var (
 // Every ActorAgent must carry a non-empty Input (uc-infra#161): ADR-0001
 // §14 names input_hash a required part of an ai_agent audit row
 // alongside model_version, and until uc-infra#161 this was only true for
-// the 7 CLI binaries uc-infra#124 fixed — internal/kernel/entity
-// (Definition drafting), internal/kernel/csvimport, and
-// internal/kernel/sqlsource could still construct a valid ActorAgent
-// actor with no Input, so this check stayed deliberately loose rather
-// than break them. uc-infra#161's audit found every real (non-test)
-// ActorAgent construction site already populates Input: the 7 CLI
-// binaries via CLIInvocationInput (see below); internal/kernel/entity's
-// only production ActorAgent callers are those same CLI binaries
-// (install-module, sync-tenant-modules, provision-tenant) publishing
-// through internal/kernel/moduleseed; and internal/kernel/csvimport and
-// internal/kernel/sqlsource have no production ActorAgent caller at
-// all — their only production callers (internal/api's import/
-// extsqlimport handlers) always pass the request's rc.Actor, which
-// every httpx.RequestContext construction site sets to ActorHuman, never
-// ActorAgent. So enforcing this here closes the gap without changing
-// any production caller.
+// the CLI binaries uc-infra#124 fixed (7 at the time; 10 as of
+// uc-infra#167's centralization into ResolveCLIActor below) —
+// internal/kernel/entity (Definition drafting), internal/kernel/
+// csvimport, and internal/kernel/sqlsource could still construct a
+// valid ActorAgent actor with no Input, so this check stayed
+// deliberately loose rather than break them. uc-infra#161's audit found
+// every real (non-test) ActorAgent construction site already populates
+// Input: the CLI binaries via CLIInvocationInput (see below);
+// internal/kernel/entity's only production ActorAgent callers are those
+// same CLI binaries (install-module, sync-tenant-modules,
+// provision-tenant) publishing through internal/kernel/moduleseed; and
+// internal/kernel/csvimport and internal/kernel/sqlsource have no
+// production ActorAgent caller at all — their only production callers
+// (internal/api's import/extsqlimport handlers) always pass the
+// request's rc.Actor, which every httpx.RequestContext construction
+// site sets to ActorHuman, never ActorAgent. So enforcing this here
+// closes the gap without changing any production caller.
 func (a Actor) Validate() error {
 	if a.ID == "" {
 		return ErrMissingActorID

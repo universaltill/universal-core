@@ -129,19 +129,10 @@ func main() {
 	if *actorID == "" {
 		log.Fatal("-actor-id is required")
 	}
-	actor := audit.Actor{Type: audit.ActorType(*actorType), ID: *actorID, ModelVersion: *modelVersion}
-	switch actor.Type {
-	case audit.ActorHuman, audit.ActorAgent:
-	default:
-		log.Fatalf("invalid actor: -actor-type must be %q or %q, got %q", audit.ActorHuman, audit.ActorAgent, *actorType)
-	}
-	if actor.Type == audit.ActorAgent {
-		actor.Input = audit.CLIInvocationInput(os.Args[1:])
-	}
-	if actor.Type == audit.ActorHuman && *modelVersion != "" {
-		log.Fatalf("invalid actor: -model-version is only meaningful when -actor-type is %q", audit.ActorAgent)
-	}
-	if err := actor.Validate(); err != nil {
+	// See audit.ResolveCLIActor for why this can't just hard-code
+	// ActorHuman (uc-infra#72/#123/#124, uc-infra#167).
+	actor, err := audit.ResolveCLIActor(*actorID, *actorType, *modelVersion, os.Args[1:])
+	if err != nil {
 		log.Fatalf("invalid actor: %v", err)
 	}
 

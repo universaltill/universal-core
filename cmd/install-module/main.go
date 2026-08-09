@@ -36,10 +36,8 @@ func main() {
 	bundlePath := flag.String("bundle", "", "path to the erp_module bundle JSON (required)")
 	tenantID := flag.String("tenant-id", "", "tenant to install into (required unless -validate)")
 	actorID := flag.String("actor-id", "", "audit actor id for every registry write (required unless -validate)")
-	// An unattended pipeline installing a module is an ai_agent actor,
-	// and ADR-0001 §14 makes that distinction first-class — hard-coding
-	// ActorHuman would write a falsified actor_type onto every
-	// draft/approve/publish row of a whole module (independent review).
+	// See audit.ResolveCLIActor for why this can't just hard-code
+	// ActorHuman (uc-infra#72/#123/#124, uc-infra#167).
 	actorType := flag.String("actor-type", string(audit.ActorHuman), "audit actor type: human | ai_agent")
 	modelVersion := flag.String("model-version", "", "model version, required when -actor-type is ai_agent")
 	validate := flag.Bool("validate", false, "parse and validate the bundle, then exit without touching any database")
@@ -71,20 +69,8 @@ func main() {
 	// Resolved and checked before any database work: an operator who
 	// mistyped the actor should learn that immediately, not after the
 	// tenant lookup.
-	actor := audit.Actor{Type: audit.ActorType(*actorType), ID: *actorID, ModelVersion: *modelVersion}
-	switch actor.Type {
-	case audit.ActorHuman, audit.ActorAgent:
-	default:
-		log.Fatalf("invalid actor: -actor-type must be %q or %q, got %q", audit.ActorHuman, audit.ActorAgent, *actorType)
-	}
-	// An ai_agent actor has no natural-language prompt of its own here —
-	// the resolved invocation is the closest analogue, and ADR-0001 §14
-	// requires input_hash for every ai_agent audit row, not just
-	// model_version (uc-infra#124).
-	if actor.Type == audit.ActorAgent {
-		actor.Input = audit.CLIInvocationInput(os.Args[1:])
-	}
-	if err := actor.Validate(); err != nil {
+	actor, err := audit.ResolveCLIActor(*actorID, *actorType, *modelVersion, os.Args[1:])
+	if err != nil {
 		log.Fatalf("invalid actor: %v", err)
 	}
 

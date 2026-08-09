@@ -58,11 +58,8 @@ func main() {
 	region := flag.String("region", "eu-west", "tenant region, only used when creating a new tenant")
 	tenantID := flag.String("tenant-id", "", "reuse an existing tenant id instead of creating a new one")
 	actorID := flag.String("actor-id", "", "audit actor id for every Definition this provisions (required)")
-	// An unattended pipeline provisioning run is an ai_agent actor, and
-	// ADR-0001 §14 makes that distinction first-class — hard-coding
-	// ActorHuman would write a falsified actor_type onto every
-	// draft/approve/publish row of every tenant this pipeline
-	// provisions (uc-infra#72, same shape as cmd/install-module's fix).
+	// See audit.ResolveCLIActor for why this can't just hard-code
+	// ActorHuman (uc-infra#72/#123/#124, uc-infra#167).
 	actorType := flag.String("actor-type", string(audit.ActorHuman), "audit actor type: human | ai_agent")
 	modelVersion := flag.String("model-version", "", "model version, required when -actor-type is ai_agent")
 	modulesFlag := flag.String("modules", "", "comma-separated modules to publish besides foundation (available: "+available+")")
@@ -78,28 +75,8 @@ func main() {
 	// mistyped the actor should learn that immediately, not after the
 	// control-plane connection and migrations already ran (same
 	// discipline as cmd/install-module).
-	actor := audit.Actor{Type: audit.ActorType(*actorType), ID: *actorID, ModelVersion: *modelVersion}
-	switch actor.Type {
-	case audit.ActorHuman, audit.ActorAgent:
-	default:
-		log.Fatalf("invalid actor: -actor-type must be %q or %q, got %q", audit.ActorHuman, audit.ActorAgent, *actorType)
-	}
-	// An ai_agent actor has no natural-language prompt of its own here —
-	// the resolved invocation is the closest analogue, and ADR-0001 §14
-	// requires input_hash for every ai_agent audit row, not just
-	// model_version (uc-infra#124).
-	if actor.Type == audit.ActorAgent {
-		actor.Input = audit.CLIInvocationInput(os.Args[1:])
-	}
-	// A human actor carrying a model version is the same class of
-	// falsified audit metadata this fix exists to prevent the other
-	// way around (uc-infra#72 independent review) — Validate() alone
-	// only rejects an EMPTY ModelVersion on an agent, never a populated
-	// one on a human, so that half of the mistake needs its own check.
-	if actor.Type == audit.ActorHuman && *modelVersion != "" {
-		log.Fatalf("invalid actor: -model-version is only meaningful when -actor-type is %q", audit.ActorAgent)
-	}
-	if err := actor.Validate(); err != nil {
+	actor, err := audit.ResolveCLIActor(*actorID, *actorType, *modelVersion, os.Args[1:])
+	if err != nil {
 		log.Fatalf("invalid actor: %v", err)
 	}
 
