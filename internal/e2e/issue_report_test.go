@@ -213,6 +213,309 @@ func TestIssueReportPage_VoiceRecordShowsCleanErrorNotRawJSON(t *testing.T) {
 	}
 }
 
+// TestIssueReportPage_MicRecord_DoubleClickDoesNotStartTwoStreams is the
+// real-browser regression test for uc-infra#173: found during uc-infra#92's
+// independent review, which fixed the identical race in the new
+// screen-record button but left the pre-existing mic button's own click
+// handler untouched. Before that handler set `recording = true` only
+// inside getUserMedia's `.then` callback and never disabled the button
+// while the promise was pending — two clicks before the browser's
+// permission prompt resolved started two independent MediaRecorders
+// against one shared `mediaRecorder` variable, and Stop only ever reached
+// whichever one the variable currently pointed at, leaving the other
+// stream's tracks live indefinitely.
+//
+// The fake getUserMedia here deliberately returns a Promise that never
+// resolves on its own (window.__resolveGetUserMedia stashes the resolver
+// instead) so the test controls the exact moment the permission prompt
+// "answers" — a Promise.resolve()-based fake (as the other tests in this
+// file use, where nothing needs the pending window itself) would still
+// usually only call getUserMedia once here, since a real browser
+// suppresses click events on an already-disabled button; this deferred
+// form additionally lets the test assert on the disabled state itself
+// while the first call is still in flight, not just the eventual call
+// count.
+func TestIssueReportPage_MicRecord_DoubleClickDoesNotStartTwoStreams(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, _ := testServer(t)
+	ctx := browserCtx(t, tenantID)
+
+	const fakeDeferredMediaScript = `
+(function() {
+  navigator.mediaDevices = navigator.mediaDevices || {};
+  window.__getUserMediaCallCount = 0;
+  window.__resolveGetUserMedia = null;
+  navigator.mediaDevices.getUserMedia = function() {
+    window.__getUserMediaCallCount++;
+    return new Promise(function(resolve) {
+      window.__resolveGetUserMedia = resolve;
+    });
+  };
+  window.MediaRecorder = function() {
+    var self = this;
+    this.start = function() {};
+    this.stop = function() {
+      if (self.ondataavailable) { self.ondataavailable({ data: new Blob(["fake"]) }); }
+      if (self.onstop) { self.onstop(); }
+    };
+  };
+})();
+`
+	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		_, err := page.AddScriptToEvaluateOnNewDocument(fakeDeferredMediaScript).Do(ctx)
+		return err
+	})); err != nil {
+		t.Fatalf("inject fake deferred media devices script: %v", err)
+	}
+
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/issue-report/new"),
+		chromedp.WaitVisible(`#uc-issue-record-btn`, chromedp.ByQuery),
+		chromedp.Click(`#uc-issue-record-btn`, chromedp.ByQuery), // first click: starts the (pending) getUserMedia call
+	); err != nil {
+		t.Fatalf("click the mic button once: %v", err)
+	}
+
+	// The guard's own proof, before the pending promise ever resolves:
+	// the button must already be disabled, which is also what makes the
+	// browser itself refuse to dispatch a second click below.
+	var disabledWhilePending bool
+	if err := chromedp.Run(ctx, chromedp.EvaluateAsDevTools(
+		`document.getElementById("uc-issue-record-btn").disabled`, &disabledWhilePending,
+	)); err != nil {
+		t.Fatalf("read the mic button's disabled state while getUserMedia is pending: %v", err)
+	}
+	if !disabledWhilePending {
+		t.Fatal("expected the mic button to be disabled synchronously on click, before getUserMedia resolves (regression: uc-infra#173)")
+	}
+
+	// A real browser does not dispatch "click" on an already-disabled
+	// button — this is the actual double-click scenario the bug report
+	// describes, driven the same way a real impatient user would.
+	if err := chromedp.Run(ctx, chromedp.Click(`#uc-issue-record-btn`, chromedp.ByQuery)); err != nil {
+		t.Fatalf("click the mic button a second time while the first getUserMedia call is pending: %v", err)
+	}
+
+	var callCount int
+	if err := chromedp.Run(ctx, chromedp.EvaluateAsDevTools(`window.__getUserMediaCallCount`, &callCount)); err != nil {
+		t.Fatalf("read getUserMedia's call count: %v", err)
+	}
+	if callCount != 1 {
+		t.Fatalf("expected getUserMedia to have been called exactly once despite two clicks, got %d calls (regression: uc-infra#173 — an earlier stream would be left live indefinitely)", callCount)
+	}
+
+	// Resolve the pending permission prompt and confirm recording still
+	// starts normally afterward — the fix must not leave the button
+	// stuck disabled or the handler otherwise broken.
+	if err := chromedp.Run(ctx, chromedp.Evaluate(
+		`window.__resolveGetUserMedia({ getTracks: function() { return []; } }); void 0;`, nil,
+	)); err != nil {
+		t.Fatalf("resolve the pending getUserMedia promise: %v", err)
+	}
+
+	// Polls for the exact post-resolve text, not merely "any non-empty
+	// text" (independent review): the button already reads a non-empty
+	// string ("Record voice note") before the resolve, so a looser
+	// predicate would be satisfied immediately and prove nothing about
+	// actually waiting for the promise — it only happened to pass before
+	// because this test's synchronous-resolve fake lets the microtask
+	// queue drain before chromedp's next CDP round-trip, not because the
+	// predicate itself waited for anything.
+	var recordBtnText string
+	if err := chromedp.Run(ctx, chromedp.PollFunction(
+		`function() {
+			var t = document.getElementById("uc-issue-record-btn").textContent;
+			return t === "Stop recording" ? t : null;
+		}`,
+		&recordBtnText,
+	)); err != nil {
+		t.Fatalf("wait for the mic button to reflect the started recording: %v", err)
+	}
+	var enabledAfterResolve bool
+	if err := chromedp.Run(ctx, chromedp.EvaluateAsDevTools(
+		`!document.getElementById("uc-issue-record-btn").disabled`, &enabledAfterResolve,
+	)); err != nil {
+		t.Fatalf("read the mic button's disabled state after getUserMedia resolves: %v", err)
+	}
+	if !enabledAfterResolve {
+		t.Fatal("expected the mic button to be re-enabled once getUserMedia resolves")
+	}
+}
+
+// TestIssueReportPage_MicRecord_PermissionDeniedReEnablesButtonForRetry is
+// the regression test for the getUserMedia promise's own rejection path
+// (independent review of uc-infra#173's fix): a denied mic permission (or
+// any other getUserMedia rejection) must leave the button re-enabled, not
+// permanently stuck disabled with no way to retry short of a page reload.
+// Deleting the fix's `recordBtn.disabled = false;` re-enable line and
+// re-running this test (done as part of that review) left the whole rest
+// of the suite green — this test is what actually pins that line.
+func TestIssueReportPage_MicRecord_PermissionDeniedReEnablesButtonForRetry(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, _ := testServer(t)
+	ctx := browserCtx(t, tenantID)
+
+	const fakeDenyThenAllowScript = `
+(function() {
+  navigator.mediaDevices = navigator.mediaDevices || {};
+  window.__getUserMediaCallCount = 0;
+  navigator.mediaDevices.getUserMedia = function() {
+    window.__getUserMediaCallCount++;
+    if (window.__getUserMediaCallCount === 1) {
+      return Promise.reject(new Error("Permission denied"));
+    }
+    return Promise.resolve({ getTracks: function() { return []; } });
+  };
+  window.MediaRecorder = function() {
+    var self = this;
+    this.start = function() {};
+    this.stop = function() {
+      if (self.ondataavailable) { self.ondataavailable({ data: new Blob(["fake"]) }); }
+      if (self.onstop) { self.onstop(); }
+    };
+  };
+})();
+`
+	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		_, err := page.AddScriptToEvaluateOnNewDocument(fakeDenyThenAllowScript).Do(ctx)
+		return err
+	})); err != nil {
+		t.Fatalf("inject fake deny-then-allow media devices script: %v", err)
+	}
+
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/issue-report/new"),
+		chromedp.WaitVisible(`#uc-issue-record-btn`, chromedp.ByQuery),
+		chromedp.Click(`#uc-issue-record-btn`, chromedp.ByQuery), // denied
+	); err != nil {
+		t.Fatalf("click the mic button: %v", err)
+	}
+
+	var status string
+	if err := chromedp.Run(ctx, chromedp.PollFunction(
+		`function() {
+			var t = document.getElementById("uc-issue-record-status").textContent;
+			return t && t.length > 0 ? t : null;
+		}`,
+		&status,
+	)); err != nil {
+		t.Fatalf("wait for the permission-denied status message: %v", err)
+	}
+	if !strings.Contains(status, "Permission denied") {
+		t.Fatalf("expected the permission-denial error to reach the status line, got %q", status)
+	}
+
+	var enabledAfterDenial bool
+	if err := chromedp.Run(ctx, chromedp.EvaluateAsDevTools(
+		`!document.getElementById("uc-issue-record-btn").disabled`, &enabledAfterDenial,
+	)); err != nil {
+		t.Fatalf("read the mic button's disabled state after denial: %v", err)
+	}
+	if !enabledAfterDenial {
+		t.Fatal("expected the mic button to be re-enabled after a getUserMedia rejection, so the person can retry (regression: independent review of uc-infra#173)")
+	}
+
+	// The actual retry proof: a second click (the fake now allows it)
+	// must be able to reach getUserMedia again, not be permanently
+	// inert from the first denial.
+	if err := chromedp.Run(ctx, chromedp.Click(`#uc-issue-record-btn`, chromedp.ByQuery)); err != nil {
+		t.Fatalf("click the mic button a second time to retry: %v", err)
+	}
+	var callCount int
+	if err := chromedp.Run(ctx, chromedp.EvaluateAsDevTools(`window.__getUserMediaCallCount`, &callCount)); err != nil {
+		t.Fatalf("read getUserMedia's call count: %v", err)
+	}
+	if callCount != 2 {
+		t.Fatalf("expected the retry click to reach getUserMedia a second time, got %d total calls", callCount)
+	}
+}
+
+// TestIssueReportPage_MicRecord_RecorderConstructorThrowStopsStream is the
+// regression test for independent review's other finding on uc-infra#173's
+// fix: getUserMedia can resolve (permission granted, a real stream handed
+// back) and then something between that and mediaRecorder.start() throw
+// synchronously — the review reproduced this via the MediaRecorder
+// constructor itself throwing, which is exactly what a browser that
+// rejects an unsupported constructor argument would do. Without a
+// try/catch spanning that whole span, the already-granted stream's tracks
+// were never stopped on that path — reaching the literal bug this issue is
+// named after ("can leave an earlier getUserMedia stream live
+// indefinitely") through a different trigger than the double-click race
+// #173 itself describes.
+func TestIssueReportPage_MicRecord_RecorderConstructorThrowStopsStream(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, _ := testServer(t)
+	ctx := browserCtx(t, tenantID)
+
+	const fakeThrowingRecorderScript = `
+(function() {
+  navigator.mediaDevices = navigator.mediaDevices || {};
+  window.__trackStopCount = 0;
+  navigator.mediaDevices.getUserMedia = function() {
+    return Promise.resolve({
+      getTracks: function() {
+        return [
+          { stop: function() { window.__trackStopCount++; } },
+          { stop: function() { window.__trackStopCount++; } }
+        ];
+      }
+    });
+  };
+  window.MediaRecorder = function() {
+    throw new Error("unsupported MediaRecorder configuration");
+  };
+})();
+`
+	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		_, err := page.AddScriptToEvaluateOnNewDocument(fakeThrowingRecorderScript).Do(ctx)
+		return err
+	})); err != nil {
+		t.Fatalf("inject fake throwing-MediaRecorder script: %v", err)
+	}
+
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/issue-report/new"),
+		chromedp.WaitVisible(`#uc-issue-record-btn`, chromedp.ByQuery),
+		chromedp.Click(`#uc-issue-record-btn`, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("click the mic button: %v", err)
+	}
+
+	var status string
+	if err := chromedp.Run(ctx, chromedp.PollFunction(
+		`function() {
+			var t = document.getElementById("uc-issue-record-status").textContent;
+			return t && t.length > 0 ? t : null;
+		}`,
+		&status,
+	)); err != nil {
+		t.Fatalf("wait for the constructor-failure status message: %v", err)
+	}
+	if !strings.Contains(status, "unsupported MediaRecorder configuration") {
+		t.Fatalf("expected the constructor's error to reach the status line, got %q", status)
+	}
+
+	// The actual proof this doesn't leak: both tracks of the
+	// already-granted stream were stopped, not left live.
+	var trackStopCount int
+	if err := chromedp.Run(ctx, chromedp.EvaluateAsDevTools(`window.__trackStopCount`, &trackStopCount)); err != nil {
+		t.Fatalf("read the track-stop count: %v", err)
+	}
+	if trackStopCount != 2 {
+		t.Fatalf("expected both stream tracks to be stopped after the MediaRecorder constructor threw, got %d stopped (regression: independent review of uc-infra#173 — the stream would otherwise be left live indefinitely)", trackStopCount)
+	}
+
+	var enabledAfterThrow bool
+	if err := chromedp.Run(ctx, chromedp.EvaluateAsDevTools(
+		`!document.getElementById("uc-issue-record-btn").disabled`, &enabledAfterThrow,
+	)); err != nil {
+		t.Fatalf("read the mic button's disabled state after the constructor threw: %v", err)
+	}
+	if !enabledAfterThrow {
+		t.Fatal("expected the mic button to be re-enabled after the constructor threw, so the person can retry")
+	}
+}
+
 // TestIssueReportPage_ConsoleLogCapturedFromEarlierPageAndPrefilled is the
 // real-browser proof for universaltill/uc-infra#46's log-capture slice:
 // internal/api/layout.go's shellTmpl installs a console/error listener on
