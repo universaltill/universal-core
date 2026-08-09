@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/textproto"
+	"os"
 	"strings"
 	"testing"
 
+	"github.com/universaltill/universal-core/internal/httpx"
 	"github.com/universaltill/universal-core/internal/i18n"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
 	"github.com/universaltill/universal-core/internal/kernel/speechassist"
@@ -196,6 +198,133 @@ func TestIssueReport_Transcribe_ReturnsTranscript(t *testing.T) {
 	}
 	if gotFilename == "" {
 		t.Fatal("expected the audio to actually reach the speech server")
+	}
+}
+
+// TestIssueReport_Transcribe_LargeRecordingSpillsToDiskNotHeap is a
+// regression test for uc-infra#171 (see attachment_test.go's identical
+// test for the full explanation of the technique): issueReportTranscribe
+// was the one sibling ParseMultipartForm call site independent review
+// found this fix had missed on its first pass — it still passed
+// maxVoiceNoteBytes (the hard http.MaxBytesReader ceiling) as
+// ParseMultipartForm's own maxMemory argument, keeping any recording
+// near that cap entirely in the process heap instead of letting Go
+// spill it to disk. Worse than the other two call sites: this endpoint
+// has no per-tenant rate limit (see issueReportTranscribe's own doc
+// comment), so it's the least-defended of the three against exactly
+// this kind of buffering pressure.
+//
+// Calls issueReportTranscribe directly (bypassing DevAuth's
+// r.WithContext, a request copy the test could no longer inspect
+// afterward), same reasoning as attachment_test.go's own direct-handler
+// tests.
+func TestIssueReport_Transcribe_LargeRecordingSpillsToDiskNotHeap(t *testing.T) {
+	router := newTestRouter(t)
+	tenantID, _ := newTestTenant(t, router)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			t.Fatalf("fake speech server: parse multipart form: %v", err)
+		}
+		w.Write([]byte("transcript"))
+	}))
+	defer srv.Close()
+	speech := speechassist.NewClient(srv.URL)
+	h := testHandlerWithSpeech(t, router, speech)
+
+	// 1 MiB over the in-memory threshold, comfortably under maxVoiceNoteBytes.
+	audio := bytes.Repeat([]byte("z"), multipartParseMemory+(1<<20))
+	req := newAudioUploadRequest(t, "/issue-report/transcribe", "", "", audio)
+	req = req.WithContext(httpx.WithRequestContext(req.Context(), httpx.RequestContext{TenantID: tenantID, Actor: humanActor()}))
+
+	rec := httptest.NewRecorder()
+	h.issueReportTranscribe(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("issueReportTranscribe: expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	if req.MultipartForm == nil {
+		t.Fatal("expected req.MultipartForm to be populated after issueReportTranscribe ran")
+	}
+	defer func() {
+		if err := req.MultipartForm.RemoveAll(); err != nil {
+			t.Fatalf("cleanup temp files: %v", err)
+		}
+	}()
+
+	fhs := req.MultipartForm.File["audio"]
+	if len(fhs) != 1 {
+		t.Fatalf("expected exactly 1 file part, got %d", len(fhs))
+	}
+	f, err := fhs[0].Open()
+	if err != nil {
+		t.Fatalf("Open uploaded file part: %v", err)
+	}
+	defer f.Close()
+
+	if _, ok := f.(*os.File); !ok {
+		// See attachment_test.go's identical assertion for the
+		// single-file-part caveat — harmless here (this request has
+		// exactly one file part).
+		t.Fatalf("file part of %d bytes (> multipartParseMemory=%d) was not spilled to a temp file at the real issueReportTranscribe call site — got %T, want *os.File; it is being buffered entirely in the process heap", len(audio), multipartParseMemory, f)
+	}
+}
+
+// TestIssueReport_Transcribe_LargeRecording_RoundTrips confirms the
+// smaller multipartParseMemory (uc-infra#171) doesn't change observable
+// behavior for a caller: a recording well over that threshold, still
+// under maxVoiceNoteBytes, still reaches the speech server and comes
+// back as a real transcript, exactly like the small-recording case in
+// TestIssueReport_Transcribe_ReturnsTranscript.
+//
+// Calls issueReportTranscribe directly rather than routing through the
+// real mux, same reasoning (and same leak this avoids) as
+// TestIssueReport_Transcribe_LargeRecordingSpillsToDiskNotHeap and
+// attachment_test.go's TestAttachmentUpload_Download_LargeFile_RoundTrips:
+// DevAuth's r.WithContext would make the mutated request unreachable
+// afterward, leaving no way to remove the spilled temp file by hand.
+func TestIssueReport_Transcribe_LargeRecording_RoundTrips(t *testing.T) {
+	router := newTestRouter(t)
+	tenantID, _ := newTestTenant(t, router)
+
+	var gotSize int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			t.Fatalf("parse multipart form: %v", err)
+		}
+		_, header, err := r.FormFile("audio_file")
+		if err != nil {
+			t.Fatalf("read audio_file: %v", err)
+		}
+		gotSize = header.Size
+		w.Write([]byte("this is the transcript"))
+	}))
+	defer srv.Close()
+	speech := speechassist.NewClient(srv.URL)
+	h := testHandlerWithSpeech(t, router, speech)
+
+	audio := bytes.Repeat([]byte("z"), multipartParseMemory+(1<<20))
+	req := newAudioUploadRequest(t, "/issue-report/transcribe", "", "", audio)
+	req = req.WithContext(httpx.WithRequestContext(req.Context(), httpx.RequestContext{TenantID: tenantID, Actor: humanActor()}))
+
+	rec := httptest.NewRecorder()
+	h.issueReportTranscribe(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec.Body.String() != "this is the transcript" {
+		t.Fatalf("expected the transcript verbatim, got %q", rec.Body.String())
+	}
+	if gotSize != int64(len(audio)) {
+		t.Fatalf("expected the full %d-byte recording to reach the speech server, got %d", len(audio), gotSize)
+	}
+	if req.MultipartForm != nil {
+		t.Cleanup(func() {
+			if err := req.MultipartForm.RemoveAll(); err != nil {
+				t.Fatalf("cleanup temp files: %v", err)
+			}
+		})
 	}
 }
 

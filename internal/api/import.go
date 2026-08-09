@@ -271,7 +271,16 @@ func (h *Handler) importCommit(w http.ResponseWriter, r *http.Request) {
 // ok=false purely as a "stop, I already responded" signal to the caller.
 func readUploadedFile(w http.ResponseWriter, r *http.Request) (data []byte, xlsx bool, ok bool) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
-	if err := r.ParseMultipartForm(maxUploadBytes); err != nil {
+	// multipartParseMemory (not maxUploadBytes) as ParseMultipartForm's
+	// maxMemory bound — see that constant's own doc comment for why.
+	// Unlike attachmentUpload's call site, this only avoids DUPLICATING
+	// the in-heap copy during parsing: io.ReadAll below still reads the
+	// whole file (spilled or not) into a single ~maxUploadBytes-sized
+	// []byte, so peak heap here is still bounded by maxUploadBytes, not
+	// multipartParseMemory — real (pre-fix: multipart's own buffer PLUS
+	// io.ReadAll's slice, ~2x; post-fix: 1x), just smaller than it might
+	// look at first glance.
+	if err := r.ParseMultipartForm(multipartParseMemory); err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, fmt.Sprintf("invalid or oversized upload (max %d MiB): %s", maxUploadBytes>>20, err.Error()))
 		return nil, false, false
 	}

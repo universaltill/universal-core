@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/universaltill/universal-core/internal/data"
+	"github.com/universaltill/universal-core/internal/httpx"
 	"github.com/universaltill/universal-core/internal/kernel/blobstore"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
@@ -323,6 +324,184 @@ func TestAttachmentUpload_OversizedFile_Rejected(t *testing.T) {
 	}
 	if countFilesUnder(t, blobRoot) != 0 {
 		t.Fatal("expected no blob written for a rejected oversized upload")
+	}
+}
+
+// TestAttachmentUpload_LargeFileSpillsToDiskNotHeap is a regression test
+// for uc-infra#171: ParseMultipartForm's second argument bounds how much
+// of the request multipart.Reader buffers in the process heap before
+// spilling the rest to a temp file — it is NOT a size cap
+// (http.MaxBytesReader, via maxAttachmentBytes, is the actual ceiling).
+// Passing the full maxAttachmentBytes cap as that argument (the pre-fix
+// behavior) meant an upload anywhere near the cap was retained entirely
+// in memory instead of spilling.
+//
+// This calls the real attachmentUpload handler (not a reimplementation
+// of its parsing logic) with an upload comfortably over
+// multipartParseMemory but well under maxAttachmentBytes, then inspects
+// the SAME *http.Request object's MultipartForm afterward — the handler
+// is invoked directly (bypassing DevAuth's r.WithContext, which would
+// otherwise mutate a copy the test can no longer see) so the request
+// pointer the test holds is exactly the one ParseMultipartForm populated
+// in production code. Asserts the resulting file part is backed by
+// *os.File — i.e. actually spilled to a temp file — which fails against
+// the pre-fix code (ParseMultipartForm(maxAttachmentBytes) keeps a file
+// this size entirely in memory) and passes after.
+func TestAttachmentUpload_LargeFileSpillsToDiskNotHeap(t *testing.T) {
+	router := newTestRouter(t)
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
+	publishEntityOnly(t, db, foundation.Attachment())
+
+	h := testHandler(t, router)
+	h.SetBlobstore(newFSStoreAt(t, t.TempDir()))
+	mux := http.NewServeMux()
+	h.Routes(mux)
+
+	withDevAuthEnabled(t)
+	createReq := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{"name":"Acme"}`))
+	createReq.Header.Set("Content-Type", "application/json")
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	var created struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+
+	// 1 MiB over the in-memory threshold, ~11 MiB under the hard cap —
+	// big enough to prove spilling happened, nowhere near maxAttachmentBytes.
+	content := bytes.Repeat([]byte("x"), multipartParseMemory+(1<<20))
+	req := newMultipartFileRequest(t, "/api/attachments/Vendor/"+created.Data.ID, "", "", "file", "big.bin", content)
+	req.SetPathValue("entityType", "Vendor")
+	req.SetPathValue("recordID", created.Data.ID)
+	req = req.WithContext(httpx.WithRequestContext(req.Context(), httpx.RequestContext{TenantID: tenantID, Actor: humanActor()}))
+
+	rec := httptest.NewRecorder()
+	h.attachmentUpload(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("attachmentUpload: expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	if req.MultipartForm == nil {
+		t.Fatal("expected req.MultipartForm to be populated after attachmentUpload ran")
+	}
+	defer func() {
+		if err := req.MultipartForm.RemoveAll(); err != nil {
+			t.Fatalf("cleanup temp files: %v", err)
+		}
+	}()
+
+	fhs := req.MultipartForm.File["file"]
+	if len(fhs) != 1 {
+		t.Fatalf("expected exactly 1 file part, got %d", len(fhs))
+	}
+	f, err := fhs[0].Open()
+	if err != nil {
+		t.Fatalf("Open uploaded file part: %v", err)
+	}
+	defer f.Close()
+
+	if _, ok := f.(*os.File); !ok {
+		// If this ever fails unexpectedly after adding a second file part
+		// to this request, check that first: FileHeader.Open() only
+		// returns a bare *os.File when exactly one part spilled — two or
+		// more sharing a temp file (fh.tmpshared) return the same
+		// in-memory-shaped wrapper type this assertion is trying to rule
+		// out, even though the data legitimately is on disk. Harmless
+		// here (this request has exactly one file part), but not a
+		// generalizable "any *os.File means spilled" check on its own.
+		t.Fatalf("file part of %d bytes (> multipartParseMemory=%d) was not spilled to a temp file at the real attachmentUpload call site — got %T, want *os.File; it is being buffered entirely in the process heap", len(content), multipartParseMemory, f)
+	}
+}
+
+// TestAttachmentUpload_Download_LargeFile_RoundTrips confirms the
+// smaller multipartParseMemory (uc-infra#171) doesn't change observable
+// behavior for a caller: a file well over that threshold, still under
+// maxAttachmentBytes, uploads and downloads back byte-for-byte through
+// the real handler + blobstore, exactly like the small-file case in
+// TestAttachmentUpload_Download_FullLoop.
+//
+// The upload step calls attachmentUpload directly rather than routing
+// through the real mux, for the same reason
+// TestAttachmentUpload_LargeFileSpillsToDiskNotHeap above does: DevAuth's
+// r.WithContext makes a request COPY, and this test needs to reach the
+// exact request object ParseMultipartForm populated afterward so it can
+// remove the spilled multipart temp file — production never needs to
+// do this by hand, Go's own net/http server calls
+// req.MultipartForm.RemoveAll() automatically once a real request
+// finishes (net/http/server.go's finishRequest), but httptest.NewRecorder
+// never reaches that code path. An earlier version of this test went
+// through the real mux and silently leaked a ~9 MiB temp file per run —
+// caught by independent review, confirmed against files it found
+// actually accumulating in /tmp from prior runs.
+func TestAttachmentUpload_Download_LargeFile_RoundTrips(t *testing.T) {
+	router := newTestRouter(t)
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
+	publishEntityOnly(t, db, foundation.Attachment())
+
+	h := testHandler(t, router)
+	blobRoot := t.TempDir()
+	h.SetBlobstore(newFSStoreAt(t, blobRoot))
+	mux := http.NewServeMux()
+	h.Routes(mux)
+
+	withDevAuthEnabled(t)
+	createReq := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{"name":"Acme Textiles"}`))
+	createReq.Header.Set("Content-Type", "application/json")
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("create Vendor: expected 201, got %d: %s", createRec.Code, createRec.Body.String())
+	}
+	var created struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+
+	content := bytes.Repeat([]byte("x"), multipartParseMemory+(1<<20))
+	uploadReq := newMultipartFileRequest(t, "/api/attachments/Vendor/"+created.Data.ID, "", "", "file", "big.bin", content)
+	uploadReq.SetPathValue("entityType", "Vendor")
+	uploadReq.SetPathValue("recordID", created.Data.ID)
+	uploadReq = uploadReq.WithContext(httpx.WithRequestContext(uploadReq.Context(), httpx.RequestContext{TenantID: tenantID, Actor: humanActor()}))
+
+	uploadRec := httptest.NewRecorder()
+	h.attachmentUpload(uploadRec, uploadReq)
+	if uploadRec.Code != http.StatusCreated {
+		t.Fatalf("upload: expected 201, got %d: %s", uploadRec.Code, uploadRec.Body.String())
+	}
+	if uploadReq.MultipartForm != nil {
+		t.Cleanup(func() {
+			if err := uploadReq.MultipartForm.RemoveAll(); err != nil {
+				t.Fatalf("cleanup temp files: %v", err)
+			}
+		})
+	}
+	var uploaded struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(uploadRec.Body.Bytes(), &uploaded); err != nil {
+		t.Fatalf("decode upload response: %v", err)
+	}
+
+	downloadReq := newRequest("GET", "/api/attachments/"+uploaded.Data.ID, tenantID, "farshid", nil)
+	downloadRec := httptest.NewRecorder()
+	mux.ServeHTTP(downloadRec, downloadReq)
+	if downloadRec.Code != http.StatusOK {
+		t.Fatalf("download: expected 200, got %d: %s", downloadRec.Code, downloadRec.Body.String())
+	}
+	if !bytes.Equal(downloadRec.Body.Bytes(), content) {
+		t.Fatal("downloaded content did not match the uploaded content byte-for-byte")
 	}
 }
 

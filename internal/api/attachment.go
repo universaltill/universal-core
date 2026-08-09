@@ -107,7 +107,12 @@ func (h *Handler) attachmentUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, maxAttachmentBytes)
-	if err := r.ParseMultipartForm(maxAttachmentBytes); err != nil {
+	// multipartParseMemory (not maxAttachmentBytes) as ParseMultipartForm's
+	// maxMemory bound — see that constant's own doc comment for why. This
+	// call site gets the FULL benefit of spilling: h.blobstore.Put below
+	// streams file via io.Copy, so a spilled part is never re-materialized
+	// in heap at all, unlike readUploadedFile's own call site in import.go.
+	if err := r.ParseMultipartForm(multipartParseMemory); err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, fmt.Sprintf("invalid or oversized upload (max %d MiB): %s", maxAttachmentBytes>>20, err.Error()))
 		return
 	}

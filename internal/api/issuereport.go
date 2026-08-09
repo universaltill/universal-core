@@ -169,7 +169,22 @@ func (h *Handler) issueReportTranscribe(w http.ResponseWriter, r *http.Request) 
 	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, maxVoiceNoteBytes)
-	if err := r.ParseMultipartForm(maxVoiceNoteBytes); err != nil {
+	// multipartParseMemory (not maxVoiceNoteBytes) as ParseMultipartForm's
+	// maxMemory bound — see that constant's own doc comment for why.
+	// Passing maxVoiceNoteBytes itself here (this endpoint's own
+	// pre-uc-infra#171 bug, the one sibling call site independent review
+	// found this fix had missed on its first pass — this handler has no
+	// per-tenant rate limit, see this function's own doc comment above,
+	// making it the worst candidate of the three for unbounded heap
+	// buffering) meant any recording near that cap stayed entirely in
+	// memory instead of spilling. Note this call site gets only the
+	// same PARTIAL benefit readUploadedFile's own call site does, not
+	// attachmentUpload's full one: speechassist.Client.Transcribe
+	// re-buffers file into its own in-memory multipart body before
+	// forwarding it to the Whisper server, so this only avoids
+	// duplicating the in-heap copy during PARSING, not the one
+	// Transcribe itself makes afterward.
+	if err := r.ParseMultipartForm(multipartParseMemory); err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, fmt.Sprintf("invalid or oversized recording (max %d MiB): %s", maxVoiceNoteBytes>>20, err.Error()))
 		return
 	}
@@ -250,19 +265,13 @@ func (h *Handler) issueReportSubmit(w http.ResponseWriter, r *http.Request) {
 	// 400ing — independent review caught this on the first pass.
 	r.Body = http.MaxBytesReader(w, r.Body, maxIssueReportSubmitBytes)
 	if isMultipartFormData(r) {
-		// maxMemory deliberately small and independent of
-		// maxIssueReportSubmitBytes: that's already the hard ceiling via
-		// MaxBytesReader above. Passing the full 61 MiB cap here as well
-		// would make ParseMultipartForm buffer an entire large recording
-		// into process heap (multipart.Reader.ReadForm only spills a
-		// part to a temp file past maxMemory) instead of spilling it —
-		// independent review flagged this as a real memory-exhaustion
-		// risk under concurrent large uploads. A spilled part still
-		// reads back fine through header.Open() in attachScreenRecording
-		// below; this constant only controls where the bytes sit while
-		// parsing, not what the handler can do with them afterward.
-		const issueReportSubmitParseMemory = 8 << 20 // 8 MiB
-		if err := r.ParseMultipartForm(issueReportSubmitParseMemory); err != nil {
+		// multipartParseMemory (not maxIssueReportSubmitBytes) as
+		// ParseMultipartForm's maxMemory bound — see that constant's own
+		// doc comment for why. A spilled part still reads back fine
+		// through header.Open() in attachScreenRecording below; this
+		// constant only controls where the bytes sit while parsing, not
+		// what the handler can do with them afterward.
+		if err := r.ParseMultipartForm(multipartParseMemory); err != nil {
 			httpx.WriteError(w, http.StatusBadRequest, fmt.Sprintf("invalid or oversized submission (max %d MiB): %s", maxIssueReportSubmitBytes>>20, err.Error()))
 			return
 		}
