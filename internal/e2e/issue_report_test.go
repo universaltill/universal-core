@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -133,6 +134,78 @@ func TestIssueReportPage_FormIsStyled(t *testing.T) {
 	}
 }
 
+// TestIssueReportPage_DescriptionAndConsoleLogEnforceMaxLength is the
+// real-browser regression test for uc-infra#174: title/description/
+// console_log had no length bound at all before entity.Field.MaxLength
+// existed. A
+// string-match test on the rendered HTML (checking `maxlength="20000"`
+// appears in the markup) would only prove the attribute's TEXT is
+// present, not that a real browser actually parses and enforces it — the
+// same "never proves it's actually applied" gap CLAUDE.md's testing
+// section calls out for CSS, equally true of an HTML attribute a typo
+// (e.g. a stray non-numeric character) could silently make inert. This
+// asks a real browser two things: (1) the parsed DOM maxLength property
+// (not the raw attribute string) is exactly the declared bound, and (2)
+// inserting text past that bound — via execCommand("insertText"), which
+// (unlike setting .value directly, a real browser's own paste/IME input
+// path) goes through the same native length-enforcement a typed or
+// pasted submission would — is actually truncated at the boundary, not
+// silently accepted.
+func TestIssueReportPage_DescriptionAndConsoleLogEnforceMaxLength(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, _ := testServer(t)
+	ctx := browserCtx(t, tenantID)
+
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/issue-report/new"),
+		chromedp.WaitVisible(`#uc-issue-description`, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("navigate to the issue report page: %v", err)
+	}
+
+	// title's own MaxLength (uc-infra#174, independent review: the
+	// original fix only covered description/console_log, leaving title —
+	// reachable through the identical unbounded-FieldString gap on the
+	// same request — untested here). transcript is deliberately excluded:
+	// its textarea is readonly (never typed into), so execCommand
+	// insertText's "real typed/pasted input" proof doesn't apply the same
+	// way there — its own script-assignment clamp is covered instead by
+	// TestIssueReportPage_TranscriptAndDescriptionAreClampedOnTranscribe.
+	for _, tc := range []struct {
+		field     string
+		maxLength int
+	}{
+		{"uc-issue-title", issueReportFieldMaxLength(t, "title")},
+		{"uc-issue-description", issueReportFieldMaxLength(t, "description")},
+		{"uc-issue-console-log", issueReportFieldMaxLength(t, "console_log")},
+	} {
+		var domMaxLength int
+		if err := chromedp.Run(ctx, chromedp.EvaluateAsDevTools(
+			`document.getElementById("`+tc.field+`").maxLength`, &domMaxLength,
+		)); err != nil {
+			t.Fatalf("%s: read the parsed DOM maxLength property: %v", tc.field, err)
+		}
+		if domMaxLength != tc.maxLength {
+			t.Fatalf("%s: DOM maxLength property = %d, want %d — the maxlength attribute isn't parsing as a real bound", tc.field, domMaxLength, tc.maxLength)
+		}
+
+		var resultLength int
+		script := `(function() {
+			var el = document.getElementById("` + tc.field + `");
+			el.focus();
+			el.value = "";
+			document.execCommand("insertText", false, "a".repeat(` + strconv.Itoa(tc.maxLength+1) + `));
+			return el.value.length;
+		})()`
+		if err := chromedp.Run(ctx, chromedp.EvaluateAsDevTools(script, &resultLength)); err != nil {
+			t.Fatalf("%s: insert text past the bound: %v", tc.field, err)
+		}
+		if resultLength != tc.maxLength {
+			t.Fatalf("%s: after inserting %d characters, the field holds %d — the browser did not truncate at its declared MaxLength (%d)", tc.field, tc.maxLength+1, resultLength, tc.maxLength)
+		}
+	}
+}
+
 // TestIssueReportPage_VoiceRecordShowsCleanErrorNotRawJSON is the real-
 // browser regression test for the second bug in the same screenshot: a
 // failed /issue-report/transcribe call (e.g. a deployment with no
@@ -210,6 +283,165 @@ func TestIssueReportPage_VoiceRecordShowsCleanErrorNotRawJSON(t *testing.T) {
 	}
 	if !strings.Contains(statusText, "voice transcription is not configured") {
 		t.Fatalf("expected the real server error message to reach the status line, got %q", statusText)
+	}
+}
+
+// issueReportFieldMaxLength is this test file's own copy of the identical
+// helper in internal/api/issuereport.go — reading the bound straight off
+// foundation.IssueReport() rather than hardcoding it a third time (the
+// Definition, the capture page's rendered attribute, and this test all
+// deriving from one source, per uc-infra#174's own "one source of truth"
+// fix for the constant-duplication finding).
+func issueReportFieldMaxLength(t *testing.T, name string) int {
+	t.Helper()
+	f, ok := foundation.IssueReport().FieldByName(name)
+	if !ok || f.MaxLength == nil {
+		t.Fatalf("expected foundation.IssueReport() field %q to declare a MaxLength", name)
+	}
+	return *f.MaxLength
+}
+
+// TestIssueReportPage_ConsoleLogPrefillIsClampedToMaxLength (uc-infra#174,
+// independent review) is the real-browser regression test for the fix in
+// issueReportTmpl's sessionStorage-prefill script: HTML's maxlength
+// attribute only constrains TYPED input, never a script assignment to
+// .value — so the console-log textarea's prefill (sourced from whatever
+// layout.go's shellTmpl buffered into sessionStorage during this tab's
+// session) needed its own explicit clamp, independent of the attribute
+// TestIssueReportPage_DescriptionAndConsoleLogEnforceMaxLength above
+// already proved is enforced against typed input. Seeds sessionStorage
+// with an oversized buffered log directly (the same shape
+// layout.go's ucAppendLog itself writes) rather than driving real console
+// activity, so this isolates the prefill script's own clamp from
+// ucAppendLog's separate per-entry cap (that one has its own coverage
+// need, but browser-JS-internal capture logic isn't reachable from a Go
+// test without a real page navigation of its own).
+func TestIssueReportPage_ConsoleLogPrefillIsClampedToMaxLength(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, _ := testServer(t)
+	ctx := browserCtx(t, tenantID)
+	maxLen := issueReportFieldMaxLength(t, "console_log")
+
+	// Navigate once first so a real page (with the real
+	// data-uc-tenant-bearing nav, which ucTenantKey's key derivation
+	// reads) exists to seed sessionStorage against, then reload — the
+	// prefill script only runs at page load.
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/issue-report/new"),
+		chromedp.WaitVisible(`#uc-issue-console-log`, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("initial navigate: %v", err)
+	}
+
+	seedScript := `(function() {
+		var nav = document.querySelector("[data-uc-tenant]");
+		var key = "ucConsoleLog:" + (nav ? nav.getAttribute("data-uc-tenant") : "anonymous");
+		window.sessionStorage.setItem(key, JSON.stringify(["a".repeat(` + strconv.Itoa(maxLen+5000) + `)]));
+	})()`
+	if err := chromedp.Run(ctx, chromedp.EvaluateAsDevTools(seedScript, nil)); err != nil {
+		t.Fatalf("seed an oversized buffered log into sessionStorage: %v", err)
+	}
+
+	if err := chromedp.Run(ctx,
+		chromedp.Reload(),
+		chromedp.WaitVisible(`#uc-issue-console-log`, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("reload to trigger the prefill script: %v", err)
+	}
+
+	var resultLength int
+	if err := chromedp.Run(ctx, chromedp.EvaluateAsDevTools(
+		`document.getElementById("uc-issue-console-log").value.length`, &resultLength,
+	)); err != nil {
+		t.Fatalf("read the prefilled console-log textarea's value length: %v", err)
+	}
+	if resultLength != maxLen {
+		t.Fatalf("prefilled console_log value is %d characters, want exactly %d (clamped) — the sessionStorage prefill script did not clamp an oversized buffered log", resultLength, maxLen)
+	}
+}
+
+// TestIssueReportPage_TranscriptAndDescriptionAreClampedOnTranscribe
+// (uc-infra#174, independent review) is transcript/description's own
+// version of the console-log prefill test above: the transcribe fetch's
+// .then() handler assigns both transcriptEl.value and (via the
+// append-into-description branch) descriptionEl.value directly, another
+// script assignment HTML's maxlength attribute does nothing for. Fakes
+// getUserMedia/MediaRecorder the same way
+// TestIssueReportPage_VoiceRecordShowsCleanErrorNotRawJSON does (a
+// headless browser has no real microphone), and additionally fakes
+// window.fetch itself for the /issue-report/transcribe call specifically
+// (letting every other fetch — HTMX nav, etc. — through unchanged) so
+// this doesn't depend on a real speechassist backend: the real click
+// handler, the real .then() clamp logic, and the real DOM assignments all
+// still run untouched, only the ASR response body is substituted.
+func TestIssueReportPage_TranscriptAndDescriptionAreClampedOnTranscribe(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, _ := testServer(t)
+	ctx := browserCtx(t, tenantID)
+	transcriptMax := issueReportFieldMaxLength(t, "transcript")
+	descriptionMax := issueReportFieldMaxLength(t, "description")
+
+	fakeScript := `
+(function() {
+  navigator.mediaDevices = navigator.mediaDevices || {};
+  navigator.mediaDevices.getUserMedia = function() {
+    return Promise.resolve({ getTracks: function() { return []; } });
+  };
+  window.MediaRecorder = function() {
+    var self = this;
+    this.start = function() {};
+    this.stop = function() {
+      if (self.ondataavailable) { self.ondataavailable({ data: new Blob(["fake"]) }); }
+      if (self.onstop) { self.onstop(); }
+    };
+  };
+  var realFetch = window.fetch;
+  window.fetch = function(url, opts) {
+    if (String(url).indexOf("/issue-report/transcribe") !== -1) {
+      return Promise.resolve(new Response("a".repeat(` + strconv.Itoa(transcriptMax+5000) + `), { status: 200 }));
+    }
+    return realFetch.apply(window, arguments);
+  };
+})();
+`
+	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		_, err := page.AddScriptToEvaluateOnNewDocument(fakeScript).Do(ctx)
+		return err
+	})); err != nil {
+		t.Fatalf("inject fake media/fetch script: %v", err)
+	}
+
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/issue-report/new"),
+		chromedp.WaitVisible(`#uc-issue-record-btn`, chromedp.ByQuery),
+		chromedp.Click(`#uc-issue-record-btn`, chromedp.ByQuery), // start "recording"
+		chromedp.Click(`#uc-issue-record-btn`, chromedp.ByQuery), // stop -> triggers the fake-fetch transcribe response
+	); err != nil {
+		t.Fatalf("click record then stop: %v", err)
+	}
+
+	var transcriptLength int
+	if err := chromedp.Run(ctx, chromedp.PollFunction(
+		`function() {
+			var v = document.getElementById("uc-issue-transcript").value;
+			return v && v.length > 0 ? v.length : null;
+		}`,
+		&transcriptLength,
+	)); err != nil {
+		t.Fatalf("wait for the transcript field to populate: %v", err)
+	}
+	if transcriptLength != transcriptMax {
+		t.Fatalf("transcript value is %d characters, want exactly %d (clamped)", transcriptLength, transcriptMax)
+	}
+
+	var descriptionLength int
+	if err := chromedp.Run(ctx, chromedp.EvaluateAsDevTools(
+		`document.getElementById("uc-issue-description").value.length`, &descriptionLength,
+	)); err != nil {
+		t.Fatalf("read the description field's resulting value length: %v", err)
+	}
+	if descriptionLength != descriptionMax {
+		t.Fatalf("description value is %d characters, want exactly %d (clamped) — the appended transcript was not clamped to description's own (smaller) MaxLength", descriptionLength, descriptionMax)
 	}
 }
 

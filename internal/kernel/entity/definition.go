@@ -151,6 +151,51 @@ type Field struct {
 	// bound itself lives on the Definition, not in this engine.
 	Min *float64 `json:"min,omitempty"`
 	Max *float64 `json:"max,omitempty"`
+	// MaxLength declares an inclusive upper bound, in Unicode code points
+	// (not bytes — a human-facing "N characters" limit, not UTF-8 byte
+	// length or JSONB storage size), on a FieldString value (uc-infra#174).
+	// NOT identical to a browser's own HTML maxlength attribute, which
+	// counts UTF-16 code units, not code points: the two agree for BMP
+	// text but diverge for astral-plane characters (many emoji included),
+	// where one code point is two UTF-16 units — so a browser rendering
+	// this bound as its maxlength attribute (formrender does, below)
+	// enforces a STRICTER limit than this Go-side check does for such
+	// text (half as many codepoints before it blocks further typing).
+	// That direction is safe (a browser can only reject something this
+	// check would still have accepted, never the reverse), so it's a
+	// documented mismatch, not a bug — but a Definition author choosing a
+	// bound with "avoid truncating legitimate content" in mind should
+	// read it as a code-point count, not assume it tracks a browser's own
+	// accounting exactly. *int, same "unset vs. zero
+	// stay distinguishable" pointer pattern Min/Max already use — a
+	// MaxLength of 0 would reject every non-empty value, which is a
+	// legitimate (if unusual) declaration, not the same thing as "no
+	// limit at all."
+	//
+	// Exists because entity.FieldString had no length concept whatsoever:
+	// every large-upload endpoint in internal/api wraps r.Body in
+	// http.MaxBytesReader to bound an accompanying file part, which (per
+	// net/http's own parsePostForm) also silently disables Go's built-in
+	// ~10 MiB text-field safety net for that whole request — so a plain
+	// FieldString riding alongside a big upload (IssueReport.description/
+	// console_log, the case that found this) inherited the FILE's cap
+	// instead of any bound of its own, up to tens of MiB of text into one
+	// JSONB field. This is that bound, declared the same generic,
+	// Definition-level way Min/Max already are — entity.ValidateRecord
+	// enforces it (validateFieldValue), so it applies uniformly
+	// regardless of which handler or form submitted the value.
+	//
+	// Only valid when Type == FieldString; Definition.Validate rejects it
+	// on any other field type and rejects MaxLength < 0. Not set on every
+	// FieldString by default — a blanket limit risks truncating a
+	// legitimately long field (a Definition author sets this only where a
+	// bound is actually warranted, an Architect-level per-field call, not
+	// a mechanism default). formrender renders it as the generated
+	// input's browser-native maxlength attribute (ADR-0017 §5's
+	// "validation defined once, applied identically client- and
+	// server-side"), the same pairing Min/Max's own comment above
+	// describes.
+	MaxLength *int `json:"max_length,omitempty"`
 }
 
 // UniqueConstraintName canonicalizes a declared field set into the stable
@@ -298,6 +343,10 @@ type Definition struct {
 // because every module package declaring bounds needs it, not just this one.
 func Float64Ptr(v float64) *float64 { return &v }
 
+// IntPtr mirrors Float64Ptr for Field.MaxLength — same reasoning, a
+// different scalar type (an int literal, not a float64 one).
+func IntPtr(v int) *int { return &v }
+
 // FieldByName returns the field with the given name, if present.
 func (d *Definition) FieldByName(name string) (Field, bool) {
 	for _, f := range d.Fields {
@@ -438,6 +487,12 @@ func (d *Definition) Validate() error {
 		}
 		if f.Min != nil && f.Max != nil && *f.Min > *f.Max {
 			return fmt.Errorf("field %q has min %v greater than max %v", f.Name, *f.Min, *f.Max)
+		}
+		if f.MaxLength != nil && f.Type != FieldString {
+			return fmt.Errorf("field %q has max_length but is type %q, not string", f.Name, f.Type)
+		}
+		if f.MaxLength != nil && *f.MaxLength < 0 {
+			return fmt.Errorf("field %q has a negative max_length %d", f.Name, *f.MaxLength)
 		}
 	}
 	// NotBefore checked in a second pass: it may reference a field

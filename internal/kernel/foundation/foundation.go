@@ -459,21 +459,101 @@ func StatusTransition() *entity.Definition {
 // (moduleseed.publishOne returns early once a version's status is
 // already Published), so the field would silently never reach an
 // already-provisioned tenant without this.
+//
+// Version bumped 2->3 again for MaxLength on every plain-text field
+// below (uc-infra#174) — same mechanism, no new field this time, but
+// moduleseed.publishOne keys strictly on (entity_type, version) already
+// being Published, so a tenant whose registry already has v2 published
+// would never pick up the tightened bound without a version bump either;
+// "the shape didn't add a field" doesn't change that.
+//
+// All four FieldStrings get a bound, not just description/console_log:
+// the exploit this closes is "an authenticated caller posts directly to
+// /issue-report/submit, no browser involved" (independent review of
+// uc-infra#92 found it; independent review of THIS fix caught that an
+// earlier draft only capped two of the four fields it rides in the same
+// request — title and transcript were just as reachable through the
+// identical unbounded-FieldString gap, only smaller in practice because
+// a real browser's own UI happens not to invite pasting megabytes into a
+// one-line title, not because anything stopped it).
+//
+// A version bump that TIGHTENS a bound (unlike one that adds a Required
+// field) has no recordmigrate story and deliberately gets none here: an
+// already-stored row whose text happens to exceed its field's new
+// MaxLength keeps rendering and stays readable exactly as before — only
+// a future UPDATE of that specific row would need edited text within
+// the new bound to save (entity.ValidateRecord runs identically on
+// Update as on Create, the same way Required/Min/Max already do; there
+// is no special case for pre-existing data on any other bound this
+// kernel enforces, e.g. Min/Max, and this doesn't invent one for
+// MaxLength either). recordmigrate's own doc comment scopes it to a
+// version bump that "adds or replaces a Required field" — this bump does
+// neither, so this deliberately doesn't reach for it; a Definition that
+// TRUNCATED submitted evidence text to make old rows fit would be doing
+// something recordmigrate's Transform pattern was never meant for
+// (silently discarding part of a user's bug report). Tracked instead as
+// a known, narrow, accepted gap — see uc-infra#(follow-up filed at
+// close-out) for whether existing over-length rows exist in practice and
+// what, if anything, should be done about them.
 func IssueReport() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "IssueReport",
-		Version:    2,
+		Version:    3,
 		Module:     "foundation",
+		// title: MaxLength 500 characters — a one-line summary, generous
+		// for hand-typed text, same closing-the-gap reasoning as every
+		// other field below.
 		Fields: []entity.Field{
-			{Name: "title", Type: entity.FieldString, Required: true},
+			{Name: "title", Type: entity.FieldString, Required: true, MaxLength: entity.IntPtr(500)},
 			// description is the field a human actually reads: typed text
 			// plus the voice transcript appended, if there was one — see
 			// internal/api/issuereport.go's submit handler. transcript
 			// below keeps the raw, unedited ASR output separately so a
 			// human's own edits to description never lose the original.
-			{Name: "description", Type: entity.FieldString, Required: true},
-			{Name: "transcript", Type: entity.FieldString},
-			{Name: "console_log", Type: entity.FieldString},
+			//
+			// MaxLength 20,000 characters (uc-infra#174): generous room for
+			// hand-typed text plus an appended Whisper transcript — the
+			// capture page's own script clamps the appended combination to
+			// this same bound before it ever reaches the textarea (see
+			// issueReportTmpl's transcribe .then() handler), since
+			// transcript's OWN bound below is deliberately larger than
+			// this field's (a long recording's full transcript still
+			// belongs verbatim in transcript even when only part of it
+			// fits in the appended description). Closes the gap that let
+			// one authenticated /issue-report/submit request write up to
+			// ~61 MiB of text here (maxIssueReportSubmitBytes,
+			// issuereport.go), inherited from the screen-recording
+			// upload's own byte cap because entity.FieldString had no
+			// length concept before this. issueReportTmpl's own textarea
+			// carries the identical bound as its browser-native maxlength
+			// attribute — read directly from THIS Definition at render
+			// time (issueReportNewPage), not duplicated as a separate
+			// constant, so the two can't drift; entity.ValidateRecord is
+			// what actually enforces it either way.
+			{Name: "description", Type: entity.FieldString, Required: true, MaxLength: entity.IntPtr(20000)},
+			// transcript: MaxLength 40,000 characters — the raw, unedited
+			// ASR output of a full maxVoiceNoteBytes (10 MiB) recording.
+			// Sized above description's own bound deliberately (independent
+			// review: MediaRecorder's default opus bitrate is UA-chosen,
+			// not pinned to a rate that guarantees a short transcript —
+			// at a low real-world bitrate a full-length recording can
+			// transcribe past 30-40k characters), since this field is the
+			// durable, complete record of what the ASR actually produced;
+			// only the copy appended into description is length-clamped
+			// client-side, this field never is.
+			{Name: "transcript", Type: entity.FieldString, MaxLength: entity.IntPtr(40000)},
+			// console_log: MaxLength 30,000 characters — headroom above
+			// the capture page's own client-side rolling cap (layout.go's
+			// ucLogMaxChars = 20000) for encoding/formatting overhead,
+			// while still closing the same unbounded-text gap description
+			// above documents — a non-browser caller posting directly to
+			// /issue-report/submit bypasses ucLogMaxChars entirely, so the
+			// real enforcement has to live here, not just client-side.
+			// (layout.go's own capture loop separately got its
+			// single-oversized-entry gap fixed alongside this — see
+			// ucAppendLog's doc comment — so a legitimately-captured log
+			// should not hit this bound in practice either.)
+			{Name: "console_log", Type: entity.FieldString, MaxLength: entity.IntPtr(30000)},
 			{Name: "page_url", Type: entity.FieldString},
 			{Name: "user_agent", Type: entity.FieldString},
 			{Name: "status", Type: entity.FieldEnum, Required: true,

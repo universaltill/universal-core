@@ -3,6 +3,7 @@ package foundation
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/universaltill/universal-core/internal/kernel/crud"
@@ -510,6 +511,148 @@ func TestIssueReport_RejectsUnknownStatus(t *testing.T) {
 	data := map[string]any{"title": "x", "description": "y", "status": "resolved-by-magic"}
 	if err := entity.ValidateRecord(def, data); err == nil {
 		t.Fatal("expected error for a status value outside the declared enum")
+	}
+}
+
+// TestIssueReport_DescriptionHasMaxLength (uc-infra#174): description had
+// no length bound at all before this — a plain FieldString riding along
+// in the same multipart request as a screen-recording upload inherited
+// that upload's own much larger http.MaxBytesReader byte cap
+// (issuereport.go's maxIssueReportSubmitBytes, 61 MiB) instead of any
+// bound of its own. This is the regression test at the entity-Definition
+// level (issue_report_test.go / e2e cover the HTTP-handler level).
+func TestIssueReport_DescriptionHasMaxLength(t *testing.T) {
+	def := IssueReport()
+	f, ok := def.FieldByName("description")
+	if !ok {
+		t.Fatal("expected a description field")
+	}
+	if f.MaxLength == nil {
+		t.Fatal("expected description to declare a MaxLength")
+	}
+	data := map[string]any{
+		"title":       "Something's broken",
+		"description": strings.Repeat("x", *f.MaxLength+1),
+		"status":      "new",
+	}
+	err := entity.ValidateRecord(def, data)
+	if err == nil {
+		t.Fatalf("expected error for description exceeding its MaxLength (%d)", *f.MaxLength)
+	}
+	var verr *entity.ValidationError
+	if !errors.As(err, &verr) || verr.Kind != entity.KindTooLong {
+		t.Fatalf("expected a KindTooLong ValidationError, got %v", err)
+	}
+	// At the exact bound: still valid (inclusive), same as Min/Max.
+	data["description"] = strings.Repeat("x", *f.MaxLength)
+	if err := entity.ValidateRecord(def, data); err != nil {
+		t.Fatalf("unexpected error at the inclusive MaxLength: %v", err)
+	}
+}
+
+// TestIssueReport_ConsoleLogHasMaxLength is console_log's own version of
+// TestIssueReport_DescriptionHasMaxLength immediately above — the other
+// field the originating review found unbounded.
+func TestIssueReport_ConsoleLogHasMaxLength(t *testing.T) {
+	def := IssueReport()
+	f, ok := def.FieldByName("console_log")
+	if !ok {
+		t.Fatal("expected a console_log field")
+	}
+	if f.MaxLength == nil {
+		t.Fatal("expected console_log to declare a MaxLength")
+	}
+	data := map[string]any{
+		"title":       "Something's broken",
+		"description": "The button does nothing when clicked.",
+		"console_log": strings.Repeat("x", *f.MaxLength+1),
+		"status":      "new",
+	}
+	err := entity.ValidateRecord(def, data)
+	if err == nil {
+		t.Fatalf("expected error for console_log exceeding its MaxLength (%d)", *f.MaxLength)
+	}
+	var verr *entity.ValidationError
+	if !errors.As(err, &verr) || verr.Kind != entity.KindTooLong {
+		t.Fatalf("expected a KindTooLong ValidationError, got %v", err)
+	}
+}
+
+// TestIssueReport_TitleHasMaxLength and TestIssueReport_TranscriptHasMaxLength
+// (uc-infra#174, independent review) close the rest of the same gap the two
+// tests above cover: the original fix only bounded description/console_log,
+// but title and transcript ride in the exact same /issue-report/submit
+// request, with the exact same entity.FieldString-had-no-length-concept
+// hole, and were just as reachable by a caller posting directly to the
+// endpoint (no browser, no maxlength attribute in the way).
+func TestIssueReport_TitleHasMaxLength(t *testing.T) {
+	def := IssueReport()
+	f, ok := def.FieldByName("title")
+	if !ok {
+		t.Fatal("expected a title field")
+	}
+	if f.MaxLength == nil {
+		t.Fatal("expected title to declare a MaxLength")
+	}
+	data := map[string]any{
+		"title":       strings.Repeat("x", *f.MaxLength+1),
+		"description": "Fine.",
+		"status":      "new",
+	}
+	err := entity.ValidateRecord(def, data)
+	if err == nil {
+		t.Fatalf("expected error for title exceeding its MaxLength (%d)", *f.MaxLength)
+	}
+	var verr *entity.ValidationError
+	if !errors.As(err, &verr) || verr.Kind != entity.KindTooLong {
+		t.Fatalf("expected a KindTooLong ValidationError, got %v", err)
+	}
+}
+
+func TestIssueReport_TranscriptHasMaxLength(t *testing.T) {
+	def := IssueReport()
+	f, ok := def.FieldByName("transcript")
+	if !ok {
+		t.Fatal("expected a transcript field")
+	}
+	if f.MaxLength == nil {
+		t.Fatal("expected transcript to declare a MaxLength")
+	}
+	data := map[string]any{
+		"title":       "Something's broken",
+		"description": "Fine.",
+		"transcript":  strings.Repeat("x", *f.MaxLength+1),
+		"status":      "new",
+	}
+	err := entity.ValidateRecord(def, data)
+	if err == nil {
+		t.Fatalf("expected error for transcript exceeding its MaxLength (%d)", *f.MaxLength)
+	}
+	var verr *entity.ValidationError
+	if !errors.As(err, &verr) || verr.Kind != entity.KindTooLong {
+		t.Fatalf("expected a KindTooLong ValidationError, got %v", err)
+	}
+}
+
+// TestIssueReport_TranscriptMaxLengthExceedsDescriptions pins the
+// deliberate asymmetry foundation.IssueReport's own doc comment
+// documents: transcript's bound must stay larger than description's, or
+// the capture page's append-transcript-into-description flow would have
+// nothing meaningful left to clamp against (a transcript legitimately
+// longer than description's own cap must still be storable in full,
+// verbatim, in its own field).
+func TestIssueReport_TranscriptMaxLengthExceedsDescriptionMaxLength(t *testing.T) {
+	def := IssueReport()
+	desc, ok := def.FieldByName("description")
+	if !ok || desc.MaxLength == nil {
+		t.Fatal("expected description to declare a MaxLength")
+	}
+	transcript, ok := def.FieldByName("transcript")
+	if !ok || transcript.MaxLength == nil {
+		t.Fatal("expected transcript to declare a MaxLength")
+	}
+	if *transcript.MaxLength <= *desc.MaxLength {
+		t.Fatalf("expected transcript's MaxLength (%d) to exceed description's (%d)", *transcript.MaxLength, *desc.MaxLength)
 	}
 }
 

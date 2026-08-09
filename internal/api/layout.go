@@ -235,6 +235,21 @@ var shellTmpl = template.Must(template.New("shell").Parse(fmt.Sprintf(`<!doctype
       } catch (e) {
         buf = [];
       }
+      // Cap the entry itself at push time, not just the joined total
+      // below (uc-infra#174, independent review): the shift-loop's own
+      // "&& buf.length > 1" guard exists so a single remaining entry is
+      // never discarded outright, but that same guard means a SINGLE
+      // entry already bigger than ucLogMaxChars on its own (one
+      // console.error carrying a large dumped payload, a stack trace
+      // with an inlined data URI) was never trimmed at all — the loop
+      // below stops shifting the instant only one entry is left,
+      // regardless of that entry's own length. Truncating here instead
+      // guarantees the invariant the loop below assumes: every
+      // individual entry is already within bounds before the join/shift
+      // pass ever runs.
+      if (entry.length > ucLogMaxChars) {
+        entry = entry.slice(0, ucLogMaxChars);
+      }
       buf.push(entry);
       while (buf.length > ucLogMaxEntries) {
         buf.shift();

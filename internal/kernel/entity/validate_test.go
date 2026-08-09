@@ -318,6 +318,76 @@ func TestValidateRecord_MinMax(t *testing.T) {
 	})
 }
 
+// TestValidateRecord_MaxLength (uc-infra#174): entity.Field.MaxLength is a
+// FieldString-only, inclusive, character-count (not byte-count) bound,
+// enforced by ValidateRecord the same generic way Min/Max already are.
+// This is the regression test for the underlying bug: before MaxLength
+// existed, a large-upload endpoint's own http.MaxBytesReader cap (sized
+// for an accompanying file part) was the ONLY thing bounding a plain
+// FieldString riding alongside it — up to tens of MiB of text into one
+// field.
+func TestValidateRecord_MaxLength(t *testing.T) {
+	def := &Definition{
+		EntityType: "IssueReport",
+		Version:    1,
+		Fields: []Field{
+			{Name: "description", Type: FieldString, MaxLength: IntPtr(5)},
+			{Name: "notes", Type: FieldString},
+		},
+	}
+
+	t.Run("under the limit is accepted", func(t *testing.T) {
+		if err := ValidateRecord(def, map[string]any{"description": "abcd"}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+	t.Run("at the limit is accepted (inclusive)", func(t *testing.T) {
+		if err := ValidateRecord(def, map[string]any{"description": "abcde"}); err != nil {
+			t.Fatalf("unexpected error at the inclusive maximum: %v", err)
+		}
+	})
+	t.Run("over the limit is rejected", func(t *testing.T) {
+		err := ValidateRecord(def, map[string]any{"description": "abcdef"})
+		if err == nil {
+			t.Fatal("expected error: description exceeds MaxLength")
+		}
+		var verr *ValidationError
+		if !errors.As(err, &verr) {
+			t.Fatalf("expected *ValidationError, got %T", err)
+		}
+		if verr.Kind != KindTooLong {
+			t.Fatalf("Kind = %q, want %q", verr.Kind, KindTooLong)
+		}
+		if verr.FieldName != "description" {
+			t.Fatalf("FieldName = %q, want %q", verr.FieldName, "description")
+		}
+	})
+	t.Run("empty string is accepted", func(t *testing.T) {
+		if err := ValidateRecord(def, map[string]any{"description": ""}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+	t.Run("a field with no declared MaxLength accepts any length", func(t *testing.T) {
+		if err := ValidateRecord(def, map[string]any{"notes": strings.Repeat("x", 1_000_000)}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+	t.Run("counted in characters, not bytes: multi-byte runes under the char limit are accepted", func(t *testing.T) {
+		// "café" is 4 characters but 5 UTF-8 bytes (é is 2 bytes) — a
+		// byte-counting implementation would wrongly reject this against
+		// a MaxLength of 5, since a 5th character ("s") would push it to
+		// 6 bytes despite still being only 5 characters.
+		if err := ValidateRecord(def, map[string]any{"description": "cafés"}); err != nil {
+			t.Fatalf("unexpected error: 5-character string should be accepted against MaxLength 5: %v", err)
+		}
+	})
+	t.Run("counted in characters, not bytes: multi-byte runes over the char limit are rejected", func(t *testing.T) {
+		if err := ValidateRecord(def, map[string]any{"description": "cafés!"}); err == nil {
+			t.Fatal("expected error: 6-character string exceeds MaxLength 5")
+		}
+	})
+}
+
 // TestValidateRecord_Money is the FieldMoney record-level matrix
 // (uc-infra#68): the whole-number-of-minor-units constraint is the
 // actual bug fix, so it gets its own dedicated coverage rather than

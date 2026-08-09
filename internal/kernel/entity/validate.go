@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/universaltill/universal-core/internal/kernel/money"
 )
@@ -55,6 +56,14 @@ const (
 	// carries the exact bound for logs and API callers.
 	KindBelowMinimum ValidationErrorKind = "below_minimum"
 	KindAboveMaximum ValidationErrorKind = "above_maximum"
+	// KindTooLong: a FieldString value exceeds its declared
+	// Field.MaxLength (uc-infra#174), counted in characters (Unicode
+	// code points), not bytes — see MaxLength's own doc comment. Same
+	// "no numeric parameter in the translated message" reasoning as
+	// KindBelowMinimum/KindAboveMaximum above: the untranslated Detail
+	// carries the exact counts for logs/API callers, the catalog message
+	// just names the field.
+	KindTooLong ValidationErrorKind = "too_long"
 	// KindInvalid is the defensive catch-all for a field whose Type
 	// isn't one ValidateRecord knows how to check at all. Definition.
 	// Validate rejects an unknown FieldType at publish time, so this
@@ -87,6 +96,7 @@ func AllValidationErrorKinds() []ValidationErrorKind {
 		KindNotBefore,
 		KindBelowMinimum,
 		KindAboveMaximum,
+		KindTooLong,
 		KindInvalid,
 	}
 }
@@ -290,7 +300,22 @@ func validateFieldValue(entityType string, f Field, v any) *ValidationError {
 		}
 	}
 	switch f.Type {
-	case FieldString, FieldDate, FieldReference:
+	case FieldString:
+		s, ok := v.(string)
+		if !ok {
+			return newErr(KindTypeMismatch, fmt.Sprintf("expected string, got %T", v))
+		}
+		// Counted in runes, not bytes (utf8.RuneCountInString), to match
+		// what MaxLength's own doc comment promises — a "characters"
+		// bound, the same unit a browser's maxlength attribute and a
+		// human reading "up to N characters" both mean, not a UTF-8 byte
+		// count that would let a multi-byte-heavy string (e.g. a
+		// non-Latin script) hit a lower effective character limit than a
+		// Latin one under the identical declared bound.
+		if f.MaxLength != nil && utf8.RuneCountInString(s) > *f.MaxLength {
+			return newErr(KindTooLong, fmt.Sprintf("value is %d characters, which is above the maximum of %d", utf8.RuneCountInString(s), *f.MaxLength))
+		}
+	case FieldDate, FieldReference:
 		if _, ok := v.(string); !ok {
 			return newErr(KindTypeMismatch, fmt.Sprintf("expected string, got %T", v))
 		}

@@ -835,6 +835,7 @@
   "entity.validation.not_before": "{field} نمی‌تواند قبل از {other_field} باشد.",
   "entity.validation.below_minimum": "{field} از حداقل مجاز کمتر است.",
   "entity.validation.above_maximum": "{field} از حداکثر مجاز بیشتر است.",
+  "entity.validation.too_long": "{field} بیش از حد طولانی است.",
   "entity.validation.invalid": "{field} نامعتبر است.",
   "crud.error.unique_constraint_violation": "این ترکیب از {fields} قبلاً توسط رکورد دیگری استفاده شده است.",
   "help.viewer.title": "راهنما",
