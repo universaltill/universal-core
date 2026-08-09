@@ -730,10 +730,13 @@ func (h *Handler) getRecord(w http.ResponseWriter, r *http.Request) {
 //
 //   - Request body: formrender's <form> submits via a real browser as
 //     application/x-www-form-urlencoded (or multipart/form-data once a
-//     form has a file field) — plain JSON only when a caller sets that
-//     Content-Type explicitly (every existing test does, and every JSON
-//     API client should keep working exactly as before; see
-//     parseRecordFields). Found via internal/e2e's real-browser testing:
+//     form has a file field — note that day parseRecordFields'
+//     maxRecordFieldsBytes, sized today for plain field values only,
+//     needs revisiting too, see its own comment) — plain JSON only when
+//     a caller sets that Content-Type explicitly (every existing test
+//     does, and every JSON API client should keep working exactly as
+//     before; see parseRecordFields). Found via internal/e2e's
+//     real-browser testing:
 //     the JSON-only decoder here used to reject every real htmx form
 //     submission outright with "invalid JSON body", before the request
 //     even reached validation.
@@ -761,7 +764,7 @@ func (h *Handler) createRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fields, err := parseRecordFields(r, entDef)
+	fields, err := parseRecordFields(w, r, entDef)
 	if err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, err.Error())
 		return
@@ -848,7 +851,7 @@ func (h *Handler) updateRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fields, err := parseRecordFields(r, entDef)
+	fields, err := parseRecordFields(w, r, entDef)
 	if err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, err.Error())
 		return
@@ -948,6 +951,55 @@ func isHTMXRequest(r *http.Request) bool {
 	return r.Header.Get("HX-Request") == "true"
 }
 
+// maxRecordFieldsBytes bounds EVERY body Content-Type
+// parseRecordFields accepts for its own generic-record endpoints (POST
+// /api/records/{entityType}[/{id}]) — multipart, urlencoded, and the
+// default/JSON fallback alike. Enforced via one http.MaxBytesReader on
+// r.Body applied before any Content-Type dispatch (mirroring
+// issueReportSubmit's own placement — issuereport.go, uc-infra#92 — not
+// just its per-branch use of http.MaxBytesReader): applying the cap
+// inside only the multipart branch, as this fix first shipped, left the
+// JSON/no-Content-Type path — the one every existing API-client test and
+// most real callers actually use — completely unbounded, which defeated
+// the point (caught by independent review of uc-infra#191/#195 itself).
+//
+// See multipartParseMemory's own comment for why the multipart branch's
+// ParseMultipartForm maxMemory argument is a SEPARATE bound from this one.
+//
+// Deliberately far below the file-upload endpoints' own caps (all
+// >= 10 MiB, all enforced via the same mechanism — maxAttachmentBytes,
+// maxUploadBytes, maxIssueReportSubmitBytes, maxVoiceNoteBytes): unlike
+// attachment.go/import.go/issuereport.go, this endpoint carries plain
+// entity field values coerced via csvimport.Coerce — never a file upload
+// today, nothing in this repo posts multipart to /api/records/*
+// (uc-infra#195) — so there is no legitimate reason for a submission here
+// to approach even this small a ceiling, only a reason to bound it. The
+// largest entity currently shipped (foundation.IssueReport, several
+// bounded FieldString/FieldI18nText fields) tops out around 360 KB
+// worst-case even as JSON, well under this — if a future entity's
+// Definition genuinely needs more (or gains a real file-bearing field,
+// contradicting createRecord's own doc comment on multipart today), raise
+// this deliberately rather than let it silently start rejecting valid
+// saves.
+const maxRecordFieldsBytes = 2 << 20 // 2 MiB
+
+// maxBytesFriendlyError turns the low-level, Hyrum's-law-frozen
+// *http.MaxBytesError message ("http: request body too large" — see its
+// own doc comment in net/http, that text cannot change) into one that
+// actually names the limit a caller hit, matching every other
+// oversized-body error this package already returns (issueReportSubmit,
+// attachmentUpload, readUploadedFile, issueReportTranscribe all format
+// their own "invalid or oversized …(max N MiB)" message the same way).
+// Falls back to a plain %w wrap for any other error, same as before this
+// existed.
+func maxBytesFriendlyError(prefix string, err error) error {
+	var mbe *http.MaxBytesError
+	if errors.As(err, &mbe) {
+		return fmt.Errorf("%s: request body exceeds the %d MiB limit for this endpoint", prefix, mbe.Limit>>20)
+	}
+	return fmt.Errorf("%s: %w", prefix, err)
+}
+
 // parseRecordFields reads entDef's fields out of r's body, dispatching on
 // Content-Type: a form-encoded body (what a real browser's htmx-driven
 // <form> submission actually sends — see this file's doc comment on
@@ -958,7 +1010,12 @@ func isHTMXRequest(r *http.Request) bool {
 // application/json, is decoded as a plain JSON body — the default that
 // preserves every existing API-client test unchanged, none of which set
 // Content-Type explicitly today.
-func parseRecordFields(r *http.Request, entDef *entity.Definition) (map[string]any, error) {
+func parseRecordFields(w http.ResponseWriter, r *http.Request, entDef *entity.Definition) (map[string]any, error) {
+	// Applied once, unconditionally, before any Content-Type dispatch —
+	// see maxRecordFieldsBytes' own comment for why this must not be
+	// scoped to only the multipart branch.
+	r.Body = http.MaxBytesReader(w, r.Body, maxRecordFieldsBytes)
+
 	ct := r.Header.Get("Content-Type")
 	isMultipart := strings.HasPrefix(ct, "multipart/form-data")
 	if isMultipart || strings.HasPrefix(ct, "application/x-www-form-urlencoded") {
@@ -982,12 +1039,23 @@ func parseRecordFields(r *http.Request, entDef *entity.Definition) (map[string]a
 		// like every other malformed submission.
 		var err error
 		if isMultipart {
-			err = r.ParseMultipartForm(32 << 20)
+			// multipartParseMemory (not maxRecordFieldsBytes) as
+			// ParseMultipartForm's maxMemory argument, mirroring every
+			// other multipart call site in this package — see that
+			// constant's own comment for why that's a separate bound from
+			// the hard MaxBytesReader ceiling above. Note this endpoint is
+			// the one exception where the hard ceiling (2 MiB) sits BELOW
+			// multipartParseMemory (8 MiB): nothing can ever exceed 8 MiB
+			// once already capped to 2 MiB, so ReadForm never spills to a
+			// temp file here — harmless (2 MiB comfortably fits in heap)
+			// and still the right constant to pass, for the same
+			// bug-on-sight consistency reason as every sibling call site.
+			err = r.ParseMultipartForm(multipartParseMemory)
 		} else {
 			err = r.ParseForm()
 		}
 		if err != nil {
-			return nil, fmt.Errorf("parse form: %w", err)
+			return nil, maxBytesFriendlyError("parse form", err)
 		}
 		fields := make(map[string]any, len(entDef.Fields))
 		for _, f := range entDef.Fields {
@@ -1052,7 +1120,7 @@ func parseRecordFields(r *http.Request, entDef *entity.Definition) (map[string]a
 	}
 	var fields map[string]any
 	if err := json.NewDecoder(r.Body).Decode(&fields); err != nil {
-		return nil, fmt.Errorf("invalid JSON body: %w", err)
+		return nil, maxBytesFriendlyError("invalid JSON body", err)
 	}
 	return fields, nil
 }
