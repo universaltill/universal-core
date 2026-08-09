@@ -2,6 +2,8 @@ package api
 
 import (
 	"html"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"regexp"
 	"strings"
@@ -356,5 +358,121 @@ func TestRegionPicker_PreservesSortAndPage(t *testing.T) {
 	}
 	if enUS.Get("sort") != "weight" || enUS.Get("dir") != "desc" || enUS.Get("page") != "1" {
 		t.Errorf("region picker dropped sort/dir/page — these are locale-invariant and should survive a region switch: %v", enUS)
+	}
+}
+
+// regionCookieFrom returns the region-preference cookie a response set,
+// or nil if it set none — same idiom TestRegionPreference_PersistsInCookie
+// (locale_regional_test.go) already uses inline, factored out here since
+// TestListPage_FilterFormPinsRegion_SurvivesBackButtonBookmarkOrSharedLink
+// needs both the positive AND (uc-infra#164 independent review, F1) the
+// negative case: asserting a response set NO region cookie at all.
+func regionCookieFrom(rec *httptest.ResponseRecorder) *http.Cookie {
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == regionCookie {
+			return c
+		}
+	}
+	return nil
+}
+
+// TestListPage_FilterFormPinsRegion_SurvivesBackButtonBookmarkOrSharedLink
+// is uc-infra#164. TestRegionPicker_DropsFilterValueAcrossRegionSwitch
+// above closes the region PICKER's own generated link (uc-infra#128),
+// but that fix does nothing for a request that never went through the
+// picker at all: the Back button returning to a page rendered earlier,
+// a bookmark saved while one region was active and opened later after
+// the region cookie preference has since changed, or a link shared to a
+// colleague whose region cookie differs from the sender's. All three
+// collapse to the same shape at the HTTP layer this test exercises
+// directly — a request whose "q" was typed under a region that is NOT
+// necessarily the request's own active (cookie) region unless the URL
+// itself says so.
+//
+// Uses setupAmbiguousDateTenant, not the weight-grouping fixture other
+// tests in this file use — independent review (F4): a grouping mismatch
+// only proves the weaker "stops matching" failure mode. This proves the
+// sharper one the issue itself is about, "silently matches a DIFFERENT
+// record", the same distinction
+// TestRegionPicker_DropsFilterValueAcrossRegionSwitch_ReinterpretsDate
+// already draws for the picker's own fix.
+//
+// Also renders under en-US, not the default en-GB every other assertion
+// in this file happens to use (independent review, F3): a mutation that
+// hardcoded "en-GB" wherever this fix reads the real active region would
+// otherwise pass every existing check in this file, since en-GB is also
+// locale.Default("en")'s value — indistinguishable from a real read by
+// coincidence alone.
+func TestListPage_FilterFormPinsRegion_SurvivesBackButtonBookmarkOrSharedLink(t *testing.T) {
+	tenantID, mux := setupAmbiguousDateTenant(t)
+	raw := "04/03/2026" // en-US month-first: 3 April = AprilThird. en-GB day-first: 4 March = MarchFourth.
+
+	// Render under an EXPLICIT en-US region switch (not the default) with
+	// the filter box filled in — this is exactly what a viewer would
+	// bookmark, share, or later navigate Back to. A genuine picker-driven
+	// switch persists as normal (unaffected by this fix — see the
+	// Set-Cookie assertion below).
+	rendered := getList(t, mux, tenantID, "?region=en-US&filter=ship_date&q="+url.QueryEscape(raw))
+	body := rendered.Body.String()
+	if !strings.Contains(body, "AprilThird") || strings.Contains(body, "MarchFourth") {
+		t.Fatalf("sanity: en-US month-first filter %q should match only AprilThird\n%s", raw, excerpt(body))
+	}
+	if !strings.Contains(body, `<input type="hidden" name="qregion" value="en-US">`) {
+		t.Fatalf("filter form should pin the region (en-US, not the en-GB default) it was rendered under as a hidden qregion field\n%s", excerpt(body))
+	}
+	if ck := regionCookieFrom(rendered); ck == nil || ck.Value != "en-US" {
+		t.Fatalf("an explicit ?region=en-US switch should still persist normally (unaffected by this fix), got cookie: %v", ck)
+	}
+
+	// The Back-button/bookmark/shared-link case: the SAME query the form
+	// above actually submits — filter=ship_date&qregion=en-US&q=<raw>,
+	// via its own hidden "qregion" field — arrives as a fresh request
+	// while the ACTIVE region cookie has since reverted to en-GB (the
+	// viewer switched back, or simply a colleague's own default in the
+	// shared-link case). Because the URL itself carries the region the
+	// text was typed under, the filter must still match AprilThird — not
+	// silently reinterpret the identical text as MarchFourth under
+	// en-GB's day-first rules the way a link with no pin of its own
+	// would (proven by the negative control below).
+	backButton := getList(t, mux, tenantID,
+		"?filter=ship_date&qregion=en-US&q="+url.QueryEscape(raw),
+		&http.Cookie{Name: "uc_locale_region", Value: "en-GB"},
+	)
+	backBody := backButton.Body.String()
+	if !strings.Contains(backBody, "AprilThird") || strings.Contains(backBody, "MarchFourth") {
+		t.Errorf("a request carrying its own qregion=en-US alongside q=%q must still match AprilThird (not silently reinterpret as MarchFourth) even with an en-GB region cookie active — got:\n%s", raw, excerpt(backBody))
+	}
+	// The pin must itself keep propagating forward (en-US, not the
+	// active en-GB cookie) so a SUBSEQUENT sort/page click from this
+	// same page still interprets "q" correctly too, not just this one
+	// request.
+	if !strings.Contains(backBody, `<input type="hidden" name="qregion" value="en-US">`) {
+		t.Errorf("the pin should keep propagating as en-US across this request too, got:\n%s", excerpt(backBody))
+	}
+	// uc-infra#164 independent review, F1 (MUST-FIX): the pin must NEVER
+	// be mistaken for an explicit region switch and persisted over the
+	// viewer's real cookie preference — an earlier version of this fix
+	// reused "region" for both the picker's explicit-switch param and
+	// this read-only pin, so every sort/pager/Clear link or filter-form
+	// submit silently overwrote (or, on a shared link, hijacked) the
+	// recipient's actual saved preference. A request carrying only
+	// qregion= (never region=) must produce no Set-Cookie for the region
+	// preference at all.
+	if ck := regionCookieFrom(backButton); ck != nil {
+		t.Errorf("a request pinning qregion= only (no explicit region= switch) must not touch the region cookie — got: %v", ck)
+	}
+
+	// Negative control proving this test would actually catch a
+	// regression: the identical raw text WITHOUT its own pin (falling
+	// back to the en-GB cookie — what every generated link produced
+	// before this fix) is silently reinterpreted as MarchFourth instead
+	// of AprilThird. This confirms the explicit qregion= in the checks
+	// above is what does the work, not some other path.
+	noPin := getList(t, mux, tenantID,
+		"?filter=ship_date&q="+url.QueryEscape(raw),
+		&http.Cookie{Name: "uc_locale_region", Value: "en-GB"},
+	).Body.String()
+	if !strings.Contains(noPin, "MarchFourth") || strings.Contains(noPin, "AprilThird") {
+		t.Fatalf("test setup problem: q=%q with no pin, under an en-GB cookie, should match MarchFourth not AprilThird (proves the reinterpretation is real absent this fix's pinning) — got:\n%s", raw, excerpt(noPin))
 	}
 }

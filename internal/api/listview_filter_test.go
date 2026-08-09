@@ -2,7 +2,10 @@ package api
 
 import (
 	"context"
+	"html"
 	"net/http"
+	"net/url"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -185,13 +188,34 @@ func TestListPage_ExplicitFilterFieldWithoutQuery_SurvivesSortClick(t *testing.T
 	testHandler(t, router).Routes(mux)
 
 	loaded := getAs(t, mux, "/records/Widget?filter=secret", tenantID, "anyone").Body.String()
-	if !strings.Contains(loaded, `href="/records/Widget?filter=secret&amp;sort=name"`) {
+	// Params come out "filter", "qregion", "sort" — url.Values.Encode()
+	// sorts keys alphabetically. "qregion" (uc-infra#164 — deliberately
+	// NOT "region", see qRegionParam's own doc comment) rides along
+	// unconditionally; default locale/no-cookie region is en-GB.
+	if !strings.Contains(loaded, `href="/records/Widget?filter=secret&amp;qregion=en-GB&amp;sort=name"`) {
 		t.Fatalf("the \"name\" column's sort link should carry filter=secret forward from a ?filter=secret (no ?q=) page, not drop it:\n%s", loaded)
 	}
 	// No q= should be tacked on when there was never a value to carry —
-	// only filter+sort, not a spurious empty q=.
-	if strings.Contains(loaded, `sort=name&amp;q=`) || strings.Contains(loaded, `q=&amp;sort=name`) {
-		t.Fatalf("sort link should not carry an empty q= when no filter value was ever typed:\n%s", loaded)
+	// only filter+qregion+sort, not a spurious empty q=. Parsed out of
+	// each /records/Widget href's own query (net/url, same idiom
+	// regionOptionValues uses elsewhere in this package), not a raw
+	// substring match: uc-infra#164 inserted "qregion" between "filter"
+	// and "sort" alphabetically, so the original `sort=name&q=` /
+	// `q=&sort=name` substrings could never appear again regardless of
+	// whether this bug was present (independent review — the guard had
+	// gone silently unreachable), and a raw "[?&]q=" pattern is its own
+	// hazard: this same page's unrelated reference-search JS builds a
+	// literal "?q=" string that isn't a list-page href at all and would
+	// false-positive the check (found by reproducing it).
+	for _, m := range regexp.MustCompile(`href="(/records/Widget\?[^"]*)"`).FindAllStringSubmatch(loaded, -1) {
+		href := html.UnescapeString(m[1])
+		u, err := url.Parse(href)
+		if err != nil {
+			t.Fatalf("href %q did not parse: %v", href, err)
+		}
+		if q, ok := u.Query()["q"]; ok && (len(q) == 0 || q[0] == "") {
+			t.Fatalf("sort link %q should not carry an empty q= when no filter value was ever typed", href)
+		}
 	}
 }
 
@@ -302,16 +326,22 @@ func TestListPage_FilterFormPreservesSort(t *testing.T) {
 	// NOT do so). Checked against `submitted` (sort=name&dir=desc AND an
 	// active filter), not `descLoaded` — the Clear link only renders at
 	// all when FilterValue is set, so a page with no active filter has no
-	// Clear link to check. Params come out "dir" before "sort" —
-	// url.Values.Encode() sorts keys alphabetically.
-	if !strings.Contains(submitted, `href="/records/Widget?dir=desc&amp;sort=name"`) {
-		t.Fatalf("Clear link should drop the filter but keep sort=name&dir=desc:\n%s", submitted)
+	// Clear link to check. Params come out "dir", "qregion", "sort" —
+	// url.Values.Encode() sorts keys alphabetically. "qregion"
+	// (deliberately NOT "region", see qRegionParam's own doc comment)
+	// rides along unconditionally since uc-infra#164 (default locale/
+	// no-cookie region is en-GB) — the Clear link, like every other link
+	// this handler generates, pins the region a stale "q" would be
+	// interpreted under so following it later never depends on whatever
+	// region cookie happens to be active at that point.
+	if !strings.Contains(submitted, `href="/records/Widget?dir=desc&amp;qregion=en-GB&amp;sort=name"`) {
+		t.Fatalf("Clear link should drop the filter but keep sort=name&dir=desc&qregion=en-GB:\n%s", submitted)
 	}
-	// No sort active: Clear reverts to the plain list path, same as before
-	// this fix — nothing to carry forward.
+	// No sort active: Clear still pins the region (uc-infra#164) even
+	// though there's no sort to carry forward.
 	filteredNoSort := getAs(t, mux, "/records/Widget?filter=name&q=an", tenantID, "anyone").Body.String()
-	if !strings.Contains(filteredNoSort, `href="/records/Widget"`) {
-		t.Fatalf("Clear link with no active sort should be the plain list path:\n%s", filteredNoSort)
+	if !strings.Contains(filteredNoSort, `href="/records/Widget?qregion=en-GB"`) {
+		t.Fatalf("Clear link with no active sort should still pin region=en-GB:\n%s", filteredNoSort)
 	}
 }
 
