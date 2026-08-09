@@ -605,8 +605,44 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
     };
 
     recordBtn.addEventListener("click", function() {
-      if (!recording) {
-        navigator.mediaDevices.getUserMedia({ audio: true }).then(function(stream) {
+      if (recording) {
+        mediaRecorder.stop();
+        recording = false;
+        recordBtn.textContent = {{.RecordLabel}};
+        return;
+      }
+      if (recordBtn.disabled) {
+        // Already awaiting a getUserMedia permission prompt from an
+        // earlier click on this same button — same race the
+        // screen-record button's own click handler below guards against
+        // (independent review, uc-infra#92), just for the mic
+        // (uc-infra#173): without this guard, two clicks before the
+        // first prompt resolves start two separate MediaRecorders
+        // against one shared mediaRecorder variable, and Stop only
+        // ever reaches whichever one the variable currently points at,
+        // leaving the other stream's tracks live indefinitely. The two
+        // lines right below (setting disabled, before the async
+        // permission prompt even opens) are what close that window
+        // entirely, rather than trying to reconcile two in-flight
+        // recorders after the fact.
+        return;
+      }
+      recordBtn.disabled = true;
+      navigator.mediaDevices.getUserMedia({ audio: true }).then(function(stream) {
+        recordBtn.disabled = false;
+        // try/catch around everything from here through mediaRecorder.
+        // start(), not just the getUserMedia promise itself (independent
+        // review, uc-infra#173): getUserMedia can resolve fine and then
+        // MediaRecorder's own constructor (or any other synchronous step
+        // before start()) throw — e.g. an unsupported mimeType in a
+        // future edit — and without this, that path fell through to
+        // nothing, leaving the just-granted stream's tracks live
+        // indefinitely with no code path left that could ever stop them.
+        // Mirrors the screen-record handler's own try/catch below, just
+        // without an options object to catch a rejection of (the mic
+        // recorder takes none), so this catches any other constructor
+        // failure instead.
+        try {
           chunks = [];
           mediaRecorder = new MediaRecorder(stream);
           mediaRecorder.ondataavailable = function(e) { if (e.data.size > 0) chunks.push(e.data); };
@@ -638,14 +674,14 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
           recording = true;
           recordBtn.textContent = {{.StopLabel}};
           statusEl.textContent = "";
-        }).catch(function(err) {
-          statusEl.textContent = String(err.message || err);
-        });
-      } else {
-        mediaRecorder.stop();
-        recording = false;
-        recordBtn.textContent = {{.RecordLabel}};
-      }
+        } catch (e) {
+          stream.getTracks().forEach(function(t) { t.stop(); });
+          statusEl.textContent = String(e.message || e);
+        }
+      }).catch(function(err) {
+        recordBtn.disabled = false;
+        statusEl.textContent = String(err.message || err);
+      });
     });
   }
 
