@@ -3,6 +3,7 @@ package money
 import (
 	"math"
 	"testing"
+	"testing/quick"
 )
 
 // TestSum_NoFloatArtifact pins the exact bug this package exists to fix
@@ -204,5 +205,94 @@ func TestIsDigits(t *testing.T) {
 func TestSum_Empty(t *testing.T) {
 	if got := Sum(); got != 0 {
 		t.Errorf("Sum() = %d, want 0", int64(got))
+	}
+}
+
+// TestFromMajorUnits is the canonical currency-aware conversion table
+// test (uc-infra#163) — promoted verbatim in spirit from
+// internal/kernel/assets' own TestMinorUnits, which exercised the
+// identical logic before it moved here.
+func TestFromMajorUnits(t *testing.T) {
+	for _, tc := range []struct {
+		v         float64
+		minorUnit int
+		want      int64
+	}{
+		{1200, 2, 120_000},
+		{1234.56, 2, 123_456},
+		{0.005, 2, 1}, // representable above the half, so it rounds up
+		{-0.005, 2, -1},
+		{1000, 0, 1000},     // a zero-decimal currency (JPY-style)
+		{12.345, 3, 12_345}, // a three-decimal currency (KWD/BHD-style)
+		// The documented float artifact: 0.145 is stored as
+		// 0.14499999…, so it rounds DOWN where decimal half-up would
+		// give 15. Pinned so a future change to this rounding is
+		// deliberate, not accidental.
+		{0.145, 2, 14},
+	} {
+		got, err := FromMajorUnits(tc.v, tc.minorUnit)
+		if err != nil {
+			t.Errorf("FromMajorUnits(%v, %d): unexpected error %v", tc.v, tc.minorUnit, err)
+			continue
+		}
+		if int64(got) != tc.want {
+			t.Errorf("FromMajorUnits(%v, %d) = %d, want %d", tc.v, tc.minorUnit, int64(got), tc.want)
+		}
+	}
+}
+
+// TestFromMajorUnits_Rejections mirrors assets.MinorUnits' own
+// regression test for the independent review's arch-dependent
+// float64->int64 conversion finding: this cluster is mixed arm64/amd64,
+// and an unchecked conversion produced a clean error on one node and a
+// fabricated amount on the other for the same input. Every one of these
+// must now be an error on every architecture.
+func TestFromMajorUnits_Rejections(t *testing.T) {
+	for name, tc := range map[string]struct {
+		v         float64
+		minorUnit int
+	}{
+		"NaN":                {math.NaN(), 2},
+		"positive infinity":  {math.Inf(1), 2},
+		"negative infinity":  {math.Inf(-1), 2},
+		"overflows int64":    {1e18, 2},
+		"overflows negative": {-1e18, 2},
+		"overflows at 3dp":   {1e16, 3},
+		"negative scale":     {100, -1},
+		"absurd scale":       {100, 20},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got, err := FromMajorUnits(tc.v, tc.minorUnit); err == nil {
+				t.Fatalf("FromMajorUnits(%v, %d) = %d, want an error", tc.v, tc.minorUnit, int64(got))
+			}
+		})
+	}
+	// The largest value that still converts cleanly must keep working —
+	// the guard has to reject overflow, not sensible money.
+	if _, err := FromMajorUnits(1e12, 2); err != nil {
+		t.Errorf("a trillion at 2dp should convert fine: %v", err)
+	}
+}
+
+// TestFromMajorUnits_NeverPanicsProperty: whatever float64 and scale
+// arrive from a JSONB record, the converter either returns a usable
+// value or an error — never a panic, and never a wrapped-around
+// negative for a positive input (the arch-dependent failure mode).
+func TestFromMajorUnits_NeverPanicsProperty(t *testing.T) {
+	f := func(v float64, scale uint8) bool {
+		got, err := FromMajorUnits(v, int(scale)%10)
+		if err != nil {
+			return true
+		}
+		if v > 0 && int64(got) < 0 {
+			return false
+		}
+		if v < 0 && int64(got) > 0 {
+			return false
+		}
+		return true
+	}
+	if err := quick.Check(f, &quick.Config{MaxCount: 5000}); err != nil {
+		t.Fatalf("FromMajorUnits sign/panic invariant violated: %v", err)
 	}
 }

@@ -876,16 +876,36 @@ func vendorInvoiceMatchDetail(ctx context.Context, tx *sql.Tx, records *data.Rec
 		return fmt.Sprintf("PurchaseOrder %s has nothing received against it yet", poID), nil
 	}
 	// total is VendorInvoice.total, still FieldNumber (major-unit float)
-	// — that field is NOT part of uc-infra#136's migration, so
-	// ledger.ToMinorUnits(total) is still the correct conversion here.
-	// receivedMinor, by contrast, already comes back in minor units from
-	// receivedValueForPurchaseOrder below (which sums POLine.unit_price,
-	// now FieldMoney) — no ToMinorUnits call on that side, since it's
-	// already at the right scale (uc-infra#136; running it through
-	// ToMinorUnits too would double-convert and compare 100x the real
-	// value, the identical hazard PostGoodsReceiptLineToLedger's own
-	// amountMinor computation above just fixed).
-	if totalMinor := ledger.ToMinorUnits(total); receivedMinor != totalMinor {
+	// — that field is NOT part of uc-infra#136's migration, so it still
+	// needs converting to minor units here.
+	//
+	// Deliberately NOT currency-aware via this invoice's own currency_id
+	// (uc-infra#163 investigated this: unlike sales.PostCustomerInvoiceToLedger,
+	// which posts a standalone Dr/Cr pair at whatever scale is chosen, this
+	// comparison's OTHER side — receivedMinor, from receivedValueForPurchaseOrder
+	// below — sums POLine.unit_price, which is money.Money and therefore
+	// pinned at this package's fixed, currency-agnostic money.Decimals (2dp)
+	// scale by design, not the PO's or invoice's own currency. Converting
+	// totalMinor at a real per-currency scale while receivedMinor stays
+	// pinned at 2dp would compare two different scales and silently break
+	// this match for any non-2dp currency — worse than today's already-
+	// documented fixed-2dp assumption, not better. A correct fix needs
+	// receivedValueForPurchaseOrder itself to become currency-aware too
+	// (recovering a major-unit amount from POLine.unit_price and
+	// re-scaling), which is a bigger, separately-scoped change — tracked
+	// as uc-infra#193 (filed this cycle) rather than ballooned into
+	// this one. money.FromMajorUnits still buys this call site the
+	// NaN/±Inf/overflow validation ledger.ToMinorUnits never had.
+	totalMinorMoney, err := money.FromMajorUnits(total, money.Decimals)
+	if err != nil {
+		// A corrupt total (NaN/±Inf/overflow) is a data problem this
+		// invoice's own record can't answer for — not an ordinary
+		// business match disagreement, so this fails the hook outright
+		// (ErrVendorInvoiceMatchFailed) rather than routing to
+		// match_exception like every other mismatch below.
+		return "", fmt.Errorf("%w: VendorInvoice %s: convert total to minor units: %w", ErrVendorInvoiceMatchFailed, rec.ID, err)
+	}
+	if totalMinor := int64(totalMinorMoney); receivedMinor != totalMinor {
 		return fmt.Sprintf("total %.2f (%d minor units) does not match received value %.2f (%d minor units) for PurchaseOrder %s",
 			total, totalMinor, money.Money(receivedMinor).Major(), receivedMinor, poID), nil
 	}

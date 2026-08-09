@@ -9,8 +9,11 @@
 //     float64 drifts, and the drift lands in the book value that a
 //     balance sheet reports. Cost and salvage arrive as the float64
 //     the entity engine stores for a FieldNumber, are converted to
-//     minor units ONCE at the boundary, and every subsequent
-//     operation is integer arithmetic.
+//     minor units ONCE at the boundary (MinorUnits — since uc-infra#163
+//     a thin wrapper over internal/kernel/money.FromMajorUnits, the
+//     shared canonical implementation this package's own conversion
+//     logic originated), and every subsequent operation is integer
+//     arithmetic.
 //  2. **The periods sum exactly to the depreciable base.** Dividing
 //     a base that isn't a whole multiple of the period count leaves a
 //     remainder; spreading it by rounding each period independently
@@ -24,8 +27,9 @@ package assets
 
 import (
 	"fmt"
-	"math"
 	"time"
+
+	"github.com/universaltill/universal-core/internal/kernel/money"
 )
 
 // Method names a depreciation method. Straight-line only for now —
@@ -75,10 +79,12 @@ type Period struct {
 	BookValueMinor    int64
 }
 
-// MaxMinorUnitScale bounds the currency scale this converter accepts.
-// No ISO 4217 currency has more than 4 decimal places; anything beyond
-// that is a corrupt Currency record, not an exotic one.
-const MaxMinorUnitScale = 6
+// MaxMinorUnitScale bounds the currency scale MinorUnits accepts. Kept
+// as an alias of money.MaxMinorUnitScale (rather than dropped) so any
+// existing caller reading assets.MaxMinorUnitScale for its numeric
+// value doesn't need to change — money is now the source of truth
+// (uc-infra#163).
+const MaxMinorUnitScale = money.MaxMinorUnitScale
 
 // MaxUsefulLifeMonths caps a depreciation term at 100 years. Without a
 // ceiling, a mistyped useful_life_months allocates a Period per month —
@@ -87,45 +93,33 @@ const MaxUsefulLifeMonths = 1200
 
 // MinorUnits converts an entity FieldNumber value to integer minor
 // units for the given currency scale, rounding to nearest (ties away
-// from zero, as far as the float's own representation allows — see
-// below).
-//
-// The float is the entity engine's storage type, not a choice made
-// here; this function is the single boundary where it stops being one,
-// which is exactly why it validates rather than trusting its input.
-// FieldNumber accepts ANY float64, including NaN, ±Inf and values far
-// beyond int64 — and Go makes an out-of-range float→int conversion
-// *implementation-dependent*: the independent review compiled this for
-// both architectures and got MaxInt64 on arm64 where amd64 gave
-// MinInt64 for the same input. This product's own cluster is mixed
-// arm64/amd64, so that is not a theoretical portability note: the same
-// asset record produced a clean error on one node and a complete,
-// fabricated depreciation schedule on another. An error return is the
-// only honest answer.
-//
-// Rounding caveat: "ties away from zero" is exact only when the decimal
-// is exactly representable. 0.145 is stored as 0.14499999…, so it
-// converts to 14, not the 15 a person would write on paper. That is
-// inherent to a float64 input and disappears when FieldNumber amounts
-// move to an integer money type; it is not something this function can
-// fix, so it is documented and pinned by a test rather than papered
-// over.
+// from zero, as far as the float's own representation allows). Thin
+// wrapper over money.FromMajorUnits — the validated, currency-aware
+// conversion this function originated (independent review of a
+// depreciation valuation bug: an out-of-range float→int conversion is
+// architecture-dependent, and this product's cluster is mixed
+// arm64/amd64, so the same asset record produced a clean error on one
+// node and a fabricated depreciation schedule on another) and which
+// uc-infra#163 promoted to internal/kernel/money once a second,
+// independent call site (sales/purchasing invoice posting) needed the
+// identical conversion. Kept here, with this exact signature
+// (int64, not money.Money), because cmd/seed-demo-data and this
+// package's own callers already depend on it unchanged. See
+// money.FromMajorUnits' own doc comment for the full validation/
+// rounding rationale.
 func MinorUnits(v float64, minorUnit int) (int64, error) {
-	if minorUnit < 0 || minorUnit > MaxMinorUnitScale {
-		return 0, fmt.Errorf("assets: currency minor unit %d is out of range 0..%d", minorUnit, MaxMinorUnitScale)
+	// No "assets: " wrap here (independent review, uc-infra#163): money.
+	// FromMajorUnits' own error text already starts with "money: ",
+	// self-describing and unambiguous on its own — an added prefix would
+	// only have doubled it ("assets: money: ...") with nothing gained,
+	// and nothing in this package's own tests assert on the exact string
+	// (only err == nil / err != nil), so there was no compatibility
+	// reason to keep it either.
+	m, err := money.FromMajorUnits(v, minorUnit)
+	if err != nil {
+		return 0, err
 	}
-	if math.IsNaN(v) || math.IsInf(v, 0) {
-		return 0, fmt.Errorf("assets: amount %v is not a finite number", v)
-	}
-	scaled := math.Round(v * math.Pow(10, float64(minorUnit)))
-	// The bound is exclusive because float64 cannot represent MaxInt64
-	// exactly — the nearest double is 2^63, one above it — so comparing
-	// against the float form of MaxInt64 would admit a value that
-	// overflows on conversion.
-	if math.Abs(scaled) >= math.Pow(2, 63) {
-		return 0, fmt.Errorf("assets: amount %v exceeds what %d minor units can represent", v, minorUnit)
-	}
-	return int64(scaled), nil
+	return int64(m), nil
 }
 
 // Build computes the full depreciation schedule. It validates its own
