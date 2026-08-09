@@ -45,9 +45,9 @@ type Client struct {
 // cold model/busy server can genuinely take tens of seconds.
 const defaultTimeout = 90 * time.Second
 
-// NewClient builds a Client for baseURL (e.g.
-// "http://whisper.whisper.svc.cluster.local" in-cluster, or an ingress
-// URL). baseURL == "" returns nil, not a Client with an empty URL — see
+// NewClient builds a Client for baseURL (e.g. "http://whisper.internal:9000"
+// in-cluster, or an external ingress URL). baseURL == "" returns nil, not
+// a Client with an empty URL — see
 // Enabled's doc comment on why every caller can then treat "STT not
 // configured" and "got back a nil *Client" as the exact same case.
 func NewClient(baseURL string) *Client {
