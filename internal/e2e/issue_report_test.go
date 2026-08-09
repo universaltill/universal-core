@@ -911,3 +911,159 @@ func TestIssueReportPage_ScreenRecord_OversizedRecordingNotAttachedFormIntact(t 
 		t.Fatalf("expected the report to have been saved despite the oversized recording, got %d: %.500s", apiResult.Status, apiResult.Body)
 	}
 }
+
+// TestIssueReportPage_ScreenRecord_DoubleClickDoesNotStartTwoStreams is the
+// real-browser regression test for uc-infra#197: the screen-record button's
+// own disable-on-click guard (issuereport.go's click handler — both the
+// synchronous `screenBtn.disabled = true;` set before the async
+// getDisplayMedia call, and the explicit `if (screenBtn.disabled) return;`
+// early return guarding the handler itself) shipped as part of uc-infra#92's
+// independent review — the same protection
+// TestIssueReportPage_MicRecord_DoubleClickDoesNotStartTwoStreams already
+// pins for the pre-existing mic button — but never got a regression test of
+// its own. This closes that gap the same way, driven against getDisplayMedia
+// instead of getUserMedia.
+//
+// A real (or CDP-simulated) click cannot reach an already-disabled button at
+// all, so the two clicks below only ever prove the synchronous disable, not
+// the explicit early-return line — the same structural gap the mic test
+// this one is modeled on has. This test additionally dispatches a synthetic
+// click event directly (bypassing the browser's native disabled-control
+// dispatch suppression, per independent review of this card) to reach the
+// handler while the button is disabled and confirm the early return itself
+// is what stops it, not merely an artifact of the browser never invoking the
+// listener a second time.
+//
+// Uses testServerWithBlobstore, not the plain testServer every other
+// double-click/permission test in this file uses, because the
+// screen-record button only renders at all when AttachmentsEnabled is true
+// (issueReportNewPage's own gate) — a blobstore-less server would never
+// show the button this test needs to click.
+func TestIssueReportPage_ScreenRecord_DoubleClickDoesNotStartTwoStreams(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, _ := testServerWithBlobstore(t)
+	ctx := browserCtx(t, tenantID)
+
+	const fakeDeferredDisplayMediaScript = `
+(function() {
+  navigator.mediaDevices = navigator.mediaDevices || {};
+  window.__getDisplayMediaCallCount = 0;
+  window.__resolveGetDisplayMedia = null;
+  navigator.mediaDevices.getDisplayMedia = function() {
+    window.__getDisplayMediaCallCount++;
+    return new Promise(function(resolve) {
+      window.__resolveGetDisplayMedia = resolve;
+    });
+  };
+  window.MediaRecorder = function() {
+    var self = this;
+    this.state = "recording";
+    this.start = function() {};
+    this.stop = function() {
+      self.state = "inactive";
+      if (self.ondataavailable) { self.ondataavailable({ data: new Blob(["fake screen recording bytes"]) }); }
+      if (self.onstop) { self.onstop(); }
+    };
+  };
+})();
+`
+	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		_, err := page.AddScriptToEvaluateOnNewDocument(fakeDeferredDisplayMediaScript).Do(ctx)
+		return err
+	})); err != nil {
+		t.Fatalf("inject fake deferred display media script: %v", err)
+	}
+
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/issue-report/new"),
+		chromedp.WaitVisible(`#uc-issue-screenrecord-btn`, chromedp.ByQuery),
+		chromedp.Click(`#uc-issue-screenrecord-btn`, chromedp.ByQuery), // first click: starts the (pending) getDisplayMedia call
+	); err != nil {
+		t.Fatalf("click the screen-record button once: %v", err)
+	}
+
+	// The guard's own proof, before the pending promise ever resolves: the
+	// button must already be disabled, which is also what makes the
+	// browser itself refuse to dispatch a second click below.
+	var disabledWhilePending bool
+	if err := chromedp.Run(ctx, chromedp.EvaluateAsDevTools(
+		`document.getElementById("uc-issue-screenrecord-btn").disabled`, &disabledWhilePending,
+	)); err != nil {
+		t.Fatalf("read the screen-record button's disabled state while getDisplayMedia is pending: %v", err)
+	}
+	if !disabledWhilePending {
+		t.Fatal("expected the screen-record button to be disabled synchronously on click, before getDisplayMedia resolves (regression: uc-infra#197)")
+	}
+
+	// A real browser does not dispatch "click" on an already-disabled
+	// button — this is the actual double-click scenario the bug report
+	// describes, driven the same way a real impatient user would.
+	if err := chromedp.Run(ctx, chromedp.Click(`#uc-issue-screenrecord-btn`, chromedp.ByQuery)); err != nil {
+		t.Fatalf("click the screen-record button a second time while the first getDisplayMedia call is pending: %v", err)
+	}
+
+	var callCount int
+	if err := chromedp.Run(ctx, chromedp.EvaluateAsDevTools(`window.__getDisplayMediaCallCount`, &callCount)); err != nil {
+		t.Fatalf("read getDisplayMedia's call count: %v", err)
+	}
+	if callCount != 1 {
+		t.Fatalf("expected getDisplayMedia to have been called exactly once despite two clicks, got %d calls (regression: uc-infra#197 — an earlier stream would be left live indefinitely, the same class of bug independent review already fixed once for the mic button)", callCount)
+	}
+
+	// The native-dispatch clicks above prove the button is disabled, but a
+	// disabled control's own semantics — not necessarily the handler's own
+	// `if (screenBtn.disabled) return;` guard — are what block them: the
+	// browser never even invokes the listener a second time, so those
+	// clicks can't tell the guard apart from "the browser didn't try."
+	// Dispatching the click event directly bypasses that native suppression
+	// and reaches the listener regardless of the disabled attribute
+	// (independent review of this card confirmed this reaches the handler
+	// where a real/CDP click does not) — this is what actually exercises the
+	// explicit early-return line the doc comment above claims to test.
+	if err := chromedp.Run(ctx, chromedp.EvaluateAsDevTools(
+		`document.getElementById("uc-issue-screenrecord-btn")
+			.dispatchEvent(new MouseEvent("click", { bubbles: true }))`, nil,
+	)); err != nil {
+		t.Fatalf("dispatch a synthetic click event at the disabled screen-record button: %v", err)
+	}
+	if err := chromedp.Run(ctx, chromedp.EvaluateAsDevTools(`window.__getDisplayMediaCallCount`, &callCount)); err != nil {
+		t.Fatalf("read getDisplayMedia's call count after the synthetic dispatch: %v", err)
+	}
+	if callCount != 1 {
+		t.Fatalf("expected the disabled button's early-return guard to block a synthetically-dispatched click too, got %d total getDisplayMedia calls (regression: uc-infra#197's guard line itself, not just the browser's native disabled-control dispatch suppression)", callCount)
+	}
+
+	// Resolve the pending permission prompt and confirm recording still
+	// starts normally afterward — the guard must not leave the button
+	// stuck disabled or the handler otherwise broken.
+	if err := chromedp.Run(ctx, chromedp.Evaluate(
+		`window.__resolveGetDisplayMedia({ getTracks: function() { return []; } }); void 0;`, nil,
+	)); err != nil {
+		t.Fatalf("resolve the pending getDisplayMedia promise: %v", err)
+	}
+
+	// Polls for the exact post-resolve text, not merely "any non-empty
+	// text" (same reasoning as the mic version of this test): the button
+	// already reads a non-empty string ("Record screen") before the
+	// resolve, so a looser predicate would prove nothing about actually
+	// waiting for the promise.
+	var recordBtnText string
+	if err := chromedp.Run(ctx, chromedp.PollFunction(
+		`function() {
+			var t = document.getElementById("uc-issue-screenrecord-btn").textContent;
+			return t === "Stop recording" ? t : null;
+		}`,
+		&recordBtnText,
+	)); err != nil {
+		t.Fatalf("wait for the screen-record button to reflect the started recording: %v", err)
+	}
+	var enabledAfterResolve bool
+	if err := chromedp.Run(ctx, chromedp.EvaluateAsDevTools(
+		`!document.getElementById("uc-issue-screenrecord-btn").disabled`, &enabledAfterResolve,
+	)); err != nil {
+		t.Fatalf("read the screen-record button's disabled state after getDisplayMedia resolves: %v", err)
+	}
+	if !enabledAfterResolve {
+		t.Fatal("expected the screen-record button to be re-enabled once getDisplayMedia resolves")
+	}
+}
