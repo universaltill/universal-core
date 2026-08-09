@@ -1299,3 +1299,271 @@ func TestIssueReportPage_ScreenRecord_DoubleClickDoesNotStartTwoStreams(t *testi
 		t.Fatal("expected the screen-record button to be re-enabled once getDisplayMedia resolves")
 	}
 }
+
+// TestIssueReportPage_ScreenRecord_RecorderConstructorThrowStopsStream is
+// the screen-record counterpart of
+// TestIssueReportPage_MicRecord_RecorderConstructorThrowStopsStream
+// (independent review, uc-infra#198): the screen-record handler's
+// try/catch only ever wrapped the primary `new MediaRecorder(stream,
+// {videoBitsPerSecond: ...})` call — a throw there was handled, by
+// falling back to `new MediaRecorder(stream)` — but a throw from that
+// fallback itself (a throw inside a catch block isn't caught by its own
+// try) or from `screenRecorder.start()` escaped into the outer
+// `.then(...).catch(...)` below, which has no access to `stream` (a
+// separate function's own parameter) and so could never stop its
+// tracks, leaving the display-share stream (and the browser's "you are
+// sharing your screen" indicator) live indefinitely. This test drives
+// the fallback-throw path (the fake makes both the primary and fallback
+// constructor calls throw); see
+// TestIssueReportPage_ScreenRecord_RecorderStartThrowStopsStream below
+// for the other escape route. Mirrors the mic handler's own fix.
+func TestIssueReportPage_ScreenRecord_RecorderConstructorThrowStopsStream(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, _ := testServerWithBlobstore(t)
+	ctx := browserCtx(t, tenantID)
+
+	const fakeThrowingScreenRecorderScript = `
+(function() {
+  navigator.mediaDevices = navigator.mediaDevices || {};
+  window.__trackStopCount = 0;
+  navigator.mediaDevices.getDisplayMedia = function() {
+    return Promise.resolve({
+      getTracks: function() {
+        return [
+          { stop: function() { window.__trackStopCount++; } },
+          { stop: function() { window.__trackStopCount++; } }
+        ];
+      }
+    });
+  };
+  window.MediaRecorder = function() {
+    throw new Error("unsupported MediaRecorder configuration");
+  };
+})();
+`
+	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		_, err := page.AddScriptToEvaluateOnNewDocument(fakeThrowingScreenRecorderScript).Do(ctx)
+		return err
+	})); err != nil {
+		t.Fatalf("inject fake throwing-MediaRecorder script: %v", err)
+	}
+
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/issue-report/new"),
+		chromedp.WaitVisible(`#uc-issue-screenrecord-btn`, chromedp.ByQuery),
+		chromedp.Click(`#uc-issue-screenrecord-btn`, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("click the screen-record button: %v", err)
+	}
+
+	var status string
+	if err := chromedp.Run(ctx, chromedp.PollFunction(
+		`function() {
+			var t = document.getElementById("uc-issue-screenrecord-status").textContent;
+			return t && t.length > 0 ? t : null;
+		}`,
+		&status,
+	)); err != nil {
+		t.Fatalf("wait for the constructor-failure status message: %v", err)
+	}
+	if !strings.Contains(status, "unsupported MediaRecorder configuration") {
+		t.Fatalf("expected the constructor's error to reach the status line, got %q", status)
+	}
+
+	// The actual proof this doesn't leak: both tracks of the
+	// already-granted display-share stream were stopped, not left live.
+	var trackStopCount int
+	if err := chromedp.Run(ctx, chromedp.EvaluateAsDevTools(`window.__trackStopCount`, &trackStopCount)); err != nil {
+		t.Fatalf("read the track-stop count: %v", err)
+	}
+	if trackStopCount != 2 {
+		t.Fatalf("expected both display-share stream tracks to be stopped after the MediaRecorder constructor threw, got %d stopped (regression: independent review of uc-infra#198 — the stream, and the browser's screen-share indicator, would otherwise be left live indefinitely)", trackStopCount)
+	}
+
+	var enabledAfterThrow bool
+	if err := chromedp.Run(ctx, chromedp.EvaluateAsDevTools(
+		`!document.getElementById("uc-issue-screenrecord-btn").disabled`, &enabledAfterThrow,
+	)); err != nil {
+		t.Fatalf("read the screen-record button's disabled state after the constructor threw: %v", err)
+	}
+	if !enabledAfterThrow {
+		t.Fatal("expected the screen-record button to be re-enabled after the constructor threw, so the person can retry")
+	}
+}
+
+// TestIssueReportPage_ScreenRecord_RecorderStartThrowStopsStream is the
+// other half of this fix (independent review of uc-infra#198's own
+// diff): the constructor-throw test above only ever exercises the
+// fallback-constructor escape route, not screenRecorder.start() itself —
+// the second route the bug report named, and the one the widened
+// try/catch has to cover for the fix to actually be complete. Without
+// this test, an edit that narrowed the try back to close right after the
+// constructor fallback (leaving start() outside it again) would leave
+// every other test in this file green, including the constructor-throw
+// test above, since its fake never reaches start() at all. Here the
+// fake constructs successfully but throws from start() instead.
+func TestIssueReportPage_ScreenRecord_RecorderStartThrowStopsStream(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, _ := testServerWithBlobstore(t)
+	ctx := browserCtx(t, tenantID)
+
+	const fakeThrowingStartScript = `
+(function() {
+  navigator.mediaDevices = navigator.mediaDevices || {};
+  window.__trackStopCount = 0;
+  navigator.mediaDevices.getDisplayMedia = function() {
+    return Promise.resolve({
+      getTracks: function() {
+        return [
+          { stop: function() { window.__trackStopCount++; } },
+          { stop: function() { window.__trackStopCount++; } }
+        ];
+      }
+    });
+  };
+  window.MediaRecorder = function() {
+    this.start = function() { throw new Error("start failed: device disconnected"); };
+  };
+})();
+`
+	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		_, err := page.AddScriptToEvaluateOnNewDocument(fakeThrowingStartScript).Do(ctx)
+		return err
+	})); err != nil {
+		t.Fatalf("inject fake throwing-start script: %v", err)
+	}
+
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/issue-report/new"),
+		chromedp.WaitVisible(`#uc-issue-screenrecord-btn`, chromedp.ByQuery),
+		chromedp.Click(`#uc-issue-screenrecord-btn`, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("click the screen-record button: %v", err)
+	}
+
+	var status string
+	if err := chromedp.Run(ctx, chromedp.PollFunction(
+		`function() {
+			var t = document.getElementById("uc-issue-screenrecord-status").textContent;
+			return t && t.length > 0 ? t : null;
+		}`,
+		&status,
+	)); err != nil {
+		t.Fatalf("wait for the start-failure status message: %v", err)
+	}
+	if !strings.Contains(status, "start failed: device disconnected") {
+		t.Fatalf("expected start()'s error to reach the status line, got %q", status)
+	}
+
+	// The actual proof this doesn't leak: both tracks of the
+	// already-granted display-share stream were stopped, not left live —
+	// this is the assertion that would NOT have failed if the try/catch
+	// only covered the constructor and not start() itself.
+	var trackStopCount int
+	if err := chromedp.Run(ctx, chromedp.EvaluateAsDevTools(`window.__trackStopCount`, &trackStopCount)); err != nil {
+		t.Fatalf("read the track-stop count: %v", err)
+	}
+	if trackStopCount != 2 {
+		t.Fatalf("expected both display-share stream tracks to be stopped after start() threw, got %d stopped (regression: independent review of uc-infra#198 — the stream, and the browser's screen-share indicator, would otherwise be left live indefinitely)", trackStopCount)
+	}
+
+	var enabledAfterThrow bool
+	if err := chromedp.Run(ctx, chromedp.EvaluateAsDevTools(
+		`!document.getElementById("uc-issue-screenrecord-btn").disabled`, &enabledAfterThrow,
+	)); err != nil {
+		t.Fatalf("read the screen-record button's disabled state after start() threw: %v", err)
+	}
+	if !enabledAfterThrow {
+		t.Fatal("expected the screen-record button to be re-enabled after start() threw, so the person can retry")
+	}
+}
+
+// TestIssueReportPage_ScreenRecord_PermissionDeniedReEnablesButtonForRetry
+// pins the screen-record handler's existing `screenBtn.disabled = false;`
+// re-enable-after-rejection line (independent review, uc-infra#198): no
+// existing test exercised a getDisplayMedia rejection, so nothing would
+// have caught a future edit silently dropping that line — leaving a
+// denied screen-share stuck disabled until page reload, with no way to
+// retry short of that. Modeled on the mic button's own
+// TestIssueReportPage_MicRecord_PermissionDeniedReEnablesButtonForRetry.
+func TestIssueReportPage_ScreenRecord_PermissionDeniedReEnablesButtonForRetry(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, _ := testServerWithBlobstore(t)
+	ctx := browserCtx(t, tenantID)
+
+	const fakeDenyThenAllowScreenShareScript = `
+(function() {
+  navigator.mediaDevices = navigator.mediaDevices || {};
+  window.__getDisplayMediaCallCount = 0;
+  navigator.mediaDevices.getDisplayMedia = function() {
+    window.__getDisplayMediaCallCount++;
+    if (window.__getDisplayMediaCallCount === 1) {
+      return Promise.reject(new Error("Permission denied"));
+    }
+    return Promise.resolve({ getTracks: function() { return []; } });
+  };
+  window.MediaRecorder = function() {
+    var self = this;
+    this.state = "recording";
+    this.start = function() {};
+    this.stop = function() {
+      self.state = "inactive";
+      if (self.ondataavailable) { self.ondataavailable({ data: new Blob(["fake"]) }); }
+      if (self.onstop) { self.onstop(); }
+    };
+  };
+})();
+`
+	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		_, err := page.AddScriptToEvaluateOnNewDocument(fakeDenyThenAllowScreenShareScript).Do(ctx)
+		return err
+	})); err != nil {
+		t.Fatalf("inject fake deny-then-allow display media script: %v", err)
+	}
+
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/issue-report/new"),
+		chromedp.WaitVisible(`#uc-issue-screenrecord-btn`, chromedp.ByQuery),
+		chromedp.Click(`#uc-issue-screenrecord-btn`, chromedp.ByQuery), // denied
+	); err != nil {
+		t.Fatalf("click the screen-record button: %v", err)
+	}
+
+	var status string
+	if err := chromedp.Run(ctx, chromedp.PollFunction(
+		`function() {
+			var t = document.getElementById("uc-issue-screenrecord-status").textContent;
+			return t && t.length > 0 ? t : null;
+		}`,
+		&status,
+	)); err != nil {
+		t.Fatalf("wait for the permission-denied status message: %v", err)
+	}
+	if !strings.Contains(status, "Permission denied") {
+		t.Fatalf("expected the permission-denial error to reach the status line, got %q", status)
+	}
+
+	var enabledAfterDenial bool
+	if err := chromedp.Run(ctx, chromedp.EvaluateAsDevTools(
+		`!document.getElementById("uc-issue-screenrecord-btn").disabled`, &enabledAfterDenial,
+	)); err != nil {
+		t.Fatalf("read the screen-record button's disabled state after denial: %v", err)
+	}
+	if !enabledAfterDenial {
+		t.Fatal("expected the screen-record button to be re-enabled after a getDisplayMedia rejection, so the person can retry (regression: independent review of uc-infra#198)")
+	}
+
+	// The actual retry proof: a second click (the fake now allows it)
+	// must be able to reach getDisplayMedia again, not be permanently
+	// inert from the first denial.
+	if err := chromedp.Run(ctx, chromedp.Click(`#uc-issue-screenrecord-btn`, chromedp.ByQuery)); err != nil {
+		t.Fatalf("click the screen-record button a second time to retry: %v", err)
+	}
+	var callCount int
+	if err := chromedp.Run(ctx, chromedp.EvaluateAsDevTools(`window.__getDisplayMediaCallCount`, &callCount)); err != nil {
+		t.Fatalf("read getDisplayMedia's call count: %v", err)
+	}
+	if callCount != 2 {
+		t.Fatalf("expected the retry click to reach getDisplayMedia a second time, got %d total calls", callCount)
+	}
+}
