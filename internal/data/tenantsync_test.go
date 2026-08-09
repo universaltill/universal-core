@@ -3,6 +3,7 @@ package data_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/universaltill/universal-core/internal/data"
@@ -97,6 +98,96 @@ func TestPublishedModules_EmptyRegistry(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Errorf("a tenant with nothing published must yield no modules, got %v", got)
+	}
+}
+
+// TestEntityDefinitionRepo_GetPublishedTx covers the Tx-capable read
+// uc-infra#165 added — first caller: purchasing.creditInventoryOnReceipt,
+// which needs InventoryItem's published Definition from inside the SAME
+// transaction as a GoodsReceiptLine write, not a separate connection.
+func TestEntityDefinitionRepo_GetPublishedTx(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	repo := data.NewEntityDefinitionRepo(tenantDB)
+	ctx := context.Background()
+
+	publishDef(t, repo, defWithModule("Alpha", "purchasing"), data.StatusPublished)
+
+	tx, err := tenantDB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	got, err := repo.GetPublishedTx(ctx, tx, "Alpha")
+	if err != nil {
+		t.Fatalf("GetPublishedTx: %v", err)
+	}
+	if got.Version != 1 || got.Status != data.StatusPublished {
+		t.Fatalf("got %+v, want version 1, status published", got)
+	}
+}
+
+func TestEntityDefinitionRepo_GetPublishedTx_NotFound(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	repo := data.NewEntityDefinitionRepo(tenantDB)
+	ctx := context.Background()
+
+	// Published BEFORE BeginTx (not after, as an earlier draft of this
+	// test did) — independent review, uc-infra#165: under READ COMMITTED
+	// a tx started first would still see a commit landing on a separate
+	// connection mid-tx, so publishing-after-BeginTx only happened to
+	// pass rather than genuinely proving anything about ordering. This
+	// way the assertion doesn't lean on that isolation-level detail.
+	publishDef(t, repo, defWithModule("StillDraft", "purchasing"), data.StatusApproved)
+
+	tx, err := tenantDB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	// Nothing published at all for this key — not even a draft.
+	_, err = repo.GetPublishedTx(ctx, tx, "NeverPublished")
+	if !errors.Is(err, data.ErrNotFound) {
+		t.Fatalf("got %v, want data.ErrNotFound", err)
+	}
+
+	// A draft/approved-but-never-published version must not satisfy the
+	// lookup either — same "published means published" semantics
+	// GetPublished (the non-Tx sibling) already enforces.
+	_, err = repo.GetPublishedTx(ctx, tx, "StillDraft")
+	if !errors.Is(err, data.ErrNotFound) {
+		t.Fatalf("got %v, want data.ErrNotFound for an approved-not-published definition", err)
+	}
+}
+
+func TestEntityDefinitionRepo_GetPublishedTx_ReturnsHighestVersion(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	repo := data.NewEntityDefinitionRepo(tenantDB)
+	ctx := context.Background()
+
+	def1 := defWithModule("Alpha", "purchasing")
+	publishDef(t, repo, def1, data.StatusPublished)
+	def2 := defWithModule("Alpha", "purchasing")
+	def2.Version = 2
+	publishDef(t, repo, def2, data.StatusPublished)
+
+	tx, err := tenantDB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	got, err := repo.GetPublishedTx(ctx, tx, "Alpha")
+	if err != nil {
+		t.Fatalf("GetPublishedTx: %v", err)
+	}
+	// getPublished's own doc comment: publishing a new version never
+	// touches older published rows, so both versions stay 'published'
+	// and the highest one wins — GetPublishedTx must honor the same
+	// ordering as its non-Tx sibling, not just "some published row."
+	if got.Version != 2 {
+		t.Fatalf("got version %d, want 2 (the highest published version)", got.Version)
 	}
 }
 
