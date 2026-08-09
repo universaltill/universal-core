@@ -7,6 +7,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -289,6 +290,102 @@ func TestImport_Preview_OversizedUploadIs400(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for an oversized upload, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestImport_ReadUploadedFile_LargeFileSpillsToDiskNotHeap is a
+// regression test for uc-infra#171 (see attachment_test.go's identical
+// test for the full explanation of why this matters): ParseMultipartForm's
+// second argument bounds how much of the request multipart.Reader buffers
+// in the process heap before spilling the rest to a temp file — it is
+// NOT a size cap (http.MaxBytesReader, via maxUploadBytes, is the actual
+// ceiling). Passing the full maxUploadBytes cap as that argument (the
+// pre-fix behavior) meant an upload anywhere near the cap was retained
+// entirely in memory instead of spilling.
+//
+// This calls the real readUploadedFile function directly (not a
+// reimplementation of its parsing logic) with an upload comfortably
+// over multipartParseMemory but well under maxUploadBytes, then inspects
+// the same *http.Request's MultipartForm afterward — readUploadedFile
+// takes no auth/context dependency, so the request pointer the test
+// holds is exactly the one ParseMultipartForm populated in production
+// code, no copy involved. Asserts the resulting file part is backed by
+// *os.File — i.e. actually spilled to a temp file — which fails against
+// the pre-fix code (ParseMultipartForm(maxUploadBytes) keeps a file
+// this size entirely in memory) and passes after.
+func TestImport_ReadUploadedFile_LargeFileSpillsToDiskNotHeap(t *testing.T) {
+	// 1 MiB over the in-memory threshold, ~41 MiB under the hard cap —
+	// big enough to prove spilling happened, nowhere near maxUploadBytes.
+	content := bytes.Repeat([]byte("y"), multipartParseMemory+(1<<20))
+	req := newMultipartRequest(t, "/import/Vendor/preview", "", "", "big.csv", content, nil)
+	rec := httptest.NewRecorder()
+
+	if _, _, ok := readUploadedFile(rec, req); !ok {
+		t.Fatalf("readUploadedFile failed: %s", rec.Body.String())
+	}
+	if req.MultipartForm == nil {
+		t.Fatal("expected req.MultipartForm to be populated after readUploadedFile ran")
+	}
+	defer func() {
+		if err := req.MultipartForm.RemoveAll(); err != nil {
+			t.Fatalf("cleanup temp files: %v", err)
+		}
+	}()
+
+	fhs := req.MultipartForm.File["file"]
+	if len(fhs) != 1 {
+		t.Fatalf("expected exactly 1 file part, got %d", len(fhs))
+	}
+	f, err := fhs[0].Open()
+	if err != nil {
+		t.Fatalf("Open uploaded file part: %v", err)
+	}
+	defer f.Close()
+
+	if _, ok := f.(*os.File); !ok {
+		// See attachment_test.go's identical assertion for the caveat:
+		// this only holds because this request has exactly one file part
+		// (FileHeader.Open() only returns a bare *os.File when nothing
+		// shares its temp file — two-or-more spilled parts would return
+		// the same wrapper type an in-memory part does).
+		t.Fatalf("file part of %d bytes (> multipartParseMemory=%d) was not spilled to a temp file at the real readUploadedFile call site — got %T, want *os.File; it is being buffered entirely in the process heap", len(content), multipartParseMemory, f)
+	}
+}
+
+// TestImport_ReadUploadedFile_LargeFile_RoundTrips confirms the smaller
+// multipartParseMemory (uc-infra#171) doesn't change observable behavior
+// for a caller: readUploadedFile still returns the exact uploaded bytes
+// for a file well over that threshold, still under maxUploadBytes, even
+// though the multipart part itself now spills to a temp file during
+// parsing rather than staying in memory.
+func TestImport_ReadUploadedFile_LargeFile_RoundTrips(t *testing.T) {
+	content := bytes.Repeat([]byte("y"), multipartParseMemory+(1<<20))
+	req := newMultipartRequest(t, "/import/Vendor/preview", "", "", "big.csv", content, nil)
+	rec := httptest.NewRecorder()
+
+	got, xlsx, ok := readUploadedFile(rec, req)
+	if !ok {
+		t.Fatalf("readUploadedFile failed: %s", rec.Body.String())
+	}
+	// readUploadedFile spills the multipart part to disk (see the spill
+	// test above) but never removes the temp file itself — production
+	// relies on Go's own net/http server doing that automatically once a
+	// real request finishes (net/http/server.go's finishRequest); this
+	// direct call bypasses that, so the test cleans up by hand. An
+	// earlier version of this test didn't, and independent review caught
+	// the resulting leaked ~9 MiB temp file per run.
+	if req.MultipartForm != nil {
+		t.Cleanup(func() {
+			if err := req.MultipartForm.RemoveAll(); err != nil {
+				t.Fatalf("cleanup temp files: %v", err)
+			}
+		})
+	}
+	if xlsx {
+		t.Fatal("expected xlsx=false for a .csv filename")
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatalf("round-tripped content mismatch: got %d bytes, want %d bytes", len(got), len(content))
 	}
 }
 
