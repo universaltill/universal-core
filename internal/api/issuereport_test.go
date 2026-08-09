@@ -72,6 +72,50 @@ func newAudioUploadRequest(t *testing.T, target, tenantID, actorID string, audio
 	return r
 }
 
+// TestIssueReportFieldMaxLength_ReadsFromDefinition (uc-infra#174,
+// independent review) pins issueReportFieldMaxLength's own contract: it
+// must read the exact bound foundation.IssueReport() declares, not a
+// second hand-kept number — the entire point of replacing the two
+// duplicate Go constants an earlier draft used.
+func TestIssueReportFieldMaxLength_ReadsFromDefinition(t *testing.T) {
+	def := foundation.IssueReport()
+	for _, name := range []string{"title", "description", "transcript", "console_log"} {
+		f, ok := def.FieldByName(name)
+		if !ok || f.MaxLength == nil {
+			t.Fatalf("expected foundation.IssueReport() field %q to declare a MaxLength", name)
+		}
+		if got, want := issueReportFieldMaxLength(name), *f.MaxLength; got != want {
+			t.Fatalf("issueReportFieldMaxLength(%q) = %d, want %d (the Definition's own declared bound)", name, got, want)
+		}
+	}
+}
+
+// TestIssueReportFieldMaxLength_PanicsOnFieldWithNoDeclaredBound confirms
+// the fail-loud contract: a field name that exists but declares no
+// MaxLength (page_url, status — anything not in the four checked above)
+// is a programmer error at a call site, not a runtime condition to
+// silently render as maxlength="0" and reject every real submission.
+func TestIssueReportFieldMaxLength_PanicsOnFieldWithNoDeclaredBound(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected a panic for a field with no declared MaxLength")
+		}
+	}()
+	issueReportFieldMaxLength("page_url")
+}
+
+// TestIssueReportFieldMaxLength_PanicsOnUnknownField is the same
+// fail-loud contract for a field name that doesn't exist on the
+// Definition at all (a typo at a call site).
+func TestIssueReportFieldMaxLength_PanicsOnUnknownField(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected a panic for an unknown field name")
+		}
+	}()
+	issueReportFieldMaxLength("no_such_field")
+}
+
 func TestIssueReport_NewPage_RendersCaptureForm(t *testing.T) {
 	router := newTestRouter(t)
 	withDevAuthEnabled(t)
@@ -497,6 +541,103 @@ func TestIssueReport_Submit_MissingRequiredFieldIs400(t *testing.T) {
 	// through writeValidationErrorLocalized, and had no assertion pinning
 	// that it actually translates).
 	if want := `title is required.`; !strings.Contains(rec.Body.String(), want) {
+		t.Fatalf("expected the translated envelope message %q, got: %s", want, rec.Body.String())
+	}
+}
+
+// TestIssueReport_Submit_OversizedDescriptionIs400 (uc-infra#174) is the
+// HTTP-handler-level regression test for the actual bug: description had
+// no length bound at all before entity.Field.MaxLength existed, so a
+// caller posting directly to this endpoint (no browser, no maxlength
+// attribute in the way — issueReportTmpl's own textarea attribute is
+// UI-only, never a security boundary) could write an arbitrarily large
+// text blob here, bounded only by maxIssueReportSubmitBytes (61 MiB,
+// sized for the accompanying screen-recording upload, not for a text
+// field). Plain urlencoded, deliberately, to prove this doesn't depend
+// on the multipart path uc-infra#92 introduced.
+func TestIssueReport_Submit_OversizedDescriptionIs400(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	oversized := strings.Repeat("a", 20001) // one over foundation.IssueReport's declared MaxLength
+	form := "title=" + "Something+is+wrong" + "&description=" + oversized
+	req := newRequest("POST", "/issue-report/submit", tenantID, "farshid", []byte(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an oversized description, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if want := `description is too long.`; !strings.Contains(rec.Body.String(), want) {
+		t.Fatalf("expected the translated envelope message %q, got: %s", want, rec.Body.String())
+	}
+
+	listReq := newRequest("GET", "/api/records/IssueReport", tenantID, "farshid", nil)
+	listRec := httptest.NewRecorder()
+	mux.ServeHTTP(listRec, listReq)
+	if strings.Contains(listRec.Body.String(), "Something is wrong") {
+		t.Fatal("rejected submission must not have been stored")
+	}
+}
+
+// TestIssueReport_Submit_OversizedConsoleLogIs400 is console_log's own
+// version of TestIssueReport_Submit_OversizedDescriptionIs400 immediately
+// above — the other field the originating review found unbounded.
+func TestIssueReport_Submit_OversizedConsoleLogIs400(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	oversized := strings.Repeat("a", 30001) // one over foundation.IssueReport's declared MaxLength
+	form := "title=" + "Something+is+wrong" + "&description=" + "Fine." + "&console_log=" + oversized
+	req := newRequest("POST", "/issue-report/submit", tenantID, "farshid", []byte(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an oversized console_log, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if want := `console_log is too long.`; !strings.Contains(rec.Body.String(), want) {
+		t.Fatalf("expected the translated envelope message %q, got: %s", want, rec.Body.String())
+	}
+}
+
+// TestIssueReport_Submit_OversizedTitleIs400 (uc-infra#174, independent
+// review) is title's own version of the two tests above — the original
+// fix only bounded description/console_log, but title rides in the exact
+// same request through the identical unbounded-FieldString gap and was
+// just as reachable by a caller posting directly here.
+func TestIssueReport_Submit_OversizedTitleIs400(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishFoundation(t, db)
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	oversized := strings.Repeat("a", 501) // one over foundation.IssueReport's declared MaxLength
+	form := "title=" + oversized + "&description=" + "Fine."
+	req := newRequest("POST", "/issue-report/submit", tenantID, "farshid", []byte(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an oversized title, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if want := `title is too long.`; !strings.Contains(rec.Body.String(), want) {
 		t.Fatalf("expected the translated envelope message %q, got: %s", want, rec.Body.String())
 	}
 }

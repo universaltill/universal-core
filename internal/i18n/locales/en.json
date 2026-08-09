@@ -835,6 +835,7 @@
   "entity.validation.not_before": "{field} must not be before {other_field}.",
   "entity.validation.below_minimum": "{field} is below the allowed minimum.",
   "entity.validation.above_maximum": "{field} is above the allowed maximum.",
+  "entity.validation.too_long": "{field} is too long.",
   "entity.validation.invalid": "{field} is invalid.",
   "crud.error.unique_constraint_violation": "This combination of {fields} is already used by another record.",
   "help.viewer.title": "Help",

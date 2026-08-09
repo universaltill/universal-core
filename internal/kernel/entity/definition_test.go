@@ -539,6 +539,46 @@ func TestDefinitionValidate(t *testing.T) {
 			},
 			wantErr: false,
 		},
+		{
+			name: "valid max_length on a string field",
+			def: Definition{
+				EntityType: "IssueReport",
+				Fields: []Field{
+					{Name: "description", Type: FieldString, MaxLength: IntPtr(20000)},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "max_length of zero is allowed (rejects every non-empty value)",
+			def: Definition{
+				EntityType: "IssueReport",
+				Fields: []Field{
+					{Name: "description", Type: FieldString, MaxLength: IntPtr(0)},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "negative max_length is rejected",
+			def: Definition{
+				EntityType: "IssueReport",
+				Fields: []Field{
+					{Name: "description", Type: FieldString, MaxLength: IntPtr(-1)},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "max_length on a non-string field is rejected",
+			def: Definition{
+				EntityType: "LeaveRequest",
+				Fields: []Field{
+					{Name: "days", Type: FieldNumber, MaxLength: IntPtr(10)},
+				},
+			},
+			wantErr: true,
+		},
 	}
 
 	for _, tc := range cases {

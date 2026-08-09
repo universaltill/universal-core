@@ -480,6 +480,14 @@ type fieldView struct {
 	// HTML attribute is either present or absent.
 	Min string
 	Max string
+	// MaxLength mirrors the field's own declared entity.Field.MaxLength
+	// (uc-infra#174), rendered as the text input's browser-native
+	// maxlength attribute — same "validation defined once, applied
+	// identically client- and server-side" pairing as Min/Max above.
+	// Pre-formatted string, empty meaning unset, same idiom as Min/Max
+	// (a *int would print as a pointer address via text/template, same
+	// reasoning Min/Max's own comment already gives for *float64).
+	MaxLength string
 	// I18nInputs is set only for FieldI18nText (ADR-0009): one entry per
 	// supported locale, each rendered as its own text input named
 	// "{Name}.{Locale}" so the form decoder can reassemble the per-locale
@@ -1062,6 +1070,13 @@ func (r *Renderer) buildFields(s form.Section, ent *entity.Definition, record ma
 		if ef.Max != nil {
 			fv.Max = strconv.FormatFloat(*ef.Max, 'f', -1, 64)
 		}
+		// MaxLength becomes the browser-native maxlength= attribute on a
+		// FieldString text input (uc-infra#174) — only FieldString can
+		// declare one (Definition.Validate rejects it elsewhere), so no
+		// type gate is needed here beyond the nil check itself.
+		if ef.MaxLength != nil {
+			fv.MaxLength = strconv.Itoa(*ef.MaxLength)
+		}
 
 		switch ef.Type {
 		case entity.FieldMoney:
@@ -1447,7 +1462,7 @@ const tmplSrc = `<form class="uc-form" data-entity-type="{{.EntityType}}"{{if .R
 {{else if eq .Type "date"}}<input type="date" id="{{.Name}}" name="{{.Name}}" value="{{.Value}}"{{if .Required}} required{{end}}>
 {{else if eq .Type "number"}}<input type="number" id="{{.Name}}" name="{{.Name}}" value="{{.Value}}"{{if .Min}} min="{{.Min}}"{{end}}{{if .Max}} max="{{.Max}}"{{end}}{{if .Required}} required{{end}}>
 {{else if eq .Type "money"}}<input type="number" step="0.01" id="{{.Name}}" name="{{.Name}}" value="{{.Value}}"{{if .Required}} required{{end}}>
-{{else}}<input type="text" id="{{.Name}}" name="{{.Name}}" value="{{.Value}}"{{if .Required}} required{{end}}>
+{{else}}<input type="text" id="{{.Name}}" name="{{.Name}}" value="{{.Value}}"{{if .MaxLength}} maxlength="{{.MaxLength}}"{{end}}{{if .Required}} required{{end}}>
 {{end}}
 </div>
 {{end}}

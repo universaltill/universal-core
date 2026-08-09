@@ -35,6 +35,7 @@ import (
 
 	"github.com/universaltill/universal-core/internal/httpx"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
+	"github.com/universaltill/universal-core/internal/kernel/foundation"
 )
 
 // maxVoiceNoteBytes bounds an uploaded voice-note recording — generous
@@ -43,6 +44,37 @@ import (
 // HTTP boundary" reasoning maxUploadBytes documents for the CSV import
 // wizard.
 const maxVoiceNoteBytes = 10 << 20 // 10 MiB
+
+// issueReportFieldMaxLength reads a declared entity.Field.MaxLength
+// straight off the compiled-in foundation.IssueReport() Definition
+// (uc-infra#174, independent review) rather than a second, hand-kept
+// Go constant: an earlier draft duplicated each bound as its own
+// constant here, with nothing pinning the two together — exactly the
+// drift maxScreenRecordingBytes's OWN doc comment above warns against
+// ("one source of truth, not two numbers that happen to agree today").
+// foundation.IssueReport() is a plain Go function with no I/O, so
+// calling it here at render time costs nothing worth caching. Panics if
+// name isn't a FieldString with a declared MaxLength — a programmer
+// error (a typo'd field name, or forgetting to declare the bound), not
+// a runtime condition any caller of this page could trigger, so failing
+// loud immediately beats silently rendering maxlength="0" and rejecting
+// every real submission.
+//
+// Rendered as the capture page's own textarea/input maxlength=
+// attributes below (ADR-0017 §5's "validation defined once, applied
+// identically client- and server-side"); the real enforcement either
+// way is entity.ValidateRecord in issueReportSubmit, which reads the
+// TENANT'S published Definition (possibly a different, later-migrated
+// version than this compiled-in default) — so this is a same-process,
+// same-commit UI hint, not a promise that every tenant's actual bound
+// is identical to it forever.
+func issueReportFieldMaxLength(name string) int {
+	f, ok := foundation.IssueReport().FieldByName(name)
+	if !ok || f.MaxLength == nil {
+		panic(fmt.Sprintf("issueReportFieldMaxLength: %q has no declared MaxLength on foundation.IssueReport()", name))
+	}
+	return *f.MaxLength
+}
 
 // screenRecordingDurationCapSeconds bounds how long the capture page's
 // JS lets a screen recording run before auto-stopping it (uc-infra#92):
@@ -133,6 +165,10 @@ func (h *Handler) issueReportNewPage(w http.ResponseWriter, r *http.Request) {
 		AttachmentsEnabled:                h.blobstore != nil,
 		ScreenRecordingDurationCapSeconds: screenRecordingDurationCapSeconds,
 		MaxScreenRecordingBytes:           maxScreenRecordingBytes,
+		TitleMaxLength:                    issueReportFieldMaxLength("title"),
+		DescriptionMaxLength:              issueReportFieldMaxLength("description"),
+		TranscriptMaxLength:               issueReportFieldMaxLength("transcript"),
+		ConsoleLogMaxLength:               issueReportFieldMaxLength("console_log"),
 	})
 	if err != nil {
 		writeInternalError(w, "render issue report page", err)
@@ -452,6 +488,14 @@ type issueReportPageView struct {
 	// MaxBytesReader boundary can never drift apart — one source of
 	// truth, not two numbers that happen to agree today.
 	MaxScreenRecordingBytes int
+	// TitleMaxLength/DescriptionMaxLength/TranscriptMaxLength/
+	// ConsoleLogMaxLength (uc-infra#174) are each read straight from
+	// foundation.IssueReport()'s own declared entity.Field.MaxLength via
+	// issueReportFieldMaxLength — see that function's own doc comment.
+	TitleMaxLength       int
+	DescriptionMaxLength int
+	TranscriptMaxLength  int
+	ConsoleLogMaxLength  int
 }
 
 type issueReportResultView struct {
@@ -480,10 +524,10 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
 <div class="uc-issue-report">
 <form id="uc-issue-report-form" class="uc-form" method="post" action="{{.SubmitHref}}" enctype="multipart/form-data">
 <label for="uc-issue-title">{{.TitleLabel}}</label>
-<input type="text" id="uc-issue-title" name="title" required>
+<input type="text" id="uc-issue-title" name="title" maxlength="{{.TitleMaxLength}}" required>
 
 <label for="uc-issue-description">{{.DescriptionLabel}}</label>
-<textarea id="uc-issue-description" name="description" rows="6" required></textarea>
+<textarea id="uc-issue-description" name="description" rows="6" maxlength="{{.DescriptionMaxLength}}" required></textarea>
 
 <div class="uc-issue-voice">
 <button type="button" id="uc-issue-record-btn">{{.RecordLabel}}</button>
@@ -491,7 +535,7 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
 </div>
 
 <label for="uc-issue-transcript">{{.TranscriptLabel}}</label>
-<textarea id="uc-issue-transcript" name="transcript" rows="4" readonly></textarea>
+<textarea id="uc-issue-transcript" name="transcript" rows="4" maxlength="{{.TranscriptMaxLength}}" readonly></textarea>
 
 {{if .AttachmentsEnabled}}
 <div class="uc-issue-screenrecord">
@@ -506,7 +550,7 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
 {{end}}
 
 <label for="uc-issue-console-log">{{.ConsoleLogLabel}}</label>
-<textarea id="uc-issue-console-log" name="console_log" rows="4"></textarea>
+<textarea id="uc-issue-console-log" name="console_log" rows="4" maxlength="{{.ConsoleLogMaxLength}}"></textarea>
 
 <input type="hidden" name="page_url" id="uc-issue-page-url">
 <button type="submit">{{.SubmitLabel}}</button>
@@ -539,7 +583,19 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
     if (rawLog) {
       var entries = JSON.parse(rawLog);
       if (Array.isArray(entries) && entries.length > 0) {
-        document.getElementById("uc-issue-console-log").value = entries.join("\n");
+        // Clamped to ConsoleLogMaxLength defensively (uc-infra#174,
+        // independent review): this is a script assignment to .value,
+        // not a typed keystroke, so the textarea's own maxlength
+        // attribute above does NOT apply here — a real browser only
+        // enforces maxlength against user input, never against .value
+        // set programmatically. layout.go's ucAppendLog already caps
+        // what it buffers per-entry (its own doc comment), so this
+        // should be a no-op in practice; kept as the actual enforcement
+        // point rather than relying solely on that upstream discipline
+        // holding forever.
+        var joined = entries.join("\n");
+        document.getElementById("uc-issue-console-log").value =
+          joined.length > {{.ConsoleLogMaxLength}} ? joined.slice(0, {{.ConsoleLogMaxLength}}) : joined;
       }
     }
   } catch (e) {
@@ -658,12 +714,33 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
                 return resp.text();
               })
               .then(function(text) {
-                transcriptEl.value = text;
-                if (descriptionEl.value.trim() !== "") {
-                  descriptionEl.value = descriptionEl.value.replace(/\s+$/, "") + "\n\n" + text;
-                } else {
-                  descriptionEl.value = text;
+                // Both assignments below are clamped defensively
+                // (uc-infra#174, independent review): text is the ASR
+                // server's own response, script-assigned to .value, so
+                // neither field's maxlength attribute above applies (a
+                // browser only enforces maxlength against typed/pasted
+                // user input, never a programmatic .value set) — without
+                // this, a long enough transcript could still make the
+                // eventual /issue-report/submit 400 on a field the user
+                // never directly touched, discarding the whole
+                // submission (title, screen recording and all) with no
+                // chance to fix it first.
+                if (text.length > {{.TranscriptMaxLength}}) {
+                  text = text.slice(0, {{.TranscriptMaxLength}});
                 }
+                transcriptEl.value = text;
+                // description's own bound is deliberately SMALLER than
+                // transcript's (see foundation.IssueReport's own doc
+                // comment on why) — the appended COMBINATION is clamped
+                // to description's bound here, independent of (and on
+                // top of) the transcript-only clamp just above.
+                var combined = descriptionEl.value.trim() !== ""
+                  ? descriptionEl.value.replace(/\s+$/, "") + "\n\n" + text
+                  : text;
+                if (combined.length > {{.DescriptionMaxLength}}) {
+                  combined = combined.slice(0, {{.DescriptionMaxLength}});
+                }
+                descriptionEl.value = combined;
                 statusEl.textContent = "";
               })
               .catch(function(err) {

@@ -655,6 +655,50 @@ func TestRender_NumberFieldMinMaxAttributes(t *testing.T) {
 	}
 }
 
+// TestRender_StringFieldMaxLengthAttribute (uc-infra#174) is
+// TestRender_NumberFieldMinMaxAttributes' own MaxLength counterpart —
+// the markup-structure half of the guarantee; the real-browser proof
+// that a rendered maxlength attribute is actually enforced by a browser
+// lives in internal/e2e's
+// TestIssueReportPage_DescriptionAndConsoleLogEnforceMaxLength (CLAUDE.md:
+// a rendered-HTML-string test proves structure, never proves real
+// enforcement).
+func TestRender_StringFieldMaxLengthAttribute(t *testing.T) {
+	r := testRenderer(t)
+	ent := &entity.Definition{
+		EntityType: "IssueReport",
+		Fields: []entity.Field{
+			{Name: "description", Type: entity.FieldString, Required: true, MaxLength: entity.IntPtr(20000)},
+			{Name: "page_url", Type: entity.FieldString},
+		},
+	}
+	def := &form.Definition{
+		EntityType: "IssueReport",
+		Sections: []form.Section{{
+			Title: "Details", Component: form.ComponentFields,
+			Fields: []form.FormField{
+				{Name: "description", Label: "Description"},
+				{Name: "page_url", Label: "Page"},
+			},
+		}},
+	}
+	data := Data{Record: map[string]any{"description": "It broke.", "page_url": "https://example.com"}}
+	var buf strings.Builder
+	if err := r.Render(&buf, def, ent, data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, `<input type="text" id="description" name="description" value="It broke." maxlength="20000" required>`) {
+		t.Fatalf("expected a maxlength attribute before required, got:\n%s", out)
+	}
+	if !strings.Contains(out, `<input type="text" id="page_url" name="page_url" value="https://example.com">`) {
+		t.Fatalf("expected a field with no declared MaxLength to render no maxlength attribute at all, got:\n%s", out)
+	}
+	if strings.Contains(out, `page_url" value="https://example.com" maxlength`) {
+		t.Fatalf("a field with no declared MaxLength must not render a maxlength attribute:\n%s", out)
+	}
+}
+
 // TestRender_ReferenceFieldWithNoOptionsStillRendersCombobox confirms a
 // reference field with no pre-loaded current-value label (a new/unset
 // field, or a target whose label lookup degraded to no entry rather than

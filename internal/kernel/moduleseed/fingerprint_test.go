@@ -224,7 +224,7 @@ var wantHashes = map[string]string{
 	"entity:StatusType@v1":                   "633c522a100ada70a2fb5aa281ba24577730a5aead9bcac43d91da4b70f1a054",
 	"entity:Status@v1":                       "53b8108a33de9c1104fbf088c8a2aa7dcd81127a4a1f0a305e095e9f3d3acdb3",
 	"entity:StatusTransition@v1":             "00f369446a59120ff712e191e65b8ab3fea4084a8fafad3a8dd437ec75921248",
-	"entity:IssueReport@v2":                  "17734a0048f334366ab605545896e6f9a6909eed9eddd8410948e651c654399f",
+	"entity:IssueReport@v3":                  "cffb12600181dd86859a7edfd432e0505a96d3f6f3b0f45749824bd99c924764",
 	"entity:AIProviderConnection@v1":         "dc50961ebab9cadfb45ab2a47ca7552b7b3c97c6c3c6a56a94bd1a8fe8ac41f7",
 	"entity:ExternalSQLSource@v1":            "837549058fc96b76c07441fa4e809e926d09e42fc21307688379df88cb21d1dd",
 	"entity:ExternalIdentity@v2":             "2b6b1ec11b587105e92d334cc497476e42a55e4077b4224cfc094ab6bce4a40b",
