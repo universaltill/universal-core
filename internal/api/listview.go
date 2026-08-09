@@ -57,6 +57,23 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 	entityType := r.PathValue("entityType")
 	locale := localeFromRequest(w, r)
 	loc := regionalLocale(r, locale)
+	// parseLoc governs ONLY how filterValue below is interpreted (and,
+	// via its own Tag(), what region gets pinned into every link this
+	// handler generates) — never what the page actually DISPLAYS, which
+	// stays loc throughout (uc-infra#164's independent review: an
+	// earlier version of this fix used loc for both, which meant every
+	// generated link's pin also silently became the page's active
+	// display region on the next click, undoing whatever the viewer's
+	// real cookie preference said). If the incoming request carries a
+	// valid qRegionParam (this page was reached via a link this handler
+	// itself generated, carrying forward the region an earlier "q" was
+	// typed under), that's what governs; otherwise this is a fresh
+	// render and parseLoc is just loc — the region actually rendering
+	// it, which becomes the pin for whatever links THIS render produces.
+	parseLoc := loc
+	if pinned, ok := pinnedRegion(r, locale); ok {
+		parseLoc = pinned
+	}
 
 	def, err := ts.entityDef(r.Context(), entityType)
 	if err != nil {
@@ -156,13 +173,14 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 				// it reaches the query; a value that doesn't parse under
 				// this locale falls through to matching the raw typed
 				// text unchanged, same honest fallback FormatNumber
-				// itself uses for unexpected input.
-				if norm, ok := loc.ParseNumber(filterValue); ok {
+				// itself uses for unexpected input. Uses parseLoc, not
+				// loc — see parseLoc's own doc comment above.
+				if norm, ok := parseLoc.ParseNumber(filterValue); ok {
 					opts.FilterValue = norm
 				}
 			case entity.FieldDate:
 				// Same reasoning for FieldDate's regional/Jalali display.
-				if norm, ok := loc.ParseDate(filterValue); ok {
+				if norm, ok := parseLoc.ParseDate(filterValue); ok {
 					opts.FilterValue = norm
 				}
 			}
@@ -232,6 +250,7 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 		ImportLink:  h.catalog.T(locale, "dashboard.import_link"),
 		ExportLink:  h.catalog.T(locale, "dashboard.export_link"),
 		Empty:       h.catalog.T(locale, "list.empty"),
+		Region:      parseLoc.Tag(),
 		FilterField: viewFilterField,
 		FilterValue: displayFilterValue,
 		FilterHref:  "/records/" + entityType,
@@ -251,7 +270,29 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 	// caller until now) because ClearHref, just below, needs it
 	// unconditionally — a single-page list still has to carry its sort
 	// forward when the "Clear" link is clicked, not just its pager.
+	//
+	// Also pins the region a stale "q" would be interpreted under
+	// (uc-infra#164): the region picker's own links already drop "q"
+	// across an explicit region SWITCH (uc-infra#128), but that fix does
+	// nothing for a server-generated link that never carries a pin at
+	// all — such a link's meaning silently depends on whatever region
+	// cookie is active whenever it's later followed (the Back button, a
+	// bookmark, a link shared to someone with a different region cookie),
+	// not the region the filter box's value was actually typed under.
+	// Setting it here, unconditionally, means every link this handler
+	// generates (the Clear link via this function directly, and every
+	// keepQuery link below) is self-describing from the moment it's
+	// rendered. Uses qRegionParam ("qregion"), NOT "region" — see that
+	// constant's own doc comment for why reusing "region" here would
+	// have persistRegionPreference silently overwrite the viewer's real
+	// preference on an ordinary click (independent review of an earlier
+	// version of this fix). Uses parseLoc.Tag(), not loc.Tag() — see
+	// parseLoc's own doc comment: this propagates whatever region
+	// governed reading THIS request's own "q" (an incoming pin, if
+	// valid, else the page's real active region), not necessarily the
+	// page's current display region.
 	sortParams := func(base url.Values) url.Values {
+		base.Set(qRegionParam, parseLoc.Tag())
 		if opts.SortField != "" {
 			base.Set("sort", opts.SortField)
 			if opts.SortDesc {
@@ -268,11 +309,11 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 	// click away from the very page this fix repairs). Deliberately NOT
 	// built from FilterHref/keepQuery: those carry the filter forward,
 	// which is exactly what "Clear" must drop.
+	// sortParams now always sets qRegionParam (uc-infra#164), so
+	// clearParams is never empty — the query string is unconditional,
+	// unlike before.
 	clearParams := sortParams(url.Values{})
-	view.ClearHref = "/records/" + entityType
-	if len(clearParams) > 0 {
-		view.ClearHref += "?" + clearParams.Encode()
-	}
+	view.ClearHref = "/records/" + entityType + "?" + clearParams.Encode()
 	// keepQuery preserves the active filter across sort and page links, so
 	// sorting a filtered list doesn't silently clear the filter. Gated on
 	// viewFilterField, NOT opts.FilterField: the latter is "" whenever
@@ -290,7 +331,13 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 	// viewer typed, not the ParseNumber/ParseDate-normalized form — see
 	// displayFilterValue's own declaration above.
 	keepQuery := func(extra url.Values) string {
-		q := url.Values{}
+		// qRegionParam is set unconditionally, same reasoning as
+		// sortParams above (uc-infra#164) — column-header links build
+		// their own sort/dir params directly rather than going through
+		// sortParams (they target a DIFFERENT sort than the one
+		// currently active), so this is the one place common to every
+		// keepQuery call.
+		q := url.Values{qRegionParam: {parseLoc.Tag()}}
 		if viewFilterField != "" {
 			q.Set("filter", viewFilterField)
 			if displayFilterValue != "" {
@@ -301,9 +348,6 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 			for _, v := range vs {
 				q.Set(k, v)
 			}
-		}
-		if len(q) == 0 {
-			return "/records/" + entityType
 		}
 		return "/records/" + entityType + "?" + q.Encode()
 	}
@@ -566,17 +610,28 @@ type columnView struct {
 }
 
 type recordListView struct {
-	Name        string
-	Code        string
-	Columns     []columnView
-	Rows        []recordRowView
-	NewHref     string
-	ImportHref  string
-	ExportHref  string
-	NewLabel    string
-	ImportLink  string
-	ExportLink  string
-	Empty       string
+	Name       string
+	Code       string
+	Columns    []columnView
+	Rows       []recordRowView
+	NewHref    string
+	ImportHref string
+	ExportHref string
+	NewLabel   string
+	ImportLink string
+	ExportLink string
+	Empty      string
+	// Region is the BCP 47 tag governing how this page's "q" (if any) was
+	// interpreted (uc-infra#164, parseLoc.Tag() — see its own doc
+	// comment) — carried as a hidden qRegionParam field on the filter
+	// form's own submit, mirroring keepQuery's/sortParams' identical
+	// addition to every sort/page/clear link this handler generates, so
+	// a filter value's meaning never depends on whichever region cookie
+	// happens to be active whenever the resulting URL is later followed.
+	// Deliberately NOT named "region" in the rendered HTML — see
+	// qRegionParam's own doc comment for why persistRegionPreference
+	// must never see this value.
+	Region      string
 	FilterField string
 	FilterValue string
 	FilterHref  string
@@ -667,6 +722,7 @@ var recordListTmpl = template.Must(template.New("recordList").Parse(`
 <div><a href="{{.NewHref}}">{{.NewLabel}}</a> · <a href="{{.ImportHref}}">{{.ImportLink}}</a> · <a href="{{.ExportHref}}">{{.ExportLink}}</a></div>
 </div>
 <form class="uc-list-filter" method="get" action="{{.FilterHref}}">
+<input type="hidden" name="qregion" value="{{.Region}}">
 {{if .FilterField}}<input type="hidden" name="filter" value="{{.FilterField}}">{{end}}
 {{if .SortField}}<input type="hidden" name="sort" value="{{.SortField}}">{{end}}
 {{if .SortDir}}<input type="hidden" name="dir" value="{{.SortDir}}">{{end}}

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -266,8 +267,15 @@ func TestAPI_I18nText_OwnListPageLocalizesAndDegrades(t *testing.T) {
 	}
 
 	// The i18n_text column header must NOT be a sort link (can't order a
-	// JSON object); the plain `code` column still is.
-	if strings.Contains(body, `href="/records/LocalizedThing?sort=name`) {
+	// JSON object); the plain `code` column still is. Matched as a
+	// standalone "sort=name" query param (bounded by "?"/"&" and "&"/
+	// the closing quote), not a raw prefix substring: uc-infra#164 added
+	// a "qregion" param that url.Values.Encode() sorts ahead of "sort"
+	// alphabetically, so a plain `?sort=name` prefix check would never
+	// match any real generated href again, silently defanging this
+	// regression guard (independent review).
+	sortNameParam := regexp.MustCompile(`[?&]sort=name(?:&|")`)
+	if sortNameParam.MatchString(body) {
 		t.Fatalf("i18n_text column must not offer a sort link, got:\n%s", body)
 	}
 	if !strings.Contains(body, "sort=code") {

@@ -150,12 +150,56 @@ type regionOption struct {
 // (uc-infra#129) — a region switch just leaves that same box empty
 // instead of guessing what the old text now means.
 //
-// What this does NOT close: "q" traveling back in via a route other than
-// this picker's own generated link — the Back button, a bookmark, or a
-// link shared to someone whose region cookie differs — since neither the
-// filter form nor the sort/page links pin the region they were rendered
-// under. That's a real, separate gap (filed as uc-infra#164), not
-// silently reopened by this fix.
+// What this did NOT originally close: "q" traveling back in via a route
+// other than this picker's own generated link — the Back button, a
+// bookmark, or a link shared to someone whose region cookie differs —
+// since neither the filter form nor the sort/page links pinned the
+// region they were rendered under. That was a real, separate gap (filed
+// as uc-infra#164) — closed by listview.go's keepQuery/sortParams and
+// the filter form's own hidden field, which now pin the rendering
+// region into every link/submit this handler generates via the
+// qRegionParam ("qregion") this file defines below — deliberately NOT
+// "region" itself, so that pin is never mistaken for an explicit switch
+// and persisted over the viewer's real preference (see qRegionParam's
+// own doc comment). Only the region a stale "q" is interpreted under is
+// pinned this way; language is not (a pinned link can still be
+// reinterpreted if the active LANGUAGE differs from the one "q" was
+// typed under — a narrower, milder residual gap than the one this fix
+// closes, since the shipped locale set degrades that case to "no
+// match" rather than a silent wrong match).
+// qRegionParam is the query parameter that pins the region a filter's
+// "q" text was actually typed/rendered under (uc-infra#164) — read-only,
+// and DELIBERATELY not "region": persistRegionPreference above only
+// ever scans "region" itself when deciding what to persist. This pin is
+// present on nearly every link listview.go generates (every sort/pager/
+// Clear link, and the filter form's own hidden field), so if it reused
+// "region" it would make EVERY one of those an "explicit switch" as far
+// as persistRegionPreference is concerned — silently overwriting the
+// viewer's real saved preference on an ordinary click, or hijacking a
+// recipient's preference the moment they open a shared link (independent
+// review of an earlier version of this fix caught exactly that: it
+// reused "region" for both purposes). Keeping this a separate,
+// differently-named parameter means persistRegionPreference never even
+// looks at it — the pin can ride along on every generated link without
+// ever being mistaken for a deliberate region switch.
+const qRegionParam = "qregion"
+
+// pinnedRegion resolves qRegionParam against language, returning the
+// Locale it names only if it's a real, offered choice for that language
+// — the same validation offeredRegion already gives "region", reused
+// rather than duplicated (a pin can't claim a region the picker itself
+// wouldn't offer). ok is false for a missing, tampered, or
+// cross-language value; the caller's own fallback (the request's real
+// active region) governs in that case — a bad or absent pin is never a
+// hard failure, just "nothing to pin".
+func pinnedRegion(r *http.Request, language string) (locale.Locale, bool) {
+	tag := r.URL.Query().Get(qRegionParam)
+	if tag == "" {
+		return locale.Locale{}, false
+	}
+	return offeredRegion(tag, language)
+}
+
 func (h *Handler) regionOptions(r *http.Request, language string) []regionOption {
 	choices := regionChoices[language]
 	if len(choices) < 2 {

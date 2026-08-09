@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/chromedp"
 
 	"github.com/universaltill/universal-core/internal/kernel/crud"
@@ -301,5 +302,159 @@ func TestListFilter_RegionalDate_AmbiguousOrder_RealBrowser(t *testing.T) {
 	}
 	if !strings.Contains(bodyText, "Container 1") {
 		t.Errorf("en-US month-first filter should match the stored 2026-04-03 record, got:\n%s", bodyText)
+	}
+}
+
+// regionCookieValue reads the live browser's own "uc_locale_region"
+// cookie, or "" if none is set — used both to confirm a genuine
+// picker-driven switch persists normally and (uc-infra#164 independent
+// review, F1) to confirm a pinned-only navigation does NOT touch it.
+func regionCookieValue(t *testing.T, ctx context.Context) string {
+	t.Helper()
+	var cookies []*network.Cookie
+	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		var err error
+		cookies, err = network.GetCookies().Do(ctx)
+		return err
+	})); err != nil {
+		t.Fatalf("read browser cookies: %v", err)
+	}
+	for _, c := range cookies {
+		if c.Name == "uc_locale_region" {
+			return c.Value
+		}
+	}
+	return ""
+}
+
+// TestListFilter_RegionPinnedInForm_RealBrowser_SurvivesCookieChange is
+// uc-infra#164 driven through a real browser end to end: it renders a
+// filtered list page, reads the LIVE DOM to confirm the filter form's
+// hidden "qregion" input actually landed in the rendered page (not just
+// in the raw HTML string a httptest-level check could pass on even if a
+// template-escaping bug silently dropped the attribute), computes the
+// exact URL a real submit of that form would produce, then changes the
+// browser's own region cookie — simulating either a region switch made
+// after this page was rendered (the Back-button case) or simply a
+// different viewer's cookie (the shared-link case) — before navigating
+// to that captured URL. The captured URL's own pin must still win over
+// the now-different cookie, so the filter still matches the right row
+// instead of silently being reinterpreted — and (independent review,
+// F1) must NOT itself overwrite that cookie, unlike an earlier version
+// of this fix that reused "region" (the picker's own explicit-switch
+// param, which DOES persist) for the pin too.
+func TestListFilter_RegionPinnedInForm_RealBrowser_SurvivesCookieChange(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, tenantDB := testServer(t)
+
+	shipDef, shipForm := filterShipmentDef("BackButtonShipment")
+	publishDef(t, tenantDB, shipDef, shipForm)
+	eng := crud.NewEngine(tenantDB)
+	if _, err := eng.Create(context.Background(), shipDef, map[string]any{
+		"name": "Container 1", "ship_date": "2026-04-03", "weight": 1234567.5,
+	}, humanActor()); err != nil {
+		t.Fatalf("seed Container 1: %v", err)
+	}
+	if _, err := eng.Create(context.Background(), shipDef, map[string]any{
+		"name": "Container 2", "ship_date": "2026-01-15", "weight": 42.0,
+	}, humanActor()); err != nil {
+		t.Fatalf("seed Container 2: %v", err)
+	}
+
+	ctx := browserCtx(t, tenantID)
+
+	// Render under en-GB (the default — no ?region= at all, no cookie
+	// either) with the filter box filled in. This is exactly the page a
+	// viewer would bookmark, share, or later navigate Back to.
+	var listText string
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/records/BackButtonShipment?filter=weight&q="+url.QueryEscape("1,234,567.5")),
+		chromedp.WaitVisible(`table`, chromedp.ByQuery),
+		chromedp.Text(`table`, &listText, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("load British-grouped filter: %v", err)
+	}
+	if !strings.Contains(listText, "Container 1") || strings.Contains(listText, "Container 2") {
+		t.Fatalf("sanity: en-GB filter should match only Container 1, got:\n%s", listText)
+	}
+	if got := regionCookieValue(t, ctx); got != "" {
+		t.Fatalf("a plain (no explicit ?region= switch) render should not have set a region cookie, got %q", got)
+	}
+
+	// Read the hidden qregion input directly out of the LIVE DOM, and
+	// compute the URL a real submit of this exact form would produce —
+	// via FormData/URLSearchParams (independent review, F7: this proves
+	// the hidden field is actually INSIDE form.uc-list-filter and would
+	// really be submitted, not just present somewhere on the page —
+	// reading individual inputs by name, as an earlier version of this
+	// test did, can't tell those two apart).
+	var regionValue, capturedHref string
+	if err := chromedp.Run(ctx,
+		chromedp.Value(`input[name="qregion"]`, &regionValue, chromedp.ByQuery),
+		chromedp.Evaluate(`(function() {
+			var f = document.querySelector('form.uc-list-filter');
+			var params = new URLSearchParams(new FormData(f));
+			params.set('filter', 'weight');
+			return f.getAttribute('action') + '?' + params.toString();
+		})()`, &capturedHref),
+	); err != nil {
+		t.Fatalf("read hidden qregion input / compute captured URL: %v", err)
+	}
+	if regionValue != "en-GB" {
+		t.Fatalf("filter form's hidden qregion input = %q, want en-GB", regionValue)
+	}
+	if !strings.Contains(capturedHref, "qregion=en-GB") {
+		t.Fatalf("the form's own FormData submit did not carry qregion=en-GB — the hidden field isn't really inside form.uc-list-filter, got href: %q", capturedHref)
+	}
+
+	// Simulate the cookie having since changed — a region switch made
+	// after this page was rendered, or a colleague's own cookie in the
+	// shared-link case — directly on the browser's real cookie jar, the
+	// same mechanism a completed region switch would have used.
+	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		return network.SetCookie("uc_locale_region", "en-IN").
+			WithURL(srv.URL).
+			WithPath("/").
+			Do(ctx)
+	})); err != nil {
+		t.Fatalf("set en-IN region cookie: %v", err)
+	}
+
+	// Navigate to the captured URL — a real browser round trip, real
+	// cookie jar, real DOM — and confirm the pin it carries still wins
+	// over the now-different cookie: Container 1 must still match, not
+	// be silently reinterpreted under en-IN's lakh/crore grouping the
+	// way a link with no pin of its own would be (proven by the negative
+	// control below). Also confirm the cookie itself is UNCHANGED by
+	// this navigation (independent review, F1) — a pinned-only request
+	// must never be mistaken for a deliberate region switch.
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+capturedHref),
+		chromedp.WaitVisible(`table`, chromedp.ByQuery),
+		chromedp.Text(`table`, &listText, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("navigate to the captured URL with an en-IN cookie active: %v", err)
+	}
+	if !strings.Contains(listText, "Container 1") {
+		t.Errorf("captured URL %q with its own qregion=en-GB must still match Container 1 despite an en-IN region cookie, got:\n%s", capturedHref, listText)
+	}
+	if got := regionCookieValue(t, ctx); got != "en-IN" {
+		t.Errorf("a pinned-only navigation (qregion=, no region=) must not touch the region cookie — want it to stay en-IN, got %q", got)
+	}
+
+	// Negative control proving this test would actually catch a
+	// regression: the identical query WITHOUT its own pin (plain
+	// ?filter=weight&q=..., what every generated link produced before
+	// this fix) is silently misread under the now-active en-IN cookie's
+	// lakh/crore grouping and finds nothing.
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/records/BackButtonShipment?filter=weight&q="+url.QueryEscape("1,234,567.5")),
+		chromedp.WaitVisible(`p.uc-empty`, chromedp.ByQuery),
+		chromedp.Text(`body`, &listText, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("load the same filter with no pin, en-IN cookie active: %v", err)
+	}
+	if strings.Contains(listText, "Container 1") {
+		t.Fatalf("test setup problem: the same filter with no pin, under an en-IN cookie, should NOT match Container 1 (proves the cookie change took effect and the pin is what's doing the work) — got a match:\n%s", listText)
 	}
 }

@@ -3360,8 +3360,12 @@ func TestAPI_RecordList_PaginatesBeyondPageSize(t *testing.T) {
 	if got := strings.Count(page1Body, "<tr onclick"); got != listPageSize {
 		t.Fatalf("expected %d rows on page 1, got %d:\n%s", listPageSize, got, page1Body)
 	}
-	if !strings.Contains(page1Body, `href="/records/Vendor?page=2"`) {
-		t.Fatalf("expected a link to page 2 on page 1, got:\n%s", page1Body)
+	// url.Values.Encode() sorts keys alphabetically: "page" before
+	// "qregion" — the latter (deliberately NOT "region", see
+	// qRegionParam's own doc comment) rides along unconditionally since
+	// uc-infra#164 (default locale/no-cookie region is en-GB).
+	if !strings.Contains(page1Body, `href="/records/Vendor?page=2&amp;qregion=en-GB"`) {
+		t.Fatalf("expected a link to page 2 (region-pinned) on page 1, got:\n%s", page1Body)
 	}
 	if strings.Contains(page1Body, "Previous") {
 		t.Fatalf("expected no Previous link on page 1, got:\n%s", page1Body)
@@ -3378,8 +3382,8 @@ func TestAPI_RecordList_PaginatesBeyondPageSize(t *testing.T) {
 	if got := strings.Count(page2Body, "<tr onclick"); got != total-listPageSize {
 		t.Fatalf("expected %d rows on page 2, got %d:\n%s", total-listPageSize, got, page2Body)
 	}
-	if !strings.Contains(page2Body, `href="/records/Vendor?page=1"`) {
-		t.Fatalf("expected a link back to page 1 on page 2, got:\n%s", page2Body)
+	if !strings.Contains(page2Body, `href="/records/Vendor?page=1&amp;qregion=en-GB"`) {
+		t.Fatalf("expected a link back to page 1 (region-pinned) on page 2, got:\n%s", page2Body)
 	}
 	if strings.Contains(page2Body, ">Next<") {
 		t.Fatalf("expected no Next link on the last page, got:\n%s", page2Body)
