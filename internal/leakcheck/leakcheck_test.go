@@ -83,6 +83,7 @@ var bannedInFile = map[string][]string{
 	"internal/kernel/speechassist/speechassist.go": {
 		"homelab-k8s",
 		"kubernetes/apps",
+		"whisper.whisper.svc.cluster.local",
 	},
 	"internal/kernel/csvimport/ai.go": {
 		"homelab",
