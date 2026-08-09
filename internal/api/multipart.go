@@ -28,4 +28,14 @@ package api
 // >= 10 MiB) so a file bigger than this but still under its handler's
 // cap reliably spills — see each call site's own comment for what
 // spilling does and doesn't buy that particular handler.
+//
+// One exception: parseRecordFields' own hard cap, maxRecordFieldsBytes
+// (2 MiB), is deliberately smaller than THIS constant — it accepts only
+// plain entity field values, never a file, so its ceiling is far below
+// every upload-carrying endpoint's. Nothing can ever exceed 8 MiB once
+// already capped to 2 MiB, so ParseMultipartForm never spills at that
+// one call site; still passed for the same "a ParseMultipartForm call
+// that doesn't reference multipartParseMemory is a bug on sight"
+// consistency reason as everywhere else, not because spilling is reachable
+// there.
 const multipartParseMemory = 8 << 20 // 8 MiB

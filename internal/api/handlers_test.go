@@ -673,9 +673,9 @@ func TestAPI_UpdateRecord_MalformedUrlencodedBodyIs400(t *testing.T) {
 // integration-gated on TEST_DATABASE_URL and skips wherever that isn't
 // set — including the new isMultipart branch, which had no test
 // exercising it at all). parseRecordFields takes only
-// (*http.Request, *entity.Definition) and touches no database, so every
-// case below runs with plain httptest.NewRequest, no router/tenant/DB
-// setup required.
+// (http.ResponseWriter, *http.Request, *entity.Definition) and touches no
+// database, so every case below runs with plain httptest.NewRequest and
+// httptest.NewRecorder, no router/tenant/DB setup required.
 func TestParseRecordFields(t *testing.T) {
 	def := itemWithFlagEntityDef()
 
@@ -698,7 +698,7 @@ func TestParseRecordFields(t *testing.T) {
 
 	t.Run("multipart happy path", func(t *testing.T) {
 		req := newMultipartRequest(t, map[string]string{"sku": "WIDGET-1", "internal_note": "hello"})
-		fields, err := parseRecordFields(req, def)
+		fields, err := parseRecordFields(httptest.NewRecorder(), req, def)
 		if err != nil {
 			t.Fatalf("parseRecordFields: %v", err)
 		}
@@ -710,15 +710,114 @@ func TestParseRecordFields(t *testing.T) {
 	t.Run("multipart missing boundary", func(t *testing.T) {
 		req := httptest.NewRequest("POST", "/api/records/ItemWithFlag", strings.NewReader("garbage"))
 		req.Header.Set("Content-Type", "multipart/form-data")
-		if _, err := parseRecordFields(req, def); err == nil {
+		if _, err := parseRecordFields(httptest.NewRecorder(), req, def); err == nil {
 			t.Fatal("expected an error for multipart/form-data with no boundary parameter, got nil")
+		}
+	})
+
+	// TestParseRecordFields/multipart_body_over_maxRecordFieldsBytes_is_rejected
+	// is one of three regression tests (alongside the urlencoded and JSON
+	// cases below) for uc-infra#191/#195: parseRecordFields had no
+	// http.MaxBytesReader cap at all on ANY of its three Content-Type
+	// branches — any caller could post an unbounded body of any of the
+	// three shapes and force up to the full (pre-fix) 32 MiB
+	// ParseMultipartForm maxMemory argument (multipart) or an outright
+	// unbounded read (urlencoded beyond stdlib's own internal limit, JSON
+	// always) to buffer in the process heap per request. Builds a real
+	// multipart body one byte over maxRecordFieldsBytes (not over the old
+	// 32 MiB literal — the fix must reject well below that, not just
+	// eventually) and asserts parseRecordFields errors rather than
+	// accepting it.
+	t.Run("multipart body over maxRecordFieldsBytes is rejected", func(t *testing.T) {
+		var buf bytes.Buffer
+		mw := multipart.NewWriter(&buf)
+		oversized := strings.Repeat("x", maxRecordFieldsBytes+1)
+		if err := mw.WriteField("internal_note", oversized); err != nil {
+			t.Fatalf("write oversized multipart field: %v", err)
+		}
+		if err := mw.Close(); err != nil {
+			t.Fatalf("close multipart writer: %v", err)
+		}
+		req := httptest.NewRequest("POST", "/api/records/ItemWithFlag", &buf)
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+
+		rec := httptest.NewRecorder()
+		if _, err := parseRecordFields(rec, req, def); err == nil {
+			t.Fatal("expected an error for a multipart body over maxRecordFieldsBytes, got nil")
+		}
+	})
+
+	// urlencoded body over maxRecordFieldsBytes (3 MiB — comfortably over
+	// this endpoint's own 2 MiB cap, but still under net/http's own
+	// internal 10 MiB ParseForm safety limit) is rejected BY OUR cap, not
+	// by falling through to stdlib's much larger one — the two must not
+	// be conflated.
+	t.Run("urlencoded body over maxRecordFieldsBytes is rejected", func(t *testing.T) {
+		oversized := strings.Repeat("x", maxRecordFieldsBytes+(1<<20))
+		req := httptest.NewRequest("POST", "/api/records/ItemWithFlag", strings.NewReader("internal_note="+oversized))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		if _, err := parseRecordFields(httptest.NewRecorder(), req, def); err == nil {
+			t.Fatal("expected an error for an urlencoded body over maxRecordFieldsBytes, got nil")
+		}
+	})
+
+	// JSON body over maxRecordFieldsBytes is rejected — the regression
+	// case for the actual finding: the multipart-only cap this fix first
+	// shipped with left the JSON/no-Content-Type path (the one every
+	// existing API-client test and most real callers use, per
+	// createRecord's own doc comment) completely unbounded, defeating the
+	// point. Fails against that intermediate version; passes once
+	// http.MaxBytesReader is applied unconditionally before the
+	// Content-Type dispatch.
+	t.Run("JSON body over maxRecordFieldsBytes is rejected", func(t *testing.T) {
+		oversized := strings.Repeat("x", maxRecordFieldsBytes+(1<<20))
+		req := httptest.NewRequest("POST", "/api/records/ItemWithFlag", strings.NewReader(`{"internal_note":"`+oversized+`"}`))
+		if _, err := parseRecordFields(httptest.NewRecorder(), req, def); err == nil {
+			t.Fatal("expected an error for a JSON body over maxRecordFieldsBytes, got nil")
+		}
+	})
+
+	// The oversized-rejection error is a friendly, sibling-consistent
+	// message naming the limit (uc-infra#191/#195 review finding), not
+	// http.MaxBytesError's own bare, Hyrum's-law-frozen
+	// "http: request body too large" with no number in it.
+	t.Run("oversized body error names the limit, not just MaxBytesError's bare message", func(t *testing.T) {
+		oversized := strings.Repeat("x", maxRecordFieldsBytes+1)
+		req := httptest.NewRequest("POST", "/api/records/ItemWithFlag", strings.NewReader(`{"internal_note":"`+oversized+`"}`))
+		_, err := parseRecordFields(httptest.NewRecorder(), req, def)
+		if err == nil {
+			t.Fatal("expected an error for an oversized JSON body, got nil")
+		}
+		if !strings.Contains(err.Error(), "2 MiB") {
+			t.Fatalf("expected the error to name the 2 MiB limit, got: %v", err)
+		}
+	})
+
+	// A body of exactly maxRecordFieldsBytes — not one byte over — is
+	// still accepted: http.MaxBytesReader only errors once a caller tries
+	// to read PAST the limit, so an exact-cap submission must round-trip
+	// normally rather than being off-by-one rejected.
+	t.Run("JSON body of exactly maxRecordFieldsBytes is accepted", func(t *testing.T) {
+		const prefix, suffix = `{"internal_note":"`, `"}`
+		padding := strings.Repeat("x", maxRecordFieldsBytes-len(prefix)-len(suffix))
+		body := prefix + padding + suffix
+		if len(body) != maxRecordFieldsBytes {
+			t.Fatalf("test setup bug: body is %d bytes, want exactly %d", len(body), maxRecordFieldsBytes)
+		}
+		req := httptest.NewRequest("POST", "/api/records/ItemWithFlag", strings.NewReader(body))
+		fields, err := parseRecordFields(httptest.NewRecorder(), req, def)
+		if err != nil {
+			t.Fatalf("expected a body of exactly maxRecordFieldsBytes to be accepted, got: %v", err)
+		}
+		if fields["internal_note"] != padding {
+			t.Fatal("expected internal_note to round-trip at exactly the cap")
 		}
 	})
 
 	t.Run("urlencoded with charset parameter", func(t *testing.T) {
 		req := httptest.NewRequest("POST", "/api/records/ItemWithFlag", strings.NewReader("sku=WIDGET-1&internal_note=hello"))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
-		fields, err := parseRecordFields(req, def)
+		fields, err := parseRecordFields(httptest.NewRecorder(), req, def)
 		if err != nil {
 			t.Fatalf("parseRecordFields: %v", err)
 		}
@@ -730,14 +829,14 @@ func TestParseRecordFields(t *testing.T) {
 	t.Run("urlencoded with bare semicolon is rejected, not silently dropped", func(t *testing.T) {
 		req := httptest.NewRequest("POST", "/api/records/ItemWithFlag", strings.NewReader("sku=WIDGET-1&internal_note=a;b"))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		if _, err := parseRecordFields(req, def); err == nil {
+		if _, err := parseRecordFields(httptest.NewRecorder(), req, def); err == nil {
 			t.Fatal("expected an error for a bare semicolon in an urlencoded body (uc-infra#172), got nil")
 		}
 	})
 
 	t.Run("JSON fallback, no Content-Type", func(t *testing.T) {
 		req := httptest.NewRequest("POST", "/api/records/ItemWithFlag", strings.NewReader(`{"sku":"WIDGET-1"}`))
-		fields, err := parseRecordFields(req, def)
+		fields, err := parseRecordFields(httptest.NewRecorder(), req, def)
 		if err != nil {
 			t.Fatalf("parseRecordFields: %v", err)
 		}
@@ -749,7 +848,7 @@ func TestParseRecordFields(t *testing.T) {
 	t.Run("JSON fallback, explicit Content-Type", func(t *testing.T) {
 		req := httptest.NewRequest("POST", "/api/records/ItemWithFlag", strings.NewReader(`{"sku":"WIDGET-1"}`))
 		req.Header.Set("Content-Type", "application/json")
-		fields, err := parseRecordFields(req, def)
+		fields, err := parseRecordFields(httptest.NewRecorder(), req, def)
 		if err != nil {
 			t.Fatalf("parseRecordFields: %v", err)
 		}
@@ -757,6 +856,161 @@ func TestParseRecordFields(t *testing.T) {
 			t.Fatalf("expected the JSON body decoded, got %#v", fields)
 		}
 	})
+}
+
+// TestAPI_CreateRecord_OversizedMultipart_Rejected is the router-level
+// (real HTTP handler, real *entity.Definition lookup) companion to
+// TestParseRecordFields' unit-level oversized-multipart case: confirms
+// POST /api/records/{entityType} itself — not just parseRecordFields in
+// isolation — returns 400 for a multipart body over maxRecordFieldsBytes,
+// and that no record is created from the rejected request.
+func TestAPI_CreateRecord_OversizedMultipart_Rejected(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	oversized := strings.Repeat("x", maxRecordFieldsBytes+1)
+	if err := mw.WriteField("name", oversized); err != nil {
+		t.Fatalf("write oversized multipart field: %v", err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+	req := httptest.NewRequest("POST", "/api/records/Vendor", &buf)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("X-Tenant-ID", tenantID)
+	req.Header.Set("X-Actor-ID", "farshid")
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an oversized multipart create, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	listReq := newRequest("GET", "/api/records/Vendor", tenantID, "farshid", nil)
+	listRec := httptest.NewRecorder()
+	mux.ServeHTTP(listRec, listReq)
+	var listed struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(listRec.Body.Bytes(), &listed); err != nil {
+		t.Fatalf("unmarshal list response: %v", err)
+	}
+	if len(listed.Data) != 0 {
+		t.Fatalf("expected no Vendor record created from the rejected oversized request, got %d", len(listed.Data))
+	}
+}
+
+// TestAPI_CreateRecord_OversizedJSON_Rejected is the router-level
+// regression test for the actual uc-infra#191/#195 review finding: an
+// intermediate version of this fix capped only the multipart branch,
+// leaving JSON — the Content-Type every existing API-client test and
+// newRequest's own helper use — completely unbounded. Fails a 201 against
+// that intermediate version; passes (400, no record created) once
+// http.MaxBytesReader is applied unconditionally in parseRecordFields.
+func TestAPI_CreateRecord_OversizedJSON_Rejected(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	oversized := strings.Repeat("x", maxRecordFieldsBytes+(1<<20))
+	req := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{"name":"`+oversized+`"}`))
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an oversized JSON create, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	listReq := newRequest("GET", "/api/records/Vendor", tenantID, "farshid", nil)
+	listRec := httptest.NewRecorder()
+	mux.ServeHTTP(listRec, listReq)
+	var listed struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(listRec.Body.Bytes(), &listed); err != nil {
+		t.Fatalf("unmarshal list response: %v", err)
+	}
+	if len(listed.Data) != 0 {
+		t.Fatalf("expected no Vendor record created from the rejected oversized JSON request, got %d", len(listed.Data))
+	}
+}
+
+// TestAPI_UpdateRecord_OversizedMultipart_Rejected is updateRecord's own
+// companion to TestAPI_CreateRecord_OversizedMultipart_Rejected — both
+// call sites changed to plumb w http.ResponseWriter into
+// parseRecordFields, and updateRecord's is the more interesting path (it
+// additionally reaches EffectiveWriteFields and extractVersion), so it
+// gets its own router-level coverage rather than relying on createRecord's
+// test alone to stand in for both changed call sites.
+func TestAPI_UpdateRecord_OversizedMultipart_Rejected(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, vendorEntityDef(), vendorFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	createReq := newRequest("POST", "/api/records/Vendor", tenantID, "farshid", []byte(`{"name":"Acme"}`))
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	var created struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal create response: %v", err)
+	}
+
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	oversized := strings.Repeat("x", maxRecordFieldsBytes+1)
+	if err := mw.WriteField("name", oversized); err != nil {
+		t.Fatalf("write oversized multipart field: %v", err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+	updateReq := httptest.NewRequest("POST", "/api/records/Vendor/"+created.Data.ID, &buf)
+	updateReq.Header.Set("Content-Type", mw.FormDataContentType())
+	updateReq.Header.Set("X-Tenant-ID", tenantID)
+	updateReq.Header.Set("X-Actor-ID", "farshid")
+
+	updateRec := httptest.NewRecorder()
+	mux.ServeHTTP(updateRec, updateReq)
+	if updateRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an oversized multipart update, got %d: %s", updateRec.Code, updateRec.Body.String())
+	}
+
+	getReq := newRequest("GET", "/api/records/Vendor/"+created.Data.ID, tenantID, "farshid", nil)
+	getRec := httptest.NewRecorder()
+	mux.ServeHTTP(getRec, getReq)
+	var current struct {
+		Data struct {
+			Data struct {
+				Name string `json:"name"`
+			} `json:"data"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(getRec.Body.Bytes(), &current); err != nil {
+		t.Fatalf("unmarshal get response: %v", err)
+	}
+	if current.Data.Data.Name != "Acme" {
+		t.Fatalf("expected the rejected oversized update to leave the record unchanged (name still %q), got %q", "Acme", current.Data.Data.Name)
+	}
 }
 
 // TestAPI_CreateRecord_HTMXRequest_ReturnsHTMLFragment confirms an
