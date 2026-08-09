@@ -198,6 +198,30 @@ func testServer(t *testing.T) (srv *httptest.Server, tenantID string, tenantDB *
 // way a real logged-in browser session would once real auth exists.
 func browserCtx(t *testing.T, tenantID string) context.Context {
 	t.Helper()
+	return browserCtxWithTimeout(t, tenantID, 30*time.Second)
+}
+
+// browserCtxWithTimeout is browserCtx with a caller-supplied overall
+// context deadline, instead of the fixed 30 seconds every other caller
+// gets — added for TestHelpScreenshot_StalenessCheck_RealBrowser and
+// TestCaptureHelpScreenshots (uc-infra#145, independent review found via
+// a real CI-reproducing `-race` run, not just reading the diff): both
+// loop 8 real navigate+capture round trips through ONE shared browser
+// context, and 30 seconds is a single, ABSOLUTE deadline for the whole
+// context — not a per-operation budget that resets each iteration. That
+// fit under plain `go test` (internal/e2e's own package finished in
+// ~13-115s across this whole file's ~50 other tests, this one included),
+// but CI always runs `-race` (`.github/workflows/ci.yml`'s Test step),
+// whose instrumentation overhead is real and measured here: this exact
+// loop, reproduced locally with `-race`, failed on its LAST combo
+// (`wizard/ar`) with "context deadline exceeded" — the cumulative time
+// of 7 prior real page loads had already spent most of the 30-second
+// budget before the 8th ever got a chance to start its own navigation.
+// A single generous deadline sized for the whole loop (not per-call)
+// fixes this without changing every other single-navigation caller's
+// existing 30-second default.
+func browserCtxWithTimeout(t *testing.T, tenantID string, timeout time.Duration) context.Context {
+	t.Helper()
 	execPath := findBrowser(t)
 
 	allocCtx, cancelAlloc := chromedp.NewExecAllocator(context.Background(),
@@ -207,7 +231,7 @@ func browserCtx(t *testing.T, tenantID string) context.Context {
 	ctx, cancel := chromedp.NewContext(allocCtx)
 	t.Cleanup(cancel)
 
-	ctx, cancelTimeout := context.WithTimeout(ctx, 30*time.Second)
+	ctx, cancelTimeout := context.WithTimeout(ctx, timeout)
 	t.Cleanup(cancelTimeout)
 
 	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {

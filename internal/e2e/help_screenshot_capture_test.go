@@ -244,7 +244,14 @@ func TestCaptureHelpScreenshots(t *testing.T) {
 	}
 	withDevAuthEnabled(t)
 	srv, tenantID, _ := demoOrgHelpServer(t)
-	ctx := browserCtx(t, tenantID)
+	// browserCtxWithTimeout, not the package's plain 30-second browserCtx
+	// (independent review, uc-infra#145): this loop does 8 real
+	// navigate+capture round trips through ONE shared browser context,
+	// and 30 seconds is that context's single absolute deadline, not a
+	// per-iteration budget — see browserCtxWithTimeout's own doc comment
+	// (csv_import_test.go) for how this was found (a real `-race` run
+	// failing on the loop's last combo).
+	ctx := browserCtxWithTimeout(t, tenantID, 3*time.Minute)
 
 	assetsRoot := filepath.Join("..", "help", "content", "assets")
 

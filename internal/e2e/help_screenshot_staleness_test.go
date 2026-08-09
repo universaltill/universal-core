@@ -60,6 +60,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/universaltill/universal-core/internal/help"
 )
@@ -101,7 +102,17 @@ func loadCheckedInHelpScreenshots(t *testing.T) map[string]image.Image {
 func TestHelpScreenshot_StalenessCheck_RealBrowser(t *testing.T) {
 	withDevAuthEnabled(t)
 	srv, tenantID, _ := demoOrgHelpServer(t)
-	ctx := browserCtx(t, tenantID)
+	// browserCtxWithTimeout, not the package's plain 30-second browserCtx
+	// (independent review, uc-infra#145 — found by actually reproducing
+	// CI's `-race` run locally, not just reading the diff): this test
+	// loops all 8 combos through ONE shared browser context, and 30
+	// seconds is that context's single absolute deadline for the whole
+	// loop, not a per-combo budget. Confirmed failing exactly this way —
+	// "context deadline exceeded" on the loop's LAST combo (wizard/ar)
+	// under `-race`, which CI's own Test step always runs — before this
+	// fix; see browserCtxWithTimeout's own doc comment
+	// (csv_import_test.go) for the full story.
+	ctx := browserCtxWithTimeout(t, tenantID, 3*time.Minute)
 
 	checkedIn := loadCheckedInHelpScreenshots(t)
 
