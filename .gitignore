@@ -19,7 +19,12 @@
 
 # Locally-built cmd binaries (go build ./cmd/... in the repo root) — a
 # 13 MB seed-demo-data binary was one git add -A away from the public
-# history once (independent review, 2026-07-31).
+# history once (independent review, 2026-07-31). A 15.8 MB
+# sync-tenant-modules binary actually landed (uc-infra#184) — this list
+# had an entry for every other cmd/ binary except that one.
+# internal/repohygiene/gitignore_test.go now guards this list against
+# missing an entry the same way again; keep this block's entries in sync
+# with cmd/*'s actual directory names or that test fails the build.
 /seed-demo-data
 /provision-tenant
 /migrate
@@ -28,6 +33,10 @@
 /backfill-quote-line-unit-price
 /backfill-purchase-order-total
 /backfill-poline-money
+/sync-tenant-modules
+/install-module
+/backfill-goods-receipt-facility
+/backfill-inventory-facility
 
 # A TestCaptureHelpScreenshots run (internal/e2e/help_screenshot_capture_
 # test.go, uc-infra#145) killed mid-write leaves its temp file behind —
