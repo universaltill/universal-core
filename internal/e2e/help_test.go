@@ -88,11 +88,22 @@ var helpFixtureTopics = []helpFixtureTopic{
 			"fa": "شروع کار",
 			"ar": "البدء",
 		},
+		// The body's second paragraph (uc-infra#145) is a real
+		// ![alt](url) image reference to one of the 8 real captured
+		// screenshots (internal/e2e's own TestCaptureHelpScreenshots,
+		// checked in under internal/help/content/assets/) — the src is
+		// intentionally the SAME file across every locale below (there is
+		// only one "list" family en capture — see the issue's own
+		// locale-policy trade-off), but each locale's ALT text is its own
+		// real, translated sentence, not a copy-pasted English string,
+		// matching this file's existing per-locale translation pattern.
+		// TestHelp_TopicImageRendersWithAltText_RealBrowser is what
+		// exercises this.
 		body: map[string]string{
-			"en": "Welcome to Universal Core. This guide walks new users through their first login.",
-			"tr": "Universal Core'a hoş geldiniz. Bu kılavuz yeni kullanıcılara ilk girişte yol gösterir.",
-			"fa": "به یونیورسال کور خوش آمدید. این راهنما کاربران جدید را در اولین ورود راهنمایی می‌کند.",
-			"ar": "مرحبًا بك في يونيفرسال كور. يوجّه هذا الدليل المستخدمين الجدد خلال أول تسجيل دخول.",
+			"en": "Welcome to Universal Core. This guide walks new users through their first login.\n\n![Screenshot of the Item list page](/help/assets/list/en.jpg)",
+			"tr": "Universal Core'a hoş geldiniz. Bu kılavuz yeni kullanıcılara ilk girişte yol gösterir.\n\n![Ürün liste sayfasının ekran görüntüsü](/help/assets/list/en.jpg)",
+			"fa": "به یونیورسال کور خوش آمدید. این راهنما کاربران جدید را در اولین ورود راهنمایی می‌کند.\n\n![تصویری از صفحهٔ فهرست اقلام](/help/assets/list/en.jpg)",
+			"ar": "مرحبًا بك في يونيفرسال كور. يوجّه هذا الدليل المستخدمين الجدد خلال أول تسجيل دخول.\n\n![لقطة شاشة لصفحة قائمة الأصناف](/help/assets/list/en.jpg)",
 		},
 	},
 	{
@@ -587,6 +598,113 @@ func TestHelp_Authz_DeniedTopicHiddenAndNotFound_RealBrowser(t *testing.T) {
 	}
 	if navCount == 0 {
 		t.Error("expected the not-found page to still render inside the normal shell (nav present), not a dead end")
+	}
+}
+
+// TestHelp_TopicImageRendersWithAltText_RealBrowser (uc-infra#145) proves
+// ![alt](url) markdown in a topic body reaches a real, LOADED <img> in
+// the browser — not just that the markup contains an <img> tag.
+// CLAUDE.md's own rule against markup-only proof for anything CSS/
+// DOM-behavior-dependent applies directly here: a broken/404'ing src
+// still produces an <img> element with the right alt attribute, so this
+// asserts naturalWidth > 0 (via a real DOM read, chromedp.EvaluateAsDevTools)
+// as the actual "it loaded" proof, for both an LTR (en) and RTL (ar)
+// locale, with each locale's own real translated alt text (not a
+// copy-pasted English fallback).
+//
+// Also asserts real layout geometry (independent review, uc-infra#145):
+// this test's first version only checked src/alt/naturalWidth and missed
+// that .uc-help-image had no CSS rule at all — every committed capture is
+// 1280px wide, wider than #uc-help-detail's own content column, so the
+// image rendered at its native size, overflowed the pane, and forced the
+// whole document to scroll horizontally. A markup-only assertion can't
+// catch that (CLAUDE.md's own warning against exactly this gap); a real
+// getBoundingClientRect/scrollWidth read can and does.
+func TestHelp_TopicImageRendersWithAltText_RealBrowser(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, _ := testHelpServer(t)
+	ctx := browserCtx(t, tenantID)
+
+	cases := []struct {
+		locale, wantAlt string
+	}{
+		{"en", "Screenshot of the Item list page"},
+		{"ar", "لقطة شاشة لصفحة قائمة الأصناف"},
+	}
+	for _, c := range cases {
+		t.Run(c.locale, func(t *testing.T) {
+			const imgSel = `#uc-help-detail img.uc-help-image`
+			var imgCount int
+			var src, alt string
+			if err := chromedp.Run(ctx,
+				chromedp.Navigate(srv.URL+"/help/route/getting-started?lang="+c.locale),
+				chromedp.WaitVisible(imgSel, chromedp.ByQuery),
+				chromedp.EvaluateAsDevTools(`document.querySelectorAll('`+imgSel+`').length`, &imgCount),
+				chromedp.EvaluateAsDevTools(`document.querySelector('`+imgSel+`').getAttribute('src')`, &src),
+				chromedp.EvaluateAsDevTools(`document.querySelector('`+imgSel+`').getAttribute('alt')`, &alt),
+			); err != nil {
+				t.Fatalf("%s: navigate and inspect the topic image: %v", c.locale, err)
+			}
+			if imgCount == 0 {
+				t.Fatalf("%s: expected an <img class=%q> in #uc-help-detail, found none", c.locale, "uc-help-image")
+			}
+			if src != "/help/assets/list/en.jpg" {
+				t.Errorf("%s: img src = %q, want %q", c.locale, src, "/help/assets/list/en.jpg")
+			}
+			if strings.TrimSpace(alt) == "" {
+				t.Fatalf("%s: img alt is empty", c.locale)
+			}
+			if alt != c.wantAlt {
+				t.Errorf("%s: img alt = %q, want the real translated text %q (not a silent fallback to en)", c.locale, alt, c.wantAlt)
+			}
+
+			// The image load completing is async relative to the DOM
+			// insertion WaitVisible already confirmed — poll naturalWidth
+			// rather than reading it immediately, so a real (if brief)
+			// network fetch of /help/assets/list/en.jpg has time to
+			// finish before this asserts on it.
+			if err := chromedp.Run(ctx, chromedp.Poll(
+				`document.querySelector('`+imgSel+`').naturalWidth > 0`,
+				nil, chromedp.WithPollingTimeout(5*time.Second),
+			)); err != nil {
+				t.Fatalf("%s: image never finished loading (naturalWidth stayed 0 — a broken src still produces an <img> tag, which is exactly why this check exists): %v", c.locale, err)
+			}
+			var naturalWidth float64
+			if err := chromedp.Run(ctx, chromedp.EvaluateAsDevTools(
+				`document.querySelector('`+imgSel+`').naturalWidth`, &naturalWidth,
+			)); err != nil {
+				t.Fatalf("%s: read naturalWidth: %v", c.locale, err)
+			}
+			if naturalWidth <= 0 {
+				t.Errorf("%s: naturalWidth = %v, want > 0 (the image failed to actually load)", c.locale, naturalWidth)
+			}
+
+			// Geometry: the image must fit inside its pane, and the page
+			// must never gain a horizontal scrollbar because of it — the
+			// concrete symptom independent review measured before
+			// app.css's .uc-help-image rule existed (imgRight 1701 vs
+			// detailRight 1192, documentElement.scrollWidth 1701 > 1280).
+			var imgWidth, detailWidth, imgRight, detailRight, scrollWidth, clientWidth float64
+			if err := chromedp.Run(ctx,
+				chromedp.EvaluateAsDevTools(`document.querySelector('`+imgSel+`').getBoundingClientRect().width`, &imgWidth),
+				chromedp.EvaluateAsDevTools(`document.querySelector('#uc-help-detail').getBoundingClientRect().width`, &detailWidth),
+				chromedp.EvaluateAsDevTools(`document.querySelector('`+imgSel+`').getBoundingClientRect().right`, &imgRight),
+				chromedp.EvaluateAsDevTools(`document.querySelector('#uc-help-detail').getBoundingClientRect().right`, &detailRight),
+				chromedp.EvaluateAsDevTools(`document.documentElement.scrollWidth`, &scrollWidth),
+				chromedp.EvaluateAsDevTools(`document.documentElement.clientWidth`, &clientWidth),
+			); err != nil {
+				t.Fatalf("%s: read layout geometry: %v", c.locale, err)
+			}
+			if imgWidth > detailWidth+0.5 {
+				t.Errorf("%s: image rendered width %v exceeds its pane's own width %v — .uc-help-image must not overflow #uc-help-detail", c.locale, imgWidth, detailWidth)
+			}
+			if imgRight > detailRight+0.5 {
+				t.Errorf("%s: image right edge %v is past its pane's right edge %v — the image escapes the pane", c.locale, imgRight, detailRight)
+			}
+			if scrollWidth > clientWidth+0.5 {
+				t.Errorf("%s: document.scrollWidth %v exceeds clientWidth %v — the image forced the whole page to scroll horizontally", c.locale, scrollWidth, clientWidth)
+			}
+		})
 	}
 }
 

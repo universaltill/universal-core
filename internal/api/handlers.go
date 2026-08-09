@@ -270,6 +270,16 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	// serving *this app's* CSS at that fixed URL is exactly the bug this
 	// fixed. shellTmpl only ever links to the hashed path.
 	mux.HandleFunc("GET "+appCSSPath, serveCSS)
+	// Captured help-manual screenshots (uc-infra#145) — see
+	// helpassets.go's own doc comment for why unauthenticated is correct
+	// here (generic Demo-Organization-only content, unlike the help
+	// TOPICS themselves below, which stay authz-gated). The literal
+	// "assets" segment outranks "/help/{topicID...}" (registered further
+	// down, behind authPage) under the mux's most-specific-pattern-wins
+	// rule — the same precedent /help/search already relies on against
+	// that identical wildcard (see help.go's renderHelpTopic doc
+	// comment and TestHelpSearchRouteWinsOverTopicWildcard).
+	mux.HandleFunc("GET /help/assets/{path...}", serveHelpAsset)
 	// webauth's own /ui/login, /ui/auth/callback, /ui/logout — never
 	// wrapped in Guard themselves; that's how a request gets a session
 	// in the first place. No-op registration when webauth is disabled.

@@ -18,9 +18,10 @@ import (
 // controlled need" reasoning frontmatter.go's own doc comment gives
 // (uc-infra#31/#95). It supports exactly: `#`/`##`/`###` headings,
 // blank-line-separated paragraphs, **bold**, *italic*/_italic_,
-// `inline code`, [text](url) links, and `-`/`*` unordered or `1.`
-// ordered lists. Anything else — including a literal `<script>` typed
-// into a topic's body — passes through as an escaped paragraph:
+// `inline code`, [text](url) links, ![alt](url) images (uc-infra#145),
+// and `-`/`*` unordered or `1.` ordered lists. Anything else — including
+// a literal `<script>` typed into a topic's body — passes through as an
+// escaped paragraph:
 // html/template.HTMLEscapeString is applied to every run of literal
 // text this parser doesn't recognize as one of the constructs above,
 // defense in depth even though topic content is authored by this
@@ -163,12 +164,12 @@ func parseBlocks(body string) []mdBlock {
 }
 
 // renderInline handles the character-level constructs (**bold**,
-// *italic*/_italic_, `code`, [text](url)) within one block's text,
-// returning the HTML fragment and the plain-word fragment in one pass.
-// Every literal character not consumed by a recognized construct is
-// escaped via html/template.HTMLEscapeString before being written to
-// the HTML output — this is what keeps a literal `<script>` (or any
-// other unrecognized markup) inert in the rendered page.
+// *italic*/_italic_, `code`, [text](url), ![alt](url)) within one
+// block's text, returning the HTML fragment and the plain-word fragment
+// in one pass. Every literal character not consumed by a recognized
+// construct is escaped via html/template.HTMLEscapeString before being
+// written to the HTML output — this is what keeps a literal `<script>`
+// (or any other unrecognized markup) inert in the rendered page.
 func renderInline(s string) (htmlOut, plainOut string) {
 	var h, p strings.Builder
 	var literal strings.Builder
@@ -246,6 +247,41 @@ func renderInline(s string) (htmlOut, plainOut string) {
 				i += 1 + end + 1
 				matched = true
 			}
+		case s[i] == '!' && i+1 < n && s[i+1] == '[':
+			// ![alt](url) — the "!" is consumed as part of the image
+			// marker here (this case is checked before the plain "["
+			// link case below, and matched stops the loop from ever
+			// re-visiting these bytes), so an image never falls through
+			// to be mis-parsed as a literal "!" followed by a
+			// [text](url) link (uc-infra#145).
+			if textEnd := strings.IndexByte(s[i+2:], ']'); textEnd >= 0 {
+				textEndAbs := i + 2 + textEnd
+				if textEndAbs+1 < n && s[textEndAbs+1] == '(' {
+					if j, closed := scanBalancedParenURL(s, textEndAbs+2); closed {
+						flushLiteral()
+						altText := s[i+2 : textEndAbs]
+						url := s[textEndAbs+2 : j]
+						if isSafeHelpImageSrc(url) {
+							h.WriteString(`<img src="` + template.HTMLEscapeString(url) + `" alt="` + template.HTMLEscapeString(altText) + `" loading="lazy" class="uc-help-image">`)
+						} else {
+							// Same reject-rather-than-emit posture as an
+							// unsafe link href below: no live src for a
+							// disallowed scheme, but the alt text still
+							// shows (escaped) rather than vanishing.
+							h.WriteString(template.HTMLEscapeString(altText))
+						}
+						// The alt text joins PlainText the same way link
+						// text already does — an image's alt text must be
+						// searchable (uc-infra#145's own acceptance
+						// criterion), not silently dropped from the
+						// search index just because it renders as an
+						// attribute, not a text node.
+						p.WriteString(altText)
+						i = j + 1
+						matched = true
+					}
+				}
+			}
 		case s[i] == '[':
 			if textEnd := strings.IndexByte(s[i+1:], ']'); textEnd >= 0 {
 				textEndAbs := i + 1 + textEnd
@@ -257,24 +293,7 @@ func renderInline(s string) (htmlOut, plainOut string) {
 					// must defang, and it contains one pair itself) —
 					// a naive first-')' match would truncate the URL
 					// mid-way and leak the rest as literal trailing text.
-					depth := 1
-					j := textEndAbs + 2
-					closed := false
-					for ; j < n; j++ {
-						switch s[j] {
-						case '(':
-							depth++
-						case ')':
-							depth--
-							if depth == 0 {
-								closed = true
-							}
-						}
-						if closed {
-							break
-						}
-					}
-					if closed {
+					if j, closed := scanBalancedParenURL(s, textEndAbs+2); closed {
 						flushLiteral()
 						linkText := s[i+1 : textEndAbs]
 						url := s[textEndAbs+2 : j]
@@ -307,6 +326,45 @@ func renderInline(s string) (htmlOut, plainOut string) {
 	return h.String(), p.String()
 }
 
+// scanBalancedParenURL scans a "(url)" span's contents starting at s[start]
+// (the byte immediately after the opening "("), depth-counting nested
+// parens so a URL that itself contains a balanced pair (e.g.
+// "javascript:alert(1)", exactly the kind of malicious URL both the
+// [text](url) link and ![alt](url) image constructs must defang) isn't
+// truncated mid-way by a naive first-")" search. Returns the index of the
+// matching close paren and whether one was found — shared by both
+// constructs' cases in renderInline above rather than duplicated per
+// construct.
+func scanBalancedParenURL(s string, start int) (closeIdx int, closed bool) {
+	depth := 1
+	for j := start; j < len(s); j++ {
+		switch s[j] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return j, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// isWordByte reports whether s[i] is a "word" byte (ASCII letter,
+// digit, underscore, or any byte belonging to a multibyte UTF-8
+// sequence, treated conservatively as word-like so this never
+// misjudges a rune boundary) for renderInline's intraword-"_" flanking
+// guard above — false for an out-of-range i (start/end of string is
+// never "inside a word").
+func isWordByte(s string, i int) bool {
+	if i < 0 || i >= len(s) {
+		return false
+	}
+	b := s[i]
+	return b == '_' || (b >= '0' && b <= '9') || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || b >= 0x80
+}
+
 // isSafeHelpLinkURL allows exactly http://, https://, or a same-origin
 // leading "/" — every other scheme (javascript:, data:, mailto: is even
 // disallowed here even though it's benign, since this narrow allowlist
@@ -325,24 +383,37 @@ func renderInline(s string) (htmlOut, plainOut string) {
 // — a bare single-backslash check, not a full net/url parse, because
 // this allowlist only ever needs to tell "same-origin path" apart from
 // "looks like one but isn't", not parse a URL for any other purpose.
-// isWordByte reports whether s[i] is a "word" byte (ASCII letter,
-// digit, underscore, or any byte belonging to a multibyte UTF-8
-// sequence, treated conservatively as word-like so this never
-// misjudges a rune boundary) for renderInline's intraword-"_" flanking
-// guard above — false for an out-of-range i (start/end of string is
-// never "inside a word").
-func isWordByte(s string, i int) bool {
-	if i < 0 || i >= len(s) {
-		return false
-	}
-	b := s[i]
-	return b == '_' || (b >= '0' && b <= '9') || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || b >= 0x80
-}
-
+//
+// Used for [text](url) LINK hrefs only — see isSafeHelpImageSrc's own
+// doc comment (independent review, uc-infra#145) for why an <img src>
+// needs a narrower allowlist than an <a href> does.
 func isSafeHelpLinkURL(url string) bool {
 	if strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://") {
 		return true
 	}
+	if !strings.HasPrefix(url, "/") {
+		return false
+	}
+	return len(url) < 2 || (url[1] != '/' && url[1] != '\\')
+}
+
+// isSafeHelpImageSrc allows same-origin "/" paths ONLY — no http(s)://,
+// unlike isSafeHelpLinkURL above. Independent review (uc-infra#145):
+// reusing the link allowlist for ![alt](url) image src was too broad. A
+// <a href="https://third-party.example/x"> is a user-INITIATED
+// navigation the reader chooses to follow; an <img src> to the same URL
+// is an UNCONDITIONAL request fired the instant the topic renders, no
+// click required — a real-world way for a self-hosted, air-gapped-
+// capable product (this package's own content/README.md and help.go's
+// go:embed doc comment both give "no network access at runtime needed"
+// as the reason content ships embedded in the binary) to silently phone
+// home to an arbitrary third-party host and leak the reader's IP/
+// Referer to it. Every screenshot this kernel actually ships is its own
+// same-origin /help/assets/... asset (helpassets.go), so there is no
+// legitimate use for an off-origin image src in a topic today; same
+// same-origin-path validation as isSafeHelpLinkURL (leading "/", no
+// "//" or "/\" protocol-relative escape) minus the http(s):// branch.
+func isSafeHelpImageSrc(url string) bool {
 	if !strings.HasPrefix(url, "/") {
 		return false
 	}

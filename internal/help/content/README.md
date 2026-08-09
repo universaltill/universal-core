@@ -55,9 +55,10 @@ order: 1
 The body below the closing `---` is Markdown, rendered by
 `internal/help/markdown.go`'s hand-rolled, deliberately narrow renderer
 (headings, paragraphs, `**bold**`/`*italic*`, `` `code` ``, `[text](url)`
-links restricted to `http(s)://` or a same-origin `/` path, and `-`/`1.`
-lists — no raw HTML). Two style notes that matter because this renderer
-is narrower than full CommonMark:
+links restricted to `http(s)://` or a same-origin `/` path, `![alt](url)`
+images restricted to a same-origin `/` path only — see below — and
+`-`/`1.` lists — no raw HTML). Two style notes that matter because this
+renderer is narrower than full CommonMark:
 - `_` never starts emphasis mid-word (so `tenant_id`, `actor_type`, and
   this kernel's other snake_case identifiers render as plain text, not
   `<em>`) — write `*emphasis*` if you need italics next to an
@@ -65,3 +66,39 @@ is narrower than full CommonMark:
 - Only `entity/*` and `route/*` topic ids exist today (see the Path
   convention above) — a topic literally named `search` would collide
   with the viewer's own `/help/search` endpoint, so don't add one.
+  `assets` (see below) is reserved the same way — don't create a topic
+  id starting with `assets/`.
+
+## Images / screenshots (uc-infra#145)
+
+A topic can reference a screenshot with `![alt text](url)`. Two things
+that don't work the way a full Markdown renderer would lead you to
+expect:
+
+- **`url` must be a same-origin `/` path — `http://`/`https://` are
+  rejected**, unlike a `[text](url)` link, which does allow them. An
+  `<img src>` fires an unconditional request the instant the topic
+  renders (no click required, unlike a link), and this product is
+  self-hosted/air-gapped-capable (that's the whole reason content ships
+  `go:embed`ded in the binary, not fetched at runtime) — an off-origin
+  image would silently phone home to a third-party host. See
+  `isSafeHelpImageSrc` in `markdown.go` for the exact rule.
+- **`alt` is required in practice, not just good accessibility
+  practice**: it's the only thing that ends up in `PlainText`
+  (`index.go`), so an image with no real alt text is invisible to
+  search — write a real, translated sentence per locale, not a
+  copy-pasted English fallback (this file's own multilingual rule
+  applies to alt text exactly like it applies to prose).
+
+Real screenshots are captured, not hand-authored: `internal/e2e/
+help_screenshot_capture_test.go`'s `TestCaptureHelpScreenshots` drives a
+real headless Chrome against a tenant named "Demo Organization" and
+writes JPEGs to `internal/help/content/assets/<family>/<locale>.jpg`
+(regenerate with `CAPTURE_HELP_SCREENSHOTS=1 go test ./internal/e2e -run
+TestCaptureHelpScreenshots -v`). They're served at `/help/assets/<family>/
+<locale>.jpg` (`internal/api/helpassets.go`, deliberately unauthenticated
+— generic Demo-Organization-only content, not tenant-specific, same
+reasoning as this app's vendored CSS/JS). `internal/help/
+asset_budget_test.go` enforces a 100 KB per-image / 500 KB total budget
+on whatever's actually checked in — keep that in mind before adding a
+new capture family or a higher-resolution recapture.

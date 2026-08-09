@@ -122,3 +122,47 @@ func exists(fsys fs.FS, path string) bool {
 	_ = f.Close()
 	return true
 }
+
+// Asset reads a static asset (a captured help screenshot, uc-infra#145 —
+// today the only kind this holds) from the embedded content/assets tree
+// at content/assets/<path>, returning ok=false when absent. Same
+// existence-check shape as HasContent above, and the same generic, no
+// entity-type-branching style as the rest of this package: path is
+// caller-supplied (internal/api's GET /help/assets/{path...} passes its
+// own wildcard capture straight through) and never interpreted beyond a
+// plain filesystem lookup — internal/api's route handler is the layer
+// that turns "not found" into a 404 and an extension into a
+// Content-Type, this function only ever answers "does this exist".
+//
+// path is safe against directory traversal without this function doing
+// anything special: fs.ReadFile itself does no validation — the
+// protection comes from the fs.FS IMPLEMENTATION it's called against.
+// contentFS is an embed.FS, and embed.FS.Open validates the joined name
+// via fs.ValidPath, which rejects any ".." path element outright — see
+// TestAssetIn_PathTraversalRejected in help_test.go for the regression
+// proof, and TestAPI_HelpAsset_EncodedTraversalRejected (internal/api/
+// helpassets_test.go, independent review, uc-infra#145) for the same
+// property proven through the real HTTP route with a percent-encoded
+// "../" (the form that actually reaches PathValue un-cleaned, unlike a
+// literal ".." in the URL, which net/http's ServeMux itself redirects
+// away via its own path-cleaning before this function is ever called).
+// This guarantee is specific to embed.FS — it would need re-verifying if
+// this function were ever pointed at a different fs.FS implementation
+// (e.g. os.DirFS for a hypothetical dev-mode "load assets from disk"
+// flag), since fs.ValidPath is a caller convention embed.FS happens to
+// enforce, not something fs.ReadFile enforces universally.
+func Asset(path string) ([]byte, bool) {
+	return assetIn(contentFS, path)
+}
+
+// assetIn is Asset's fs.FS-parametrized core, split out the same reason
+// hasContentIn is: help_test.go exercises it against an in-memory
+// fstest.MapFS without needing real captured screenshots to exist for
+// the test to mean anything.
+func assetIn(fsys fs.FS, path string) ([]byte, bool) {
+	data, err := fs.ReadFile(fsys, "content/assets/"+path)
+	if err != nil {
+		return nil, false
+	}
+	return data, true
+}

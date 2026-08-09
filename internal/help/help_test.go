@@ -99,6 +99,61 @@ func TestHasContentIn_EmptyFS(t *testing.T) {
 	}
 }
 
+func TestAssetIn(t *testing.T) {
+	fsys := fstest.MapFS{
+		"content/assets/list/en.jpg": {Data: []byte("fake-jpeg-bytes")},
+	}
+
+	data, ok := assetIn(fsys, "list/en.jpg")
+	if !ok {
+		t.Fatal("expected list/en.jpg to be found")
+	}
+	if string(data) != "fake-jpeg-bytes" {
+		t.Errorf("data = %q, want %q", data, "fake-jpeg-bytes")
+	}
+
+	if _, ok := assetIn(fsys, "list/missing.jpg"); ok {
+		t.Error("expected a missing asset to report ok=false")
+	}
+	if _, ok := assetIn(fsys, ""); ok {
+		t.Error("expected an empty path to report ok=false")
+	}
+}
+
+// TestAssetIn_PathTraversalRejected is the regression proof for Asset's
+// own doc comment: a "../" path element must never escape content/assets
+// — fs.ReadFile against an fs.FS validates the joined name via
+// fs.ValidPath and refuses it outright, so this never reaches a real
+// filesystem read outside the embedded tree.
+func TestAssetIn_PathTraversalRejected(t *testing.T) {
+	fsys := fstest.MapFS{
+		"content/assets/list/en.jpg": {Data: []byte("fake-jpeg-bytes")},
+		"content/README.md":          {Data: []byte("# Help content\n")},
+	}
+	if _, ok := assetIn(fsys, "../README.md"); ok {
+		t.Error("expected a \"../\" path element to be rejected, not escape content/assets")
+	}
+	if _, ok := assetIn(fsys, "../../help.go"); ok {
+		t.Error("expected a multi-level \"../\" path to be rejected")
+	}
+}
+
+func TestAsset_RealEmbeddedFS(t *testing.T) {
+	// Confirms the real captured screenshots (uc-infra#145,
+	// internal/e2e's TestCaptureHelpScreenshots) actually shipped —
+	// 4 layout families x 2 locales, en always present per family.
+	for _, family := range []string{"list", "form", "help", "wizard"} {
+		data, ok := Asset(family + "/en.jpg")
+		if !ok {
+			t.Errorf("Asset(%q) not found — run CAPTURE_HELP_SCREENSHOTS=1 go test ./internal/e2e -run TestCaptureHelpScreenshots -v", family+"/en.jpg")
+			continue
+		}
+		if len(data) == 0 {
+			t.Errorf("Asset(%q) returned 0 bytes", family+"/en.jpg")
+		}
+	}
+}
+
 func TestHasContent_RealEmbeddedFS(t *testing.T) {
 	// Confirms the actual shipped state as of ADR-0023 landing: no topic
 	// has content yet, so HasContent must be false for everything,
