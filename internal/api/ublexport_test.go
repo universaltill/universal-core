@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -434,67 +435,210 @@ func TestUBLExport_ErrorPaths(t *testing.T) {
 	}
 }
 
-// TestUBLExport_UnpublishedSecondaryDefinitionIs500NotDocumentNotFound
-// (uc-infra#179): writeUBLError's errors.Is(err, data.ErrNotFound) case
-// used to fire for BOTH "the URL's own document record doesn't exist"
-// and "some other entity type this document also reads has no published
-// Definition" — ts.entityDef returns data.ErrNotFound for the latter
-// too. Rolling back Currency's published Definition (never touching the
-// PurchaseOrder's own) reproduces the second case: the PurchaseOrder
-// record fully exists, but ublCurrency's own ts.entityDef("Currency")
-// call now fails. Before the fix this surfaced as a false 404 claiming
-// the PurchaseOrder itself was missing; it must now be a 500 that names
-// neither the PurchaseOrder nor pretends it doesn't exist.
-func TestUBLExport_UnpublishedSecondaryDefinitionIs500NotDocumentNotFound(t *testing.T) {
-	f := setupUBLTenant(t)
-	ctx := context.Background()
-	repo := data.NewEntityDefinitionRepo(f.db)
-
-	published, err := repo.GetPublished(ctx, "Currency")
-	if err != nil {
-		t.Fatalf("GetPublished(Currency): %v", err)
-	}
-	if err := repo.Rollback(ctx, "Currency", published.Version, humanActor()); err != nil {
-		t.Fatalf("roll back Currency's published definition: %v", err)
-	}
-
-	rec := f.get(t, "/export/PurchaseOrder/"+f.poID+"/ubl")
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("expected 500 for an unpublished secondary Definition (Currency), got %d: %s", rec.Code, rec.Body.String())
-	}
-	if strings.Contains(rec.Body.String(), "PurchaseOrder") || strings.Contains(rec.Body.String(), "not found") {
-		t.Fatalf("must never report the still-existing PurchaseOrder as not found when an unrelated lookup (Currency) failed: %s", rec.Body.String())
+// TestWriteUBLError_ClassifiesByCase pins writeUBLError's switch-case
+// ordering directly against synthetic errors, without a tenant/HTTP
+// round trip — the actual bug this card fixes (uc-infra#179) was
+// entirely in this ordering (a def-lookup failure and a missing-record
+// failure both wrap data.ErrNotFound), and a full-stack test alone only
+// proves whichever branches its particular setup happens to reach, not
+// that every branch chooses correctly independent of the others.
+// Independent review of this card's first draft found the primary
+// document type's own lookup failure had been folded into the same
+// always-500 bucket as a secondary lookup (e.g. Currency) — wrong, since
+// every other CRUD-ish route in this package answers "this entity type
+// has no published Definition" with writeDefinitionLookupError's honest
+// 404, not a bespoke 500; the two cases below pin that this stayed
+// correct after the fix.
+func TestWriteUBLError_ClassifiesByCase(t *testing.T) {
+	for name, tc := range map[string]struct {
+		err      error
+		wantCode int
+		wantBody string
+	}{
+		"primary type unpublished -> 404, honest message, not the generic 'not found'": {
+			ublPrimaryDefLookupError{entityType: "PurchaseOrder", err: data.ErrNotFound},
+			http.StatusNotFound,
+			`no published definition for entity type "PurchaseOrder"`,
+		},
+		"secondary type unpublished -> 500, never named": {
+			secondaryDefLookupError{entityType: "Currency", err: data.ErrNotFound},
+			http.StatusInternalServerError,
+			"internal error",
+		},
+		"document's own record missing -> 404 naming the document": {
+			data.ErrNotFound,
+			http.StatusNotFound,
+			"PurchaseOrder deadbeef not found",
+		},
+		"record's own bad state -> 400 verbatim": {
+			ublInputError{msg: "cannot export PurchaseOrder PO-1: it has no lines"},
+			http.StatusBadRequest,
+			"cannot export PurchaseOrder PO-1: it has no lines",
+		},
+		"unrecognized error -> 500": {
+			fmt.Errorf("boom"),
+			http.StatusInternalServerError,
+			"internal error",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			writeUBLError(rec, "PurchaseOrder", "deadbeef", tc.err)
+			if rec.Code != tc.wantCode {
+				t.Fatalf("code = %d, want %d: %s", rec.Code, tc.wantCode, rec.Body.String())
+			}
+			if !strings.Contains(errorMessage(t, rec), tc.wantBody) {
+				t.Errorf("error message %q should contain %q", errorMessage(t, rec), tc.wantBody)
+			}
+		})
 	}
 }
 
-// TestUBLExport_UnpublishedPartyRoleDefinitionIs500NotDocumentNotFound
-// is the same regression as above, through the other code path the
-// independent review of uc-infra#179 found: h.ublTenantParty (called by
-// both buildUBLOrder and buildUBLInvoice) always calls
-// h.ownOrganizationParty, which is shared with SAF-T export
-// (saftexport.go) and has its own two ts.entityDef calls (PartyRole,
-// Party) — neither was covered by the six call sites in this file
-// alone. SAF-T's own caller never maps errors to a 404, so it needed no
-// equivalent fix; UBL export's does.
-func TestUBLExport_UnpublishedPartyRoleDefinitionIs500NotDocumentNotFound(t *testing.T) {
+// errorMessage decodes rec's {"data":null,"error":"..."} envelope and
+// returns the error string — a raw rec.Body.String() substring check
+// would compare against the JSON-escaped form (httpx.WriteError's %q
+// message quotes come out as \" once json.Encode escapes them), which
+// is exactly the kind of assertion that "passes" while checking the
+// wrong bytes.
+func errorMessage(t *testing.T, rec *httptest.ResponseRecorder) string {
+	t.Helper()
+	var envelope struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("response body is not the expected JSON envelope: %v: %s", err, rec.Body.String())
+	}
+	return envelope.Error
+}
+
+// TestDefLookupErrors_UnwrapPreservesErrorsIs proves both wrapper types'
+// Unwrap actually does something, rather than being unexercised
+// defensive code (independent review of this card's first draft found
+// Unwrap at 0% coverage — writeUBLError's own errors.As calls never
+// reach it, since they match at the top of the chain).
+func TestDefLookupErrors_UnwrapPreservesErrorsIs(t *testing.T) {
+	if err := error(ublPrimaryDefLookupError{entityType: "PurchaseOrder", err: data.ErrNotFound}); !errors.Is(err, data.ErrNotFound) {
+		t.Error("errors.Is(ublPrimaryDefLookupError{...}, data.ErrNotFound) should be true via Unwrap")
+	}
+	if err := error(secondaryDefLookupError{entityType: "Currency", err: data.ErrNotFound}); !errors.Is(err, data.ErrNotFound) {
+		t.Error("errors.Is(secondaryDefLookupError{...}, data.ErrNotFound) should be true via Unwrap")
+	}
+}
+
+// TestUBLExport_UnpublishedDefinition is the full-stack regression for
+// uc-infra#179, exercised at every ts.entityDef call site this fix
+// touched (independent review measured 7 of 9 changed lines as
+// uncovered in this card's first draft — this table closes all of
+// them): rolling back one entity type's published Definition, while
+// every record the export actually needs stays fully intact, must
+// classify by WHICH type failed — the URL's own document type is a
+// clean 404 with the honest message; anything else is a 500 that never
+// pretends the document itself is missing.
+func TestUBLExport_UnpublishedDefinition(t *testing.T) {
+	rollbackPublished := func(t *testing.T, db *sql.DB, entityType string) {
+		t.Helper()
+		ctx := context.Background()
+		repo := data.NewEntityDefinitionRepo(db)
+		published, err := repo.GetPublished(ctx, entityType)
+		if err != nil {
+			t.Fatalf("GetPublished(%s): %v", entityType, err)
+		}
+		if err := repo.Rollback(ctx, entityType, published.Version, humanActor()); err != nil {
+			t.Fatalf("roll back %s's published definition: %v", entityType, err)
+		}
+	}
+
+	for _, tc := range []struct {
+		name       string
+		unpublish  string
+		path       func(f *ublFixture) string
+		wantCode   int
+		wantHonest string // substring required on a 404; empty for a 500 (body is always the fixed "internal error")
+	}{
+		{"primary type: PurchaseOrder's own", "PurchaseOrder",
+			func(f *ublFixture) string { return "/export/PurchaseOrder/" + f.poID + "/ubl" },
+			http.StatusNotFound, `no published definition for entity type "PurchaseOrder"`},
+		{"primary type: CustomerInvoice's own", "CustomerInvoice",
+			func(f *ublFixture) string { return "/export/CustomerInvoice/" + f.invoiceID + "/ubl" },
+			http.StatusNotFound, `no published definition for entity type "CustomerInvoice"`},
+		{"secondary: Currency (ublCurrency)", "Currency",
+			func(f *ublFixture) string { return "/export/PurchaseOrder/" + f.poID + "/ubl" },
+			http.StatusInternalServerError, ""},
+		{"secondary: Party (ublParty)", "Party",
+			func(f *ublFixture) string { return "/export/PurchaseOrder/" + f.poID + "/ubl" },
+			http.StatusInternalServerError, ""},
+		{"secondary: Item (ublLines)", "Item",
+			func(f *ublFixture) string { return "/export/PurchaseOrder/" + f.poID + "/ubl" },
+			http.StatusInternalServerError, ""},
+		{"secondary: POLine (ublLines' line entity)", "POLine",
+			func(f *ublFixture) string { return "/export/PurchaseOrder/" + f.poID + "/ubl" },
+			http.StatusInternalServerError, ""},
+		{"secondary: SalesOrder (invoice's linked-order lookup)", "SalesOrder",
+			func(f *ublFixture) string { return "/export/CustomerInvoice/" + f.invoiceID + "/ubl" },
+			http.StatusInternalServerError, ""},
+		{"secondary: PartyRole (ownOrganizationParty, shared w/ SAF-T)", "PartyRole",
+			func(f *ublFixture) string { return "/export/PurchaseOrder/" + f.poID + "/ubl" },
+			http.StatusInternalServerError, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := setupUBLTenant(t)
+			rollbackPublished(t, f.db, tc.unpublish)
+
+			rec := f.get(t, tc.path(f))
+			if rec.Code != tc.wantCode {
+				t.Fatalf("expected %d, got %d: %s", tc.wantCode, rec.Code, rec.Body.String())
+			}
+			if tc.wantHonest != "" && !strings.Contains(errorMessage(t, rec), tc.wantHonest) {
+				t.Errorf("error message %q should contain %q", errorMessage(t, rec), tc.wantHonest)
+			}
+			if rec.Code == http.StatusInternalServerError && strings.Contains(rec.Body.String(), "PurchaseOrder") {
+				t.Errorf("must never report the still-existing PurchaseOrder as not found when an unrelated lookup (%s) failed: %s", tc.unpublish, rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestUBLExport_UnpublishedPartyDefinitionInOwnOrganizationLookup covers
+// ownOrganizationParty's SECOND ts.entityDef call (Party, reached only
+// once an own_organization PartyRole actually resolves to a party id —
+// the table above's "PartyRole" case only reaches the FIRST call, since
+// the base fixture has no own_organization role at all and that lookup
+// fails before ever reading partyID). Modeled on
+// TestUBLExport_OwnOrganizationSetsTenantTaxID's own setup.
+func TestUBLExport_UnpublishedPartyDefinitionInOwnOrganizationLookup(t *testing.T) {
 	f := setupUBLTenant(t)
 	ctx := context.Background()
-	repo := data.NewEntityDefinitionRepo(f.db)
+	engine := crud.NewEngine(f.db)
+	defs := entityDefLookup(t, f.db)
+	actor := humanActor()
 
-	published, err := repo.GetPublished(ctx, "PartyRole")
+	org, err := engine.Create(ctx, defs("Party"), map[string]any{
+		"party_type": "organization", "name": "Demo Organization", "tax_id": "TENANT-TAX-1",
+	}, actor)
 	if err != nil {
-		t.Fatalf("GetPublished(PartyRole): %v", err)
+		t.Fatalf("create own-organization Party: %v", err)
 	}
-	if err := repo.Rollback(ctx, "PartyRole", published.Version, humanActor()); err != nil {
-		t.Fatalf("roll back PartyRole's published definition: %v", err)
+	if _, err := engine.Create(ctx, defs("PartyRole"), map[string]any{
+		"party_id": org.ID, "role_type": "own_organization",
+	}, actor); err != nil {
+		t.Fatalf("create own_organization PartyRole: %v", err)
+	}
+
+	repo := data.NewEntityDefinitionRepo(f.db)
+	published, err := repo.GetPublished(ctx, "Party")
+	if err != nil {
+		t.Fatalf("GetPublished(Party): %v", err)
+	}
+	if err := repo.Rollback(ctx, "Party", published.Version, actor); err != nil {
+		t.Fatalf("roll back Party's published definition: %v", err)
 	}
 
 	rec := f.get(t, "/export/PurchaseOrder/"+f.poID+"/ubl")
 	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("expected 500 for an unpublished secondary Definition (PartyRole), got %d: %s", rec.Code, rec.Body.String())
+		t.Fatalf("expected 500 for an unpublished secondary Definition (Party, via ownOrganizationParty), got %d: %s", rec.Code, rec.Body.String())
 	}
-	if strings.Contains(rec.Body.String(), "PurchaseOrder") || strings.Contains(rec.Body.String(), "not found") {
-		t.Fatalf("must never report the still-existing PurchaseOrder as not found when an unrelated lookup (PartyRole) failed: %s", rec.Body.String())
+	if strings.Contains(rec.Body.String(), "PurchaseOrder") {
+		t.Errorf("must never report the still-existing PurchaseOrder as not found when an unrelated lookup (Party) failed: %s", rec.Body.String())
 	}
 }
 

@@ -183,42 +183,71 @@ type ublInputError struct{ msg string }
 
 func (e ublInputError) Error() string { return e.msg }
 
-// ublDefLookupError marks a failed entity-Definition lookup (ts.entityDef)
-// as distinct from data.ErrNotFound on the *document's own record*
-// (uc-infra#179). ts.entityDef returns data.ErrNotFound both when the
-// URL's own {entityType}/{id} record is missing (via the later
-// ts.crud.Get call, never wrapped in this type) and when some other
-// entity type this document also reads — Party, PartyRole, Currency,
-// SalesOrder, the line entity, Item — has no published Definition at
-// all, e.g. a partial/failed module publish. Those are not the same
-// failure: the first genuinely means "the requested document doesn't
-// exist" (a clean 404); the second means an unrelated internal lookup
-// is broken and must never be reported as if the caller's own document
-// were missing. Wrapping every ts.entityDef call site's error in this
-// type — instead of the plain fmt.Errorf("look up %s definition: %w", ...)
-// every call site used before this fix — lets writeUBLError tell the two
-// apart even though both ultimately wrap data.ErrNotFound; Unwrap keeps
-// errors.Is/errors.As working for anything else that inspects the chain.
-type ublDefLookupError struct {
+// ublPrimaryDefLookupError marks a failed lookup of the URL's own
+// document entity type's Definition (PurchaseOrder/SalesOrder/
+// CustomerInvoice) — distinct from data.ErrNotFound on that same type's
+// *record* (the later ts.crud.Get call, never wrapped in either error
+// type here). "This entity type has no published Definition at all" is
+// not "id doesn't exist"; it's the exact condition every other CRUD-ish
+// route in this package already answers via writeDefinitionLookupError
+// (handlers.go) — a 404 with the honest "no published definition for
+// entity type %q" message — so UBL export matches that established
+// convention instead of a bespoke response. Independent review of this
+// card's first draft (uc-infra#179) caught that draft silently 500ing
+// this case instead: it had folded the primary type into the same
+// "secondary lookup" bucket below, which is correct for e.g. Currency
+// or Party but wrong for the document's own type, and untested (the
+// review's own coverage pass showed 0 hits on that line).
+type ublPrimaryDefLookupError struct {
 	entityType string
 	err        error
 }
 
-func (e ublDefLookupError) Error() string {
+func (e ublPrimaryDefLookupError) Error() string {
 	return fmt.Sprintf("look up %s definition: %s", e.entityType, e.err)
 }
 
-func (e ublDefLookupError) Unwrap() error { return e.err }
+func (e ublPrimaryDefLookupError) Unwrap() error { return e.err }
+
+// secondaryDefLookupError marks a failed entity-Definition lookup
+// (ts.entityDef) for anything OTHER than the URL's own document type —
+// Party, PartyRole, Currency, SalesOrder (the invoice's linked order),
+// the line entity, Item — as distinct from data.ErrNotFound on the
+// document's own record (uc-infra#179). Both wrap data.ErrNotFound when
+// the failing Definition simply isn't published (e.g. a partial/failed
+// module publish), so without this marker writeUBLError could not tell
+// "an unrelated internal lookup is broken" apart from "the requested
+// document doesn't exist" — and must never report the former as the
+// latter. Always a 500: unlike the primary type above, there is no
+// honest "not found" framing a caller could act on for a document field
+// they didn't even ask about. Shared with saftexport.go's
+// ownOrganizationParty (SAF-T's own caller never maps any error to a
+// 404, so wrapping there is behavior-neutral for that path — done only
+// for consistency, since ownOrganizationParty is reachable from UBL
+// export too, via ublTenantParty).
+type secondaryDefLookupError struct {
+	entityType string
+	err        error
+}
+
+func (e secondaryDefLookupError) Error() string {
+	return fmt.Sprintf("look up %s definition: %s", e.entityType, e.err)
+}
+
+func (e secondaryDefLookupError) Unwrap() error { return e.err }
 
 func writeUBLError(w http.ResponseWriter, entityType, id string, err error) {
 	var inputErr ublInputError
-	var defErr ublDefLookupError
+	var primErr ublPrimaryDefLookupError
+	var secErr secondaryDefLookupError
 	switch {
-	// Checked before the ErrNotFound case below: a ublDefLookupError
-	// wraps data.ErrNotFound too when the failing Definition simply isn't
-	// published, so it would otherwise still match errors.Is(err,
-	// data.ErrNotFound) and be misreported as the document itself missing.
-	case errors.As(err, &defErr):
+	// Both def-lookup cases are checked before the plain ErrNotFound
+	// case below: each wraps data.ErrNotFound too when the failing
+	// Definition simply isn't published, so either would otherwise still
+	// match errors.Is(err, data.ErrNotFound) and take the generic branch.
+	case errors.As(err, &primErr):
+		writeDefinitionLookupError(w, primErr.entityType, primErr.err)
+	case errors.As(err, &secErr):
 		writeInternalError(w, "assemble UBL document for "+entityType, err)
 	case errors.Is(err, data.ErrNotFound):
 		httpx.WriteError(w, http.StatusNotFound, entityType+" "+id+" not found")
@@ -246,7 +275,7 @@ func (h *Handler) buildUBLOrder(r *http.Request, rc httpx.RequestContext, ts ten
 
 	def, err := ts.entityDef(ctx, entityType)
 	if err != nil {
-		return nil, "", ublDefLookupError{entityType: entityType, err: err}
+		return nil, "", ublPrimaryDefLookupError{entityType: entityType, err: err}
 	}
 	rec, err := ts.crud.Get(ctx, def, id)
 	if err != nil {
@@ -308,7 +337,7 @@ func (h *Handler) buildUBLInvoice(r *http.Request, rc httpx.RequestContext, ts t
 	ctx := r.Context()
 	def, err := ts.entityDef(ctx, "CustomerInvoice")
 	if err != nil {
-		return nil, "", ublDefLookupError{entityType: "CustomerInvoice", err: err}
+		return nil, "", ublPrimaryDefLookupError{entityType: "CustomerInvoice", err: err}
 	}
 	rec, err := ts.crud.Get(ctx, def, id)
 	if err != nil {
@@ -333,7 +362,7 @@ func (h *Handler) buildUBLInvoice(r *http.Request, rc httpx.RequestContext, ts t
 	if soID := stringField(rec.Data, "sales_order_id"); soID != "" {
 		soDef, err := ts.entityDef(ctx, "SalesOrder")
 		if err != nil {
-			return nil, "", ublDefLookupError{entityType: "SalesOrder", err: err}
+			return nil, "", secondaryDefLookupError{entityType: "SalesOrder", err: err}
 		}
 		if so, err := ts.crud.Get(ctx, soDef, soID); err == nil {
 			orderRef = stringField(so.Data, "so_number")
@@ -379,7 +408,7 @@ func (h *Handler) ublParty(ctx context.Context, ts tenantScope, partyID, docEnti
 	}
 	def, err := ts.entityDef(ctx, "Party")
 	if err != nil {
-		return ubl.Party{}, ublDefLookupError{entityType: "Party", err: err}
+		return ubl.Party{}, secondaryDefLookupError{entityType: "Party", err: err}
 	}
 	rec, err := ts.crud.Get(ctx, def, partyID)
 	if errors.Is(err, data.ErrNotFound) {
@@ -405,7 +434,7 @@ func (h *Handler) ublCurrency(ctx context.Context, ts tenantScope, recData map[s
 	}
 	def, err := ts.entityDef(ctx, "Currency")
 	if err != nil {
-		return "", 0, ublDefLookupError{entityType: "Currency", err: err}
+		return "", 0, secondaryDefLookupError{entityType: "Currency", err: err}
 	}
 	rec, err := ts.crud.Get(ctx, def, currencyID)
 	if errors.Is(err, data.ErrNotFound) {
@@ -431,7 +460,7 @@ func (h *Handler) ublCurrency(ctx context.Context, ts tenantScope, recData map[s
 func (h *Handler) ublLines(ctx context.Context, ts tenantScope, lineEntity, lineParent, parentID string) ([]ubl.Line, error) {
 	lineDef, err := ts.entityDef(ctx, lineEntity)
 	if err != nil {
-		return nil, ublDefLookupError{entityType: lineEntity, err: err}
+		return nil, secondaryDefLookupError{entityType: lineEntity, err: err}
 	}
 	recs, err := ts.crud.ListByField(ctx, lineDef, lineParent, parentID)
 	if err != nil {
@@ -440,7 +469,7 @@ func (h *Handler) ublLines(ctx context.Context, ts tenantScope, lineEntity, line
 
 	itemDef, err := ts.entityDef(ctx, "Item")
 	if err != nil {
-		return nil, ublDefLookupError{entityType: "Item", err: err}
+		return nil, secondaryDefLookupError{entityType: "Item", err: err}
 	}
 	items := map[string]data.Record{}
 	lines := make([]ubl.Line, 0, len(recs))
