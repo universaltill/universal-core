@@ -821,89 +821,106 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
         navigator.mediaDevices.getDisplayMedia({ video: true }).then(function(stream) {
           screenBtn.disabled = false;
           screenChunks = [];
+          // try/catch around everything from the MediaRecorder
+          // constructor fallback through screenRecorder.start(), not
+          // just the primary constructor call (independent review,
+          // uc-infra#198): a throw reaching either the primary
+          // constructor's fallback or start() itself previously escaped
+          // into the outer .then(...).catch(...) below, which surfaces
+          // the error message and re-enables the button but has no
+          // access to stream (a separate function's own parameter) to
+          // stop its tracks — leaving the just-granted display-share
+          // stream (and the browser's "you are sharing your screen"
+          // indicator) live indefinitely. Mirrors the mic handler's own
+          // try/catch above.
           try {
-            screenRecorder = new MediaRecorder(stream, { videoBitsPerSecond: 2000000 });
-          } catch (e) {
-            // A browser that rejects the videoBitsPerSecond hint (or the
-            // whole options object) still gets a recording, just without
-            // the explicit bitrate hint — the duration cap still bounds
-            // recording length either way, and the onstop handler below
-            // independently checks the resulting blob's actual size
-            // before ever attaching it, regardless of what bitrate the
-            // browser chose on its own.
-            screenRecorder = new MediaRecorder(stream);
-          }
-          // onstop, not the click handler that calls .stop(), is where
-          // this cleanup has to live: reaching the duration cap calls
-          // screenRecorder.stop() directly (see screenAutoStopId below)
-          // without ever going through this button's own click handler,
-          // so onstop is the one place both paths converge.
-          screenRecorder.onstop = function() {
-            stream.getTracks().forEach(function(t) { t.stop(); });
-            clearInterval(screenTimerId);
-            clearTimeout(screenAutoStopId);
-            var blob = new Blob(screenChunks, { type: "video/webm" });
-            // Independent review, uc-infra#92: the videoBitsPerSecond
-            // hint above is only a hint (a multi-monitor/4K share, or
-            // the no-options MediaRecorder fallback just above, routinely
-            // encodes well past it) — this is the ONE place that checks
-            // what actually got recorded, before it ever touches the
-            // hidden file input. Without it, an oversized recording only
-            // surfaced server-side as MaxBytesReader 400ing the ENTIRE
-            // submission — title, description, transcript and all —
-            // destroying everything the person typed over a video they
-            // may not even have cared about keeping.
-            if (blob.size > {{.MaxScreenRecordingBytes}}) {
+            try {
+              screenRecorder = new MediaRecorder(stream, { videoBitsPerSecond: 2000000 });
+            } catch (e) {
+              // A browser that rejects the videoBitsPerSecond hint (or the
+              // whole options object) still gets a recording, just without
+              // the explicit bitrate hint — the duration cap still bounds
+              // recording length either way, and the onstop handler below
+              // independently checks the resulting blob's actual size
+              // before ever attaching it, regardless of what bitrate the
+              // browser chose on its own.
+              screenRecorder = new MediaRecorder(stream);
+            }
+            // onstop, not the click handler that calls .stop(), is where
+            // this cleanup has to live: reaching the duration cap calls
+            // screenRecorder.stop() directly (see screenAutoStopId below)
+            // without ever going through this button's own click handler,
+            // so onstop is the one place both paths converge.
+            screenRecorder.onstop = function() {
+              stream.getTracks().forEach(function(t) { t.stop(); });
+              clearInterval(screenTimerId);
+              clearTimeout(screenAutoStopId);
+              var blob = new Blob(screenChunks, { type: "video/webm" });
+              // Independent review, uc-infra#92: the videoBitsPerSecond
+              // hint above is only a hint (a multi-monitor/4K share, or
+              // the no-options MediaRecorder fallback just above, routinely
+              // encodes well past it) — this is the ONE place that checks
+              // what actually got recorded, before it ever touches the
+              // hidden file input. Without it, an oversized recording only
+              // surfaced server-side as MaxBytesReader 400ing the ENTIRE
+              // submission — title, description, transcript and all —
+              // destroying everything the person typed over a video they
+              // may not even have cared about keeping.
+              if (blob.size > {{.MaxScreenRecordingBytes}}) {
+                revokePreviousPreview();
+                fileInput.value = ""; // clear any earlier (valid-sized) file that rode in fileInput.files
+                previewEl.removeAttribute("src");
+                previewWrap.style.display = "none";
+                screenStatusEl.textContent = {{.ScreenRecordingTooLargeLabel}};
+                screenBtn.textContent = {{.ScreenRecordLabel}};
+                screenRecording = false;
+                return;
+              }
+              try {
+                var file = new File([blob], "screen-recording.webm", { type: "video/webm" });
+                var dt = new DataTransfer();
+                dt.items.add(file);
+                fileInput.files = dt.files;
+              } catch (e) {
+                // File/DataTransfer construction unsupported — the
+                // recording is still shown for review below, it just won't
+                // ride along with Submit. Same "degrade, never silently
+                // break the rest of the form" posture as every other
+                // capture control on this page.
+              }
               revokePreviousPreview();
-              fileInput.value = ""; // clear any earlier (valid-sized) file that rode in fileInput.files
-              previewEl.removeAttribute("src");
-              previewWrap.style.display = "none";
-              screenStatusEl.textContent = {{.ScreenRecordingTooLargeLabel}};
+              previewEl.src = URL.createObjectURL(blob);
+              previewWrap.style.display = "";
+              screenStatusEl.textContent = "";
               screenBtn.textContent = {{.ScreenRecordLabel}};
               screenRecording = false;
-              return;
-            }
-            try {
-              var file = new File([blob], "screen-recording.webm", { type: "video/webm" });
-              var dt = new DataTransfer();
-              dt.items.add(file);
-              fileInput.files = dt.files;
-            } catch (e) {
-              // File/DataTransfer construction unsupported — the
-              // recording is still shown for review below, it just won't
-              // ride along with Submit. Same "degrade, never silently
-              // break the rest of the form" posture as every other
-              // capture control on this page.
-            }
-            revokePreviousPreview();
-            previewEl.src = URL.createObjectURL(blob);
-            previewWrap.style.display = "";
-            screenStatusEl.textContent = "";
-            screenBtn.textContent = {{.ScreenRecordLabel}};
-            screenRecording = false;
-          };
-          screenRecorder.ondataavailable = function(e) { if (e.data.size > 0) screenChunks.push(e.data); };
-          screenRecorder.start();
-          screenRecording = true;
-          screenBtn.textContent = {{.StopLabel}};
-          screenStartedAt = Date.now();
-          screenTimerId = setInterval(function() {
-            var elapsed = Math.floor((Date.now() - screenStartedAt) / 1000);
-            var m = Math.floor(elapsed / 60);
-            var s = elapsed % 60;
-            screenStatusEl.textContent = {{.RecordingLabel}} + " " + m + ":" + (s < 10 ? "0" : "") + s;
-          }, 1000);
-          // Auto-stop at the duration cap (screenRecordingDurationCapSeconds,
-          // issuereport.go) rather than relying on the person to remember
-          // to click Stop — bounds recording length without a
-          // mid-recording server round-trip; the blob.size check above
-          // is what actually bounds the upload, since duration alone
-          // doesn't bound bytes at an unpredictable real-world bitrate.
-          screenAutoStopId = setTimeout(function() {
-            if (screenRecording && screenRecorder && screenRecorder.state !== "inactive") {
-              screenRecorder.stop();
-            }
-          }, {{.ScreenRecordingDurationCapSeconds}} * 1000);
+            };
+            screenRecorder.ondataavailable = function(e) { if (e.data.size > 0) screenChunks.push(e.data); };
+            screenRecorder.start();
+            screenRecording = true;
+            screenBtn.textContent = {{.StopLabel}};
+            screenStartedAt = Date.now();
+            screenTimerId = setInterval(function() {
+              var elapsed = Math.floor((Date.now() - screenStartedAt) / 1000);
+              var m = Math.floor(elapsed / 60);
+              var s = elapsed % 60;
+              screenStatusEl.textContent = {{.RecordingLabel}} + " " + m + ":" + (s < 10 ? "0" : "") + s;
+            }, 1000);
+            // Auto-stop at the duration cap (screenRecordingDurationCapSeconds,
+            // issuereport.go) rather than relying on the person to remember
+            // to click Stop — bounds recording length without a
+            // mid-recording server round-trip; the blob.size check above
+            // is what actually bounds the upload, since duration alone
+            // doesn't bound bytes at an unpredictable real-world bitrate.
+            screenAutoStopId = setTimeout(function() {
+              if (screenRecording && screenRecorder && screenRecorder.state !== "inactive") {
+                screenRecorder.stop();
+              }
+            }, {{.ScreenRecordingDurationCapSeconds}} * 1000);
+          } catch (e) {
+            stream.getTracks().forEach(function(t) { t.stop(); });
+            screenStatusEl.textContent = String(e.message || e);
+          }
         }).catch(function(err) {
           // Covers both "no screen to share" denial (NotAllowedError)
           // and any other getDisplayMedia rejection — same status-line
