@@ -434,6 +434,70 @@ func TestUBLExport_ErrorPaths(t *testing.T) {
 	}
 }
 
+// TestUBLExport_UnpublishedSecondaryDefinitionIs500NotDocumentNotFound
+// (uc-infra#179): writeUBLError's errors.Is(err, data.ErrNotFound) case
+// used to fire for BOTH "the URL's own document record doesn't exist"
+// and "some other entity type this document also reads has no published
+// Definition" — ts.entityDef returns data.ErrNotFound for the latter
+// too. Rolling back Currency's published Definition (never touching the
+// PurchaseOrder's own) reproduces the second case: the PurchaseOrder
+// record fully exists, but ublCurrency's own ts.entityDef("Currency")
+// call now fails. Before the fix this surfaced as a false 404 claiming
+// the PurchaseOrder itself was missing; it must now be a 500 that names
+// neither the PurchaseOrder nor pretends it doesn't exist.
+func TestUBLExport_UnpublishedSecondaryDefinitionIs500NotDocumentNotFound(t *testing.T) {
+	f := setupUBLTenant(t)
+	ctx := context.Background()
+	repo := data.NewEntityDefinitionRepo(f.db)
+
+	published, err := repo.GetPublished(ctx, "Currency")
+	if err != nil {
+		t.Fatalf("GetPublished(Currency): %v", err)
+	}
+	if err := repo.Rollback(ctx, "Currency", published.Version, humanActor()); err != nil {
+		t.Fatalf("roll back Currency's published definition: %v", err)
+	}
+
+	rec := f.get(t, "/export/PurchaseOrder/"+f.poID+"/ubl")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 for an unpublished secondary Definition (Currency), got %d: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "PurchaseOrder") || strings.Contains(rec.Body.String(), "not found") {
+		t.Fatalf("must never report the still-existing PurchaseOrder as not found when an unrelated lookup (Currency) failed: %s", rec.Body.String())
+	}
+}
+
+// TestUBLExport_UnpublishedPartyRoleDefinitionIs500NotDocumentNotFound
+// is the same regression as above, through the other code path the
+// independent review of uc-infra#179 found: h.ublTenantParty (called by
+// both buildUBLOrder and buildUBLInvoice) always calls
+// h.ownOrganizationParty, which is shared with SAF-T export
+// (saftexport.go) and has its own two ts.entityDef calls (PartyRole,
+// Party) — neither was covered by the six call sites in this file
+// alone. SAF-T's own caller never maps errors to a 404, so it needed no
+// equivalent fix; UBL export's does.
+func TestUBLExport_UnpublishedPartyRoleDefinitionIs500NotDocumentNotFound(t *testing.T) {
+	f := setupUBLTenant(t)
+	ctx := context.Background()
+	repo := data.NewEntityDefinitionRepo(f.db)
+
+	published, err := repo.GetPublished(ctx, "PartyRole")
+	if err != nil {
+		t.Fatalf("GetPublished(PartyRole): %v", err)
+	}
+	if err := repo.Rollback(ctx, "PartyRole", published.Version, humanActor()); err != nil {
+		t.Fatalf("roll back PartyRole's published definition: %v", err)
+	}
+
+	rec := f.get(t, "/export/PurchaseOrder/"+f.poID+"/ubl")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 for an unpublished secondary Definition (PartyRole), got %d: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "PurchaseOrder") || strings.Contains(rec.Body.String(), "not found") {
+		t.Fatalf("must never report the still-existing PurchaseOrder as not found when an unrelated lookup (PartyRole) failed: %s", rec.Body.String())
+	}
+}
+
 // TestUBLExport_DanglingReferences: a counterparty or currency deleted
 // after the document was created is the record's own defect — a clean
 // 400 naming the missing reference, never a 500 or invalid XML. A

@@ -183,9 +183,43 @@ type ublInputError struct{ msg string }
 
 func (e ublInputError) Error() string { return e.msg }
 
+// ublDefLookupError marks a failed entity-Definition lookup (ts.entityDef)
+// as distinct from data.ErrNotFound on the *document's own record*
+// (uc-infra#179). ts.entityDef returns data.ErrNotFound both when the
+// URL's own {entityType}/{id} record is missing (via the later
+// ts.crud.Get call, never wrapped in this type) and when some other
+// entity type this document also reads — Party, PartyRole, Currency,
+// SalesOrder, the line entity, Item — has no published Definition at
+// all, e.g. a partial/failed module publish. Those are not the same
+// failure: the first genuinely means "the requested document doesn't
+// exist" (a clean 404); the second means an unrelated internal lookup
+// is broken and must never be reported as if the caller's own document
+// were missing. Wrapping every ts.entityDef call site's error in this
+// type — instead of the plain fmt.Errorf("look up %s definition: %w", ...)
+// every call site used before this fix — lets writeUBLError tell the two
+// apart even though both ultimately wrap data.ErrNotFound; Unwrap keeps
+// errors.Is/errors.As working for anything else that inspects the chain.
+type ublDefLookupError struct {
+	entityType string
+	err        error
+}
+
+func (e ublDefLookupError) Error() string {
+	return fmt.Sprintf("look up %s definition: %s", e.entityType, e.err)
+}
+
+func (e ublDefLookupError) Unwrap() error { return e.err }
+
 func writeUBLError(w http.ResponseWriter, entityType, id string, err error) {
 	var inputErr ublInputError
+	var defErr ublDefLookupError
 	switch {
+	// Checked before the ErrNotFound case below: a ublDefLookupError
+	// wraps data.ErrNotFound too when the failing Definition simply isn't
+	// published, so it would otherwise still match errors.Is(err,
+	// data.ErrNotFound) and be misreported as the document itself missing.
+	case errors.As(err, &defErr):
+		writeInternalError(w, "assemble UBL document for "+entityType, err)
 	case errors.Is(err, data.ErrNotFound):
 		httpx.WriteError(w, http.StatusNotFound, entityType+" "+id+" not found")
 	case errors.As(err, &inputErr):
@@ -212,7 +246,7 @@ func (h *Handler) buildUBLOrder(r *http.Request, rc httpx.RequestContext, ts ten
 
 	def, err := ts.entityDef(ctx, entityType)
 	if err != nil {
-		return nil, "", fmt.Errorf("look up %s definition: %w", entityType, err)
+		return nil, "", ublDefLookupError{entityType: entityType, err: err}
 	}
 	rec, err := ts.crud.Get(ctx, def, id)
 	if err != nil {
@@ -274,7 +308,7 @@ func (h *Handler) buildUBLInvoice(r *http.Request, rc httpx.RequestContext, ts t
 	ctx := r.Context()
 	def, err := ts.entityDef(ctx, "CustomerInvoice")
 	if err != nil {
-		return nil, "", fmt.Errorf("look up CustomerInvoice definition: %w", err)
+		return nil, "", ublDefLookupError{entityType: "CustomerInvoice", err: err}
 	}
 	rec, err := ts.crud.Get(ctx, def, id)
 	if err != nil {
@@ -299,7 +333,7 @@ func (h *Handler) buildUBLInvoice(r *http.Request, rc httpx.RequestContext, ts t
 	if soID := stringField(rec.Data, "sales_order_id"); soID != "" {
 		soDef, err := ts.entityDef(ctx, "SalesOrder")
 		if err != nil {
-			return nil, "", fmt.Errorf("look up SalesOrder definition: %w", err)
+			return nil, "", ublDefLookupError{entityType: "SalesOrder", err: err}
 		}
 		if so, err := ts.crud.Get(ctx, soDef, soID); err == nil {
 			orderRef = stringField(so.Data, "so_number")
@@ -345,7 +379,7 @@ func (h *Handler) ublParty(ctx context.Context, ts tenantScope, partyID, docEnti
 	}
 	def, err := ts.entityDef(ctx, "Party")
 	if err != nil {
-		return ubl.Party{}, fmt.Errorf("look up Party definition: %w", err)
+		return ubl.Party{}, ublDefLookupError{entityType: "Party", err: err}
 	}
 	rec, err := ts.crud.Get(ctx, def, partyID)
 	if errors.Is(err, data.ErrNotFound) {
@@ -371,7 +405,7 @@ func (h *Handler) ublCurrency(ctx context.Context, ts tenantScope, recData map[s
 	}
 	def, err := ts.entityDef(ctx, "Currency")
 	if err != nil {
-		return "", 0, fmt.Errorf("look up Currency definition: %w", err)
+		return "", 0, ublDefLookupError{entityType: "Currency", err: err}
 	}
 	rec, err := ts.crud.Get(ctx, def, currencyID)
 	if errors.Is(err, data.ErrNotFound) {
@@ -397,7 +431,7 @@ func (h *Handler) ublCurrency(ctx context.Context, ts tenantScope, recData map[s
 func (h *Handler) ublLines(ctx context.Context, ts tenantScope, lineEntity, lineParent, parentID string) ([]ubl.Line, error) {
 	lineDef, err := ts.entityDef(ctx, lineEntity)
 	if err != nil {
-		return nil, fmt.Errorf("look up %s definition: %w", lineEntity, err)
+		return nil, ublDefLookupError{entityType: lineEntity, err: err}
 	}
 	recs, err := ts.crud.ListByField(ctx, lineDef, lineParent, parentID)
 	if err != nil {
@@ -406,7 +440,7 @@ func (h *Handler) ublLines(ctx context.Context, ts tenantScope, lineEntity, line
 
 	itemDef, err := ts.entityDef(ctx, "Item")
 	if err != nil {
-		return nil, fmt.Errorf("look up Item definition: %w", err)
+		return nil, ublDefLookupError{entityType: "Item", err: err}
 	}
 	items := map[string]data.Record{}
 	lines := make([]ubl.Line, 0, len(recs))
