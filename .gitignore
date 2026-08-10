@@ -44,3 +44,8 @@
 # here means an interrupted capture, never a real screenshot `git add -A`
 # should pick up.
 /internal/help/content/assets/**/.tmp-capture-*
+
+# Isolated worktrees created by Agent(isolation:"worktree") for
+# independent-review subagents — a local tooling artifact, never
+# something to commit (uc-infra#179's review left one of these behind).
+/.claude/worktrees/

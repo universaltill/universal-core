@@ -406,7 +406,13 @@ func (h *Handler) saftCompanyProfile(r *http.Request, ts tenantScope) (regNum, t
 func (h *Handler) ownOrganizationParty(ctx context.Context, ts tenantScope) (org data.Record, ok bool, err error) {
 	roleDef, err := ts.entityDef(ctx, "PartyRole")
 	if err != nil {
-		return data.Record{}, false, fmt.Errorf("look up PartyRole definition: %w", err)
+		// secondaryDefLookupError, not a plain fmt.Errorf-wrapped one:
+		// this helper is shared with UBL export (see doc comment above),
+		// whose writeUBLError must not mistake "PartyRole has no
+		// published Definition" for "the requested document doesn't
+		// exist" (uc-infra#179). SAF-T's own caller never maps errors to
+		// a 404, so this makes no difference on that path.
+		return data.Record{}, false, secondaryDefLookupError{entityType: "PartyRole", err: err}
 	}
 	roleRecs, err := ts.crud.ListByField(ctx, roleDef, "role_type", "own_organization")
 	if err != nil {
@@ -451,7 +457,8 @@ func (h *Handler) ownOrganizationParty(ctx context.Context, ts tenantScope) (org
 
 	partyDef, err := ts.entityDef(ctx, "Party")
 	if err != nil {
-		return data.Record{}, false, fmt.Errorf("look up Party definition: %w", err)
+		// Same reasoning as the PartyRole lookup above.
+		return data.Record{}, false, secondaryDefLookupError{entityType: "Party", err: err}
 	}
 	org, err = ts.crud.Get(ctx, partyDef, partyID)
 	if errors.Is(err, data.ErrNotFound) {
