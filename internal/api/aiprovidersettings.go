@@ -21,31 +21,49 @@ package api
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"html/template"
 	"net"
 	"net/http"
 	"net/url"
 
+	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/httpx"
+	"github.com/universaltill/universal-core/internal/kernel/audit"
+	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 )
 
+// aiProviderConnectionSingletonKey is the fixed value this handler always
+// writes into every AIProviderConnection record's singleton_key field
+// (foundation.AIProviderConnection's own doc comment) — never read for
+// its content, only for the fact that it's the same value on every row,
+// which is what lets the Definition's ordinary Unique mechanism enforce
+// "at most one row per tenant" the same way it enforces any real natural
+// key. Unexported and never exposed to a template or form: a human
+// looking at the settings page has no reason to ever see it.
+const aiProviderConnectionSingletonKey = "singleton"
+
 // aiProviderConnectionRecord looks up tenantID's single AIProviderConnection
 // row, if any — nil, nil when none exists yet (the tenant is on the
-// platform default). AIProviderConnection still has no unique constraint
-// of its own — unlike PurchaseOrder.po_number, which gained one
-// (uc-infra#121); AIProviderConnection is a true singleton with no
-// natural-key field to declare Unique against, tracked separately as
-// uc-infra#180. A tenant is only ever EXPECTED to have zero or one, but
-// that is not yet enforced: this settings page is the only INTENDED
-// writer, not (today) the only ABLE writer — see foundation.go's own doc
-// comment on AIProviderConnection for why that gap is still open. If
-// more than one somehow exists, the first (List's own, unspecified-
-// beyond-insertion-order) is treated as authoritative rather than
-// erroring — a settings page must always be able to render something to
-// fix the situation from,
-// not 500.
+// platform default). Since uc-infra#180, AIProviderConnection has a real
+// Unique constraint (singleton_key, see foundation.go's own doc comment)
+// and is in authz.systemOnlyWriteTypes, so this settings page — reached
+// only by a tenant_admin, see aiProviderRequireAdmin below — really is
+// the one writer, not merely the intended one. List still goes through
+// the ordinary RBAC-guarded ts.crud (unlike Create/Update/Delete below):
+// systemOnlyWriteTypes only denies CanWrite, never CanRead, so there is
+// no read-side reason to bypass it, and doing so would silently skip
+// GuardedEngine's FieldPermission redaction for no benefit — the same
+// read path internal/api/import.go's aiProviderFor resolution already
+// uses for this exact entity type. If more than one record somehow
+// exists (pre-#180 data, or the same class of external tampering
+// aiProviderRequireAdmin's own doc comment discusses), the first
+// (List's own, unspecified-beyond-insertion-order) is treated as
+// authoritative rather than erroring — a settings page must always be
+// able to render something to fix the situation from, not 500.
 func (h *Handler) aiProviderConnectionRecord(w http.ResponseWriter, r *http.Request, ts tenantScope) (def *entity.Definition, id string, fields map[string]any, version int, ok bool) {
 	def, err := ts.entityDef(r.Context(), "AIProviderConnection")
 	if err != nil {
@@ -64,20 +82,55 @@ func (h *Handler) aiProviderConnectionRecord(w http.ResponseWriter, r *http.Requ
 	return def, rec.ID, rec.Data, rec.Version, true
 }
 
-// aiProviderSettingsPage renders the current configuration (an API key,
-// if one is stored, is never read back out of Data for display — only
-// whether one exists, see view.HasAPIKey) alongside a form to change it.
-func (h *Handler) aiProviderSettingsPage(w http.ResponseWriter, r *http.Request) {
+// aiProviderRequireAdmin runs the shared preamble for every AI-provider
+// settings route: request context, tenant scope, and a tenant_admin
+// gate — rendering the localized 403 page (denyPageUnless, internal/api
+// /denied.go) when the actor isn't an admin.
+//
+// This exists because of a gap an independent review of the uc-infra#180
+// fix caught: AIProviderConnection joined authz.systemOnlyWriteTypes so
+// CanWrite hard-denies EVERY caller for this entity type — including
+// this settings page's own writes, which is why aiProviderSettingsSave/
+// Clear below construct a raw, unguarded crud.Engine instead of using
+// ts.crud. But RBAC's ordinary Permission-row mechanism can no longer
+// express "who may change this tenant's AI provider settings" once
+// CanWrite is hard-false, and this page's routes are registered with
+// bare auth(...) (no route-level role check, internal/api/handlers.go) —
+// so switching Create/Update/Delete to the raw engine, without adding a
+// replacement gate here, would have left the page reachable and writable
+// by ANY authenticated tenant member, RBAC configuration notwithstanding.
+// tenant_admin is the same fallback members.go's own requireMembersAccess
+// already established for a similarly sensitive settings surface (who
+// may add/remove members) — reused here rather than inventing a second,
+// parallel admin-gate pattern for what is, structurally, the same
+// problem: a systemOnlyWriteTypes entity's one legitimate human writer
+// needs its own authorization check, because RBAC no longer supplies one.
+func (h *Handler) aiProviderRequireAdmin(w http.ResponseWriter, r *http.Request) (httpx.RequestContext, tenantScope, string, bool) {
 	rc, ok := requestContext(w, r)
 	if !ok {
-		return
+		return rc, tenantScope{}, "", false
 	}
 	ts, err := h.scope(r.Context(), rc)
 	if err != nil {
 		writeInternalError(w, "resolve tenant scope", err)
-		return
+		return rc, tenantScope{}, "", false
 	}
 	locale := localeFromRequest(w, r)
+	admin, err := isTenantAdmin(r.Context(), ts, rc)
+	if !h.denyPageUnless(w, r, &rc, locale, admin, err, "check tenant_admin gate for AI provider settings") {
+		return rc, tenantScope{}, "", false
+	}
+	return rc, ts, locale, true
+}
+
+// aiProviderSettingsPage renders the current configuration (an API key,
+// if one is stored, is never read back out of Data for display — only
+// whether one exists, see view.HasAPIKey) alongside a form to change it.
+func (h *Handler) aiProviderSettingsPage(w http.ResponseWriter, r *http.Request) {
+	rc, ts, locale, ok := h.aiProviderRequireAdmin(w, r)
+	if !ok {
+		return
+	}
 
 	_, id, fields, _, ok := h.aiProviderConnectionRecord(w, r, ts)
 	if !ok {
@@ -85,7 +138,7 @@ func (h *Handler) aiProviderSettingsPage(w http.ResponseWriter, r *http.Request)
 	}
 
 	var buf bytes.Buffer
-	err = aiProviderSettingsTmpl.ExecuteTemplate(&buf, "page", h.aiProviderSettingsPageView(locale, id, fields))
+	err := aiProviderSettingsTmpl.ExecuteTemplate(&buf, "page", h.aiProviderSettingsPageView(locale, id, fields))
 	if err != nil {
 		writeInternalError(w, "render AI provider settings page", err)
 		return
@@ -149,16 +202,10 @@ func (h *Handler) aiProviderSettingsPageView(locale, id string, fields map[strin
 // confusing, silent bug the first time that provider's API call failed
 // with an auth error nobody could explain from the settings page alone.
 func (h *Handler) aiProviderSettingsSave(w http.ResponseWriter, r *http.Request) {
-	rc, ok := requestContext(w, r)
+	rc, ts, locale, ok := h.aiProviderRequireAdmin(w, r)
 	if !ok {
 		return
 	}
-	ts, err := h.scope(r.Context(), rc)
-	if err != nil {
-		writeInternalError(w, "resolve tenant scope", err)
-		return
-	}
-	locale := localeFromRequest(w, r)
 
 	def, id, existing, version, ok := h.aiProviderConnectionRecord(w, r, ts)
 	if !ok {
@@ -180,20 +227,20 @@ func (h *Handler) aiProviderSettingsSave(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Raw engine, not ts.crud — see aiProviderConnectionRecord's own
+	// comment: AIProviderConnection is system-only-write, and this
+	// handler is the system path.
+	rawCrud := h.rawCrud(ts.db)
 	if id == "" {
-		rec, err := ts.crud.Create(r.Context(), def, fields, rc.Actor)
+		newID, err := h.createOrRecoverAIProviderConnection(r.Context(), rawCrud, def, fields, rc.Actor)
 		if err != nil {
-			// Localized crud mapper, not writeInternalError: the guarded
-			// engine's typed refusals (RBAC denial, a system-of-record
-			// block — uc-infra#102) are the requester's 4xx with a
-			// legible translated message, never a generic 500.
 			h.writeCrudErrorLocalized(w, r, "create AIProviderConnection", err)
 			return
 		}
-		id = rec.ID
+		id = newID
 	} else {
 		v := version
-		if _, err := ts.crud.Update(r.Context(), def, id, fields, &v, rc.Actor); err != nil {
+		if _, err := rawCrud.Update(r.Context(), def, id, fields, &v, rc.Actor); err != nil {
 			h.writeCrudErrorLocalized(w, r, "update AIProviderConnection", err)
 			return
 		}
@@ -203,6 +250,71 @@ func (h *Handler) aiProviderSettingsSave(w http.ResponseWriter, r *http.Request)
 	if err := aiProviderSettingsTmpl.ExecuteTemplate(w, "page", h.aiProviderSettingsPageView(locale, id, fields)); err != nil {
 		writeInternalError(w, "render AI provider settings result", err)
 	}
+}
+
+// aiProviderConnectionMaxUpsertAttempts bounds
+// createOrRecoverAIProviderConnection's retry loop — generous enough to
+// absorb realistic concurrent-Save contention (a double form submit, a
+// couple of browser tabs) without looping indefinitely against a
+// genuinely stuck database.
+const aiProviderConnectionMaxUpsertAttempts = 10
+
+// createOrRecoverAIProviderConnection attempts Create, and on a
+// singleton_key conflict (uc-infra#180) recovers by re-reading and
+// updating the winner's row instead of surfacing
+// *crud.UniqueConstraintError — which would name singleton_key, an
+// internal marker field no human ever typed and has no reason to ever
+// see (foundation.go's own doc comment) — to whichever request lost the
+// race. A conflict here means a genuinely concurrent first-time Save (a
+// double-submit, or two requests racing between aiProviderConnectionRecord
+// above observing "no row yet" and this Create) already landed the row;
+// proven by this INSERT's own conflict, not merely suspected.
+//
+// The re-read-then-update recovery step is itself retried, bounded, not
+// attempted once: with MORE than two requests racing, the losers of the
+// Create race can also race each other on the recovery Update (optimistic
+// locking, data.ErrVersionConflict) — a single-attempt recovery only
+// closes the two-request case and still 500s under heavier contention
+// (caught by TestAIProviderSettings_ConcurrentSaves_ProduceExactlyOneRow,
+// independent review of the first version of this fix).
+func (h *Handler) createOrRecoverAIProviderConnection(ctx context.Context, rawCrud *crud.Engine, def *entity.Definition, fields map[string]any, actor audit.Actor) (string, error) {
+	rec, err := rawCrud.Create(ctx, def, fields, actor)
+	if err == nil {
+		return rec.ID, nil
+	}
+	if !errors.Is(err, crud.ErrUniqueConstraintViolation) {
+		return "", err
+	}
+	for attempt := 0; attempt < aiProviderConnectionMaxUpsertAttempts; attempt++ {
+		existing, listErr := rawCrud.List(ctx, def)
+		if listErr != nil {
+			return "", listErr
+		}
+		if len(existing) == 0 {
+			// The conflicting row is gone again (a concurrent Clear
+			// landed between our Create and this List) — recurse into a
+			// plain Create instead of updating a row that no longer
+			// exists.
+			rec, err := rawCrud.Create(ctx, def, fields, actor)
+			if err == nil {
+				return rec.ID, nil
+			}
+			if !errors.Is(err, crud.ErrUniqueConstraintViolation) {
+				return "", err
+			}
+			continue
+		}
+		id := existing[0].ID
+		v := existing[0].Version
+		if _, err := rawCrud.Update(ctx, def, id, fields, &v, actor); err != nil {
+			if errors.Is(err, data.ErrVersionConflict) {
+				continue // another loser of the race won this round instead
+			}
+			return "", err
+		}
+		return id, nil
+	}
+	return "", fmt.Errorf("recover from concurrent AIProviderConnection create: exceeded %d attempts under sustained contention", aiProviderConnectionMaxUpsertAttempts)
 }
 
 // validateOllamaBaseURL rejects a base_url this server would otherwise
@@ -254,7 +366,17 @@ func (h *Handler) buildAIProviderFields(provider, baseURL, model, apiKeyPlain st
 		return nil, fmt.Errorf("model is required")
 	}
 
-	fields := map[string]any{"provider": provider, "model": model}
+	// singleton_key: always the same fixed constant — see this file's own
+	// doc comment on aiProviderConnectionSingletonKey. Set unconditionally
+	// here, before any provider-specific branch, so every return path
+	// below carries it — Update replaces wholesale (this function's own
+	// doc comment), so a return path that forgot it would silently strip
+	// the marker back off an existing record on its next save.
+	fields := map[string]any{
+		"provider":      provider,
+		"model":         model,
+		"singleton_key": aiProviderConnectionSingletonKey,
+	}
 
 	if provider == "ollama" {
 		if baseURL == "" {
@@ -314,27 +436,24 @@ func (h *Handler) rerenderAIProviderSettingsWithError(w http.ResponseWriter, loc
 // not an error — the end state ("no override on file") is identical
 // either way.
 func (h *Handler) aiProviderSettingsClear(w http.ResponseWriter, r *http.Request) {
-	rc, ok := requestContext(w, r)
+	rc, ts, locale, ok := h.aiProviderRequireAdmin(w, r)
 	if !ok {
 		return
 	}
-	ts, err := h.scope(r.Context(), rc)
-	if err != nil {
-		writeInternalError(w, "resolve tenant scope", err)
-		return
-	}
-	locale := localeFromRequest(w, r)
 
 	def, id, _, _, ok := h.aiProviderConnectionRecord(w, r, ts)
 	if !ok {
 		return
 	}
 	if id != "" {
-		if err := ts.crud.Delete(r.Context(), def, id, rc.Actor); err != nil {
-			// writeCrudErrorLocalized, not writeInternalError: the guarded
-			// Delete's typed refusals (an RBAC denial, or a system-of-record
-			// block — uc-infra#102) are the requester's 4xx with a legible
-			// message, not a server fault to bury as a 500.
+		// Raw engine, not ts.crud — see aiProviderConnectionRecord's own
+		// comment: AIProviderConnection is system-only-write, and this
+		// handler is the system path.
+		if err := h.rawCrud(ts.db).Delete(r.Context(), def, id, rc.Actor); err != nil {
+			// writeCrudErrorLocalized, not writeInternalError: even off the
+			// guarded engine, Delete's typed refusals are the requester's
+			// 4xx with a legible message, not a server fault to bury as a
+			// 500.
 			h.writeCrudErrorLocalized(w, r, "delete AIProviderConnection", err)
 			return
 		}

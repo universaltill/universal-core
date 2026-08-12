@@ -681,9 +681,39 @@ func TestAIProviderConnection_RejectsUnknownProvider(t *testing.T) {
 // on why api_key_encrypted is deliberately not Required here).
 func TestAIProviderConnection_APIKeyEncryptedIsNotRequiredAtTheEntityLevel(t *testing.T) {
 	def := AIProviderConnection()
-	data := map[string]any{"provider": "ollama", "base_url": "http://localhost:11434", "model": "llama3.2:3b"}
+	data := map[string]any{"provider": "ollama", "base_url": "http://localhost:11434", "model": "llama3.2:3b", "singleton_key": "singleton"}
 	if err := entity.ValidateRecord(def, data); err != nil {
 		t.Fatalf("expected an Ollama connection with no api_key_encrypted to be valid at the entity level, got %v", err)
+	}
+}
+
+// TestAIProviderConnection_SingletonKeyIsRequired confirms singleton_key
+// (uc-infra#180) is enforced like any other Required field at the entity
+// level — a record missing it (the settings handler always sets it, but
+// entity.ValidateRecord has no way to know that) is invalid, the same
+// belt-and-braces reasoning this field's own doc comment gives for
+// declaring it Required at all.
+func TestAIProviderConnection_SingletonKeyIsRequired(t *testing.T) {
+	def := AIProviderConnection()
+	data := map[string]any{"provider": "ollama", "base_url": "http://localhost:11434", "model": "llama3.2:3b"}
+	if err := entity.ValidateRecord(def, data); err == nil {
+		t.Fatal("expected error for missing required singleton_key")
+	}
+}
+
+// TestAIProviderConnection_DeclaresUniqueOnSingletonKey confirms the
+// Definition itself declares the Unique constraint the marker-field
+// mechanism relies on (uc-infra#180) — a static, Version-controlled
+// shape check independent of crud.Engine's own database-aware
+// enforcement (covered separately, integration-level, in
+// internal/kernel/crud).
+func TestAIProviderConnection_DeclaresUniqueOnSingletonKey(t *testing.T) {
+	def := AIProviderConnection()
+	if len(def.Unique) != 1 || len(def.Unique[0]) != 1 || def.Unique[0][0] != "singleton_key" {
+		t.Fatalf("expected Unique == [][]string{{\"singleton_key\"}}, got %v", def.Unique)
+	}
+	if err := def.Validate(); err != nil {
+		t.Fatalf("expected AIProviderConnection() to be a valid Definition, got %v", err)
 	}
 }
 

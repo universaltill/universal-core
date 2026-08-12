@@ -55,7 +55,12 @@
 //   - Machine actors (svcauth's service tokens) bypass entity/field
 //     RBAC: they are already coarse-gated by Zitadel's
 //     tenant_integration role, and per-integration fine-graining is
-//     future work, not silently half-built here.
+//     future work, not silently half-built here. EXCEPT
+//     systemOnlyWriteTypes (CanWrite's own doc comment, uc-infra#180):
+//     those types have no legitimate machine writer through this
+//     Resolver at all — their real writers are raw-engine system-path
+//     bypasses that never reach this package — so the machine bypass is
+//     checked after, not before, that map.
 //
 // This package sits beside crud, not inside it: crud.Engine stays the
 // raw, identity-free mechanism system paths (workflow steps, seeding,
@@ -440,18 +445,51 @@ func (r *Resolver) CanRead(ctx context.Context, entityType string) (bool, error)
 // Checked before the admin bypass deliberately: an admin hand-editing
 // identity rows breaks import idempotency exactly like anyone else —
 // there is no legitimate hand-written identity row.
+//
+// AIProviderConnection (uc-infra#180) joined for the same shape of
+// reason, not the same threat: the risk here isn't authority-redirection
+// like ExternalIdentity/SystemOfRecord above, it's that
+// foundation.AIProviderConnection() is a true per-tenant singleton with
+// no natural-key field, so its Unique declaration is enforced against a
+// marker field (singleton_key) the settings handler alone knows to
+// populate — a write that reaches crud.Engine some other way (an
+// ordinary authenticated user POSTing /api/records/AIProviderConnection
+// directly) would either omit singleton_key entirely (exempt from the
+// Unique check, silently producing a second, unreachable-by-the-settings
+// -page row — foundation.go's own doc comment on that field) or, worse,
+// guess the right value and collide with the legitimate row. Either way
+// "the settings page is the only writer" needs to be enforced, not
+// assumed, same as ExternalIdentity's "the import engine is the only
+// writer." internal/api/aiprovidersettings.go writes through a raw
+// crud.Engine (system-path bypass, foundation.go's own doc comment)
+// instead of tenantScope's guarded ts.crud, precisely because this map
+// denies even an admin, and even the settings page's own writes if they
+// went through the guarded engine.
 var systemOnlyWriteTypes = map[string]bool{
-	"ExternalIdentity": true,
+	"ExternalIdentity":     true,
+	"AIProviderConnection": true,
 }
 
 // CanWrite reports whether the actor may create/update/delete records
 // of entityType.
 func (r *Resolver) CanWrite(ctx context.Context, entityType string) (bool, error) {
-	if r.machine {
-		return true, nil
-	}
+	// Checked before the machine bypass deliberately (independent review,
+	// uc-infra#180): a service-token request is still a user-driven write
+	// path in the sense systemOnlyWriteTypes' own doc comment means — it
+	// reaches this Resolver via svcauth, not via one of the raw-engine
+	// system-path bypasses (the import engine's side-channel, this
+	// package's own doc comment) that are the ONLY intended writers for
+	// every type in this map. Ordering CanWrite's two early-return checks
+	// the other way around would let a machine/service-token caller write
+	// ExternalIdentity or AIProviderConnection directly through the
+	// generic API — reopening exactly the gap systemOnlyWriteTypes exists
+	// to close, just via a different actor kind than the ones its own doc
+	// comment discusses.
 	if systemOnlyWriteTypes[entityType] {
 		return false, nil
+	}
+	if r.machine {
+		return true, nil
 	}
 	if err := r.loadRoles(ctx); err != nil {
 		return false, err

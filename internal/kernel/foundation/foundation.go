@@ -57,12 +57,22 @@ func Party() *entity.Definition {
 // internal/api/saftexport.go's saftCompanyProfile to populate
 // internal/kernel/saft.Input's RegistrationNumber/TaxRegistrationNumber/
 // ContactFirstName/ContactLastName instead of the spec's "NA" markers.
-// Exactly one Party is expected to hold it per tenant, but — like every
-// other one-row-per-tenant convention in this package
-// (AIProviderConnection, SystemOfRecord) — that is an application-level
-// convention, not a DB constraint the generic entity/crud layer can
-// express (nor is there any uniqueness mechanism to stop the same Party
-// holding the role twice); a caller finding zero, or rows naming more
+// Exactly one Party is expected to hold it per tenant, but that is still
+// an application-level convention, not a DB constraint the generic
+// entity/crud layer can express — unlike AIProviderConnection
+// (uc-infra#180), which fixed its own equivalent gap: that one is an
+// UNCONDITIONAL singleton (every row should be unique), which the
+// ordinary Unique mechanism can enforce via a marker field. This one
+// needs uniqueness CONDITIONAL on role_type=="own_organization"
+// specifically (a plain Unique on role_type would wrongly cap every
+// role_type — vendor, customer, ... — at one row each), which the
+// mechanism as it exists cannot express at all; nor is there any
+// uniqueness mechanism today to stop the same Party holding the role
+// twice. Tracked as uc-infra#201 (split from #180) — a declarative
+// conditional-Unique kernel capability, Architect's call when picked up;
+// foundation.Currency.is_base has the identical shape (that Definition's
+// own doc comment cross-references this one) and would migrate onto the
+// same mechanism. Until then, a caller finding zero, or rows naming more
 // than one DISTINCT Party, degrades to treating it as absent rather than
 // guessing, the same fail-safe posture SystemOfRecord's own doc comment
 // already argues for. Additive
@@ -260,16 +270,21 @@ func UomConversion() *entity.Definition {
 // per-account/per-ledger currency. Exactly one Currency row is expected
 // to hold is_base=true per tenant (ADR-0003: the database is the tenant,
 // so "per tenant" here just means "per database") — an application-level
-// convention, not a DB constraint the generic entity/crud layer can
-// express (same limitation PartyRole.own_organization's and
-// AIProviderConnection's one-row-per-tenant conventions already
-// document, pending the declarative-uniqueness work tracked separately,
-// uc-infra#121). A caller finding zero, or more than one, DISTINCT
+// convention, not (yet) a DB constraint the generic entity/crud layer can
+// express: Unique enforces "at most one row per VALUE," and is_base=true
+// is a value many rows could each legitimately claim without a mechanism
+// that scopes uniqueness to only the records where a field holds one
+// specific value — the same shape PartyRole.own_organization's
+// uniqueness-conditional-on-role_type needs (see PartyRole's own doc
+// comment) and split off from AIProviderConnection's simpler true-
+// singleton case (which reused the ordinary Unique mechanism via a
+// marker field, uc-infra#180) precisely because it doesn't fit that
+// mechanism either. A caller finding zero, or more than one, DISTINCT
 // Currency with is_base=true degrades to the hardcoded fallback rather
-// than guessing which one is correct — the same fail-safe posture those
-// two conventions already established. Additive field, no data
-// migration: rows written against v3 still hold legal values (is_base
-// defaults false).
+// than guessing which one is correct — fail-safe, the same posture
+// PartyRole's still-open gap has to lean on until a conditional-Unique
+// mechanism exists. Additive field, no data migration: rows written
+// against v3 still hold legal values (is_base defaults false).
 func Currency() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "Currency",
@@ -575,22 +590,48 @@ func IssueReport() *entity.Definition {
 // control) instead of the platform's shared one.
 //
 // One row per tenant (an upsert, not a list — internal/api's settings
-// handler enforces that). Deliberately NOT migrated to a Unique
-// declaration alongside PurchaseOrder.po_number/SystemOfRecord/
-// ExternalIdentity (uc-infra#121): this is a true singleton with no
-// natural-key field — every tenant's row legitimately differs (provider,
-// model, base_url all vary) — and entity.Definition.Validate() rejects
-// an empty Unique field set outright, so the mechanism as built cannot
-// express "at most one row, full stop" the way it expresses "at most one
-// row per value." Also worth being honest about here rather than
-// asserting past it: AIProviderConnection is not in
-// authz.systemOnlyWriteTypes or controlPlaneTypes, so an ordinary user
-// with ordinary create permission can already POST directly to
-// /api/records/AIProviderConnection today and create a second row,
-// bypassing this settings handler's upsert-only logic — "the one place
-// that writes it" is this file's intent, not yet an enforced fact.
-// Tracked as uc-infra#180 (a marker-field mechanism, or closing the
-// authz gap, or both — Architect's call when picked up).
+// handler enforces that). v2 (uc-infra#180) closed the two gaps this
+// doc comment used to just document:
+//
+//   - singleton_key is a caller-invisible marker field the settings
+//     handler (internal/api/aiprovidersettings.go) always sets to the
+//     same fixed constant on every write, so this Definition's ordinary
+//     Unique mechanism — which can only express "at most one row per
+//     VALUE," not "at most one row, full stop" (entity.Definition
+//     .Validate() rejects an empty Unique field set outright) — has a
+//     value to be unique ON. Every tenant's other fields legitimately
+//     differ (provider, model, base_url), which is exactly why this
+//     needed a dedicated field rather than reusing one of them: no real
+//     field is a natural key here the way PurchaseOrder.po_number or
+//     SystemOfRecord's (entity_type, source_id) pair already are
+//     (uc-infra#121). Not rendered anywhere in the settings form and not
+//     meaningful to a human — purely the mechanism's own bookkeeping,
+//     the same role api_key_encrypted's ciphertext plays for secrecy
+//     rather than uniqueness.
+//   - AIProviderConnection joined authz.systemOnlyWriteTypes, closing the
+//     gap where an ordinary user with ordinary create permission could
+//     POST directly to /api/records/AIProviderConnection and create a
+//     second row, bypassing this settings handler's upsert-only logic —
+//     "the one place that writes it" is now an enforced fact, not just
+//     this file's stated intent. systemOnlyWriteTypes denies the
+//     RBAC-guarded engine unconditionally for this type — even to an
+//     admin, even to a machine/service-token caller (CanWrite checks
+//     systemOnlyWriteTypes before its machine bypass specifically so
+//     this holds, authz.go's own doc comment) — so the settings handler
+//     itself writes through a raw crud.Engine instead
+//     (internal/api/aiprovidersettings.go), the same system-path bypass
+//     ExternalIdentity's import engine already uses. Because that raw
+//     engine carries no RBAC check of its own, the settings handler
+//     gates itself independently on the tenant_admin role
+//     (aiProviderRequireAdmin) — an independent review of this change
+//     caught that switching to the raw engine without adding a
+//     replacement gate would have made the page writable by any
+//     authenticated tenant member, RBAC configuration notwithstanding,
+//     since these routes carry no route-level role check otherwise. List
+//     (reads) stays on the ordinary RBAC-guarded ts.crud throughout —
+//     systemOnlyWriteTypes only touches CanWrite, never CanRead, so
+//     there is no reason to give up GuardedEngine's FieldPermission
+//     redaction on the read path.
 //
 // api_key_encrypted is never the plaintext key: internal/kernel/
 // secretcrypt encrypts it before internal/api's handler ever calls
@@ -609,8 +650,11 @@ func IssueReport() *entity.Definition {
 func AIProviderConnection() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "AIProviderConnection",
-		Version:    1,
-		Module:     "foundation",
+		// Version 2 (uc-infra#180): singleton_key added, with a Unique
+		// declaration enforcing the one-row-per-tenant invariant for
+		// real — see this function's own doc comment above.
+		Version: 2,
+		Module:  "foundation",
 		Fields: []entity.Field{
 			{Name: "provider", Type: entity.FieldEnum, Required: true,
 				EnumValues: []string{"ollama", "anthropic", "openai"}},
@@ -627,7 +671,18 @@ func AIProviderConnection() *entity.Definition {
 			// api_key_encrypted: Anthropic/OpenAI only. See this
 			// function's own doc comment above.
 			{Name: "api_key_encrypted", Type: entity.FieldString},
+			// singleton_key: see this function's own doc comment above.
+			// Required so a row that somehow reaches storage without it
+			// (a pre-v2 row that predates this field, until the settings
+			// handler next rewrites it) is at least visibly incomplete
+			// rather than silently exempt from the Unique check below —
+			// uniqueKeyValue's own "any named field absent/empty is
+			// exempt" rule (mirroring SQL NULL-in-a-unique-index
+			// semantics) already covers that pre-v2 case gracefully, this
+			// Required is belt-and-braces for any *new* row.
+			{Name: "singleton_key", Type: entity.FieldString, Required: true},
 		},
+		Unique: [][]string{{"singleton_key"}},
 	}
 }
 
