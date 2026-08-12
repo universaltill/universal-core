@@ -348,11 +348,15 @@ func TestGetIndex_RealEmbeddedContent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetIndex: %v", err)
 	}
-	// No real topic content ships yet (content/README.md only, ADR-0023)
-	// — the production index must build successfully but empty, exactly
-	// like help.HasContent degrades every topic to false today.
-	if got := idx.Topics("en"); len(got) != 0 {
-		t.Errorf("GetIndex().Topics(en) = %+v, want empty — no help content ships in this slice", got)
+	// uc-infra#147 shipped the first real topic content (the foundation
+	// module, in all four locales) — the production index must build
+	// successfully and actually contain it. Checked via one known-stable
+	// topic (entity/Party, foundation's own canonical example) rather than
+	// an exact count, since later content slices (uc-infra#148-152) will
+	// keep adding topics without this test needing to track the total.
+	rendered, ok := idx.Get("entity/Party", "en")
+	if !ok || strings.TrimSpace(rendered.PlainText) == "" {
+		t.Fatalf("GetIndex().Get(entity/Party, en) = (%+v, %v), want real, non-blank content now that uc-infra#147 has shipped it", rendered, ok)
 	}
 }
 
@@ -378,8 +382,16 @@ func TestSetIndexForTesting_OverridesAndRestores(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetIndex after restore: %v", err)
 	}
-	if len(after.Topics("en")) != 0 {
-		t.Errorf("GetIndex().Topics(en) after restore = %+v, want back to the empty real index", after.Topics("en"))
+	// The restored index must be the real production index again, not the
+	// fixture — checked by identity (not by an empty topic count: since
+	// uc-infra#147 the real index actually ships real content, so "empty"
+	// is no longer what "restored" means) and by containing the real
+	// entity/Party topic the fixture above never defined.
+	if after == fixture {
+		t.Fatalf("GetIndex() after restore = the fixture index %p, want the real production index back", fixture)
+	}
+	if _, ok := after.Get("entity/Party", "en"); !ok {
+		t.Errorf("GetIndex().Get(entity/Party, en) after restore: not found, want the real production index's own content back")
 	}
 }
 
