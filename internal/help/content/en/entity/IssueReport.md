@@ -19,13 +19,8 @@ which team or module is responsible — just describe what happened.
 ## Submitting an issue
 
 1. Choose **Report an Issue** from the navigation bar.
-2. Type a short title and a description of the problem. You can also record
-   a voice note, which is transcribed automatically and appended to your
-   description — useful when typing out a long explanation is inconvenient.
-3. Submit. The system automatically attaches the page you were on and, if
-   your browser logged any errors, its console output — this is what lets
-   the team reproduce a problem without you having to describe technical
-   details yourself.
+2. Type a short title and a description of the problem. You can also record a voice note, which is transcribed automatically and appended to your description — useful when typing out a long explanation is inconvenient. If it would help to show what happened rather than describe it, you can also record a short screen recording (up to about three minutes) — you get a preview to review before you submit.
+3. Submit. The system automatically attaches the page you were on and, if your browser logged any errors, its console output — this is what lets the team reproduce a problem without you having to describe technical details yourself.
 
 ## Reviewing issues (admin)
 
@@ -36,17 +31,11 @@ type gets — it is not the submission screen itself, only the triage view.
 
 ## Rules to know
 
-- A report always starts in **New** status; there is no required sequence
-  after that — an admin can move it directly to Triaged or Dismissed.
-- Title, description, and status are required; the voice transcript,
-  console log, page, and browser fields are optional and only present when
-  the browser actually captured them.
-- Every field on a report has a generous but real length limit, so pasting
-  an unreasonably large amount of text into a report is rejected rather
-  than silently accepted.
+- A report always starts in **New** status; there is no required sequence after that — an admin can move it directly to Triaged or Dismissed.
+- Title, description, and status are required; the voice transcript, console log, page, and browser fields are optional and only present when the browser actually captured them.
+- The optional screen recording is capped at about three minutes; if the resulting file ends up too large to attach, the report is still submitted, just without the recording.
+- Every field on a report has a generous but real length limit, so pasting an unreasonably large amount of text into a report is rejected rather than silently accepted.
 
 ## What it connects to
 
-An Issue Report stands on its own — it does not reference other records in
-the system. It is captured with the same audit trail as any other record,
-so who submitted it and when is always visible in its history.
+An Issue Report does not reference other records itself, but a screen recording attached to one is stored as a linked **Attachment** record — see that topic for how attachments work. It is captured with the same audit trail as any other record, so who submitted it and when is always visible in its history.
