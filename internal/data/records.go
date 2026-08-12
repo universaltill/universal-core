@@ -209,6 +209,220 @@ func (r *RecordRepo) list(ctx context.Context, q querier, entityType string) ([]
 	return out, rows.Err()
 }
 
+// ListDueUnpostedGate optionally narrows RecordRepo.ListDueUnposted to
+// rows whose parent record is currently in a state that makes the row
+// actually POSTABLE, not merely due — see ListDueUnposted's own doc
+// comment for why this matters once the worklist itself is LIMITed.
+// Zero value (ParentType == "") means no gate is applied.
+type ListDueUnpostedGate struct {
+	ParentType string
+	// JoinField is this (child) entity's field holding the parent
+	// record's own id.
+	JoinField        string
+	ParentMatchField string // parent field to match, e.g. "status_id"
+	ParentMatchValue string
+	// ParentRequiredNonEmpty lists additional parent fields that must
+	// all hold a non-empty value for a child row to be included.
+	ParentRequiredNonEmpty []string
+}
+
+// ListDueUnposted returns up to limit non-deleted entityType records
+// whose dueField holds a non-empty value <= cutoff AND whose
+// postedField is empty (absent, JSON null, or "") — the bounded,
+// query-level worklist assets.PostDueDepreciationBatch needs
+// (entityType="DepreciationSchedule", dueField="period_end",
+// postedField="posted_at") to find rows to post without reading and
+// decoding the tenant's ENTIRE table for that entity type on every call
+// (uc-infra#182: the previous shape was List(entityType) followed by
+// in-Go filtering of every row). Ordered by (created_at, id) — the same
+// stable, deterministic order every other paginated/limited query in
+// this file uses — so which rows land in one capped call vs. the next
+// is predictable.
+//
+// gate, when its ParentType is non-empty, additionally requires the
+// row's parent (found via gate.JoinField) to currently match
+// gate.ParentMatchField=gate.ParentMatchValue and have every field in
+// gate.ParentRequiredNonEmpty non-empty. This exists to prevent a
+// starvation bug independent review caught in this method's first
+// version (uc-infra#182): a row that can never actually be posted — its
+// parent isn't in the right state (e.g. a disposed FixedAsset, whose
+// remaining schedule rows stay due-and-unposted forever by design — see
+// assets.PostDueDepreciation's own doc comment) or is missing required
+// wiring — never mutates, so without the gate it sorts into the SAME
+// LIMITed window on every future call forever. Once enough such rows
+// exist earlier in (created_at, id) order than any genuinely postable
+// row, this worklist would return only permanently-stuck rows and
+// posting would silently stop for the whole tenant. The gate excludes
+// such rows from the worklist entirely, so they never occupy a slot —
+// exactly mirroring what the caller's own per-row posting logic would
+// have skipped anyway, just decided at the query level instead of after
+// spending a worklist slot on it.
+//
+// This narrows, but does not claim to catch, every possible permanent-
+// failure mode — an asset whose account fields are all non-empty but
+// point at a since-deleted Account record (a narrower, unconfirmed
+// hazard, not the concretely demonstrated one this gate fixes) is not
+// covered; see ADR-0026's own note on this residual gap.
+//
+// dueField/postedField/gate fields are all bound as parameters to the
+// ->> operator, never concatenated into the query text — same
+// discipline every other generic field-name-driven query in this file
+// follows; the CALLER is responsible for passing real field names.
+//
+// A dueField value of "" is deliberately excluded (data->>dueField <>
+// ”), not merely compared <= cutoff: an empty string sorts before
+// every real ISO date lexically, so without this a malformed row with
+// no due date at all would incorrectly read as "due" — matching the
+// in-Go filter this replaces (assets.postAssetDepreciation's own
+// "periodEnd == "" ... not due yet" check).
+func (r *RecordRepo) ListDueUnposted(ctx context.Context, entityType, dueField, cutoff, postedField string, gate ListDueUnpostedGate, limit int) ([]Record, error) {
+	args := []any{entityType, postedField, dueField, cutoff}
+	where := `entity_type = $1 AND deleted_at IS NULL
+		   AND coalesce(data->>$2, '') = ''
+		   AND data->>$3 <> '' AND data->>$3 <= $4`
+	if gate.ParentType != "" {
+		args = append(args, gate.ParentType, gate.JoinField, gate.ParentMatchField, gate.ParentMatchValue)
+		n := len(args)
+		join := fmt.Sprintf(
+			`SELECT 1 FROM records parent
+			 WHERE parent.entity_type = $%d AND parent.deleted_at IS NULL
+			   AND parent.id::text = records.data->>$%d
+			   AND parent.data->>$%d = $%d`,
+			n-3, n-2, n-1, n,
+		)
+		for _, field := range gate.ParentRequiredNonEmpty {
+			args = append(args, field)
+			join += fmt.Sprintf(` AND coalesce(parent.data->>$%d, '') <> ''`, len(args))
+		}
+		where += " AND EXISTS (" + join + ")"
+	}
+	args = append(args, limit)
+
+	rows, err := r.db.QueryContext(ctx, fmt.Sprintf(
+		`SELECT id, data, version FROM records
+		 WHERE %s
+		 ORDER BY created_at, id
+		 LIMIT $%d`, where, len(args)),
+		args...,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list due unposted records: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Record
+	for rows.Next() {
+		var id string
+		var raw []byte
+		var version int
+		if err := rows.Scan(&id, &raw, &version); err != nil {
+			return nil, fmt.Errorf("scan record: %w", err)
+		}
+		var data map[string]any
+		if err := json.Unmarshal(raw, &data); err != nil {
+			return nil, fmt.Errorf("unmarshal record data: %w", err)
+		}
+		out = append(out, Record{ID: id, EntityType: entityType, Data: data, Version: version})
+	}
+	return out, rows.Err()
+}
+
+// LifeCompleteGroupOptions parametrizes RecordRepo.LifeCompleteGroupIDs
+// — see that method's own doc comment.
+type LifeCompleteGroupOptions struct {
+	ParentType       string
+	ParentMatchField string // parent field to match, e.g. "status_id"
+	ParentMatchValue string
+	LifeField        string // parent field, numeric — the child "quota"
+	ChildType        string
+	ChildJoinField   string // child field holding the parent's own id
+	ChildPostedField string // child field; non-empty means "counts toward the quota"
+	ChildDueField    string // child field, an ISO date string
+	Cutoff           string // ISO date; a child is "due" when ChildDueField <= Cutoff
+}
+
+// LifeCompleteGroupIDs returns up to limit ParentType record ids
+// matching ParentMatchField=ParentMatchValue whose ChildType children
+// (joined via ChildJoinField == the parent's own id) satisfy BOTH:
+//   - at least LifeField-many (parsed as a positive number) children
+//     have a non-empty ChildPostedField, AND
+//   - no child has an EMPTY ChildPostedField and a ChildDueField <=
+//     Cutoff (nothing due is still outstanding for that parent).
+//
+// First real caller: assets.PostDueDepreciationBatch's completion/
+// healing sweep (uc-infra#182) — finds FixedAsset records that are
+// currently in_service but whose entire DepreciationSchedule has
+// already been posted, so the ordinary due-row worklist
+// (ListDueUnposted above) — which only ever surfaces rows still
+// needing posting — would never visit them again to run the completion
+// check that transitions them out of in_service. See
+// PostDueDepreciationBatch's own doc comment for the retry-safety
+// invariant this preserves (uc-infra#137's "fire-once-or-never"
+// finding): an asset that finishes its schedule but whose transition
+// write never lands (a crash, a version conflict, an overlapping
+// poller) has ZERO due-or-unposted rows left, so nothing about it looks
+// like "due work" to the ordinary worklist — this sweep is what still
+// finds it.
+//
+// Computed as one SQL query — a self-join on the same generic `records`
+// table (parent and child rows both live there) using a correlated
+// NOT EXISTS and a correlated count — rather than a Go-side loop
+// reading and decoding every child row for every candidate parent: cost
+// is proportional to how many parents are ACTUALLY stuck (the ordinary
+// case is zero), not to total child-row volume, which is exactly what
+// made the previous shape of this whole area (reading every
+// DepreciationSchedule row in the tenant on every call) the problem
+// uc-infra#182 tracks.
+//
+// Every field name is bound as a parameter to the ->> operator, never
+// concatenated into the query text, the same discipline every other
+// generic field-name-driven query in this file follows.
+func (r *RecordRepo) LifeCompleteGroupIDs(ctx context.Context, opts LifeCompleteGroupOptions, limit int) ([]string, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT parent.id
+		FROM records parent
+		WHERE parent.entity_type = $1
+		  AND parent.deleted_at IS NULL
+		  AND parent.data->>$2 = $3
+		  AND parent.data->>$4 ~ '^-?[0-9]+(\.[0-9]+)?$'
+		  AND (parent.data->>$4)::numeric > 0
+		  AND NOT EXISTS (
+			SELECT 1 FROM records child
+			WHERE child.entity_type = $5
+			  AND child.deleted_at IS NULL
+			  AND child.data->>$6 = parent.id::text
+			  AND coalesce(child.data->>$7, '') = ''
+			  AND child.data->>$8 <> '' AND child.data->>$8 <= $9
+		  )
+		  AND (
+			SELECT count(*) FROM records child2
+			WHERE child2.entity_type = $5
+			  AND child2.deleted_at IS NULL
+			  AND child2.data->>$6 = parent.id::text
+			  AND coalesce(child2.data->>$7, '') <> ''
+		  ) >= (parent.data->>$4)::numeric
+		ORDER BY parent.id
+		LIMIT $10`,
+		opts.ParentType, opts.ParentMatchField, opts.ParentMatchValue, opts.LifeField,
+		opts.ChildType, opts.ChildJoinField, opts.ChildPostedField, opts.ChildDueField, opts.Cutoff,
+		limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("find life-complete groups: %w", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan life-complete group id: %w", err)
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 // CountByEntityType returns how many non-deleted records of entityType
 // exist — the total a pager needs to compute page count, kept as its own
 // query rather than folded into ListPage via a window function
