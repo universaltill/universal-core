@@ -811,12 +811,22 @@ func TestPostDueDepreciationBatch_CapsPerCallAndResumesAcrossCalls(t *testing.T)
 	const cap = 2
 	wantPerCall := []int{cap, cap, cap} // 6 due rows / cap 2 = exactly 3 calls
 	for i, want := range wantPerCall {
-		posted, err := PostDueDepreciationBatch(ctx, fx.tenantDB, SchedulerActor(), cap)
+		posted, truncated, err := PostDueDepreciationBatch(ctx, fx.tenantDB, SchedulerActor(), cap)
 		if err != nil {
 			t.Fatalf("call %d: PostDueDepreciationBatch: %v", i+1, err)
 		}
 		if posted != want {
 			t.Fatalf("call %d: posted = %d, want %d", i+1, posted, want)
+		}
+		// uc-infra#183: every one of these 3 calls reads exactly `cap`
+		// due rows (6 rows / cap 2), so each reports truncated=true, even
+		// the 3rd — the backlog landing exactly on a multiple of cap is
+		// the one explicitly-accepted imprecision (see
+		// PostDueDepreciationBatch's own doc comment); the "final call
+		// has nothing left to do" check below is what proves it's
+		// harmless (one extra attempt, not a correctness problem).
+		if !truncated {
+			t.Errorf("call %d: truncated = false, want true (this call's own read hit the cap)", i+1)
 		}
 
 		wantStatus := "in_service"
@@ -849,13 +859,19 @@ func TestPostDueDepreciationBatch_CapsPerCallAndResumesAcrossCalls(t *testing.T)
 		t.Fatalf("journal entries = %d, want %d (one per schedule row, no double-posting across the capped calls)", len(list), usefulLifeMonths)
 	}
 
-	// A further call has nothing left to do.
-	posted, err := PostDueDepreciationBatch(ctx, fx.tenantDB, SchedulerActor(), cap)
+	// A further call has nothing left to do — and, uc-infra#183, must
+	// report truncated=false: this is what makes the 3rd call's own
+	// truncated=true above just one wasted extra attempt, not a stuck
+	// "always retries immediately" loop.
+	posted, truncated, err := PostDueDepreciationBatch(ctx, fx.tenantDB, SchedulerActor(), cap)
 	if err != nil {
 		t.Fatalf("final call: PostDueDepreciationBatch: %v", err)
 	}
 	if posted != 0 {
 		t.Errorf("final call posted = %d, want 0 (nothing left due)", posted)
+	}
+	if truncated {
+		t.Errorf("final call truncated = true, want false (nothing left due, so the read didn't hit the cap)")
 	}
 }
 
@@ -868,7 +884,7 @@ func TestPostDueDepreciationBatch_RejectsNonPositiveMaxRows(t *testing.T) {
 	fx := setUpDepreciationFixture(t)
 	ctx := context.Background()
 	for _, maxRows := range []int{0, -1} {
-		if _, err := PostDueDepreciationBatch(ctx, fx.tenantDB, SchedulerActor(), maxRows); err == nil {
+		if _, _, err := PostDueDepreciationBatch(ctx, fx.tenantDB, SchedulerActor(), maxRows); err == nil {
 			t.Errorf("maxRows=%d: expected an error, got nil", maxRows)
 		}
 	}
@@ -938,12 +954,19 @@ func TestPostDueDepreciationBatch_OuterBudgetLeavesUnvisitedAssetUntouched(t *te
 		}
 	}
 
-	posted, err := PostDueDepreciationBatch(ctx, fx.tenantDB, SchedulerActor(), cap)
+	posted, truncated, err := PostDueDepreciationBatch(ctx, fx.tenantDB, SchedulerActor(), cap)
 	if err != nil {
 		t.Fatalf("PostDueDepreciationBatch: %v", err)
 	}
 	if posted != cap {
 		t.Fatalf("posted = %d, want %d (exactly one asset's worth, the budget for a second)", posted, cap)
+	}
+	// uc-infra#183: the worklist read itself hit the cap (6 due rows
+	// across both assets, LIMITed to `cap`=3), so this call must report
+	// truncated=true — the untouched asset's own rows are exactly the
+	// real work this signal exists to let tickTenant retry sooner for.
+	if !truncated {
+		t.Errorf("truncated = false, want true (an entire asset's worth of due rows was left untouched)")
 	}
 
 	rowPosted := func(rowID string) bool {
@@ -1049,12 +1072,18 @@ func TestPostDueDepreciationBatch_TruncatedCallDoesNotTransitionEarly(t *testing
 	// one) — postedCount would read exactly 6, equal to the edited-down
 	// life, on this very call.
 	const cap = 6
-	posted, err := PostDueDepreciationBatch(ctx, fx.tenantDB, SchedulerActor(), cap)
+	posted, truncated, err := PostDueDepreciationBatch(ctx, fx.tenantDB, SchedulerActor(), cap)
 	if err != nil {
 		t.Fatalf("PostDueDepreciationBatch: %v", err)
 	}
 	if posted != cap {
 		t.Fatalf("posted = %d, want %d", posted, cap)
+	}
+	// uc-infra#183: 12 due rows, capped at 6 — the worklist read hit the
+	// cap, so this call must report truncated=true regardless of what
+	// postedCount happens to equal.
+	if !truncated {
+		t.Errorf("truncated = false, want true (6 due rows were left unattempted by this call)")
 	}
 	if code := fx.statusCode(t, "FixedAsset", assetID); code != "in_service" {
 		t.Fatalf("asset status = %q, want in_service — a truncated call must not transition the asset even though postedCount reached the (edited-down) useful_life_months, because 6 due rows are still genuinely unposted", code)
@@ -1063,12 +1092,17 @@ func TestPostDueDepreciationBatch_TruncatedCallDoesNotTransitionEarly(t *testing
 	// The remaining 6 due rows must still be postable — the asset must
 	// not have been locked out of ever posting them by an early
 	// transition (there is no fully_depreciated -> in_service edge).
-	posted2, err := PostDueDepreciationBatch(ctx, fx.tenantDB, SchedulerActor(), totalRows)
+	posted2, truncated2, err := PostDueDepreciationBatch(ctx, fx.tenantDB, SchedulerActor(), totalRows)
 	if err != nil {
 		t.Fatalf("second PostDueDepreciationBatch: %v", err)
 	}
 	if posted2 != cap {
 		t.Fatalf("second call posted = %d, want %d (the remaining 6 rows)", posted2, cap)
+	}
+	// uc-infra#183: this call's cap (totalRows=12) comfortably exceeds
+	// the 6 rows actually due, so the read didn't hit it.
+	if truncated2 {
+		t.Errorf("second call truncated = true, want false (nothing left due after this call)")
 	}
 	if code := fx.statusCode(t, "FixedAsset", assetID); code != "fully_depreciated" {
 		t.Fatalf("asset status = %q, want fully_depreciated once every due row is genuinely posted", code)
@@ -1081,5 +1115,242 @@ func TestPostDueDepreciationBatch_TruncatedCallDoesNotTransitionEarly(t *testing
 		if postedAt, _ := row.Data["posted_at"].(string); postedAt == "" {
 			t.Errorf("row %d still unposted after both calls", i+1)
 		}
+	}
+}
+
+// TestPostDueDepreciationBatch_ReportsTruncatedWhenHealingSweepHitsCap is
+// the direct regression test for uc-infra#183's other truncation source:
+// PostDueDepreciationBatch's due-rows read can find nothing to do (every
+// row already posted) while its healing sweep still has more
+// stuck-but-never-transitioned assets than this call's own cap can heal
+// in one pass — see healStuckFullyDepreciatedAssets's own doc comment on
+// why nothing about the due-rows worklist can ever surface these assets
+// again. truncated must reflect that too, not just the due-rows read: a
+// caller checking only the posting phase would silently wait out the
+// full throttle interval between capped healing sweeps, the same bug
+// this issue exists to fix, just via the other worklist.
+func TestPostDueDepreciationBatch_ReportsTruncatedWhenHealingSweepHitsCap(t *testing.T) {
+	fx := setUpDepreciationFixture(t)
+	ctx := context.Background()
+
+	const numStuckAssets = 3
+	assetIDs := make([]string, numStuckAssets)
+	for i := 0; i < numStuckAssets; i++ {
+		assetID := fx.createAssetWithLife(t, fmt.Sprintf("FA-stuck-%d", i+1), 1)
+		rowID := fx.createScheduleRow(t, assetID, 1, "2020-01-31", 1000.00, 0.00)
+		// Mark posted directly (bypassing PostDueDepreciation, same
+		// pattern TestPostDueDepreciation_
+		// AlreadyFullyPostedButNotTransitioned_HealsOnNextRun uses) so
+		// the schedule is genuinely exhausted but the fully_depreciated
+		// transition never ran.
+		row, err := fx.engine.Get(ctx, publishedDef(t, fx.tenantDB, "DepreciationSchedule"), rowID)
+		if err != nil {
+			t.Fatalf("Get row for asset %d: %v", i+1, err)
+		}
+		fields := map[string]any{}
+		for k, v := range row.Data {
+			fields[k] = v
+		}
+		fields["posted_at"] = "2020-01-31"
+		version := row.Version
+		if _, err := fx.engine.Update(ctx, publishedDef(t, fx.tenantDB, "DepreciationSchedule"), rowID, fields, &version, humanActor()); err != nil {
+			t.Fatalf("mark row posted for asset %d: %v", i+1, err)
+		}
+		assetIDs[i] = assetID
+	}
+
+	// cap smaller than numStuckAssets: the due-rows read finds nothing
+	// (every row already posted), but the healing sweep's own
+	// LifeCompleteGroupIDs read is capped too and can only heal `cap` of
+	// the 3 stuck assets this call.
+	const cap = 2
+	posted, truncated, err := PostDueDepreciationBatch(ctx, fx.tenantDB, SchedulerActor(), cap)
+	if err != nil {
+		t.Fatalf("PostDueDepreciationBatch: %v", err)
+	}
+	if posted != 0 {
+		t.Fatalf("posted = %d, want 0 (every row was already marked posted before this call)", posted)
+	}
+	if !truncated {
+		t.Errorf("truncated = false, want true (the healing sweep's own read hit its cap with a stuck asset left over)")
+	}
+
+	healedCount := 0
+	for _, assetID := range assetIDs {
+		if fx.statusCode(t, "FixedAsset", assetID) == "fully_depreciated" {
+			healedCount++
+		}
+	}
+	if healedCount != cap {
+		t.Fatalf("healed %d of %d stuck assets, want exactly %d (the healing sweep's own cap)", healedCount, numStuckAssets, cap)
+	}
+
+	// A further call with room for the remainder finishes healing and
+	// reports truncated=false.
+	posted2, truncated2, err := PostDueDepreciationBatch(ctx, fx.tenantDB, SchedulerActor(), numStuckAssets)
+	if err != nil {
+		t.Fatalf("second PostDueDepreciationBatch: %v", err)
+	}
+	if posted2 != 0 {
+		t.Errorf("second call posted = %d, want 0 (healing never posts a journal entry)", posted2)
+	}
+	if truncated2 {
+		t.Errorf("second call truncated = true, want false (every stuck asset healed)")
+	}
+	for _, assetID := range assetIDs {
+		if code := fx.statusCode(t, "FixedAsset", assetID); code != "fully_depreciated" {
+			t.Errorf("asset %s status = %q, want fully_depreciated after the second call", assetID, code)
+		}
+	}
+}
+
+// TestPostDueDepreciationBatch_DoesNotReportTruncatedWhenHealingSweepIsPermanentlyStuck
+// is the direct regression test for independent review's MAJOR finding
+// on this function's first uc-infra#183 version: a healing-sweep window
+// permanently full of assets this call can NEVER transition (here: the
+// tenant's fixed_asset_status "fully_depreciated" Status was never
+// seeded, so transitionToFullyDepreciated's own statusIDByCodeTx call
+// fails identically every time) must NOT report truncated=true forever.
+// The old (posted-window-fullness-only) version would have: every
+// candidate lands back in the same LIMITed window on every future call,
+// windowFull stays true, and tickTenant would clear its throttle
+// unconditionally — a caller retrying at PollInterval cadence forever
+// for zero possible gain, on the one query ADR-0026/uc-infra#202 already
+// flags as the expensive one.
+func TestPostDueDepreciationBatch_DoesNotReportTruncatedWhenHealingSweepIsPermanentlyStuck(t *testing.T) {
+	fx := setUpDepreciationFixture(t)
+	ctx := context.Background()
+
+	// Simulate a tenant whose fixed_asset_status Status set is missing
+	// fully_depreciated (a corrupted/partial PublishStatuses run, or a
+	// direct data edit) — transitionToFullyDepreciated's own
+	// statusIDByCodeTx call will fail identically on every attempt.
+	if _, err := fx.tenantDB.ExecContext(ctx, `DELETE FROM records WHERE entity_type = 'Status' AND data->>'code' = 'fully_depreciated'`); err != nil {
+		t.Fatalf("delete fully_depreciated Status: %v", err)
+	}
+
+	const numStuckAssets = 3
+	assetIDs := make([]string, numStuckAssets)
+	for i := 0; i < numStuckAssets; i++ {
+		assetID := fx.createAssetWithLife(t, fmt.Sprintf("FA-permastuck-%d", i+1), 1)
+		rowID := fx.createScheduleRow(t, assetID, 1, "2020-01-31", 1000.00, 0.00)
+		row, err := fx.engine.Get(ctx, publishedDef(t, fx.tenantDB, "DepreciationSchedule"), rowID)
+		if err != nil {
+			t.Fatalf("Get row for asset %d: %v", i+1, err)
+		}
+		fields := map[string]any{}
+		for k, v := range row.Data {
+			fields[k] = v
+		}
+		fields["posted_at"] = "2020-01-31"
+		version := row.Version
+		if _, err := fx.engine.Update(ctx, publishedDef(t, fx.tenantDB, "DepreciationSchedule"), rowID, fields, &version, humanActor()); err != nil {
+			t.Fatalf("mark row posted for asset %d: %v", i+1, err)
+		}
+		assetIDs[i] = assetID
+	}
+
+	const cap = 2 // < numStuckAssets, so the healing sweep's own window is exactly full every call
+	for attempt := 1; attempt <= 3; attempt++ {
+		posted, truncated, err := PostDueDepreciationBatch(ctx, fx.tenantDB, SchedulerActor(), cap)
+		if err != nil {
+			t.Fatalf("attempt %d: PostDueDepreciationBatch: %v", attempt, err)
+		}
+		if posted != 0 {
+			t.Errorf("attempt %d: posted = %d, want 0 (nothing due — this is a healing-only scenario)", attempt, posted)
+		}
+		if truncated {
+			t.Errorf("attempt %d: truncated = true, want false — the healing window is permanently full of assets this call can never transition, so a caller must fall back to the ordinary throttle instead of retrying every poll tick forever", attempt)
+		}
+	}
+
+	for _, assetID := range assetIDs {
+		if code := fx.statusCode(t, "FixedAsset", assetID); code != "in_service" {
+			t.Errorf("asset %s status = %q, want in_service — it must never have transitioned (the target status doesn't exist)", assetID, code)
+		}
+	}
+}
+
+// TestPostDueDepreciationBatch_DoesNotReportTruncatedWhenDueRowsArePermanentlyUnpostable
+// is the due-rows-side sibling of the healing-sweep test above:
+// DepreciationSchedule rows whose asset's account references are all
+// non-empty (so they pass records.ListDueUnposted's own gate) but point
+// at Account records that don't exist stay due-and-unposted forever —
+// postAssetDepreciation's accountCode lookup fails, and fails BEFORE
+// spending any of its attempted budget, so the exact same rows sort
+// into the exact same LIMITed window on every future call. Must not
+// report truncated=true forever, for the same reason as the healing
+// case above.
+func TestPostDueDepreciationBatch_DoesNotReportTruncatedWhenDueRowsArePermanentlyUnpostable(t *testing.T) {
+	fx := setUpDepreciationFixture(t)
+	ctx := context.Background()
+
+	const noSuchAccount = "00000000-0000-0000-0000-000000000099" // well-formed UUID, no matching Account record
+	rec, err := fx.engine.Create(ctx, publishedDef(t, fx.tenantDB, "FixedAsset"), map[string]any{
+		"asset_number": "FA-dangling-accounts", "name": map[string]any{"en": "Test Asset"},
+		"acquisition_date": "2020-01-01", "cost": 3000.0, "salvage_value": 0.0,
+		"useful_life_months": 3.0, "depreciation_method": "straight_line",
+		"currency_id":                         fx.currencyID,
+		"asset_account_id":                    noSuchAccount,
+		"depreciation_expense_account_id":     noSuchAccount,
+		"accumulated_depreciation_account_id": noSuchAccount,
+		"status_id":                           fx.statusID["in_service"],
+	}, humanActor())
+	if err != nil {
+		t.Fatalf("create FixedAsset with dangling account refs: %v", err)
+	}
+	const numRows = 3
+	rowIDs := make([]string, numRows)
+	for i := 0; i < numRows; i++ {
+		seq := i + 1
+		rowIDs[i] = fx.createScheduleRow(t, rec.ID, seq, fmt.Sprintf("2020-%02d-28", seq), 1000.00, 0.00)
+	}
+
+	const cap = 2 // < numRows, so the due-rows read is exactly full every call
+	for attempt := 1; attempt <= 3; attempt++ {
+		posted, truncated, err := PostDueDepreciationBatch(ctx, fx.tenantDB, SchedulerActor(), cap)
+		if err != nil {
+			t.Fatalf("attempt %d: PostDueDepreciationBatch: %v", attempt, err)
+		}
+		if posted != 0 {
+			t.Errorf("attempt %d: posted = %d, want 0 (every row's account refs are unresolvable)", attempt, posted)
+		}
+		if truncated {
+			t.Errorf("attempt %d: truncated = true, want false — the due-rows window is permanently full of rows this call can never post, so a caller must fall back to the ordinary throttle instead of retrying every poll tick forever", attempt)
+		}
+	}
+
+	for i, rowID := range rowIDs {
+		row, err := fx.engine.Get(ctx, publishedDef(t, fx.tenantDB, "DepreciationSchedule"), rowID)
+		if err != nil {
+			t.Fatalf("Get row %d: %v", i+1, err)
+		}
+		if postedAt, _ := row.Data["posted_at"].(string); postedAt != "" {
+			t.Errorf("row %d: posted_at = %q, want empty — it must never have posted (its accounts don't resolve)", i+1, postedAt)
+		}
+	}
+}
+
+// TestPostDueDepreciationBatch_PropagatesContextCancellation confirms
+// the earliest DB reads (depreciationInServiceStatusID's StatusType
+// lookup, and the due-rows worklist read itself) surface a cancelled
+// context as a real error rather than a misleading (0, false, nil) —
+// the same "don't report a clean return for a call actually cut short"
+// discipline this function's own doc comment already holds the healing
+// sweep to.
+func TestPostDueDepreciationBatch_PropagatesContextCancellation(t *testing.T) {
+	fx := setUpDepreciationFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancelled before the call even starts
+
+	posted, truncated, err := PostDueDepreciationBatch(ctx, fx.tenantDB, SchedulerActor(), 10)
+	if err == nil {
+		t.Fatal("expected an error from a call made with an already-cancelled context, got nil")
+	}
+	if posted != 0 {
+		t.Errorf("posted = %d, want 0", posted)
+	}
+	if truncated {
+		t.Errorf("truncated = true, want false on an error return")
 	}
 }
