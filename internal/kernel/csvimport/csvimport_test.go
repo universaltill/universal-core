@@ -3,6 +3,7 @@ package csvimport
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -238,6 +239,23 @@ func TestValidateMapping_RejectsUnmappedRequiredField(t *testing.T) {
 	err := ValidateMapping(vendorDef(), []string{"Lead Time"}, ColumnMapping{"Lead Time": "lead_time_days"})
 	if err == nil {
 		t.Fatal("expected error: required field name has no mapped column")
+	}
+	// Structured, not just a formatted string (uc-infra#200): a caller
+	// with a hidden-field set to redact against (import.go's importCommit)
+	// needs FieldName via errors.As, not string-parsing, to tell whether
+	// this specific failure is safe to show an actor. Error()'s wording
+	// stays pinned too — extsqlimport.go's/import.go's mapping-error UI
+	// fragment renders it verbatim, so a silent wording change would be a
+	// user-facing regression this test would otherwise miss.
+	var mapErr *MappingError
+	if !errors.As(err, &mapErr) {
+		t.Fatalf("expected a *MappingError, got %T: %v", err, err)
+	}
+	if mapErr.FieldName != "name" {
+		t.Fatalf("MappingError.FieldName = %q, want %q", mapErr.FieldName, "name")
+	}
+	if want := `required field "name" has no column mapped to it`; err.Error() != want {
+		t.Fatalf("Error() = %q, want %q", err.Error(), want)
 	}
 }
 

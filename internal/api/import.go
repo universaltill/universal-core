@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"github.com/universaltill/universal-core/internal/httpx"
 	"github.com/universaltill/universal-core/internal/kernel/aiassist"
 	"github.com/universaltill/universal-core/internal/kernel/aiprovider"
+	"github.com/universaltill/universal-core/internal/kernel/authz"
 	"github.com/universaltill/universal-core/internal/kernel/claudeassist"
 	"github.com/universaltill/universal-core/internal/kernel/csvimport"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
@@ -191,7 +193,12 @@ func (h *Handler) importPreview(w http.ResponseWriter, r *http.Request) {
 	} else {
 		rowOK := h.catalog.T(locale, "import.row_status_ok")
 		rowError := h.catalog.T(locale, "import.row_status_error")
-		view.Rows = buildResultRows(results, rowOK, rowError)
+		// def is already redacted (above), so no per-row ValidateRecord
+		// failure here can name a hidden field on its own — passing
+		// redacted through anyway keeps this call site on the same
+		// disclosure-safe path importCommit below now uses (uc-infra#200),
+		// rather than relying on the redacted-Definition side effect alone.
+		view.Rows = h.buildResultRows(locale, results, rowOK, rowError, redacted)
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -222,12 +229,48 @@ func (h *Handler) importCommit(w http.ResponseWriter, r *http.Request) {
 		writeDefinitionLookupError(w, entityType, err)
 		return
 	}
+	// Unlike importPreview, def here is deliberately NOT redacted before
+	// validation — same reasoning as handlers.go's createRecord/updateRecord
+	// (uc-infra#178): a hidden Required field left unmapped must still fail
+	// validation for real, just without naming the field to an actor who
+	// cannot see it. hidden resolves which field names get redacted below.
+	//
+	// CORRECTION (independent review, uc-infra#200): an earlier version of
+	// this comment claimed a hidden field "is always absent, never
+	// [explicitly] a mapping target" because the mapping UI never offers
+	// one — true of the UI, false of this endpoint. mappingFromForm below
+	// accepts whatever the client actually posts, and because def here is
+	// unredacted, csvimport.ValidateMapping's def.FieldByName lookup
+	// happily accepts a hidden field as an explicit mapping target too —
+	// which the reviewer proved is a field-EXISTENCE ORACLE: mapping a
+	// guessed field name to a real (if hidden) field reaches
+	// authz.ErrDenied ("no permission to write field ...") one row at a
+	// time, distinguishable from mapping a name that doesn't exist at all
+	// (csvimport.ValidateMapping's own "doesn't exist on entity" error).
+	// The fix below refuses any mapping that targets a hidden field
+	// outright, before a single row is ever processed — the same
+	// "redacted Definition means nothing hidden can be targeted at all"
+	// guarantee importPreview already gets for free from its own def
+	// redaction, applied here explicitly since this handler needs the
+	// FULL def for genuine Required-field validation to still work.
+	hidden, hErr := ts.crud.HiddenFields(r.Context(), entityType)
+	if hErr != nil {
+		writeInternalError(w, fmt.Sprintf("resolve hidden fields for %s import commit", entityType), hErr)
+		return
+	}
 
 	data, xlsx, ok := readUploadedFile(w, r)
 	if !ok {
 		return
 	}
 	mapping := mappingFromForm(r)
+	for _, fieldName := range mapping {
+		if hidden[fieldName] {
+			log.Printf("api: import commit: mapping targeted a hidden field for %s", entityType)
+			httpx.WriteError(w, http.StatusBadRequest, h.catalog.T(locale, "entity.validation.hidden_field_blocked"))
+			return
+		}
+	}
 
 	var results []csvimport.RowResult
 	if xlsx {
@@ -236,6 +279,24 @@ func (h *Handler) importCommit(w http.ResponseWriter, r *http.Request) {
 		results, err = csvimport.Commit(r.Context(), bytes.NewReader(data), def, mapping, ts.crud, rc.Actor)
 	}
 	if err != nil {
+		// uc-infra#200: unlike importPreview (whose def is already
+		// redacted, so ValidateMapping can't even see a hidden Required
+		// field to complain about), this request-level mapping check runs
+		// against the FULL def and fires BEFORE any row is processed. The
+		// mapping-targets-a-hidden-field case is already refused above;
+		// this remaining branch is for a hidden Required field left
+		// UNMAPPED entirely (mapping says nothing about it either way) — a
+		// *csvimport.MappingError naming it gets the same generic
+		// hidden_field_blocked message every other disclosure of this
+		// class uses. Every other mapping error (a typo'd column, a
+		// nonexistent target field — both the caller's own submission, not
+		// Definition-driven) is unaffected.
+		var mappingErr *csvimport.MappingError
+		if errors.As(err, &mappingErr) && hidden[mappingErr.FieldName] {
+			log.Printf("api: import commit: %v", err)
+			httpx.WriteError(w, http.StatusBadRequest, h.catalog.T(locale, "entity.validation.hidden_field_blocked"))
+			return
+		}
 		httpx.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -258,7 +319,7 @@ func (h *Handler) importCommit(w http.ResponseWriter, r *http.Request) {
 		Total:          len(results),
 		SucceededLabel: h.catalog.T(locale, "import.result_succeeded"),
 		FailedLabel:    h.catalog.T(locale, "import.result_failed"),
-		Rows:           buildResultRows(results, rowOK, rowError),
+		Rows:           h.buildResultRows(locale, results, rowOK, rowError, hidden),
 	})
 	if err != nil {
 		writeInternalError(w, "render import result", err)
@@ -555,20 +616,76 @@ func buildMappingRows(headers []string, mapping csvimport.ColumnMapping, aiSugge
 	return mappings
 }
 
-func buildResultRows(results []csvimport.RowResult, okLabel, errorLabel string) []previewRowView {
+// buildResultRows renders a per-row import result, translating any
+// validation failure through h.validationErrorMessage rather than
+// showing its raw err.Error() (uc-infra#200): the same *entity.
+// ValidationError a single-record create/update can produce is exactly
+// what entity.ValidateRecord returns per row here, so it carries the
+// identical hidden-field disclosure risk and the same
+// untranslated-English-string CLAUDE.md i18n gap. In practice, for THIS
+// package's two callers, importCommit's own up-front refusal (any
+// mapping targeting a hidden field, or a hidden Required field left
+// unmapped) and importPreview's already-redacted def mean neither ever
+// hands this function a *entity.ValidationError naming a hidden field
+// today — this redaction is defense-in-depth against a future caller (or
+// a future change to either of those guards) landing here unguarded, not
+// a currently-exercised production path (independent review, uc-infra#200
+// — see this fix's own end-to-end test comments for why, and this
+// package's code review record for the full trace). hidden is nil-safe
+// (map[string]bool's zero value): a caller with nothing to redact can
+// pass nil and every message resolves exactly as before this fix.
+//
+// A separate, ALWAYS-reachable leak independent review found in this
+// fix's first version: authz.ErrDenied ("no permission to write field
+// ...") is a plain error, not a *entity.ValidationError, so it fell
+// through validationErrorMessage's own fallback to err.Error() untouched
+// — still naming the field, worse than the disclosure this function
+// exists to close, and reachable any time a row attempts to write a
+// field this actor cannot write (hidden or merely read-only-for-this-
+// role). Handled the same way writeCrudError/denyFragmentUnlessWritable
+// already handle it elsewhere in this package: the fixed, field-free
+// "access denied" string, not a per-Kind or per-field message at all.
+func (h *Handler) buildResultRows(locale string, results []csvimport.RowResult, okLabel, errorLabel string, hidden map[string]bool) []previewRowView {
 	rows := make([]previewRowView, len(results))
 	for i, res := range results {
 		row := previewRowView{RowNumber: res.RowNumber, Data: fmt.Sprintf("%v", res.Data)}
-		if res.Err == nil {
+		switch {
+		case res.Err == nil:
 			row.OK = true
 			row.Status = okLabel
-		} else {
+		case errors.Is(res.Err, authz.ErrDenied):
 			row.Status = errorLabel
-			row.Error = res.Err.Error()
+			row.Error = "access denied"
+		default:
+			row.Status = errorLabel
+			if redactsHiddenField(res.Err, hidden) {
+				log.Printf("api: import: row %d: %v", res.RowNumber, res.Err)
+			}
+			row.Error = h.validationErrorMessage(locale, res.Err, hidden)
 		}
 		rows[i] = row
 	}
 	return rows
+}
+
+// redactsHiddenField reports whether err is a *entity.ValidationError
+// that validationErrorMessage is about to swap for the generic
+// hidden_field_blocked message — the one case where the real field
+// name/detail this function's caller would otherwise have logged nowhere
+// (independent review, uc-infra#200: unlike a per-record create/update's
+// single writeValidationErrorLocalized call, a bulk import's per-row
+// loop has no other log line for a redacted row, so the operator-facing
+// detail validationErrorMessage's own doc comment promises every caller
+// preserves would silently vanish without this). Every OTHER row error
+// (a genuinely unrelated failure, or a ValidationError naming a field
+// this actor CAN see) is left exactly as visible as it always was — this
+// only decides whether to ALSO log, never changes what's shown.
+func redactsHiddenField(err error, hidden map[string]bool) bool {
+	var verr *entity.ValidationError
+	if !errors.As(err, &verr) {
+		return false
+	}
+	return hidden[verr.FieldName] || (verr.Kind == entity.KindNotBefore && hidden[verr.OtherField])
 }
 
 var importTmpl = template.Must(template.New("import").Parse(`
