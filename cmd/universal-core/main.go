@@ -23,6 +23,7 @@ import (
 	"github.com/universaltill/universal-core/internal/i18n"
 	"github.com/universaltill/universal-core/internal/kernel/aiassist"
 	"github.com/universaltill/universal-core/internal/kernel/blobstore"
+	"github.com/universaltill/universal-core/internal/kernel/finance"
 	"github.com/universaltill/universal-core/internal/kernel/purchasing"
 	"github.com/universaltill/universal-core/internal/kernel/sales"
 	"github.com/universaltill/universal-core/internal/kernel/secretcrypt"
@@ -325,6 +326,12 @@ func main() {
 	handler.RegisterHook("CustomerInvoice", sales.PostCustomerInvoiceToLedger)
 	handler.RegisterHook("VendorInvoice", purchasing.MatchVendorInvoiceOnUpdate)
 	handler.RegisterHook("StockTransfer", purchasing.ValidateStockTransfer)
+	// uc-infra#204 / ADR-0004's 2026-08-12 addendum: keeps gl_accounts
+	// (the ledger's own typed chart) current the moment a tenant admin
+	// actually edits their chart of accounts through the generic Account
+	// CRUD screen — previously nothing outside cmd/seed-demo-data ever
+	// called finance.SyncGLAccounts at all.
+	handler.RegisterHook("Account", finance.SyncGLAccountOnWrite)
 	handler.Routes(mux)
 
 	// The durable workflow job queue (internal/kernel/workflow.Queue) has

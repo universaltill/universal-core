@@ -18,9 +18,9 @@ longer used. Accounts you don't set up yourself may already be expected
 by the system: **Sales Revenue (code 4100)** and **Accounts Receivable
 (code 1200)** are the codes issuing a Customer Invoice posts to, and if
 your chart doesn't use those exact codes, that posting fails to find
-them — see Customer Invoice's own topic. In this release, a brand-new
-Account isn't usable by the ledger the moment you save it — see "What it
-connects to" below for why.
+them — see Customer Invoice's own topic. A brand-new Account is usable by
+the ledger the moment you save it — no separate synchronization step
+needed.
 
 ## Creating an account
 
@@ -40,16 +40,11 @@ connects to" below for why.
 - Parent Account can be any other Account — nesting is unlimited, but the
   system does not check for a circular chain (an account set as its own
   ancestor), so avoid creating one by hand.
-- The **Active** checkbox is a label on this record — in this release it
-  does not, by itself, stop the ledger from accepting postings against
-  the account. Whether the ledger actually rejects a deactivated
-  account's code depends on whether an administrator has re-synchronized
-  the ledger's own copy of the chart of accounts since you unchecked it
-  (see "What it connects to" below); until that happens, postings keep
-  going through exactly as before.
-- Code is not schema-enforced unique — treat your own numbering as a
-  convention to keep straight, the system won't catch a duplicate for
-  you.
+- The **Active** checkbox takes effect immediately — unchecking it stops
+  the ledger from accepting new postings against the account as soon as
+  you save.
+- Code must be unique — the system rejects a second Account that reuses a
+  code already in use by another one.
 
 ## What it connects to
 
@@ -61,12 +56,15 @@ not this record — is what the ledger checks before accepting a posting's
 date; see Period's own topic. Account and Tax Code both feed the SAF-T
 statutory export.
 
-**A real limitation to know about in this release**: the ledger and the
-SAF-T export don't read Account records directly — they read a separate,
-internal copy of your chart of accounts that only an administrator
-running a synchronization step (outside this screen, not something you
-can trigger yourself here) keeps up to date. Adding, renaming, changing
-the type of, or deactivating an Account has no effect on what the ledger
-will accept, or on what a SAF-T export shows, until that synchronization
-next runs. If a posting or an export doesn't reflect a change you just
-made here, this is why — ask your administrator to re-synchronize.
+The ledger and the SAF-T export don't read Account records directly —
+they read a separate, internal copy of your chart of accounts, kept
+current automatically the moment you add, deactivate, or change the type
+of an Account. No separate synchronization step is needed for any of
+that.
+
+**A narrower limitation to know about**: renaming an existing Account's
+**Code** doesn't relabel its internal ledger entry — it creates a new one
+under the new code and leaves the old one behind, still active and still
+usable by that old code. If you need to correct a numbering mistake,
+prefer creating a new Account with the right code and deactivating the
+old one, rather than renaming — ask your administrator if you're unsure.

@@ -19,10 +19,9 @@ birini pasife almak için. Kendiniz kurmadığınız bazı hesaplar sistem
 tarafından zaten bekleniyor olabilir: **Satış Geliri (kod 4100)** ve
 **Alacak Hesapları (kod 1200)**, bir Müşteri Faturası'nı kesmenin işlem
 yaptığı kodlardır; hesap planınız tam olarak bu kodları kullanmıyorsa, bu
-işlem onları bulamaz — bkz. Müşteri Faturası'nın kendi konusu. Bu
-sürümde, yepyeni bir Hesap, kaydettiğiniz anda defter tarafından
-kullanılabilir hale gelmez — nedeni için aşağıdaki "Neyle bağlantılı"
-bölümüne bakın.
+işlem onları bulamaz — bkz. Müşteri Faturası'nın kendi konusu. Yepyeni
+bir Hesap, kaydettiğiniz anda defter tarafından kullanılabilir hale
+gelir — ayrı bir eşitleme adımına gerek yoktur.
 
 ## Hesap oluşturma
 
@@ -43,16 +42,11 @@ bölümüne bakın.
 - Üst Hesap başka herhangi bir Hesap olabilir — iç içe geçirme sınırsızdır,
   ancak sistem döngüsel bir zincir (bir hesabın kendi atası olarak
   ayarlanması) kontrol etmez, bunu elle oluşturmaktan kaçının.
-- **Aktif** kutucuğu bu kayıt üzerinde bir etikettir — bu sürümde tek
-  başına defterin bu hesaba karşı işlemleri kabul etmesini durdurmaz.
-  Defterin pasife alınmış bir hesabın kodunu gerçekten reddedip
-  reddetmeyeceği, işareti kaldırdığınızdan bu yana bir yöneticinin
-  defterin kendi hesap planı kopyasını yeniden eşitleyip eşitlemediğine
-  bağlıdır (aşağıdaki "Neyle bağlantılı" bölümüne bakın); bu gerçekleşene
-  kadar işlemler tam olarak öncekiyle aynı şekilde geçmeye devam eder.
-- Kod, şema düzeyinde benzersizliği zorunlu kılınmaz — kendi
-  numaralandırmanızı tutarlı tutmayı bir kural olarak benimseyin, sistem
-  sizin için bir yinelemeyi yakalamaz.
+- **Aktif** kutucuğu kaydettiğiniz anda etkiye girer — işareti
+  kaldırmak, kaydettiğiniz anda defterin bu hesaba karşı yeni işlemleri
+  kabul etmesini durdurur.
+- Kod benzersiz olmalıdır — sistem, başka bir Hesap tarafından zaten
+  kullanılan bir kodu yeniden kullanan ikinci bir Hesabı reddeder.
 
 ## Neyle bağlantılı
 
@@ -65,13 +59,16 @@ defterin bir işlemi kabul etmeden önce kontrol ettiği şeydir; bkz.
 Dönem'in kendi konusu. Hesap ve Vergi Kodu, ikisi de SAF-T yasal dışa
 aktarımına veri sağlar.
 
-**Bu sürümde bilinmesi gereken gerçek bir kısıtlama**: defter ve SAF-T
-dışa aktarımı Hesap kayıtlarını doğrudan okumaz — yalnızca bir yöneticinin
-(bu ekranın dışında, burada kendinizin tetikleyebileceği bir şey değil)
-çalıştırdığı bir eşitleme adımının güncel tuttuğu, ayrı, iç bir hesap
-planı kopyasını okurlar. Bir Hesap eklemek, adını değiştirmek, türünü
-değiştirmek veya pasife almak, bu eşitleme bir sonraki kez çalışana kadar
-defterin neyi kabul edeceği veya bir SAF-T dışa aktarımının ne
-göstereceği üzerinde hiçbir etki yapmaz. Burada az önce yaptığınız bir
-değişiklik bir işlemde veya dışa aktarımda yansımıyorsa, nedeni budur —
-yöneticinizden yeniden eşitlemesini isteyin.
+Defter ve SAF-T dışa aktarımı Hesap kayıtlarını doğrudan okumaz —
+hesap planınızın ayrı, iç bir kopyasını okurlar; bu kopya, bir Hesap
+eklediğinizde, pasife aldığınızda veya türünü değiştirdiğinizde otomatik
+olarak güncel tutulur. Bunların hiçbiri için ayrı bir eşitleme adımına
+gerek yoktur.
+
+**Bilinmesi gereken daha dar bir kısıtlama**: mevcut bir Hesabın
+**Kod**unu değiştirmek, defterdeki iç kaydını yeniden etiketlemez — yeni
+kod altında yeni bir kayıt oluşturur ve eskisini, hâlâ aktif ve hâlâ eski
+koduyla kullanılabilir durumda, geride bırakır. Bir numaralandırma
+hatasını düzeltmeniz gerekiyorsa, kodu değiştirmek yerine doğru kodla
+yeni bir Hesap oluşturup eskisini pasife almayı tercih edin — emin
+değilseniz yöneticinize danışın.

@@ -253,7 +253,7 @@ var wantHashes = map[string]string{
 	"entity:FixedAsset@v3":                   "e6a276e3aa48ef1bde0c3c9d3ced2c9205ad032f22334f4058e9dfac95a35161",
 	"entity:DepreciationSchedule@v2":         "3607f579708ad0c0b57f8e9247c8d769f257f48ea2501b21a92aa9387d7fb735",
 	"entity:MaintenanceOrder@v2":             "6ba40ab40280a724de9566f38d5f7c416bcb10eb8ae3b78c46495d987650eecb",
-	"entity:Account@v1":                      "21603e07ce6d708bc062f0b21a893e88001d4d004491a6ac291861c2710e4b4f",
+	"entity:Account@v2":                      "ffe39c08e8763a6744fcb7d74ec806e48b7f12c3e8709abafd7a01d105b60349",
 	"entity:FiscalYear@v1":                   "4e5ffb474cc2e288efdad6bce811bf137643e2140d5b98597466a94636509210",
 	"entity:Period@v1":                       "bc327fb5c8fb3dac7e68faa7e3bbb889cce743fc178cc6a5f8cfc610269af5c5",
 	"entity:TaxCode@v2":                      "e071d43f60c3a3c6d16f97dcae26e69507ed54dcd5ebe6e28ada9ed2484a62f2",

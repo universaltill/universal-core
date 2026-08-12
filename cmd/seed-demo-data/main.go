@@ -95,6 +95,15 @@ func main() {
 	engine.SetHook("CustomerInvoice", sales.PostCustomerInvoiceToLedger)
 	engine.SetHook("VendorInvoice", purchasing.MatchVendorInvoiceOnUpdate)
 	engine.SetHook("StockTransfer", purchasing.ValidateStockTransfer)
+	// uc-infra#204: same wiring as cmd/universal-core's real HTTP path —
+	// seedFinance's Account creates/updates below now sync gl_accounts
+	// through this hook as they happen, same as a real user's edit
+	// would. The explicit finance.SyncGLAccounts call further down stays
+	// too, now a redundant (idempotent, harmless) no-op sweep in this
+	// particular command's own flow, kept so this binary keeps
+	// exercising the standalone sweep path directly rather than only
+	// through its own package tests.
+	engine.SetHook("Account", finance.SyncGLAccountOnWrite)
 
 	s := &seeder{
 		ctx:        context.Background(),
@@ -140,9 +149,12 @@ func main() {
 	s.seedOrgChart()
 	// gl_accounts (the ledger core's own typed chart, ADR-0004) is a
 	// projection of the finance.Account records seedFinance just
-	// created/confirmed — sync it now so cmd/backfill-... or any future
-	// posting code has a real, matching gl_accounts row to post against
-	// immediately, not only after some separate manual step.
+	// created/confirmed — the engine.SetHook("Account", ...) call above
+	// already synced every one of them as they were written, so this is
+	// now a redundant, idempotent confirmation rather than the only path
+	// (uc-infra#204); kept so any future posting code depending on this
+	// exact call site staying present, and this package's own full-sweep
+	// coverage, aren't quietly lost in a later edit.
 	if err := finance.SyncGLAccounts(context.Background(), sqlDB, s.actor); err != nil {
 		log.Fatalf("sync gl_accounts: %v", err)
 	}

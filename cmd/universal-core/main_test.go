@@ -862,6 +862,96 @@ func TestUniversalCore_StockTransferRoutes_ServedByRealBinary(t *testing.T) {
 	}
 }
 
+// TestUniversalCore_Account_SavedByRealBinarySyncsGLAccounts is the smoke
+// layer for uc-infra#204: the specific handler.RegisterHook("Account",
+// finance.SyncGLAccountOnWrite) call this file's own main() adds is
+// really wired on the production mux, not just proven generically by
+// internal/api's own hook-mapping tests or by another entity's hook here
+// (TestUniversalCore_StockTransferRoutes_ServedByRealBinary's own doc
+// comment names this exact gap: "not proof this specific hook is
+// actually registered in main()" — independent review flagged that this
+// card had no such test for its own hook).
+//
+// gl_accounts (the ledger core's own typed table, ADR-0004) has no
+// generic /api/records surface to read it back through — unlike every
+// other smoke test in this file, which talks only to the running server
+// from the point setup finishes (see
+// TestUniversalCore_AttendanceRecordUniqueConstraint_EnforcedByRealBinary's
+// own comment on why), this one keeps its setup tenantDB connection open
+// deliberately, as the one honest way to observe a deterministic-core
+// table's state — same reasoning ADR-0004 already gives for why
+// journal_entries only gets a "dedicated, hand-built read-only report
+// page," not a generic list. The real HTTP create is still what's under
+// test; the DB read is only the assertion.
+func TestUniversalCore_Account_SavedByRealBinarySyncsGLAccounts(t *testing.T) {
+	controlDSN := testexec.FreshDatabase(t, "uc_test_server_control")
+
+	control := testexec.Open(t, controlDSN)
+	ctx := context.Background()
+	if err := db.ApplyControl(ctx, control); err != nil {
+		t.Fatalf("ApplyControl: %v", err)
+	}
+	router, err := tenantdb.NewRouter(control, controlDSN)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+	defer router.Close()
+	tenantID, err := router.Create(ctx, "Account Smoke Test", "eu-west")
+	if err != nil {
+		t.Fatalf("router.Create: %v", err)
+	}
+	testexec.DropTenantDatabase(t, testexec.Open(t, controlDSN), tenantID)
+	tenantDB, err := router.Get(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("router.Get: %v", err)
+	}
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "smoke-test-setup"}
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := finance.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("finance.Publish: %v", err)
+	}
+
+	baseURL := startServer(t, controlDSN, "INSECURE_DEV_AUTH=true")
+
+	post := func(path, body string) (*http.Response, string) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, baseURL+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("build request %s: %v", path, err)
+		}
+		req.Header.Set("X-Tenant-ID", tenantID)
+		req.Header.Set("X-Actor-ID", "smoke-test")
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		respBody, _ := io.ReadAll(resp.Body)
+		return resp, string(respBody)
+	}
+
+	createBody := `{"code":"1000","name":"Assets","type":"asset","is_active":true}`
+	createResp, createRespBody := post("/api/records/Account", createBody)
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 creating Account via the real running server, got %d: %s", createResp.StatusCode, createRespBody)
+	}
+
+	glAccounts := data.NewGLAccountRepo(tenantDB)
+	id, isActive, err := glAccounts.IDByCode(ctx, "1000")
+	if err != nil {
+		t.Fatalf("expected a gl_accounts row for code 1000 right after the real server's create — RegisterHook(\"Account\", ...) may not be wired in main(): %v", err)
+	}
+	if !isActive {
+		t.Fatal("expected the synced gl_account to be active")
+	}
+	if id == "" {
+		t.Fatal("expected a real gl_accounts id")
+	}
+}
+
 // TestUniversalCore_AttendanceRecordUniqueConstraint_EnforcedByRealBinary
 // is the smoke layer for uc-infra#81: the real compiled binary, talking
 // to a real Postgres tenant database, actually rejects a second

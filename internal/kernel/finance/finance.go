@@ -36,13 +36,35 @@ import "github.com/universaltill/universal-core/internal/kernel/entity"
 func Account() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "Account",
-		Version:    1,
-		Module:     "finance",
+		// v2 (uc-infra#204 independent review, finding 3): code is
+		// gl_accounts' own natural key (UpsertByCode) — two Account
+		// records sharing a code used to silently clobber each other's
+		// projected gl_accounts row with no trace, once
+		// SyncGLAccountOnWrite (seed.go) made real writes actually reach
+		// that projection. Unique now enforces it the same way
+		// PurchaseOrder.po_number/InventoryItem's own natural keys
+		// already are — see entity.Definition's Unique field.
+		Version: 2,
+		Module:  "finance",
 		Fields: []entity.Field{
 			// code is the natural key (chart-of-accounts numbering, e.g.
-			// "1000", "4000") — same application-level-convention-only
-			// uniqueness as po_number/Item.sku/Currency.code (no such
-			// constraint concept exists yet in entity.Field).
+			// "1000", "4000") — real DB-level uniqueness as of v2 above
+			// (record_unique_keys), not just an application convention.
+			//
+			// NOT enforced immutable once written: renaming an existing
+			// Account's code is still allowed, and SyncGLAccountOnWrite
+			// upserts gl_accounts by the NEW code — the OLD code's
+			// gl_accounts row is orphaned (left behind, still active,
+			// no longer reachable from any Account), not renamed or
+			// deactivated in place, because gl_accounts carries no link
+			// back to the Account record it came from to find it by.
+			// Real gap (uc-infra#204 independent review, finding 2),
+			// deliberately not closed in this change — closing it
+			// properly needs gl_accounts to gain a source-record
+			// linkage (a migration) or Account.code to become
+			// immutable-after-create, either of which is a bigger,
+			// separable change; tracked as its own backlog card rather
+			// than expanding this one.
 			{Name: "code", Type: entity.FieldString, Required: true},
 			{Name: "name", Type: entity.FieldString, Required: true},
 			{Name: "type", Type: entity.FieldEnum, Required: true,
@@ -51,6 +73,7 @@ func Account() *entity.Definition {
 			{Name: "currency_id", Type: entity.FieldReference, Target: "Currency"},
 			{Name: "is_active", Type: entity.FieldBool, Default: true},
 		},
+		Unique: [][]string{{"code"}},
 	}
 }
 

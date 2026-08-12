@@ -189,7 +189,11 @@ func TestPublish_LeavesRolledBackVersionAlone(t *testing.T) {
 	if err := Publish(ctx, tenantDB, actor); err != nil {
 		t.Fatalf("first Publish: %v", err)
 	}
-	if err := repo.Rollback(ctx, "Account", 1, actor); err != nil {
+	// Account() now publishes at v2 (uc-infra#204's Unique constraint) —
+	// hardcoding 1 here would roll back a version that was never
+	// published in this test's own flow, silently making the Rollback
+	// call itself the thing under test a no-op-by-accident.
+	if err := repo.Rollback(ctx, "Account", Account().Version, actor); err != nil {
 		t.Fatalf("Rollback: %v", err)
 	}
 
