@@ -283,7 +283,12 @@ func syncTenant(
 		warnings := requiredFieldWarnings(ctx, tenantDB, name, changes, defFor)
 		warnings = append(warnings, targetConstraintWarnings(ctx, tenantDB, entityDefs, name, changes, defFor)...)
 		warnings = append(warnings, numericBoundWarnings(ctx, tenantDB, entityDefs, name, changes, defFor)...)
-		warnings = append(warnings, uniqueConstraintWarnings(ctx, tenantDB, entityDefs, name, changes, defFor)...)
+		// Built inline, unlike the real-run path below: a dry run has only
+		// this one consumer of the lookup (no backfill step), so there is
+		// nothing to share it with yet. If a second dry-run consumer is
+		// ever added, hoist this to a local and pass the same instance to
+		// both, the same way the real-run path already has to.
+		warnings = append(warnings, uniqueConstraintWarnings(ctx, tenantDB, name, changes, defFor, oldUniqueNameLookup(ctx, entityDefs, name))...)
 		return warnings, outcomeSynced
 	}
 
@@ -347,14 +352,20 @@ func syncTenant(
 	// behavior; this line's wiring to that function is otherwise
 	// unverified by an automated test.
 	defFor := publishedDefFor(ctx, entityDefs, name, id)
+	// One shared instance across both calls below (uniqueConstraintWarnings
+	// and backfillNewUniqueConstraints run over the exact same `changes` on
+	// a real sync) so a corrupt/unreadable old version warns once per
+	// syncTenant call, not once per caller — see oldUniqueNameLookup's own
+	// doc comment.
+	oldNamesFor := oldUniqueNameLookup(ctx, entityDefs, name)
 	warnings := requiredFieldWarnings(ctx, tenantDB, name, changes, defFor)
 	warnings = append(warnings, targetConstraintWarnings(ctx, tenantDB, entityDefs, name, changes, defFor)...)
 	warnings = append(warnings, numericBoundWarnings(ctx, tenantDB, entityDefs, name, changes, defFor)...)
-	warnings = append(warnings, uniqueConstraintWarnings(ctx, tenantDB, entityDefs, name, changes, defFor)...)
+	warnings = append(warnings, uniqueConstraintWarnings(ctx, tenantDB, name, changes, defFor, oldNamesFor)...)
 	// Real run only — a dry run must not write record_unique_keys rows,
 	// same "nothing is published" contract this whole branch's dry-run
 	// sibling above holds for entity/form definitions.
-	backfillNewUniqueConstraints(ctx, tenantDB, entityDefs, name, changes, defFor)
+	backfillNewUniqueConstraints(ctx, tenantDB, name, changes, defFor, oldNamesFor)
 	return warnings, result
 }
 
@@ -751,9 +762,15 @@ func targetConstraintWarnings(
 		var oldDef *entity.Definition
 		if c.from > 0 {
 			v, err := entityDefs.GetVersion(ctx, c.entityType, c.from)
-			if err == nil {
+			if err != nil {
+				log.Printf("WARNING: %s: %s v%d — could not re-read the previous published version to tell which reference constraints are actually new this run, so every reference constraint on this entity type is being re-checked as if newly added; the record-migration warning(s) below may repeat one already reported for an earlier version: %v",
+					tenantName, c.entityType, c.from, err)
+			} else {
 				var d entity.Definition
-				if json.Unmarshal(v.Definition, &d) == nil {
+				if err := json.Unmarshal(v.Definition, &d); err != nil {
+					log.Printf("WARNING: %s: %s v%d — the previous published version could not be decoded to tell which reference constraints are actually new this run, so every reference constraint on this entity type is being re-checked as if newly added; the record-migration warning(s) below may repeat one already reported for an earlier version: %v",
+						tenantName, c.entityType, c.from, err)
+				} else {
 					oldDef = &d
 				}
 			}
@@ -826,9 +843,15 @@ func numericBoundWarnings(
 		var oldDef *entity.Definition
 		if c.from > 0 {
 			v, err := entityDefs.GetVersion(ctx, c.entityType, c.from)
-			if err == nil {
+			if err != nil {
+				log.Printf("WARNING: %s: %s v%d — could not re-read the previous published version to tell which numeric bounds are actually new this run, so every numeric bound on this entity type is being re-checked as if newly added; the record-migration warning(s) below may repeat one already reported for an earlier version: %v",
+					tenantName, c.entityType, c.from, err)
+			} else {
 				var d entity.Definition
-				if json.Unmarshal(v.Definition, &d) == nil {
+				if err := json.Unmarshal(v.Definition, &d); err != nil {
+					log.Printf("WARNING: %s: %s v%d — the previous published version could not be decoded to tell which numeric bounds are actually new this run, so every numeric bound on this entity type is being re-checked as if newly added; the record-migration warning(s) below may repeat one already reported for an earlier version: %v",
+						tenantName, c.entityType, c.from, err)
+				} else {
 					oldDef = &d
 				}
 			}
@@ -898,10 +921,10 @@ func numericBoundChanged(oldDef *entity.Definition, newField entity.Field) bool 
 func uniqueConstraintWarnings(
 	ctx context.Context,
 	tenantDB *sql.DB,
-	entityDefs *data.EntityDefinitionRepo,
 	tenantName string,
 	changes []change,
 	defFor func(entityType string) (*entity.Definition, bool),
+	oldNamesFor func(change) map[string]bool,
 ) []string {
 	records := data.NewRecordRepo(tenantDB)
 	var out []string
@@ -910,7 +933,7 @@ func uniqueConstraintWarnings(
 		if !ok {
 			continue
 		}
-		for _, set := range newlyAddedUniqueSets(ctx, entityDefs, c, newDef) {
+		for _, set := range newlyAddedUniqueSets(c, newDef, oldNamesFor) {
 			name := entity.UniqueConstraintName(set)
 			n, err := crud.CountUniqueConstraintViolations(ctx, records, c.entityType, set)
 			if err != nil {
@@ -929,29 +952,71 @@ func uniqueConstraintWarnings(
 	return out
 }
 
-// newlyAddedUniqueSets returns newDef.Unique's sets that were NOT already
-// declared on c's old published version — the shared "what's actually
-// new" logic uniqueConstraintWarnings and backfillNewUniqueConstraints
-// both need, extracted so the two can never quietly disagree about which
-// sets are new. A brand-new-to-the-registry type (c.from == 0) treats
-// every declared set as new, same reasoning requiredFieldWarnings' own
-// doc comment gives for not skipping it ("new to the published registry"
-// does not mean "no records" — a rolled-back version's records are still
-// there).
-func newlyAddedUniqueSets(ctx context.Context, entityDefs *data.EntityDefinitionRepo, c change, newDef *entity.Definition) [][]string {
-	var oldNames map[string]bool
-	if c.from > 0 {
-		v, err := entityDefs.GetVersion(ctx, c.entityType, c.from)
-		if err == nil {
-			var d entity.Definition
-			if json.Unmarshal(v.Definition, &d) == nil {
-				oldNames = make(map[string]bool, len(d.Unique))
-				for _, set := range d.Unique {
-					oldNames[entity.UniqueConstraintName(set)] = true
-				}
-			}
+// oldUniqueNameLookup returns a closure that resolves c's OLD published
+// version's declared Unique-set names, canonicalized via
+// entity.UniqueConstraintName — the piece newlyAddedUniqueSets needs to
+// tell "already declared" apart from "actually new".
+//
+// This is built ONCE per syncTenant call and shared by both of
+// newlyAddedUniqueSets' callers (uniqueConstraintWarnings and, on a real
+// run, backfillNewUniqueConstraints — both invoked with the exact same
+// `changes`): without sharing it, a single corrupt/unreadable old version
+// would resolve independently in each caller and log the identical
+// WARNING twice per syncTenant call, the same "near-identical warnings
+// bury the signal" problem publishedDefFor's own dedup exists to avoid.
+// Deduped by entity type, same reasoning and same one-call scope as
+// publishedDefFor's warned map — c.from is fixed per entity type within
+// one syncTenant call, so keying on entityType alone can't hide a
+// different failure for the same type.
+func oldUniqueNameLookup(ctx context.Context, entityDefs *data.EntityDefinitionRepo, tenantName string) func(c change) map[string]bool {
+	warned := make(map[string]bool)
+	warnOnce := func(t, msg string) {
+		if warned[t] {
+			return
 		}
+		warned[t] = true
+		log.Print(msg)
 	}
+	return func(c change) map[string]bool {
+		if c.from == 0 {
+			return nil // brand new to the registry: nothing old to compare against, not an error
+		}
+		v, err := entityDefs.GetVersion(ctx, c.entityType, c.from)
+		if err != nil {
+			warnOnce(c.entityType, fmt.Sprintf(
+				"WARNING: %s: %s v%d — could not re-read the previous published version to tell which unique constraints are actually new this run, so every unique constraint on this entity type is being re-checked (and re-backfilled) as if newly added; the record-migration warning(s) below may repeat one already reported for an earlier version: %v",
+				tenantName, c.entityType, c.from, err))
+			return nil
+		}
+		var d entity.Definition
+		if err := json.Unmarshal(v.Definition, &d); err != nil {
+			warnOnce(c.entityType, fmt.Sprintf(
+				"WARNING: %s: %s v%d — the previous published version could not be decoded to tell which unique constraints are actually new this run, so every unique constraint on this entity type is being re-checked (and re-backfilled) as if newly added; the record-migration warning(s) below may repeat one already reported for an earlier version: %v",
+				tenantName, c.entityType, c.from, err))
+			return nil
+		}
+		names := make(map[string]bool, len(d.Unique))
+		for _, set := range d.Unique {
+			names[entity.UniqueConstraintName(set)] = true
+		}
+		return names
+	}
+}
+
+// newlyAddedUniqueSets returns newDef.Unique's sets that were NOT already
+// declared on c's old published version (per oldNamesFor, see
+// oldUniqueNameLookup above) — the shared "what's actually new" logic
+// uniqueConstraintWarnings and backfillNewUniqueConstraints both need,
+// extracted so the two can never quietly disagree about which sets are
+// new. A brand-new-to-the-registry type (c.from == 0) treats every
+// declared set as new, same reasoning requiredFieldWarnings' own doc
+// comment gives for not skipping it ("new to the published registry"
+// does not mean "no records" — a rolled-back version's records are still
+// there); so does a lookup that failed to resolve an old version at all
+// (oldNamesFor already warned about that; a nil result here fails open
+// to "check everything", never silently to "check nothing").
+func newlyAddedUniqueSets(c change, newDef *entity.Definition, oldNamesFor func(change) map[string]bool) [][]string {
+	oldNames := oldNamesFor(c)
 	var out [][]string
 	for _, set := range newDef.Unique {
 		if oldNames != nil && oldNames[entity.UniqueConstraintName(set)] {
@@ -990,10 +1055,10 @@ func newlyAddedUniqueSets(ctx context.Context, entityDefs *data.EntityDefinition
 func backfillNewUniqueConstraints(
 	ctx context.Context,
 	tenantDB *sql.DB,
-	entityDefs *data.EntityDefinitionRepo,
 	tenantName string,
 	changes []change,
 	defFor func(entityType string) (*entity.Definition, bool),
+	oldNamesFor func(change) map[string]bool,
 ) {
 	records := data.NewRecordRepo(tenantDB)
 	keys := data.NewRecordUniqueKeyRepo(tenantDB)
@@ -1002,7 +1067,7 @@ func backfillNewUniqueConstraints(
 		if !ok {
 			continue
 		}
-		for _, set := range newlyAddedUniqueSets(ctx, entityDefs, c, newDef) {
+		for _, set := range newlyAddedUniqueSets(c, newDef, oldNamesFor) {
 			name := entity.UniqueConstraintName(set)
 			backfilled, skipped, err := crud.BackfillUniqueConstraintKeys(ctx, tenantDB, records, keys, c.entityType, set)
 			if err != nil {

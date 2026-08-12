@@ -323,9 +323,10 @@ func TestUniqueConstraintWarnings_CountErrorIsSurfacedNotSwallowed(t *testing.T)
 	changes := []change{{entityType: "Voucher", from: 0, to: 1}}
 	entityDefs := data.NewEntityDefinitionRepo(closedDB(t))
 
+	ctx := context.Background()
 	var out []string
 	logged := captureLog(t, func() {
-		out = uniqueConstraintWarnings(context.Background(), closedDB(t), entityDefs, "Demo Organization", changes, defFor)
+		out = uniqueConstraintWarnings(ctx, closedDB(t), "Demo Organization", changes, defFor, oldUniqueNameLookup(ctx, entityDefs, "Demo Organization"))
 	})
 
 	if len(out) != 0 {
@@ -381,9 +382,10 @@ func TestUniqueConstraintWarnings_ZeroCountStaysSilent(t *testing.T) {
 		return def, true
 	}
 	changes := []change{{entityType: "Voucher", from: 0, to: 1}}
+	ctx := context.Background()
 
 	logged := captureLog(t, func() {
-		out := uniqueConstraintWarnings(context.Background(), tenantDB, entityDefs, name, changes, defFor)
+		out := uniqueConstraintWarnings(ctx, tenantDB, name, changes, defFor, oldUniqueNameLookup(ctx, entityDefs, name))
 		if len(out) != 0 {
 			t.Errorf("expected no warnings against an empty table, got %v", out)
 		}
