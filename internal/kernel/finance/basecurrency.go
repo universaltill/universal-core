@@ -71,6 +71,36 @@ func ResolveBaseCurrency(ctx context.Context, db *sql.DB) (string, error) {
 		return "", fmt.Errorf("list Currency records: %w", err)
 	}
 
+	return pickBaseCurrencyCode(currencies), nil
+}
+
+// resolveBaseCurrencyTx is ResolveBaseCurrency against a caller-supplied
+// transaction instead of db — the shape SyncGLAccountOnWrite (seed.go)
+// needs, since a crud.Hook must do all of its reading and writing inside
+// the write's own transaction (Hook's own doc comment). Shares
+// pickBaseCurrencyCode with ResolveBaseCurrency deliberately: the two
+// entry points must never disagree on which currency counts as "the"
+// base one just because they took different repo methods to get there.
+// Same "tenant hasn't published Currency at all is a real error" posture
+// as ResolveBaseCurrency — see that function's own doc comment.
+func resolveBaseCurrencyTx(ctx context.Context, tx *sql.Tx) (string, error) {
+	entityDefs := data.NewEntityDefinitionRepo(nil)
+	if _, err := entityDefs.GetPublishedTx(ctx, tx, "Currency"); err != nil {
+		return "", fmt.Errorf("look up published Currency definition: %w", err)
+	}
+	currencies, err := data.NewRecordRepo(nil).ListTx(ctx, tx, "Currency")
+	if err != nil {
+		return "", fmt.Errorf("list Currency records: %w", err)
+	}
+	return pickBaseCurrencyCode(currencies), nil
+}
+
+// pickBaseCurrencyCode is ResolveBaseCurrency's/resolveBaseCurrencyTx's
+// shared, pure selection rule (uc-infra#120) — see ResolveBaseCurrency's
+// own doc comment for the full reasoning (distinctness by CODE not row
+// count, malformed-code handling, the DefaultGLCurrency degrade). Pure
+// so it needs no database at all to test the actual decision rule.
+func pickBaseCurrencyCode(currencies []data.Record) string {
 	distinctCodes := map[string]bool{}
 	for _, c := range currencies {
 		isBase, _ := c.Data["is_base"].(bool)
@@ -85,10 +115,10 @@ func ResolveBaseCurrency(ctx context.Context, db *sql.DB) (string, error) {
 		distinctCodes[code] = true
 	}
 	if len(distinctCodes) != 1 {
-		return DefaultGLCurrency, nil
+		return DefaultGLCurrency
 	}
 	for code := range distinctCodes {
-		return code, nil
+		return code
 	}
-	return DefaultGLCurrency, nil // unreachable: the len check above guarantees exactly one entry
+	return DefaultGLCurrency // unreachable: the len check above guarantees exactly one entry
 }

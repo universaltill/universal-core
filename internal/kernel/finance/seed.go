@@ -73,12 +73,19 @@ const DefaultGLCurrency = "USD"
 // SyncGLAccounts brings gl_accounts (the ledger core's own typed chart of
 // accounts, ADR-0004) up to date with every published finance.Account
 // record — the one narrow, hand-written bridge from the generic entity
-// engine to a deterministic-core table, called explicitly (never
-// automatically on every write; no lifecycle-hook mechanism exists yet
-// in internal/kernel/crud — see ADR-0004's own "not fully closed" note)
-// from cmd/seed-demo-data and from this package's own Publish. Idempotent
-// by construction (GLAccountRepo.UpsertByCode), safe to call any number
-// of times.
+// engine to a deterministic-core table. Idempotent by construction
+// (GLAccountRepo.UpsertByCode), safe to call any number of times.
+//
+// This is the full, all-accounts sweep — used by cmd/seed-demo-data
+// (after seeding its sample chart) and as a one-time backfill for any
+// Account records that already existed before SyncGLAccountOnWrite
+// (below) was wired in. Ordinary, ongoing Account create/update no
+// longer depends on this running at all: SyncGLAccountOnWrite, the
+// crud.Hook registered for "Account" by cmd/universal-core's real HTTP
+// composition root and by cmd/seed-demo-data's own engine, projects each
+// record the moment it's written — see uc-infra ADR-0004's 2026-08-12
+// addendum (uc-infra#204) for why the fix is a per-record hook and not a
+// finance.Publish-time call to this function.
 func SyncGLAccounts(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 	entityDefs := data.NewEntityDefinitionRepo(db)
 	accountDefRaw, err := entityDefs.GetPublished(ctx, "Account")
@@ -159,6 +166,56 @@ func SyncGLAccounts(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 		if _, err := glAccounts.UpsertByCode(ctx, code, name, accountType, currency, isActive); err != nil {
 			return fmt.Errorf("sync gl_account %s: %w", code, err)
 		}
+	}
+	return nil
+}
+
+// SyncGLAccountOnWrite is the crud.Hook (uc-infra#204, closing ADR-0004's
+// "not fully closed" note — see its 2026-08-12 addendum) that keeps
+// gl_accounts current going forward: registered for the "Account" entity
+// type by cmd/universal-core's real HTTP composition root
+// (internal/api.Handler.RegisterHook) and by cmd/seed-demo-data's own
+// engine (crud.Engine.SetHook), it runs inside the same transaction as
+// the Account create/update it's reacting to, so a projection failure
+// rolls back the write itself rather than leaving gl_accounts and
+// finance.Account able to disagree. Unlike SyncGLAccounts above, this
+// projects only the one record rec already is — an O(1) cost per Account
+// save regardless of how large the tenant's chart of accounts has grown,
+// not a full re-sweep.
+//
+// action is unused: Engine.runHook only ever calls a hook on Create or
+// Update (never Delete — see crud.go's own two call sites), and both
+// actions need the identical upsert, so there is nothing to branch on.
+func SyncGLAccountOnWrite(ctx context.Context, tx *sql.Tx, _ *entity.Definition, rec data.Record, _ audit.Action, _ audit.Actor) error {
+	code, _ := rec.Data["code"].(string)
+	name, _ := rec.Data["name"].(string)
+	accountType, _ := rec.Data["type"].(string)
+	isActive, _ := rec.Data["is_active"].(bool)
+
+	currency := DefaultGLCurrency
+	if currencyID, _ := rec.Data["currency_id"].(string); currencyID != "" {
+		currencyRec, err := data.NewRecordRepo(nil).GetTx(ctx, tx, "Currency", currencyID)
+		if err != nil {
+			return fmt.Errorf("resolve Account %s currency %s: %w", code, currencyID, err)
+		}
+		if c, _ := currencyRec.Data["code"].(string); c != "" {
+			currency = c
+		}
+	} else {
+		base, err := resolveBaseCurrencyTx(ctx, tx)
+		if err != nil {
+			return fmt.Errorf("resolve base currency: %w", err)
+		}
+		currency = base
+		// Same observability reasoning as SyncGLAccounts' own fallback
+		// branch above — silent-USD-by-default is exactly what an
+		// independent review already caught once for the sweep path;
+		// the per-write path gets the identical trace.
+		log.Printf("finance: SyncGLAccountOnWrite: Account %s has no currency_id set, defaulting gl_accounts.currency to %s", code, currency)
+	}
+
+	if _, err := data.NewGLAccountRepo(tx).UpsertByCode(ctx, code, name, accountType, currency, isActive); err != nil {
+		return fmt.Errorf("sync gl_account %s on write: %w", code, err)
 	}
 	return nil
 }

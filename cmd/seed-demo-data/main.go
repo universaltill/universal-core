@@ -95,6 +95,14 @@ func main() {
 	engine.SetHook("CustomerInvoice", sales.PostCustomerInvoiceToLedger)
 	engine.SetHook("VendorInvoice", purchasing.MatchVendorInvoiceOnUpdate)
 	engine.SetHook("StockTransfer", purchasing.ValidateStockTransfer)
+	// uc-infra#204: same wiring as cmd/universal-core's real HTTP path —
+	// seedFinance's Account creates/updates below now sync gl_accounts
+	// through this hook as they happen, same as a real user's edit
+	// would. The explicit finance.SyncGLAccounts call further down stays
+	// too, as a backfill for cmd/backfill-...-style callers and to keep
+	// its own idempotency/currency-fallback tests exercising the
+	// standalone sweep path directly.
+	engine.SetHook("Account", finance.SyncGLAccountOnWrite)
 
 	s := &seeder{
 		ctx:        context.Background(),

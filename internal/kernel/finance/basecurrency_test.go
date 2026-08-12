@@ -268,6 +268,112 @@ func TestResolveBaseCurrency_UnpublishedCurrency_ReturnsError(t *testing.T) {
 	}
 }
 
+// TestPickBaseCurrencyCode_TableDriven exercises pickBaseCurrencyCode's
+// selection rule directly, with no database at all — the pure core both
+// ResolveBaseCurrency (above) and resolveBaseCurrencyTx (used by
+// SyncGLAccountOnWrite, hooks_test.go) share, so the two entry points
+// can never drift on the answer. The *sql.DB-backed tests above already
+// cover each of these cases end to end through ResolveBaseCurrency;
+// this is the fast, dependency-free version of the same rule.
+func TestPickBaseCurrencyCode_TableDriven(t *testing.T) {
+	cases := []struct {
+		name string
+		recs []data.Record
+		want string
+	}{
+		{"no records", nil, DefaultGLCurrency},
+		{"none is_base", []data.Record{
+			{Data: map[string]any{"code": "USD", "is_base": false}},
+		}, DefaultGLCurrency},
+		{"one is_base", []data.Record{
+			{Data: map[string]any{"code": "GBP", "is_base": true}},
+		}, "GBP"},
+		{"two distinct is_base codes", []data.Record{
+			{Data: map[string]any{"code": "GBP", "is_base": true}},
+			{Data: map[string]any{"code": "EUR", "is_base": true}},
+		}, DefaultGLCurrency},
+		{"two rows, same is_base code", []data.Record{
+			{Data: map[string]any{"code": "GBP", "is_base": true}},
+			{Data: map[string]any{"code": "GBP", "is_base": true}},
+		}, "GBP"},
+		{"malformed code", []data.Record{
+			{Data: map[string]any{"code": "TOOLONG", "is_base": true}},
+		}, DefaultGLCurrency},
+		{"whitespace/case normalized", []data.Record{
+			{Data: map[string]any{"code": " gbp ", "is_base": true}},
+		}, "GBP"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := pickBaseCurrencyCode(c.recs); got != c.want {
+				t.Fatalf("pickBaseCurrencyCode(%v) = %q, want %q", c.recs, got, c.want)
+			}
+		})
+	}
+}
+
+// TestResolveBaseCurrencyTx_MatchesResolveBaseCurrency confirms the
+// tx-scoped path SyncGLAccountOnWrite uses agrees with the *sql.DB path
+// ResolveBaseCurrency uses against the same data — the actual risk of
+// having two entry points into the same selection rule.
+func TestResolveBaseCurrencyTx_MatchesResolveBaseCurrency(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	currencyDef := publishedCurrencyDef(t, tenantDB)
+	engine := crud.NewEngine(tenantDB)
+	if _, err := engine.Create(ctx, currencyDef, map[string]any{
+		"code": "GBP", "name": "British Pound", "is_base": true,
+	}, actor); err != nil {
+		t.Fatalf("create GBP Currency: %v", err)
+	}
+
+	wantCode, err := ResolveBaseCurrency(ctx, tenantDB)
+	if err != nil {
+		t.Fatalf("ResolveBaseCurrency: %v", err)
+	}
+
+	tx, err := tenantDB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	defer tx.Rollback()
+	gotCode, err := resolveBaseCurrencyTx(ctx, tx)
+	if err != nil {
+		t.Fatalf("resolveBaseCurrencyTx: %v", err)
+	}
+	if gotCode != wantCode {
+		t.Fatalf("resolveBaseCurrencyTx = %q, ResolveBaseCurrency = %q — the two must agree", gotCode, wantCode)
+	}
+	if gotCode != "GBP" {
+		t.Fatalf("expected %q, got %q", "GBP", gotCode)
+	}
+}
+
+// TestResolveBaseCurrencyTx_UnpublishedCurrency_ReturnsError mirrors
+// TestResolveBaseCurrency_UnpublishedCurrency_ReturnsError for the tx
+// path — the case SyncGLAccountOnWrite's own
+// TestSyncGLAccountOnWrite_CurrencyNotPublished_RollsBackAccountCreate
+// (hooks_test.go) exercises end to end through the hook.
+func TestResolveBaseCurrencyTx_UnpublishedCurrency_ReturnsError(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+
+	tx, err := tenantDB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := resolveBaseCurrencyTx(ctx, tx); err == nil {
+		t.Fatal("expected an error when Currency has never been published, got nil")
+	}
+}
+
 // publishedCurrencyDef looks up the published Currency Definition — the
 // same lookup+unmarshal ResolveBaseCurrency and SyncGLAccounts's own
 // tests already perform, factored out for these tests' own use.
