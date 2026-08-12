@@ -306,6 +306,21 @@ func TestAPI_FieldPermission_WritingHiddenFieldIs403(t *testing.T) {
 
 // A denied CSV import is also refused at the field level: the row's
 // hidden-field value is a write the importer must not perform.
+// TestAPI_FieldPermission_ImportSettingHiddenFieldWritesNothing pinned the
+// PRE-uc-infra#200 behavior: mapping a CSV column onto "salary" (hidden
+// from user-clerk) used to be let through to per-row processing, where
+// every row came back a per-row "access denied" naming the field —
+// confirmed nothing was WRITTEN, but never checked "salary" itself wasn't
+// disclosed. Independent review on uc-infra#200 pointed out that's
+// exactly a field-EXISTENCE oracle (a mapping targeting a hidden field
+// that exists behaves observably differently, one row at a time, from one
+// targeting a field that doesn't exist at all — csvimport.ValidateMapping
+// happily resolves a hidden field via its own def.FieldByName lookup,
+// since importCommit deliberately keeps the FULL, unredacted Definition
+// for genuine Required-field validation). Fixed by refusing any mapping
+// that targets a hidden field outright, before a single row is
+// processed — this test now pins THAT behavior instead of the disclosure
+// it replaced.
 func TestAPI_FieldPermission_ImportSettingHiddenFieldWritesNothing(t *testing.T) {
 	tenantID, db, mux, _ := fieldPermFixture(t)
 	ctx := context.Background()
@@ -321,15 +336,22 @@ func TestAPI_FieldPermission_ImportSettingHiddenFieldWritesNothing(t *testing.T)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
-	if !strings.Contains(rec.Body.String(), "access denied") {
-		t.Fatalf("expected per-row access-denied results, got:\n%s", rec.Body.String())
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 refusing a mapping that targets a hidden field, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "salary") {
+		t.Fatalf("refusal leaked the hidden field's name: %s", body)
+	}
+	if want := "administrator"; !strings.Contains(body, want) {
+		t.Fatalf("expected the generic hidden_field_blocked message (containing %q), got: %s", want, body)
 	}
 	after, err := crud.NewEngine(db).Count(ctx, salariedStaffEntityDef())
 	if err != nil {
 		t.Fatalf("count after: %v", err)
 	}
 	if after != before {
-		t.Fatalf("denied import wrote %d record(s)", after-before)
+		t.Fatalf("refused import wrote %d record(s)", after-before)
 	}
 }
 

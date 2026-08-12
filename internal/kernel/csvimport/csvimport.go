@@ -59,6 +59,26 @@ type RowResult struct {
 	RecordID string
 }
 
+// MappingError is ValidateMapping's own Required-field-unmapped failure
+// — the one ValidateMapping error shaped by def.Fields rather than by the
+// caller's own submitted mapping (the other two branches below name a
+// column or field the caller themselves typed, nothing def-driven to
+// redact). A structured FieldName, not just Error()'s formatted string,
+// lets a caller with a hidden set (uc-infra#200: import.go's importCommit
+// validates against the FULL, unredacted Definition, same reasoning as
+// createRecord/updateRecord's uc-infra#178) tell whether this specific
+// failure is naming a field the current actor cannot see, the same
+// disclosure question validationErrorMessage already answers for a
+// per-row *entity.ValidationError — this is the request-level mapping
+// check's own equivalent, reached before any row is ever processed.
+type MappingError struct {
+	FieldName string
+}
+
+func (e *MappingError) Error() string {
+	return fmt.Sprintf("required field %q has no column mapped to it", e.FieldName)
+}
+
 // ValidateMapping checks the mapping itself before touching any row: every
 // mapping target must be a real field on def, every mapping source must be
 // a real CSV header, and every Required field must have something mapped
@@ -93,7 +113,7 @@ func ValidateMapping(def *entity.Definition, headers []string, mapping ColumnMap
 	}
 	for _, f := range def.Fields {
 		if f.Required && mappedFrom[f.Name] == "" {
-			return fmt.Errorf("required field %q has no column mapped to it", f.Name)
+			return &MappingError{FieldName: f.Name}
 		}
 	}
 	return nil

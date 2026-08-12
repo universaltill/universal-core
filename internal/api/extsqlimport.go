@@ -413,7 +413,11 @@ func (h *Handler) extSQLImportPreviewOrCommit(w http.ResponseWriter, r *http.Req
 				return
 			}
 		}
-		view.Rows = buildResultRows(results, rowOK, rowError)
+		// def is already redacted (above), same reasoning as import.go's
+		// importPreview call site — redacted is passed through anyway to
+		// stay on the same disclosure-safe path the commit branch below
+		// now uses (uc-infra#200).
+		view.Rows = h.buildResultRows(locale, results, rowOK, rowError, redacted)
 		h.writeExtSQLImportFragment(w, "preview", view)
 		return
 	}
@@ -491,7 +495,7 @@ func (h *Handler) extSQLImportPreviewOrCommit(w http.ResponseWriter, r *http.Req
 		UpdatedLabel: h.catalog.T(locale, "extsql_import.result_updated"),
 		FailedLabel:  h.catalog.T(locale, "import.result_failed"),
 		RowCapNote:   extSQLRowCapNote(h, locale),
-		Rows:         h.buildUpsertResultRows(locale, upserts, rowCreated, rowUpdated, rowError),
+		Rows:         h.buildUpsertResultRows(locale, upserts, rowCreated, rowUpdated, rowError, redacted),
 	})
 }
 
@@ -500,20 +504,52 @@ func (h *Handler) extSQLImportPreviewOrCommit(w http.ResponseWriter, r *http.Req
 // through it too — every OK row is simply "created"). A Handler method
 // because a per-row system-of-record refusal — an import from a
 // DIFFERENT source touching records a read_only source owns — must
-// render its translated message, not authz's logs-only Error() text;
-// every other row error keeps the raw text, matching the CSV result
-// table's existing convention.
-func (h *Handler) buildUpsertResultRows(locale string, results []sqlsource.UpsertResult, createdLabel, updatedLabel, errorLabel string) []previewRowView {
+// render its translated message, not authz's logs-only Error() text.
+//
+// Every other row error now goes through h.validationErrorMessage rather
+// than the raw res.Err.Error() (uc-infra#200). def is already redacted
+// before it ever reaches CommitRowsUpserting (extSQLImportPreviewOrCommit
+// strips a hidden field out of def.Fields entirely, above) — so a plain
+// *entity.ValidationError naming a hidden FieldName directly is NOT
+// actually reachable here in production (independent review confirmed
+// entity.ValidateRecord iterates def.Fields only, and nothing in
+// authz.GuardedEngine.EffectiveWriteFields/HiddenFields re-widens that
+// redacted copy). What IS reachable: KindNotBefore's OtherField — a
+// VISIBLE field's own NotBefore rule still names a hidden field by
+// string, independent of whether that field kept its own Field entry —
+// via a keyed re-import's merge (records.Get returns the redacted
+// current.Data, but EffectiveWriteFields restores the hidden field's
+// REAL stored value into the merged fields before re-validating), the
+// same restore-then-leak mechanism uc-infra#178 closed for the
+// single-record update handler's own OtherField case. hidden is
+// nil-safe, same as buildResultRows.
+//
+// authz.ErrDenied ("no permission to write field ...") is a second,
+// always-reachable leak independent review found in buildResultRows'
+// first version (this function shares the fix): a plain error, not a
+// *entity.ValidationError, so it fell through validationErrorMessage's
+// fallback to err.Error() untouched. Checked ahead of the
+// system-of-record branch below (both are non-ValidationError sentinels
+// authz can return; SoR is the more specific, more common one for THIS
+// flow — an import from a different source — so it keeps first refusal,
+// same ordering as before this fix).
+func (h *Handler) buildUpsertResultRows(locale string, results []sqlsource.UpsertResult, createdLabel, updatedLabel, errorLabel string, hidden map[string]bool) []previewRowView {
 	rows := make([]previewRowView, len(results))
 	for i, res := range results {
 		row := previewRowView{RowNumber: res.RowNumber, Data: fmt.Sprintf("%v", res.Data)}
 		switch {
 		case res.Err != nil:
 			row.Status = errorLabel
-			if errors.Is(res.Err, authz.ErrSystemOfRecordReadOnly) {
+			switch {
+			case errors.Is(res.Err, authz.ErrSystemOfRecordReadOnly):
 				row.Error = h.sorReadOnlyMessage(locale, res.Err)
-			} else {
-				row.Error = res.Err.Error()
+			case errors.Is(res.Err, authz.ErrDenied):
+				row.Error = "access denied"
+			default:
+				if redactsHiddenField(res.Err, hidden) {
+					log.Printf("api: SQL import: row %d: %v", res.RowNumber, res.Err)
+				}
+				row.Error = h.validationErrorMessage(locale, res.Err, hidden)
 			}
 		case res.Updated:
 			row.OK = true
