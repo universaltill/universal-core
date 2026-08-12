@@ -58,11 +58,13 @@ type Config struct {
 	// DepreciationPostInterval is how often (per tenant, at most)
 	// assets.PostDueDepreciationBatch runs (uc-infra#76, ADR-0022). Zero
 	// means the 30s default. Separate from PollInterval for the same
-	// reason ScheduleSyncInterval is: scanning every DepreciationSchedule
-	// row in the tenant is an O(n) table scan, and a depreciation posting
-	// is due at most once a day per asset — running that every 2s forever
-	// is pure waste for a job nothing needs sub-minute latency on. A
-	// period that came due mid-interval waits at most this long to post.
+	// reason ScheduleSyncInterval is: a depreciation posting is due at
+	// most once a day per asset, so running the query (even the bounded,
+	// indexed form uc-infra#182 gives it — see
+	// defaultDepreciationPostBatchSize's own doc comment) every 2s
+	// forever is pure waste for a job nothing needs sub-minute latency
+	// on. A period that came due mid-interval waits at most this long to
+	// post.
 	DepreciationPostInterval time.Duration
 	// DepreciationPostBatchSize caps how many DepreciationSchedule rows
 	// one assets.PostDueDepreciationBatch call posts (uc-infra#137,
@@ -90,18 +92,16 @@ const (
 	// assets.PostDueDepreciationBatch does one DB transaction per
 	// attempted row (postDepreciationRow), so the POSTING portion of a
 	// call's wall-clock cost is roughly linear in rows attempted, capped
-	// here. This does NOT bound the whole call: PostDueDepreciationBatch
-	// still reads and decodes every DepreciationSchedule row in the
-	// tenant on every call (assets.records.List has no due-filter or
-	// LIMIT — see that function's own doc comment) before applying this
-	// cap, so a tenant with a very large total schedule row count still
-	// pays that full-scan cost each call, capped or not — tracked as a
-	// follow-up (uc-infra#182) rather than fixed here, since fixing it
-	// for real needs a due-filtered/LIMITed internal/data query method,
-	// not a worker-side change. 200 keeps the POSTING portion of a
-	// single call's worst case to a small fraction of a second —
-	// bounding how long one tenant can delay every other tenant's tick
-	// on that part — while still making real catch-up progress every
+	// here. This also bounds the read side (uc-infra#182,
+	// assets.records.ListDueUnposted): the worklist fetch itself is
+	// LIMITed to this same value, so a tenant with a very large total
+	// schedule row count no longer pays a full-table read/decode cost on
+	// every call — only maxRows candidate rows are ever read. The
+	// separate completion/healing sweep (PostDueDepreciationBatch's own
+	// doc comment) is bounded the same way, by the same value. 200 keeps
+	// a single call's worst case to a small fraction of a second —
+	// bounding how long one tenant can delay every other tenant's tick —
+	// while still making real catch-up progress every
 	// DepreciationPostInterval. Deployments with unusually large
 	// per-tenant asset counts can raise this via Config.
 	defaultDepreciationPostBatchSize = 200

@@ -901,3 +901,383 @@ func TestRecordRepo_DistinctFieldValues_ExcludesSoftDeletedRecords(t *testing.T)
 		t.Fatalf("expected a soft-deleted PersonRole to be excluded, got %v", ids)
 	}
 }
+
+// TestRecordRepo_ListDueUnposted_FiltersDueAndUnposted is the direct
+// regression test for uc-infra#182: assets.PostDueDepreciationBatch used
+// to find its posting worklist by reading and decoding EVERY row of an
+// entity type and filtering in Go; this asserts the query-level
+// replacement selects exactly the rows that shape of code used to
+// select — due (<= cutoff) and unposted (empty/absent/JSON-null) — and
+// nothing else.
+func TestRecordRepo_ListDueUnposted_FiltersDueAndUnposted(t *testing.T) {
+	tdb := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(tdb)
+
+	dueUnposted, err := repo.Create(ctx, "Task", map[string]any{"due_date": "2020-01-15", "done_at": ""})
+	if err != nil {
+		t.Fatalf("create dueUnposted: %v", err)
+	}
+	dueUnpostedAbsent, err := repo.Create(ctx, "Task", map[string]any{"due_date": "2020-01-16"})
+	if err != nil {
+		t.Fatalf("create dueUnpostedAbsent (no done_at field at all): %v", err)
+	}
+	dueUnpostedNull, err := repo.Create(ctx, "Task", map[string]any{"due_date": "2020-01-17", "done_at": nil})
+	if err != nil {
+		t.Fatalf("create dueUnpostedNull (JSON null done_at): %v", err)
+	}
+	// due_date exactly equal to cutoff — the boundary the <= comparison
+	// must include, the single most common real case (an amount posts
+	// ON its own due date, not strictly before it).
+	dueOnCutoff, err := repo.Create(ctx, "Task", map[string]any{"due_date": "2020-06-01", "done_at": ""})
+	if err != nil {
+		t.Fatalf("create dueOnCutoff: %v", err)
+	}
+	duePosted, err := repo.Create(ctx, "Task", map[string]any{"due_date": "2020-01-15", "done_at": "2020-01-15"})
+	if err != nil {
+		t.Fatalf("create duePosted: %v", err)
+	}
+	future, err := repo.Create(ctx, "Task", map[string]any{"due_date": "2099-01-01", "done_at": ""})
+	if err != nil {
+		t.Fatalf("create future: %v", err)
+	}
+	noDueDate, err := repo.Create(ctx, "Task", map[string]any{"due_date": "", "done_at": ""})
+	if err != nil {
+		t.Fatalf("create noDueDate: %v", err)
+	}
+	otherType, err := repo.Create(ctx, "OtherTask", map[string]any{"due_date": "2020-01-15", "done_at": ""})
+	if err != nil {
+		t.Fatalf("create otherType: %v", err)
+	}
+
+	got, err := repo.ListDueUnposted(ctx, "Task", "due_date", "2020-06-01", "done_at", ListDueUnpostedGate{}, 100)
+	if err != nil {
+		t.Fatalf("ListDueUnposted: %v", err)
+	}
+	gotIDs := map[string]bool{}
+	for _, r := range got {
+		gotIDs[r.ID] = true
+	}
+	want := map[string]bool{dueUnposted.ID: true, dueUnpostedAbsent.ID: true, dueUnpostedNull.ID: true, dueOnCutoff.ID: true}
+	if len(gotIDs) != len(want) {
+		t.Fatalf("got %d rows %v, want exactly %v", len(gotIDs), gotIDs, want)
+	}
+	for id := range want {
+		if !gotIDs[id] {
+			t.Errorf("expected due+unposted row %s in results, missing", id)
+		}
+	}
+	for _, excluded := range []struct {
+		name string
+		id   string
+	}{
+		{"duePosted", duePosted.ID}, {"future", future.ID},
+		{"noDueDate", noDueDate.ID}, {"otherType (wrong entity type)", otherType.ID},
+	} {
+		if gotIDs[excluded.id] {
+			t.Errorf("%s (%s) should have been excluded, was returned", excluded.name, excluded.id)
+		}
+	}
+}
+
+// TestRecordRepo_ListDueUnposted_OrdersByCreatedAtThenIDAndRespectsLimit
+// confirms the same (created_at, id) ordering and LIMIT behavior every
+// other bounded/paginated query in this file already gives — which
+// specific rows land in one capped call vs. the next must be
+// deterministic, not whatever order Postgres happens to return.
+func TestRecordRepo_ListDueUnposted_OrdersByCreatedAtThenIDAndRespectsLimit(t *testing.T) {
+	tdb := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(tdb)
+
+	var ids []string
+	for i := 0; i < 5; i++ {
+		rec, err := repo.Create(ctx, "Task", map[string]any{"due_date": "2020-01-01", "done_at": ""})
+		if err != nil {
+			t.Fatalf("create row %d: %v", i, err)
+		}
+		ids = append(ids, rec.ID)
+	}
+
+	got, err := repo.ListDueUnposted(ctx, "Task", "due_date", "2020-06-01", "done_at", ListDueUnpostedGate{}, 3)
+	if err != nil {
+		t.Fatalf("ListDueUnposted: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("expected exactly 3 rows (limit), got %d", len(got))
+	}
+	for i, r := range got {
+		if r.ID != ids[i] {
+			t.Errorf("row %d: got id %s, want %s (creation order)", i, r.ID, ids[i])
+		}
+	}
+}
+
+// TestRecordRepo_ListDueUnposted_ExcludesSoftDeletedRecords matches
+// every other read method in this file's own deleted_at IS NULL scope.
+func TestRecordRepo_ListDueUnposted_ExcludesSoftDeletedRecords(t *testing.T) {
+	tdb := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(tdb)
+
+	rec, err := repo.Create(ctx, "Task", map[string]any{"due_date": "2020-01-01", "done_at": ""})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := repo.Delete(ctx, "Task", rec.ID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	got, err := repo.ListDueUnposted(ctx, "Task", "due_date", "2020-06-01", "done_at", ListDueUnpostedGate{}, 100)
+	if err != nil {
+		t.Fatalf("ListDueUnposted: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected a soft-deleted row to be excluded, got %v", got)
+	}
+}
+
+// TestRecordRepo_ListDueUnposted_GateExcludesRowsWithUnpostableParent is
+// the direct regression test for independent review's finding on the
+// first version of this method (uc-infra#182): a due-and-unposted row
+// whose parent will NEVER become postable (wrong status, or missing
+// required wiring) never mutates, so without the gate it would occupy
+// the SAME LIMITed window on every future call forever — starving
+// genuinely postable rows that happen to sort later by (created_at,
+// id). This asserts the gate excludes exactly the unpostable rows, by
+// construction, rather than relying on a caller-side budget to route
+// around them (which the LIMIT itself defeats).
+func TestRecordRepo_ListDueUnposted_GateExcludesRowsWithUnpostableParent(t *testing.T) {
+	tdb := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(tdb)
+
+	gate := ListDueUnpostedGate{
+		ParentType: "Asset", JoinField: "asset_id",
+		ParentMatchField: "status", ParentMatchValue: "active",
+		ParentRequiredNonEmpty: []string{"account_a", "account_b"},
+	}
+
+	// Blocker 1: parent status wrong (disposed, not active).
+	disposed, err := repo.Create(ctx, "Asset", map[string]any{"status": "disposed", "account_a": "x", "account_b": "y"})
+	if err != nil {
+		t.Fatalf("create disposed parent: %v", err)
+	}
+	blockedByStatus, err := repo.Create(ctx, "Schedule", map[string]any{"asset_id": disposed.ID, "due_date": "2020-01-01", "posted_at": ""})
+	if err != nil {
+		t.Fatalf("create blockedByStatus row: %v", err)
+	}
+
+	// Blocker 2: parent active but missing required wiring.
+	unwired, err := repo.Create(ctx, "Asset", map[string]any{"status": "active", "account_a": ""})
+	if err != nil {
+		t.Fatalf("create unwired parent: %v", err)
+	}
+	blockedByWiring, err := repo.Create(ctx, "Schedule", map[string]any{"asset_id": unwired.ID, "due_date": "2020-01-02", "posted_at": ""})
+	if err != nil {
+		t.Fatalf("create blockedByWiring row: %v", err)
+	}
+
+	// Blocker 3: parent doesn't exist at all (empty/dangling reference).
+	orphan, err := repo.Create(ctx, "Schedule", map[string]any{"asset_id": "", "due_date": "2020-01-03", "posted_at": ""})
+	if err != nil {
+		t.Fatalf("create orphan row: %v", err)
+	}
+
+	// Postable: active, fully wired — created LAST (latest created_at),
+	// so a non-gated fetch ordered by (created_at, id) with a LIMIT
+	// smaller than the blocker count would never even reach it.
+	healthy, err := repo.Create(ctx, "Asset", map[string]any{"status": "active", "account_a": "x", "account_b": "y"})
+	if err != nil {
+		t.Fatalf("create healthy parent: %v", err)
+	}
+	postable, err := repo.Create(ctx, "Schedule", map[string]any{"asset_id": healthy.ID, "due_date": "2020-01-04", "posted_at": ""})
+	if err != nil {
+		t.Fatalf("create postable row: %v", err)
+	}
+
+	// The whole point: LIMIT 1, smaller than the 3 blockers ahead of it
+	// in creation order. A gate-less fetch would return only a blocker
+	// and never reach the postable row on ANY future call.
+	got, err := repo.ListDueUnposted(ctx, "Schedule", "due_date", "2020-06-01", "posted_at", gate, 1)
+	if err != nil {
+		t.Fatalf("ListDueUnposted: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != postable.ID {
+		gotIDs := make([]string, len(got))
+		for i, r := range got {
+			gotIDs[i] = r.ID
+		}
+		t.Fatalf("got %v, want exactly [%s] (postable) — a blocked row must never occupy the LIMITed window", gotIDs, postable.ID)
+	}
+
+	// Sanity: a wide-open fetch (no gate) DOES return the blockers —
+	// confirms the gate, not some other filter, is what's excluding them.
+	ungated, err := repo.ListDueUnposted(ctx, "Schedule", "due_date", "2020-06-01", "posted_at", ListDueUnpostedGate{}, 100)
+	if err != nil {
+		t.Fatalf("ListDueUnposted (ungated): %v", err)
+	}
+	ungatedIDs := map[string]bool{}
+	for _, r := range ungated {
+		ungatedIDs[r.ID] = true
+	}
+	for _, id := range []string{blockedByStatus.ID, blockedByWiring.ID, orphan.ID, postable.ID} {
+		if !ungatedIDs[id] {
+			t.Errorf("ungated fetch should include %s, missing from %v", id, ungatedIDs)
+		}
+	}
+}
+
+// TestRecordRepo_LifeCompleteGroupIDs_FindsCompleteGroupsWithNoOutstandingDue
+// is the direct regression test for uc-infra#182's completion/healing
+// sweep: a parent whose children have met the quota (LifeField) AND
+// have no outstanding due-and-unposted child is "life complete"; a
+// parent short of quota, or one with an outstanding due child even
+// after meeting quota, must not be.
+func TestRecordRepo_LifeCompleteGroupIDs_FindsCompleteGroupsWithNoOutstandingDue(t *testing.T) {
+	tdb := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(tdb)
+
+	opts := func(matchValue string) LifeCompleteGroupOptions {
+		return LifeCompleteGroupOptions{
+			ParentType: "Parent", ParentMatchField: "status", ParentMatchValue: matchValue,
+			LifeField: "quota", ChildType: "Child", ChildJoinField: "parent_id",
+			ChildPostedField: "done_at", ChildDueField: "due_date", Cutoff: "2020-06-01",
+		}
+	}
+
+	// complete: quota 2, both children done, nothing outstanding.
+	complete, err := repo.Create(ctx, "Parent", map[string]any{"status": "active", "quota": float64(2)})
+	if err != nil {
+		t.Fatalf("create complete parent: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := repo.Create(ctx, "Child", map[string]any{"parent_id": complete.ID, "done_at": "2020-01-01"}); err != nil {
+			t.Fatalf("create complete child %d: %v", i, err)
+		}
+	}
+
+	// shortOfQuota: quota 3, only 2 children done.
+	shortOfQuota, err := repo.Create(ctx, "Parent", map[string]any{"status": "active", "quota": float64(3)})
+	if err != nil {
+		t.Fatalf("create shortOfQuota parent: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := repo.Create(ctx, "Child", map[string]any{"parent_id": shortOfQuota.ID, "done_at": "2020-01-01"}); err != nil {
+			t.Fatalf("create shortOfQuota child %d: %v", i, err)
+		}
+	}
+
+	// quotaMetButStillDue: quota 1 already met, but a SEPARATE due,
+	// unposted child still exists — must NOT be reported complete (this
+	// is the exact uc-infra#137 premature-transition shape: don't
+	// finalize while due work remains, regardless of the raw count).
+	quotaMetButStillDue, err := repo.Create(ctx, "Parent", map[string]any{"status": "active", "quota": float64(1)})
+	if err != nil {
+		t.Fatalf("create quotaMetButStillDue parent: %v", err)
+	}
+	if _, err := repo.Create(ctx, "Child", map[string]any{"parent_id": quotaMetButStillDue.ID, "done_at": "2020-01-01"}); err != nil {
+		t.Fatalf("create quotaMetButStillDue done child: %v", err)
+	}
+	if _, err := repo.Create(ctx, "Child", map[string]any{"parent_id": quotaMetButStillDue.ID, "due_date": "2020-01-02", "done_at": ""}); err != nil {
+		t.Fatalf("create quotaMetButStillDue outstanding child: %v", err)
+	}
+
+	// futureChildOnly: quota met, and the only "outstanding" child isn't
+	// due yet — must be reported complete (an unposted FUTURE row must
+	// not block completion, same as the due-cutoff already means
+	// elsewhere in this file).
+	futureChildOnly, err := repo.Create(ctx, "Parent", map[string]any{"status": "active", "quota": float64(1)})
+	if err != nil {
+		t.Fatalf("create futureChildOnly parent: %v", err)
+	}
+	if _, err := repo.Create(ctx, "Child", map[string]any{"parent_id": futureChildOnly.ID, "done_at": "2020-01-01"}); err != nil {
+		t.Fatalf("create futureChildOnly done child: %v", err)
+	}
+	if _, err := repo.Create(ctx, "Child", map[string]any{"parent_id": futureChildOnly.ID, "due_date": "2099-01-01", "done_at": ""}); err != nil {
+		t.Fatalf("create futureChildOnly not-yet-due child: %v", err)
+	}
+
+	// wrongStatus: would otherwise be complete, but doesn't match
+	// ParentMatchValue.
+	wrongStatus, err := repo.Create(ctx, "Parent", map[string]any{"status": "archived", "quota": float64(1)})
+	if err != nil {
+		t.Fatalf("create wrongStatus parent: %v", err)
+	}
+	if _, err := repo.Create(ctx, "Child", map[string]any{"parent_id": wrongStatus.ID, "done_at": "2020-01-01"}); err != nil {
+		t.Fatalf("create wrongStatus child: %v", err)
+	}
+
+	// zeroQuota: quota <= 0 must never read as "complete" regardless of
+	// children — same ">0" gate assets.postAssetDepreciation's own
+	// pre-uc-infra#182 useful_life_months check used.
+	zeroQuota, err := repo.Create(ctx, "Parent", map[string]any{"status": "active", "quota": float64(0)})
+	if err != nil {
+		t.Fatalf("create zeroQuota parent: %v", err)
+	}
+	if _, err := repo.Create(ctx, "Child", map[string]any{"parent_id": zeroQuota.ID, "done_at": "2020-01-01"}); err != nil {
+		t.Fatalf("create zeroQuota child: %v", err)
+	}
+
+	got, err := repo.LifeCompleteGroupIDs(ctx, opts("active"), 100)
+	if err != nil {
+		t.Fatalf("LifeCompleteGroupIDs: %v", err)
+	}
+	gotIDs := map[string]bool{}
+	for _, id := range got {
+		gotIDs[id] = true
+	}
+	want := map[string]bool{complete.ID: true, futureChildOnly.ID: true}
+	if len(gotIDs) != len(want) {
+		t.Fatalf("got %v, want exactly %v", got, want)
+	}
+	for id := range want {
+		if !gotIDs[id] {
+			t.Errorf("expected parent %s to be reported life-complete, missing", id)
+		}
+	}
+	for _, excluded := range []struct {
+		name string
+		id   string
+	}{
+		{"shortOfQuota", shortOfQuota.ID}, {"quotaMetButStillDue", quotaMetButStillDue.ID},
+		{"wrongStatus", wrongStatus.ID}, {"zeroQuota", zeroQuota.ID},
+	} {
+		if gotIDs[excluded.id] {
+			t.Errorf("%s (%s) should NOT have been reported life-complete", excluded.name, excluded.id)
+		}
+	}
+}
+
+// TestRecordRepo_LifeCompleteGroupIDs_RespectsLimit confirms the sweep
+// is itself bounded and resumable across calls, the same "resumes on a
+// later call" latency model ListDueUnposted's own cap already gives the
+// posting side (uc-infra#182).
+func TestRecordRepo_LifeCompleteGroupIDs_RespectsLimit(t *testing.T) {
+	tdb := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(tdb)
+
+	for i := 0; i < 3; i++ {
+		parent, err := repo.Create(ctx, "Parent", map[string]any{"status": "active", "quota": float64(1)})
+		if err != nil {
+			t.Fatalf("create parent %d: %v", i, err)
+		}
+		if _, err := repo.Create(ctx, "Child", map[string]any{"parent_id": parent.ID, "done_at": "2020-01-01"}); err != nil {
+			t.Fatalf("create child %d: %v", i, err)
+		}
+	}
+
+	got, err := repo.LifeCompleteGroupIDs(ctx, LifeCompleteGroupOptions{
+		ParentType: "Parent", ParentMatchField: "status", ParentMatchValue: "active",
+		LifeField: "quota", ChildType: "Child", ChildJoinField: "parent_id",
+		ChildPostedField: "done_at", ChildDueField: "due_date", Cutoff: "2020-06-01",
+	}, 2)
+	if err != nil {
+		t.Fatalf("LifeCompleteGroupIDs: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected exactly 2 rows (limit), got %d: %v", len(got), got)
+	}
+}
