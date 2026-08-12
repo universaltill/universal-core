@@ -3,6 +3,7 @@ package finance
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"testing"
 
 	"github.com/universaltill/universal-core/internal/data"
@@ -200,6 +201,209 @@ func TestSyncGLAccountOnWrite_NoCurrencyIDFallsBackToBaseCurrency(t *testing.T) 
 	}
 	if currency != "QAR" {
 		t.Fatalf("expected the tenant's base currency %q to be used as the fallback, got %q", "QAR", currency)
+	}
+}
+
+// TestSyncGLAccountOnWrite_DuplicateCode_RejectedNotSilentlyOverwritten
+// is the regression test for independent review's finding 3: before the
+// Account Definition declared Unique on code (uc-infra#204 v2), a second
+// Account created with a code already in use didn't just create a
+// second, separately-identified Account — it silently clobbered the
+// FIRST account's gl_accounts row wholesale the moment this hook made
+// real writes reach that projection at all, with no error and no trace.
+// Now the Create itself is rejected before the hook ever runs.
+func TestSyncGLAccountOnWrite_DuplicateCode_RejectedNotSilentlyOverwritten(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	accountDefinition := publishedAccountDef(t, tenantDB)
+
+	engine := crud.NewEngine(tenantDB)
+	engine.SetHook("Account", SyncGLAccountOnWrite)
+
+	if _, err := engine.Create(ctx, accountDefinition, map[string]any{
+		"code": "1000", "name": "Assets", "type": "asset", "is_active": true,
+	}, actor); err != nil {
+		t.Fatalf("create first Account 1000: %v", err)
+	}
+
+	if _, err := engine.Create(ctx, accountDefinition, map[string]any{
+		"code": "1000", "name": "Something Else", "type": "expense", "is_active": false,
+	}, actor); !errors.Is(err, crud.ErrUniqueConstraintViolation) {
+		t.Fatalf("expected ErrUniqueConstraintViolation creating a second Account with code 1000, got: %v", err)
+	}
+
+	// The first account's own gl_accounts projection must be untouched —
+	// the exact clobbering independent review reproduced before Unique
+	// existed on this Definition.
+	glAccounts := data.NewGLAccountRepo(tenantDB)
+	id, isActive, err := glAccounts.IDByCode(ctx, "1000")
+	if err != nil {
+		t.Fatalf("IDByCode: %v", err)
+	}
+	if !isActive {
+		t.Fatal("expected the first Account's gl_accounts row to still be active — the rejected duplicate must never have reached the hook")
+	}
+	var name string
+	if err := tenantDB.QueryRowContext(ctx, `SELECT name FROM gl_accounts WHERE id = $1`, id).Scan(&name); err != nil {
+		t.Fatalf("read gl_account name: %v", err)
+	}
+	if name != "Assets" {
+		t.Fatalf("expected the first Account's own name to survive the rejected duplicate, got %q", name)
+	}
+}
+
+// TestSyncGLAccountOnWrite_RenamingCodeOrphansThePreviousGLAccountsRow
+// pins down, deliberately, a real limitation independent review found
+// (finding 2) that this change does not close: gl_accounts is keyed by
+// Account.code (UpsertByCode), and nothing links a gl_accounts row back
+// to the Account record it was projected from. Renaming an existing
+// Account's code — legal; code is Unique but not immutable, see
+// Account()'s own doc comment — makes this hook upsert a NEW gl_accounts
+// row under the new code, while the OLD code's row is left behind,
+// active, orphaned. This test exists so that behavior can't silently
+// change (for better or worse) without this test having to change too —
+// not as an endorsement of the behavior. Closing it properly needs
+// gl_accounts to gain a source-record link (a migration) or Account.code
+// to become immutable after create; tracked as a separate backlog card.
+func TestSyncGLAccountOnWrite_RenamingCodeOrphansThePreviousGLAccountsRow(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	accountDefinition := publishedAccountDef(t, tenantDB)
+
+	engine := crud.NewEngine(tenantDB)
+	engine.SetHook("Account", SyncGLAccountOnWrite)
+
+	rec, err := engine.Create(ctx, accountDefinition, map[string]any{
+		"code": "1000", "name": "Assets", "type": "asset", "is_active": true,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create Account: %v", err)
+	}
+
+	version := rec.Version
+	if _, err := engine.Update(ctx, accountDefinition, rec.ID, map[string]any{
+		"code": "1100", "name": "Assets", "type": "asset", "is_active": true,
+	}, &version, actor); err != nil {
+		t.Fatalf("update Account's code: %v", err)
+	}
+
+	glAccounts := data.NewGLAccountRepo(tenantDB)
+	if _, _, err := glAccounts.IDByCode(ctx, "1100"); err != nil {
+		t.Fatalf("expected a gl_accounts row for the NEW code 1100, got: %v", err)
+	}
+	// Documents today's real gap: the OLD code's row is still there,
+	// unchanged, orphaned — not cleaned up, not deactivated.
+	oldID, oldActive, err := glAccounts.IDByCode(ctx, "1000")
+	if err != nil {
+		t.Fatalf("expected the OLD code 1000's gl_accounts row to still exist (orphaned, not this fix's job to clean up), got: %v", err)
+	}
+	if !oldActive {
+		t.Fatal("expected the orphaned old-code row to still read as active — this hook never touches it once the code changes")
+	}
+	if oldID == "" {
+		t.Fatal("expected a real id for the orphaned row")
+	}
+}
+
+// TestSyncGLAccountOnWrite_IsActiveOmittedOnCreate_StoresInactive pins
+// down another real gap independent review found (finding 5) that is
+// pre-existing in internal/kernel/formrender (a FieldBool's declared
+// Default is not honored when rendering a NEW record's form — only
+// FieldEnum's Default is, per formrender's own code), not something this
+// change introduces — but this change is what makes the gap reach the
+// ledger: an ordinary UI create where the admin never touches the
+// "Active" checkbox now projects into gl_accounts as inactive, silently
+// making a brand-new account unusable for posting
+// (ledger.ErrInactiveAccount). Filed as its own follow-up card rather
+// than fixed here (fixing formrender's Default handling is a
+// cross-module change well outside this card's scope) — this test only
+// makes sure the interaction can't get worse unnoticed.
+func TestSyncGLAccountOnWrite_IsActiveOmittedOnCreate_StoresInactive(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	accountDefinition := publishedAccountDef(t, tenantDB)
+
+	engine := crud.NewEngine(tenantDB)
+	engine.SetHook("Account", SyncGLAccountOnWrite)
+
+	// is_active deliberately omitted — Account()'s Default:true is a
+	// Definition-level declaration, not something Create fills in.
+	if _, err := engine.Create(ctx, accountDefinition, map[string]any{
+		"code": "1000", "name": "Assets", "type": "asset",
+	}, actor); err != nil {
+		t.Fatalf("create Account without is_active: %v", err)
+	}
+
+	_, isActive, err := data.NewGLAccountRepo(tenantDB).IDByCode(ctx, "1000")
+	if err != nil {
+		t.Fatalf("IDByCode: %v", err)
+	}
+	if isActive {
+		t.Fatal("expected today's real (pre-existing, cross-module) gap to store is_active=false when omitted — if this now passes with isActive=true, formrender's Default handling changed and this test (and its follow-up card) should be revisited")
+	}
+}
+
+// TestSyncGLAccountOnWrite_CurrencyIDNotFound_RollsBackAccountUpdate
+// covers the GetTx error branch independent review flagged as untested:
+// an Account referencing a currency_id that doesn't resolve (e.g. a
+// stale/bad reference) must fail the write loudly, not panic or silently
+// fall back to a wrong currency.
+func TestSyncGLAccountOnWrite_CurrencyIDNotFound_RollsBackAccountUpdate(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	accountDefinition := publishedAccountDef(t, tenantDB)
+
+	engine := crud.NewEngine(tenantDB)
+	engine.SetHook("Account", SyncGLAccountOnWrite)
+
+	if _, err := engine.Create(ctx, accountDefinition, map[string]any{
+		"code": "1000", "name": "Assets", "type": "asset", "is_active": true,
+		"currency_id": "00000000-0000-0000-0000-000000000000",
+	}, actor); err == nil {
+		t.Fatal("expected Create to fail when currency_id doesn't resolve to a real Currency record, got nil")
+	}
+
+	if _, _, err := data.NewGLAccountRepo(tenantDB).IDByCode(ctx, "1000"); err == nil {
+		t.Fatal("expected no gl_accounts row after the rolled-back create")
+	}
+	var count int
+	if err := tenantDB.QueryRowContext(ctx, `SELECT count(*) FROM records WHERE entity_type = 'Account'`).Scan(&count); err != nil {
+		t.Fatalf("count Account records: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected the failed hook to roll back the Account write too, found %d Account record(s)", count)
 	}
 }
 

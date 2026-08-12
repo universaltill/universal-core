@@ -77,15 +77,21 @@ const DefaultGLCurrency = "USD"
 // (GLAccountRepo.UpsertByCode), safe to call any number of times.
 //
 // This is the full, all-accounts sweep — used by cmd/seed-demo-data
-// (after seeding its sample chart) and as a one-time backfill for any
-// Account records that already existed before SyncGLAccountOnWrite
-// (below) was wired in. Ordinary, ongoing Account create/update no
-// longer depends on this running at all: SyncGLAccountOnWrite, the
-// crud.Hook registered for "Account" by cmd/universal-core's real HTTP
-// composition root and by cmd/seed-demo-data's own engine, projects each
-// record the moment it's written — see uc-infra ADR-0004's 2026-08-12
-// addendum (uc-infra#204) for why the fix is a per-record hook and not a
-// finance.Publish-time call to this function.
+// (after seeding its sample chart) and, callable ad hoc, as the backfill
+// path for any Account records that already existed before
+// SyncGLAccountOnWrite (below) was wired in — no cmd/backfill-* binary
+// wraps it yet (unlike cmd/backfill-poline-money and its siblings), so
+// today that's a manual call, not an in-product or CLI-invokable one; a
+// real gap, not fixed by this change (uc-infra ADR-0004's 2026-08-12
+// addendum). Ordinary, ongoing Account create/update no longer depends
+// on this running at all: SyncGLAccountOnWrite, the crud.Hook registered
+// for "Account" by cmd/universal-core's real HTTP composition root and
+// by cmd/seed-demo-data's own engine, projects each record the moment
+// it's written — see that same addendum for why the fix is a per-record
+// hook and not a finance.Publish-time call to this function. Running
+// this sweep concurrently with live hook-driven edits can race (its own
+// List-then-per-account-UpsertByCode isn't transactional against a
+// write landing in between) — run with writes quiesced.
 func SyncGLAccounts(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 	entityDefs := data.NewEntityDefinitionRepo(db)
 	accountDefRaw, err := entityDefs.GetPublished(ctx, "Account")
@@ -192,21 +198,31 @@ func SyncGLAccountOnWrite(ctx context.Context, tx *sql.Tx, _ *entity.Definition,
 	accountType, _ := rec.Data["type"].(string)
 	isActive, _ := rec.Data["is_active"].(bool)
 
-	currency := DefaultGLCurrency
+	// Same structure as SyncGLAccounts' own loop body above, deliberately:
+	// resolve the tenant base currency first and only override it with
+	// the Account's own currency_id when that reference resolves to a
+	// non-empty code — independent review caught that an earlier draft
+	// of this hook initialized to DefaultGLCurrency instead, which would
+	// have disagreed with the sweep the one time currency_id pointed at
+	// a Currency with a blank code (not reachable today, since
+	// Currency.code is Required — but the two entry points must never
+	// have a reason to drift on the answer even in an unreachable case).
+	usedFallback := true
+	currency, err := resolveBaseCurrencyTx(ctx, tx)
+	if err != nil {
+		return fmt.Errorf("resolve base currency: %w", err)
+	}
 	if currencyID, _ := rec.Data["currency_id"].(string); currencyID != "" {
 		currencyRec, err := data.NewRecordRepo(nil).GetTx(ctx, tx, "Currency", currencyID)
 		if err != nil {
 			return fmt.Errorf("resolve Account %s currency %s: %w", code, currencyID, err)
 		}
 		if c, _ := currencyRec.Data["code"].(string); c != "" {
+			usedFallback = false
 			currency = c
 		}
-	} else {
-		base, err := resolveBaseCurrencyTx(ctx, tx)
-		if err != nil {
-			return fmt.Errorf("resolve base currency: %w", err)
-		}
-		currency = base
+	}
+	if usedFallback {
 		// Same observability reasoning as SyncGLAccounts' own fallback
 		// branch above — silent-USD-by-default is exactly what an
 		// independent review already caught once for the sweep path;

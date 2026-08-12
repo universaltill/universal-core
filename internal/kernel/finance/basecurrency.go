@@ -83,6 +83,15 @@ func ResolveBaseCurrency(ctx context.Context, db *sql.DB) (string, error) {
 // base one just because they took different repo methods to get there.
 // Same "tenant hasn't published Currency at all is a real error" posture
 // as ResolveBaseCurrency — see that function's own doc comment.
+//
+// Deliberately skips entity.Unmarshal of the published Definition
+// (ResolveBaseCurrency's own crud.Engine.List path needs it only to get
+// at EntityType, a constant string; RecordRepo.ListTx below needs the
+// string directly) — GetPublishedTx's own error is enough to prove
+// Currency is published, so a corrupt stored Definition would fail the
+// *sql.DB path's Unmarshal but not this one. Harmless today (nothing
+// else in this codebase can produce a stored Definition Unmarshal can't
+// parse), not full parity with ResolveBaseCurrency's exact steps.
 func resolveBaseCurrencyTx(ctx context.Context, tx *sql.Tx) (string, error) {
 	entityDefs := data.NewEntityDefinitionRepo(nil)
 	if _, err := entityDefs.GetPublishedTx(ctx, tx, "Currency"); err != nil {

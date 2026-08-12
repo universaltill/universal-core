@@ -207,3 +207,39 @@ func TestEngine_Create_NoHookRegistered_IsANoOp(t *testing.T) {
 		t.Fatal("expected a valid record")
 	}
 }
+
+// TestEngine_Delete_DoesNotFireHook pins down, with a real test rather
+// than only a doc comment, a premise several hooks in this codebase rely
+// on (most recently finance.SyncGLAccountOnWrite, uc-infra#204 —
+// independent review flagged that this was asserted in a comment but
+// never actually verified anywhere): Engine.Delete has no runHook call
+// at all (see Delete's own body), so a hook registered for an entity
+// type is never invoked on a soft-delete of that entity. If Delete ever
+// grows a runHook call in the future, every hook relying on "only
+// Create/Update, never Delete" needs to be re-audited — this test is
+// what would catch that silently changing.
+func TestEngine_Delete_DoesNotFireHook(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	def := vendorDef()
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	rec, err := engine.Create(ctx, def, map[string]any{"name": "Acme Textiles"}, actor)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	fired := false
+	engine.SetHook("Vendor", func(context.Context, *sql.Tx, *entity.Definition, data.Record, audit.Action, audit.Actor) error {
+		fired = true
+		return nil
+	})
+
+	if err := engine.Delete(ctx, def, rec.ID, actor); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if fired {
+		t.Fatal("expected the registered hook NOT to fire on Delete — Engine.Delete has no runHook call")
+	}
+}
