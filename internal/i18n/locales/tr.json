@@ -837,6 +837,7 @@
   "entity.validation.above_maximum": "{field} izin verilen en yüksek değerin üstünde.",
   "entity.validation.too_long": "{field} çok uzun.",
   "entity.validation.invalid": "{field} geçersiz.",
+  "entity.validation.hidden_field_blocked": "Erişiminiz olmayan bir alandaki veri sorunu nedeniyle bu kayıt kaydedilemiyor. Yardım için bir yöneticiyle iletişime geçin.",
   "crud.error.unique_constraint_violation": "Bu {fields} kombinasyonu zaten başka bir kayıt tarafından kullanılıyor.",
   "help.viewer.title": "Yardım",
   "help.viewer.search_placeholder": "Yardım konularında ara…",

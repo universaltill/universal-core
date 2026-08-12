@@ -149,7 +149,10 @@ func (h *Handler) attachmentUpload(w http.ResponseWriter, r *http.Request) {
 
 	if err := entity.ValidateRecord(attachmentDef, fields); err != nil {
 		h.cleanupOrphanBlob(r.Context(), key) // orphan cleanup — see doc comment step 5
-		h.writeValidationErrorLocalized(w, r, "validate new Attachment", err)
+		// nil: this handler never calls EffectiveWriteFields, so no field
+		// here can be one restored from a hidden stored value (see
+		// writeValidationErrorLocalized's own doc comment, uc-infra#178).
+		h.writeValidationErrorLocalized(w, r, "validate new Attachment", err, nil)
 		return
 	}
 	rec, err := ts.crud.Create(r.Context(), attachmentDef, fields, rc.Actor)

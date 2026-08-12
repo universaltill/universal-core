@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/kernel/authz"
 	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
@@ -605,5 +606,290 @@ func TestAPI_FieldPermission_ImportMappingHidesField(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "name") {
 		t.Fatalf("import mapping page lost the visible field:\n%s", rec.Body.String())
+	}
+}
+
+// legacyHiddenRequiredEntityDef/legacyHiddenRequiredFormDef are a
+// dedicated fixture for uc-infra#178, not a reuse of
+// salariedStaffEntityDef above: "salary" there is deliberately optional
+// (the file's own doc comment on why — hiding a Required field makes
+// creation impossible for that role, a separate, already-known
+// limitation), and widening it to Required would change what every
+// other test in this file that shares the fixture is exercising. "note"
+// here is Required specifically so a legacy row can hold a stored
+// whitespace-only value in it — the shape this ticket reports.
+func legacyHiddenRequiredEntityDef() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "LegacyHiddenRequired",
+		Version:    1,
+		Module:     "foundation",
+		Fields: []entity.Field{
+			{Name: "name", Type: entity.FieldString, Required: true},
+			{Name: "note", Type: entity.FieldString, Required: true},
+		},
+	}
+}
+
+func legacyHiddenRequiredFormDef() *form.Definition {
+	return &form.Definition{
+		EntityType: "LegacyHiddenRequired",
+		Version:    1,
+		Sections: []form.Section{{
+			Title:     "Details",
+			Component: form.ComponentFields,
+			Fields: []form.FormField{
+				{Name: "name", Label: "Name"},
+				{Name: "note", Label: "Note"},
+			},
+		}},
+	}
+}
+
+// legacyHiddenRequiredFixture publishes LegacyHiddenRequired, hides
+// "note" from role "clerk2" (granted to "user-clerk2"; "user-open" holds
+// no roles), and seeds ONE record whose Required "note" field already
+// holds a whitespace-only value — written through the raw data.RecordRepo,
+// NOT crud.Engine, because crud.Engine.Create validates via
+// entity.ValidateRecord same as Update does, and would refuse to create
+// a row in this shape at all (uc-infra#105's whitespace-Required check
+// applies equally to create and update). A raw repo write is exactly how
+// such a row can exist today: a record stored before that check landed,
+// or via any path that bypasses crud.Engine's own validation.
+func legacyHiddenRequiredFixture(t *testing.T) (tenantID string, db *sql.DB, mux *http.ServeMux, recordID string) {
+	t.Helper()
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db = newTestTenant(t, router)
+	ctx := context.Background()
+	if err := foundation.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	publishEntityAndForm(t, db, legacyHiddenRequiredEntityDef(), legacyHiddenRequiredFormDef())
+	seedFieldRule(t, db, "clerk2", "user-clerk2", "LegacyHiddenRequired", "note")
+
+	rec, err := data.NewRecordRepo(db).Create(ctx, "LegacyHiddenRequired", map[string]any{"name": "Dana", "note": "   "})
+	if err != nil {
+		t.Fatalf("seed legacy row with a whitespace-only Required field: %v", err)
+	}
+
+	mux = http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+	return tenantID, db, mux, rec.ID
+}
+
+// TestAPI_FieldPermission_LegacyHiddenRequiredBlankDoesNotNameHiddenField
+// is the end-to-end regression test for uc-infra#178: a legacy record
+// whose hidden Required field already holds a blank value must still
+// refuse the save (the row genuinely is invalid — this fix does not
+// weaken that), but the error reaching an actor who cannot see that
+// field must not name it. An actor who CAN see it gets the real,
+// actionable field name unchanged — this only narrows disclosure to the
+// actor the field is hidden from, exactly the "drop, don't deny"
+// discipline authz.go's own cond.Entity handling already uses elsewhere
+// for a hidden field.
+func TestAPI_FieldPermission_LegacyHiddenRequiredBlankDoesNotNameHiddenField(t *testing.T) {
+	tenantID, db, mux, recordID := legacyHiddenRequiredFixture(t)
+
+	// user-clerk2 cannot see "note". Saving an edit to the unrelated,
+	// visible "name" field still 400s (EffectiveWriteFields restores
+	// note's stored "   " into the validated set), but must not name
+	// "note" anywhere in the response.
+	req := newRequest("POST", "/api/records/LegacyHiddenRequired/"+recordID, tenantID, "user-clerk2",
+		[]byte(`{"name":"Dana Renamed"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("clerk2 save blocked by a legacy blank hidden Required field: expected 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "note") {
+		t.Fatalf("error leaked the hidden field's name to an actor who cannot see it: %s", body)
+	}
+	// Positive assertion, not just the negative one above (independent
+	// review, uc-infra#178): without this, ANY unrelated 400 on this route
+	// — a parseRecordFields failure, a fixture regression that stops
+	// EffectiveWriteFields from restoring "note" at all, a future guard
+	// that 400s earlier — would also contain no "note" and pass, without
+	// this test ever having exercised the hidden_field_blocked branch.
+	if want := "administrator"; !strings.Contains(body, want) {
+		t.Fatalf("expected the generic hidden_field_blocked message (containing %q), got: %s", want, body)
+	}
+
+	// user-open holds no roles, so HiddenFields returns nil and
+	// EffectiveWriteFields restores nothing — "note" is simply ABSENT from
+	// the submitted map, a different failure (missing, not whitespace-only)
+	// on a different code path than clerk2's restore above. Still the
+	// right comparison to make: same record, same Required field, but
+	// because nothing is hidden from this actor the error names it.
+	req2 := newRequest("POST", "/api/records/LegacyHiddenRequired/"+recordID, tenantID, "user-open",
+		[]byte(`{"name":"Dana Renamed Again"}`))
+	req2.Header.Set("Content-Type", "application/json")
+	rec2 := httptest.NewRecorder()
+	mux.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusBadRequest {
+		t.Fatalf("unrestricted save of a genuinely-invalid Required field: expected 400, got %d: %s", rec2.Code, rec2.Body.String())
+	}
+	if body := rec2.Body.String(); !strings.Contains(body, "note") {
+		t.Fatalf("unrestricted actor lost the actionable field name: %s", body)
+	}
+
+	// Neither rejected save mutated the record.
+	stored, err := crud.NewEngine(db).Get(context.Background(), legacyHiddenRequiredEntityDef(), recordID)
+	if err != nil {
+		t.Fatalf("raw Get: %v", err)
+	}
+	if stored.Data["name"] != "Dana" {
+		t.Fatalf("a rejected validation save still mutated the record: %v", stored.Data)
+	}
+}
+
+// TestAPI_FieldPermission_CreateWithHiddenRequiredFieldDoesNotNameHiddenField
+// is createRecord's own case, not update's (independent review,
+// uc-infra#178: the two handlers share validationErrorMessage but are
+// separate production branches — EffectiveWriteFields DELETES a hidden
+// field with no stored value on create, rather than restoring one, so a
+// hidden Required field submitted-absent still reaches ValidateRecord as
+// KindRequired naming a field this actor cannot see, the same disclosure
+// as the update case, just via the delete path instead of the restore
+// path). No pre-existing record needed — "note" was never stored.
+func TestAPI_FieldPermission_CreateWithHiddenRequiredFieldDoesNotNameHiddenField(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := foundation.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	publishEntityAndForm(t, db, legacyHiddenRequiredEntityDef(), legacyHiddenRequiredFormDef())
+	seedFieldRule(t, db, "clerk3", "user-clerk3", "LegacyHiddenRequired", "note")
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	req := newRequest("POST", "/api/records/LegacyHiddenRequired", tenantID, "user-clerk3",
+		[]byte(`{"name":"New"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("clerk3 create blocked by a hidden Required field: expected 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "note") {
+		t.Fatalf("error leaked the hidden field's name to an actor who cannot see it: %s", body)
+	}
+	if want := "administrator"; !strings.Contains(body, want) {
+		t.Fatalf("expected the generic hidden_field_blocked message (containing %q), got: %s", want, body)
+	}
+
+	// An actor who CAN see "note" gets the real, actionable message —
+	// same entity, same missing field, only disclosure differs.
+	req2 := newRequest("POST", "/api/records/LegacyHiddenRequired", tenantID, "user-open",
+		[]byte(`{"name":"New"}`))
+	req2.Header.Set("Content-Type", "application/json")
+	rec2 := httptest.NewRecorder()
+	mux.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusBadRequest {
+		t.Fatalf("unrestricted create missing a genuinely-Required field: expected 400, got %d: %s", rec2.Code, rec2.Body.String())
+	}
+	if body := rec2.Body.String(); !strings.Contains(body, "note") {
+		t.Fatalf("unrestricted actor lost the actionable field name: %s", body)
+	}
+}
+
+// notBeforeHiddenOtherFieldEntityDef/FormDef reproduce the second leak
+// independent review found in this fix's first version (uc-infra#178):
+// KindNotBefore's OtherField is restorable via EffectiveWriteFields
+// exactly like a plain Required field's own FieldName is, just on the
+// OTHER side of the comparison — a VISIBLE date field checked against a
+// HIDDEN one. Checking only hidden[verr.FieldName] would still name (and
+// let an actor binary-search the stored value of) customs_date here.
+func notBeforeHiddenOtherFieldEntityDef() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "NotBeforeHiddenOther",
+		Version:    1,
+		Module:     "foundation",
+		Fields: []entity.Field{
+			{Name: "name", Type: entity.FieldString, Required: true},
+			{Name: "customs_date", Type: entity.FieldDate},
+			{Name: "received_date", Type: entity.FieldDate, NotBefore: "customs_date"},
+		},
+	}
+}
+
+func notBeforeHiddenOtherFieldFormDef() *form.Definition {
+	return &form.Definition{
+		EntityType: "NotBeforeHiddenOther",
+		Version:    1,
+		Sections: []form.Section{{
+			Title:     "Details",
+			Component: form.ComponentFields,
+			Fields: []form.FormField{
+				{Name: "name", Label: "Name"},
+				{Name: "customs_date", Label: "Customs Date"},
+				{Name: "received_date", Label: "Received Date"},
+			},
+		}},
+	}
+}
+
+func TestAPI_FieldPermission_NotBeforeHiddenOtherFieldDoesNotNameHiddenField(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := foundation.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	publishEntityAndForm(t, db, notBeforeHiddenOtherFieldEntityDef(), notBeforeHiddenOtherFieldFormDef())
+	seedFieldRule(t, db, "clerk4", "user-clerk4", "NotBeforeHiddenOther", "customs_date")
+
+	rec, err := crud.NewEngine(db).Create(ctx, notBeforeHiddenOtherFieldEntityDef(),
+		map[string]any{"name": "Shipment 1", "customs_date": "2026-06-01", "received_date": "2026-06-15"}, humanActor())
+	if err != nil {
+		t.Fatalf("seed NotBeforeHiddenOther: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	// clerk4 cannot see customs_date. Moving received_date to before the
+	// (hidden, restored-from-stored) customs_date must 400 without naming
+	// customs_date anywhere — including via {other_field} substitution.
+	req := newRequest("POST", "/api/records/NotBeforeHiddenOther/"+rec.ID, tenantID, "user-clerk4",
+		[]byte(`{"name":"Shipment 1","received_date":"2026-01-15"}`))
+	req.Header.Set("Content-Type", "application/json")
+	got := httptest.NewRecorder()
+	mux.ServeHTTP(got, req)
+	if got.Code != http.StatusBadRequest {
+		t.Fatalf("clerk4 save blocked by not_before against a hidden field: expected 400, got %d: %s", got.Code, got.Body.String())
+	}
+	body := got.Body.String()
+	if strings.Contains(body, "customs") || strings.Contains(body, "Customs") {
+		t.Fatalf("error leaked the hidden OtherField's name/label to an actor who cannot see it: %s", body)
+	}
+	if want := "administrator"; !strings.Contains(body, want) {
+		t.Fatalf("expected the generic hidden_field_blocked message (containing %q), got: %s", want, body)
+	}
+
+	// user-open sees everything, including customs_date — same genuinely-
+	// invalid comparison, but the error names both real fields. Submitted
+	// explicitly (not omitted like clerk4's request above): EffectiveWriteFields
+	// only RESTORES a field that is actually hidden from the actor
+	// (len(hidden)==0 short-circuits to "return fields unchanged" — see its
+	// own doc comment), so an unrestricted actor's write is a genuine
+	// full replacement — omitting customs_date here would silently erase
+	// it rather than reproduce the same comparison clerk4 hit.
+	req2 := newRequest("POST", "/api/records/NotBeforeHiddenOther/"+rec.ID, tenantID, "user-open",
+		[]byte(`{"name":"Shipment 1","customs_date":"2026-06-01","received_date":"2026-01-15"}`))
+	req2.Header.Set("Content-Type", "application/json")
+	got2 := httptest.NewRecorder()
+	mux.ServeHTTP(got2, req2)
+	if got2.Code != http.StatusBadRequest {
+		t.Fatalf("unrestricted save of a genuinely-invalid not_before pair: expected 400, got %d: %s", got2.Code, got2.Body.String())
+	}
+	if body := got2.Body.String(); !strings.Contains(body, "customs_date") {
+		t.Fatalf("unrestricted actor lost the actionable OtherField name: %s", body)
 	}
 }

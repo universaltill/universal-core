@@ -837,6 +837,7 @@
   "entity.validation.above_maximum": "{field} is above the allowed maximum.",
   "entity.validation.too_long": "{field} is too long.",
   "entity.validation.invalid": "{field} is invalid.",
+  "entity.validation.hidden_field_blocked": "This record can't be saved because of a data issue in a field you don't have access to. Contact an administrator for help.",
   "crud.error.unique_constraint_violation": "This combination of {fields} is already used by another record.",
   "help.viewer.title": "Help",
   "help.viewer.search_placeholder": "Search help topics…",

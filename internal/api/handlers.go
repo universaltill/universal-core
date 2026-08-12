@@ -588,7 +588,15 @@ func (h *Handler) writeCrudErrorLocalized(w http.ResponseWriter, r *http.Request
 	// production caller ever checking it).
 	if errors.Is(err, entity.ErrValidation) {
 		log.Printf("api: %s: %v", logContext, err)
-		httpx.WriteError(w, http.StatusBadRequest, h.validationErrorMessage(localeFromRequest(w, r), err))
+		// nil hidden set: this function's signature carries no tenantScope
+		// to ask which fields are hidden from the current actor, but that's
+		// moot here regardless — this is the defense-in-depth branch (see
+		// the doc comment below on every current caller pre-validating the
+		// identical post-EffectiveWriteFields map before ever reaching this
+		// far), genuinely unreachable in production, not merely inconvenient
+		// to wire up. See writeValidationErrorLocalized's own doc comment
+		// for the call sites that DO have a tenantScope and pass one through.
+		httpx.WriteError(w, http.StatusBadRequest, h.validationErrorMessage(localeFromRequest(w, r), err, nil))
 		return
 	}
 	writeCrudError(w, logContext, err)
@@ -608,9 +616,25 @@ func (h *Handler) writeCrudErrorLocalized(w http.ResponseWriter, r *http.Request
 // writeCrudErrorLocalized's TargetConstraintError branch uses below, so
 // an operator debugging a "can't save" report still has the actual
 // field/reason, not just the generic per-Kind summary a user sees.
-func (h *Handler) writeValidationErrorLocalized(w http.ResponseWriter, r *http.Request, logContext string, err error) {
+//
+// hidden is the set of field names EffectiveWriteFields' caller has
+// already established are hidden from the current actor (uc-infra#178)
+// — nil from every call site that never restores a hidden field's
+// stored value into what it validates in the first place (attachment.go,
+// extsqlsource.go, issuereport.go: none of these call
+// authz.GuardedEngine.EffectiveWriteFields, so a ValidationError here can
+// never legitimately name a field this actor cannot see). createRecord
+// and updateRecord below DO call EffectiveWriteFields, which restores a
+// hidden field's stored value so a redacted form save can't erase it
+// (authz.go's own doc comment on EffectiveWriteFields) — but a legacy row
+// whose hidden Required field already holds a blank value (predating
+// uc-infra#105's whitespace check, or written some other way) then fails
+// validation on every edit, including one that never touches that field,
+// with an error that used to name it. See validationErrorMessage below
+// for what changes when a field name IS in hidden.
+func (h *Handler) writeValidationErrorLocalized(w http.ResponseWriter, r *http.Request, logContext string, err error, hidden map[string]bool) {
 	log.Printf("api: %s: %v", logContext, err)
-	httpx.WriteError(w, http.StatusBadRequest, h.validationErrorMessage(localeFromRequest(w, r), err))
+	httpx.WriteError(w, http.StatusBadRequest, h.validationErrorMessage(localeFromRequest(w, r), err, hidden))
 }
 
 // validationErrorMessage is writeValidationErrorLocalized's pure
@@ -625,13 +649,46 @@ func (h *Handler) writeValidationErrorLocalized(w http.ResponseWriter, r *http.R
 // err.Error() (the untranslated, English Detail) for any error that
 // isn't an *entity.ValidationError, so it's safe to call unconditionally
 // on anything ValidateRecord might return, including nil.
-func (h *Handler) validationErrorMessage(locale string, err error) string {
+//
+// hidden[verr.FieldName] (or, for KindNotBefore, hidden[verr.OtherField])
+// true (uc-infra#178) means the current actor has no read access to a
+// field this failure is about — most concretely, a legacy record whose
+// hidden Required field already holds a blank value restored by
+// EffectiveWriteFields ahead of validation. Naming the field in that case
+// would be exactly the disclosure authz's own "drop, don't deny"
+// discipline (see e.g. GuardedEngine's cond.Entity handling) refuses
+// elsewhere: an error telling this actor a field they cannot see exists,
+// with no way for them to fix it. So either field being hidden gets a
+// single generic entity.validation.hidden_field_blocked message instead
+// of the per-Kind template — deliberately the SAME message regardless of
+// Kind (required, too_long, not_before, whatever legacy value it is),
+// since which constraint failed is itself information about a field this
+// actor cannot read. Detail (including the real FieldName/OtherField) is
+// unaffected and still logged untranslated by every caller, so a session
+// that CAN read the field — an admin, or anyone this hidden set doesn't
+// apply to — still gets the real, actionable message (this only ever
+// narrows disclosure to an actor a field is hidden from; it never
+// changes whether the save succeeds).
+//
+// OtherField matters here as much as FieldName: EffectiveWriteFields
+// restores a hidden FieldDate's stored value the same way it restores a
+// hidden Required string's, so a legacy record can just as easily fail
+// KindNotBefore with a VISIBLE FieldName and a HIDDEN OtherField (e.g. a
+// visible received_date compared against a hidden customs_date) —
+// checking FieldName alone would still name (and, worse, let an actor
+// binary-search the stored value of) a field they cannot see, the exact
+// class of leak this fix exists to close, just reachable through the
+// second field instead of the first (independent review, uc-infra#178).
+func (h *Handler) validationErrorMessage(locale string, err error, hidden map[string]bool) string {
 	if err == nil {
 		return ""
 	}
 	var verr *entity.ValidationError
 	if !errors.As(err, &verr) {
 		return err.Error()
+	}
+	if hidden[verr.FieldName] || (verr.Kind == entity.KindNotBefore && hidden[verr.OtherField]) {
+		return h.catalog.T(locale, "entity.validation.hidden_field_blocked")
 	}
 	fieldLabel := h.catalog.TOrDefault(locale, "field."+verr.EntityType+"."+verr.FieldName, verr.FieldName)
 	msg := strings.ReplaceAll(h.catalog.T(locale, "entity.validation."+string(verr.Kind)), "{field}", fieldLabel)
@@ -795,7 +852,19 @@ func (h *Handler) createRecord(w http.ResponseWriter, r *http.Request) {
 	// itself still fails on past this point is a genuine internal/DB
 	// error (500, generic message, logged).
 	if err := entity.ValidateRecord(entDef, fields); err != nil {
-		h.writeValidationErrorLocalized(w, r, fmt.Sprintf("validate new %s", entityType), err)
+		// A failure here can only be about a field this handler already
+		// resolved into `fields` above, which for create means either a
+		// submitted value or nothing (EffectiveWriteFields deletes a hidden
+		// field with no prior stored value rather than restoring one — see
+		// its own doc comment) — so a hidden Required field with nothing
+		// stored yet lands here as "required", naming a field this actor
+		// cannot see, the same disclosure uc-infra#178 fixes for update.
+		hidden, hErr := ts.crud.HiddenFields(r.Context(), entDef.EntityType)
+		if hErr != nil {
+			writeInternalError(w, fmt.Sprintf("resolve hidden fields for new %s", entityType), hErr)
+			return
+		}
+		h.writeValidationErrorLocalized(w, r, fmt.Sprintf("validate new %s", entityType), err, hidden)
 		return
 	}
 	// isCreate=true, id/version both ignored: Create generates the
@@ -876,7 +945,21 @@ func (h *Handler) updateRecord(w http.ResponseWriter, r *http.Request) {
 	// bad update is unambiguously a 400, not indistinguishable from a
 	// genuine 500.
 	if err := entity.ValidateRecord(entDef, fields); err != nil {
-		h.writeValidationErrorLocalized(w, r, fmt.Sprintf("validate update of %s %s", entityType, id), err)
+		// uc-infra#178: EffectiveWriteFields above restored every hidden
+		// field's STORED value into `fields` so a redacted form save can't
+		// erase it — including a legacy hidden Required field that already
+		// holds a blank value. That failure is real (the row is still
+		// invalid) but naming the field here would tell this actor a field
+		// they cannot see exists and blocks their save with no way to fix
+		// it. hidden lets validationErrorMessage swap in a generic message
+		// for exactly that field, without touching what any other actor —
+		// or any other field — sees.
+		hidden, hErr := ts.crud.HiddenFields(r.Context(), entDef.EntityType)
+		if hErr != nil {
+			writeInternalError(w, fmt.Sprintf("resolve hidden fields for %s %s", entityType, id), hErr)
+			return
+		}
+		h.writeValidationErrorLocalized(w, r, fmt.Sprintf("validate update of %s %s", entityType, id), err, hidden)
 		return
 	}
 	// Extracted before ValidateStatusTransition, not after: a real status

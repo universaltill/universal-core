@@ -40,3 +40,28 @@ func TestValidationErrorKinds_HaveCatalogKeysInEveryLocale(t *testing.T) {
 		}
 	}
 }
+
+// TestHiddenFieldBlockedMessage_HasCatalogKeyInEveryLocale is the same
+// enforcement as above for entity.validation.hidden_field_blocked
+// (uc-infra#178) — validationErrorMessage's own generic message for a
+// ValidationError whose FieldName is hidden from the current actor. It
+// isn't one of entity.AllValidationErrorKinds (it replaces the per-Kind
+// template entirely, deliberately the same message regardless of which
+// Kind failed — see validationErrorMessage's doc comment), so the loop
+// above never reaches it; this is its own, otherwise-identical check.
+func TestHiddenFieldBlockedMessage_HasCatalogKeyInEveryLocale(t *testing.T) {
+	catalog, err := i18n.Load("en")
+	if err != nil {
+		t.Fatalf("i18n.Load: %v", err)
+	}
+	locales := catalog.Available()
+	if len(locales) == 0 {
+		t.Fatal("no locales loaded — cannot check coverage")
+	}
+	const key = "entity.validation.hidden_field_blocked"
+	for _, locale := range locales {
+		if !catalog.HasOwn(locale, key) {
+			t.Errorf("locale %q has no translation for catalog key %q", locale, key)
+		}
+	}
+}

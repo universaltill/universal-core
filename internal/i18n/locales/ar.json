@@ -837,6 +837,7 @@
   "entity.validation.above_maximum": "{field} أكبر من الحد الأقصى المسموح به.",
   "entity.validation.too_long": "{field} طويل جدًا.",
   "entity.validation.invalid": "{field} غير صالح.",
+  "entity.validation.hidden_field_blocked": "لا يمكن حفظ هذا السجل بسبب مشكلة في بيانات حقل لا تملك صلاحية الوصول إليه. تواصل مع مسؤول للمساعدة.",
   "crud.error.unique_constraint_violation": "هذا المزيج من {fields} مستخدم بالفعل من قبل سجل آخر.",
   "help.viewer.title": "مساعدة",
   "help.viewer.search_placeholder": "ابحث في مواضيع المساعدة…",
