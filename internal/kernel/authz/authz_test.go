@@ -359,6 +359,44 @@ func TestResolver_ControlPlane_SelfProtection(t *testing.T) {
 	mustCan(t, got, err, false, "delegated hr CanWrite(Role) — not delegated")
 }
 
+// TestResolver_AIProviderConnection_SystemOnlyWrite confirms the
+// uc-infra#180 gap is actually closed: AIProviderConnection is not a
+// controlPlaneType (it grants no authority over anything else), but it
+// IS systemOnlyWriteTypes — no user-driven write path may touch it,
+// bootstrap window or not, admin or not — because the Unique constraint
+// its foundation.go doc comment describes is only sound if
+// internal/api/aiprovidersettings.go's own raw-engine write is the sole
+// writer. Reads stay open throughout, same as ExternalIdentity: nothing
+// here is secret, only not user-editable.
+func TestResolver_AIProviderConnection_SystemOnlyWrite(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+
+	// Bootstrap window: nothing configured yet.
+	r := humanResolver(f, "user-first")
+	got, err := r.CanWrite(ctx, "AIProviderConnection")
+	mustCan(t, got, err, false, "bootstrap CanWrite(AIProviderConnection)")
+	got, err = r.CanRead(ctx, "AIProviderConnection")
+	mustCan(t, got, err, true, "bootstrap CanRead(AIProviderConnection)")
+
+	// Configure RBAC with a real tenant_admin grant — still denied, even
+	// to the admin, same posture as ExternalIdentity.
+	admin := f.role(AdminRoleCode)
+	f.grant("user-admin", admin.ID)
+	r = humanResolver(f, "user-admin")
+	got, err = r.CanWrite(ctx, "AIProviderConnection")
+	mustCan(t, got, err, false, "admin CanWrite(AIProviderConnection) — system-only")
+	got, err = r.CanRead(ctx, "AIProviderConnection")
+	mustCan(t, got, err, true, "admin CanRead(AIProviderConnection)")
+
+	// An ordinary, non-admin member: also denied, same reasoning.
+	member := f.role("member")
+	f.grant("user-mallory", member.ID)
+	r = humanResolver(f, "user-mallory")
+	got, err = r.CanWrite(ctx, "AIProviderConnection")
+	mustCan(t, got, err, false, "member CanWrite(AIProviderConnection) — system-only")
+}
+
 // The tenant_admin role code bypasses everything — the
 // lockout-prevention convention (ADR-0006).
 func TestResolver_TenantAdminBypasses(t *testing.T) {
@@ -391,6 +429,18 @@ func TestResolver_MachineActorBypasses(t *testing.T) {
 	mustCan(t, got, err, true, "machine CanRead(Party)")
 	got, err = r.CanWrite(ctx, "Party")
 	mustCan(t, got, err, true, "machine CanWrite(Party)")
+
+	// EXCEPT systemOnlyWriteTypes (uc-infra#180 independent review):
+	// those types have no legitimate machine writer through THIS
+	// Resolver at all (their real writers are raw-engine system-path
+	// bypasses that never call CanWrite), so a machine/service-token
+	// caller reaching the generic API must be denied exactly like a
+	// human — CanWrite checks systemOnlyWriteTypes before the machine
+	// bypass, not after, specifically so this stays true.
+	got, err = r.CanWrite(ctx, "ExternalIdentity")
+	mustCan(t, got, err, false, "machine CanWrite(ExternalIdentity) — system-only overrides the machine bypass")
+	got, err = r.CanWrite(ctx, "AIProviderConnection")
+	mustCan(t, got, err, false, "machine CanWrite(AIProviderConnection) — system-only overrides the machine bypass")
 }
 
 // The guarded engine end to end: denied calls fail with ErrDenied (the

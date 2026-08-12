@@ -205,16 +205,11 @@ func (h *Handler) scope(ctx context.Context, rc httpx.RequestContext) (tenantSco
 		// leaving workflowQueue nil for something later to panic on.
 		return tenantScope{}, fmt.Errorf("build workflow queue: %w", err)
 	}
-	engine := crud.NewEngine(db)
-	// Apply whatever the real composition root registered via
-	// RegisterHook (Handler's own doc comment on the hooks field) — this
-	// loop has zero knowledge of what any registered entityType/hook
-	// actually is, same generic-dispatch shape crud.Engine.SetHook
-	// itself already is.
-	for _, hr := range h.hooks {
-		engine.SetHook(hr.entityType, hr.hook)
-	}
-	guarded := authz.Guard(engine, authz.NewResolver(db, rc.Actor, rc.Machine))
+	// rawCrud applies whatever the real composition root registered via
+	// RegisterHook (Handler's own doc comment on the hooks field) — zero
+	// knowledge here of what any registered entityType/hook actually is,
+	// same generic-dispatch shape crud.Engine.SetHook itself already is.
+	guarded := authz.Guard(h.rawCrud(db), authz.NewResolver(db, rc.Actor, rc.Machine))
 
 	return tenantScope{
 		db:            db,
@@ -225,6 +220,27 @@ func (h *Handler) scope(ctx context.Context, rc httpx.RequestContext) (tenantSco
 		workflowQueue: workflowQueue,
 		reporting:     data.NewReportingRepo(db),
 	}, nil
+}
+
+// rawCrud builds a raw, RBAC-unguarded crud.Engine against db, with
+// whatever hooks the real composition root registered via RegisterHook
+// applied — the same hook-registration loop scope's own guarded engine
+// gets, pulled out so the two constructions can't drift apart. For the
+// system-path bypasses that construct their own engine directly instead
+// of using tenantScope's guarded ts.crud (systemOnlyWriteTypes entities
+// like AIProviderConnection, uc-infra#180 — see
+// internal/api/aiprovidersettings.go) — without this, a future
+// RegisterHook("AIProviderConnection", ...) would be silently skipped on
+// the only path that writes it, since a bare crud.NewEngine(db) call
+// carries no hooks at all (independent review, uc-infra#180). Inert
+// today: cmd/universal-core only registers hooks for four
+// purchasing/sales entity types, none of them system-only-write.
+func (h *Handler) rawCrud(db *sql.DB) *crud.Engine {
+	engine := crud.NewEngine(db)
+	for _, hr := range h.hooks {
+		engine.SetHook(hr.entityType, hr.hook)
+	}
+	return engine
 }
 
 // entityDef looks up entityType's published Definition. Every handler

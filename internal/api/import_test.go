@@ -591,6 +591,7 @@ func TestImport_Preview_UsesTenantBYOKProviderInsteadOfPlatformDefault(t *testin
 	tenantID, db := newTestTenant(t, router)
 	publishFoundation(t, db)
 	publishEntityAndForm(t, db, orderEntityDef(), orderFormDef())
+	seedAIProviderAdmin(t, db)
 
 	var platformCalled, tenantCalled bool
 	platformSrv := fakeAIServer(t, nil, &platformCalled)
