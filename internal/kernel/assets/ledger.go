@@ -94,7 +94,8 @@ func SchedulerActor() audit.Actor {
 // accumulated set but not asset_account_id) is far more likely a data
 // entry mistake than an intentional state.
 func PostDueDepreciation(ctx context.Context, db *sql.DB, actor audit.Actor) (posted int, err error) {
-	return PostDueDepreciationBatch(ctx, db, actor, math.MaxInt)
+	posted, _, err = PostDueDepreciationBatch(ctx, db, actor, math.MaxInt)
+	return posted, err
 }
 
 // PostDueDepreciationBatch is PostDueDepreciation, bounded to attempting
@@ -148,9 +149,59 @@ func PostDueDepreciation(ctx context.Context, db *sql.DB, actor audit.Actor) (po
 // against a partial, in-memory view of its schedule) — see
 // healStuckFullyDepreciatedAssets's own doc comment for the query-level
 // check that replaced it.
-func PostDueDepreciationBatch(ctx context.Context, db *sql.DB, actor audit.Actor, maxRows int) (posted int, err error) {
+//
+// truncated (uc-infra#183) reports whether tickTenant should retry this
+// tenant on the very next poll tick instead of waiting out the full
+// DepreciationPostInterval throttle. It requires BOTH of:
+//
+//  1. A window hit its own limit — either the due-rows worklist read
+//     (records.ListDueUnposted's own LIMIT, so there may be more due rows
+//     beyond this window) or the healing sweep (records.
+//     LifeCompleteGroupIDs, so there may be more stuck assets beyond that
+//     window).
+//  2. This call actually made progress — posted at least one row, or
+//     healed (actually transitioned) at least one stuck asset.
+//
+// Both conditions matter, not just the first (independent review's
+// finding on this function's first version): a window can be
+// PERMANENTLY full of items this call can never act on — a
+// DepreciationSchedule row whose asset's account references point at a
+// since-deleted Account (accountCode below errors every call, and
+// postAssetDepreciation returns before spending any of its attempted
+// budget, so the same unpostable rows sort into the same LIMITed window
+// forever), or a life-complete FixedAsset whose tenant never seeded a
+// fully_depreciated Status (statusIDByCodeTx below errors every call,
+// same permanent-residency effect on LifeCompleteGroupIDs' own window).
+// Reporting truncated=true for either case — as this function's first
+// version did, checking only condition 1 — would make tickTenant clear
+// the throttle unconditionally, turning DepreciationPostInterval into a
+// permanent no-op for that tenant: the exact per-tenant-delays-every-
+// other-tenant's-tick hazard ADR-0025 exists to bound (uc-infra#137),
+// reintroduced at up to 15x the query rate for the one query
+// uc-infra#202 already flags as the expensive one. Gating on progress
+// too means a permanently-stuck window instead falls back to the plain
+// pre-uc-infra#183 behavior: one attempt per DepreciationPostInterval,
+// forever, same as an ordinary error — see
+// TestPostDueDepreciationBatch_DoesNotReportTruncatedWhenHealingSweepIsPermanentlyStuck
+// and its due-rows sibling in ledger_test.go for the direct regression
+// coverage.
+//
+// Deliberately NOT "posted == maxRows" for condition 1: posted only
+// counts rows this call actually wrote a journal entry for, but the
+// budget is spent on rows ATTEMPTED (see the remaining/attempted
+// accounting above) — a backlog dominated by rows a concurrent run
+// already posted first can exhaust the whole cap while posted stays low
+// or even zero, which would make a posted-based check under-report
+// truncation exactly in the pathological case (uc-infra#137's own
+// motivating scenario) where noticing it matters most. Checking the
+// worklist read length directly has only the same narrow,
+// explicitly-accepted imprecision the simpler heuristic would have had
+// (a backlog that lands EXACTLY on maxRows AND makes real progress this
+// call still reads as truncated after the call that actually finished
+// it — one wasted extra attempt next tick, not a correctness problem).
+func PostDueDepreciationBatch(ctx context.Context, db *sql.DB, actor audit.Actor, maxRows int) (posted int, truncated bool, err error) {
 	if maxRows <= 0 {
-		return 0, fmt.Errorf("assets: PostDueDepreciationBatch: maxRows must be positive, got %d", maxRows)
+		return 0, false, fmt.Errorf("assets: PostDueDepreciationBatch: maxRows must be positive, got %d", maxRows)
 	}
 
 	records := data.NewRecordRepo(db)
@@ -161,13 +212,13 @@ func PostDueDepreciationBatch(ctx context.Context, db *sql.DB, actor audit.Actor
 	// and the completion sweep further down need it.
 	statusID, err := depreciationInServiceStatusID(ctx, records)
 	if err != nil {
-		return 0, fmt.Errorf("resolve in_service status: %w", err)
+		return 0, false, fmt.Errorf("resolve in_service status: %w", err)
 	}
 	if statusID == "" {
 		// Assets not published for this tenant — not an error, the
 		// common case for most tenants (mirrors the pre-uc-infra#182
 		// "no schedules yet" early-out this replaced).
-		return 0, nil
+		return 0, false, nil
 	}
 
 	due, err := records.ListDueUnposted(ctx, "DepreciationSchedule", "period_end", today, "posted_at", data.ListDueUnpostedGate{
@@ -180,8 +231,16 @@ func PostDueDepreciationBatch(ctx context.Context, db *sql.DB, actor audit.Actor
 		},
 	}, maxRows)
 	if err != nil {
-		return 0, fmt.Errorf("list due DepreciationSchedule: %w", err)
+		return 0, false, fmt.Errorf("list due DepreciationSchedule: %w", err)
 	}
+	// The worklist read itself hit its LIMIT — there may be more due rows
+	// than this window covers, regardless of how many of THESE rows the
+	// posting loop below actually gets to (see this function's own doc
+	// comment on why this is checked here, not via posted==maxRows). Only
+	// half of the truncated signal (see this function's own doc comment)
+	// — windowFull alone says nothing about whether this call could act
+	// on any of it.
+	windowFull := len(due) == maxRows
 
 	if len(due) > 0 {
 		// Grouped by asset so a bad asset (missing accounts, wrong
@@ -206,7 +265,11 @@ func PostDueDepreciationBatch(ctx context.Context, db *sql.DB, actor audit.Actor
 		remaining := maxRows
 		for assetID, rows := range rowsByAsset {
 			if ctx.Err() != nil {
-				return posted, ctx.Err()
+				// truncated is deliberately not computed here (its
+				// progress-gating needs this whole call to have finished
+				// running) — irrelevant anyway, since tickTenant only
+				// reads truncated when err == nil.
+				return posted, false, ctx.Err()
 			}
 			if remaining <= 0 {
 				break
@@ -242,11 +305,25 @@ func PostDueDepreciationBatch(ctx context.Context, db *sql.DB, actor audit.Actor
 	// error rather than a swallowed one, and this sweep should behave
 	// the same way rather than reporting a clean (posted, nil) return
 	// for a call that was actually cut short mid-sweep by a shutdown.
-	if err := healStuckFullyDepreciatedAssets(ctx, db, records, actor, statusID, today, maxRows); err != nil {
-		return posted, fmt.Errorf("heal stuck fully-depreciated assets: %w", err)
+	healed, healWindowFull, err := healStuckFullyDepreciatedAssets(ctx, db, records, actor, statusID, today, maxRows)
+	if err != nil {
+		return posted, false, fmt.Errorf("heal stuck fully-depreciated assets: %w", err)
 	}
+	// Either phase hitting its own window is a candidate signal — the two
+	// phases are independent worklists (due-unposted rows vs.
+	// stuck-but-never-transitioned assets), and a caller retrying sooner
+	// because of one doesn't need to know which. But a candidate alone
+	// isn't enough (this function's own doc comment): only report
+	// truncated when this call actually made progress somewhere — posted
+	// a row, or actually transitioned a stuck asset — so a window
+	// permanently full of items neither phase can ever act on falls back
+	// to the ordinary once-per-DepreciationPostInterval cadence instead
+	// of retrying every poll tick forever for no possible gain.
+	windowFull = windowFull || healWindowFull
+	progressed := posted > 0 || healed > 0
+	truncated = windowFull && progressed
 
-	return posted, nil
+	return posted, truncated, nil
 }
 
 // healStuckFullyDepreciatedAssets is PostDueDepreciationBatch's
@@ -286,7 +363,20 @@ func PostDueDepreciationBatch(ctx context.Context, db *sql.DB, actor audit.Actor
 // motivating example) is genuinely bounded now; this sweep's residual
 // cost is a smaller, separate, and honestly-documented gap, not a
 // regression from before this change.
-func healStuckFullyDepreciatedAssets(ctx context.Context, db *sql.DB, records *data.RecordRepo, actor audit.Actor, statusID, today string, limit int) error {
+// The returned windowFull (uc-infra#183) reports whether this sweep's
+// own candidate read hit limit — same "the LIMIT was actually the
+// limiting factor" signal PostDueDepreciationBatch's due-rows read uses,
+// and the same narrow imprecision (a stuck count that lands exactly on
+// limit still reads as windowFull after a sweep that actually caught
+// every stuck asset). transitioned counts only the candidates this call
+// ACTUALLY moved to fully_depreciated — not len(stuck), which also
+// includes any candidate transitionToFullyDepreciated failed for (logged
+// below, not returned as an error: one bad asset must not stop the rest
+// from healing). PostDueDepreciationBatch needs this distinction to tell
+// "the window is full of assets this call is genuinely making progress
+// on" apart from "the window is full of assets permanently stuck for a
+// reason this sweep can never resolve" — see its own doc comment.
+func healStuckFullyDepreciatedAssets(ctx context.Context, db *sql.DB, records *data.RecordRepo, actor audit.Actor, statusID, today string, limit int) (transitioned int, windowFull bool, err error) {
 	stuck, err := records.LifeCompleteGroupIDs(ctx, data.LifeCompleteGroupOptions{
 		ParentType:       "FixedAsset",
 		ParentMatchField: "status_id",
@@ -299,14 +389,16 @@ func healStuckFullyDepreciatedAssets(ctx context.Context, db *sql.DB, records *d
 		Cutoff:           today,
 	}, limit)
 	if err != nil {
-		return fmt.Errorf("find stuck fully-depreciated FixedAssets: %w", err)
+		return 0, false, fmt.Errorf("find stuck fully-depreciated FixedAssets: %w", err)
 	}
 	for _, assetID := range stuck {
 		if err := transitionToFullyDepreciated(ctx, db, records, assetID, actor); err != nil {
 			log.Printf("assets: heal stuck FixedAsset %s: %v", assetID, err)
+			continue
 		}
+		transitioned++
 	}
-	return nil
+	return transitioned, len(stuck) == limit, nil
 }
 
 // depreciationInServiceStatusID resolves the fixed_asset_status

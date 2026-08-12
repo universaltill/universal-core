@@ -77,9 +77,13 @@ type Config struct {
 	// job's own "catch-up, not skip" design intentionally supports)
 	// delayed every OTHER tenant's tick, including the queued-job work a
 	// user is actually waiting on. A tenant whose backlog exceeds this
-	// cap simply resumes posting the remainder on its next
-	// DepreciationPostInterval tick, same latency model as
-	// DepreciationPostInterval's own "waits at most this long" tradeoff.
+	// cap resumes posting the remainder on its very next poll tick, not
+	// its next DepreciationPostInterval tick (uc-infra#183): tickTenant
+	// treats a truncated call (PostDueDepreciationBatch's own
+	// maxRows-hit signal) the same as a failed one and clears the
+	// throttle immediately, so a large backlog catches up at roughly
+	// PollInterval cadence instead of waiting out the full throttle
+	// interval between every capped call.
 	DepreciationPostBatchSize int
 }
 
@@ -101,9 +105,12 @@ const (
 	// doc comment) is bounded the same way, by the same value. 200 keeps
 	// a single call's worst case to a small fraction of a second —
 	// bounding how long one tenant can delay every other tenant's tick —
-	// while still making real catch-up progress every
-	// DepreciationPostInterval. Deployments with unusually large
-	// per-tenant asset counts can raise this via Config.
+	// while still making real catch-up progress. A backlog spanning
+	// multiple capped calls now resumes at roughly PollInterval cadence,
+	// not DepreciationPostInterval (uc-infra#183) — see the truncated
+	// handling at this file's PostDueDepreciationBatch call site.
+	// Deployments with unusually large per-tenant asset counts can raise
+	// this via Config.
 	defaultDepreciationPostBatchSize = 200
 )
 
@@ -287,26 +294,53 @@ func (r *Runner) tickTenant(ctx context.Context, tenantID string, q *workflow.Qu
 		// DepreciationSchedule table scan, and nothing here needs
 		// sub-minute latency. Capped by DepreciationPostBatchSize (see
 		// its own doc comment) so a large catch-up backlog can't make
-		// this one call block every other tenant's tick — the remainder
-		// resumes on this tenant's next due tick. Failures are logged
-		// and skipped, never fatal to this tenant's tick — same
-		// isolation as every other per-tenant step in this function.
+		// this one call block every other tenant's tick. A finished
+		// (non-truncated) call's remainder — if any turns up later —
+		// resumes on this tenant's next DepreciationPostInterval-due
+		// tick; a truncated call (uc-infra#183, see below) resumes on
+		// the very next poll tick instead. Failures are logged and
+		// skipped, never fatal to this tenant's tick — same isolation as
+		// every other per-tenant step in this function.
 		if r.shouldPostDepreciation(tenantID, now) {
-			posted, err := assets.PostDueDepreciationBatch(ctx, db, assets.SchedulerActor(), r.cfg.DepreciationPostBatchSize)
-			// finishDepreciationPost unconditionally, success or error:
-			// this is what lets a SECOND poller (RunConcurrent) pick this
-			// tenant back up as soon as this run ends, rather than staying
-			// blocked until DepreciationPostInterval elapses from this
-			// run's START time — see depreciationInFlight's own doc
-			// comment for why an overlapping run is the dangerous case,
-			// not merely a redundant one.
-			r.finishDepreciationPost(tenantID)
+			posted, truncated, err := assets.PostDueDepreciationBatch(ctx, db, assets.SchedulerActor(), r.cfg.DepreciationPostBatchSize)
 			if err != nil {
 				log.Printf("worker: tenant %s: post due depreciation: %v", tenantID, err)
-				r.forgetDepreciationPost(tenantID) // retry next tick, not next interval
 			} else if posted > 0 {
 				log.Printf("worker: tenant %s: posted %d depreciation schedule row(s)", tenantID, posted)
 			}
+			if truncated {
+				// uc-infra#183: this call left real work behind it (hit
+				// assets.PostDueDepreciationBatch's own maxRows cap on
+				// either its due-rows read or its healing sweep, AND
+				// actually made progress somewhere this call — see that
+				// function's own doc comment on why progress is required,
+				// not just a full window) — same treatment as a failed
+				// run, so this tenant's next attempt is the very next
+				// poll tick instead of waiting out the full
+				// DepreciationPostInterval throttle. A tenant whose
+				// backlog spans N capped calls now catches up at roughly
+				// PollInterval cadence, not DepreciationPostInterval
+				// cadence.
+				log.Printf("worker: tenant %s: depreciation post truncated (hit the per-call cap), retrying next tick", tenantID)
+			}
+			// Releases the in-flight claim unconditionally (success or
+			// error — this is what lets a SECOND poller (RunConcurrent)
+			// pick this tenant back up as soon as this run ends, rather
+			// than staying blocked until DepreciationPostInterval elapses
+			// from this run's START time — see depreciationInFlight's own
+			// doc comment) and clears the throttle timestamp too on
+			// err != nil or truncated (retry next tick, not next
+			// interval). Both effects happen under ONE lock acquisition
+			// deliberately (independent review's finding): releasing
+			// in-flight and clearing the throttle as two separate locked
+			// sections left a window where a concurrent RunConcurrent
+			// poller's shouldPostDepreciation could see "not in-flight"
+			// but still throttled by the about-to-be-cleared timestamp,
+			// start ITS OWN run, record ITS OWN fresh timestamp — which
+			// this call's own second, unconditional lock/delete would
+			// then discard, having no way to tell its own stale intent
+			// apart from the new state.
+			r.finishDepreciationPost(tenantID, err != nil || truncated)
 		}
 	}
 
@@ -428,23 +462,30 @@ func (r *Runner) shouldPostDepreciation(tenantID string, now time.Time) bool {
 }
 
 // finishDepreciationPost releases tenantID's in-flight claim once its
-// assets.PostDueDepreciation call has returned (success or error) — the
-// counterpart every shouldPostDepreciation(tenantID, ...) == true must
-// eventually call, exactly once, so a later poller can claim the slot
-// again.
-func (r *Runner) finishDepreciationPost(tenantID string) {
+// assets.PostDueDepreciation call has returned — the counterpart every
+// shouldPostDepreciation(tenantID, ...) == true must eventually call,
+// exactly once, so a later poller can claim the slot again. When
+// clearThrottle is true, this ALSO clears the throttle timestamp in the
+// same locked section, so the very next poll tick becomes due again
+// instead of waiting out the full DepreciationPostInterval — tickTenant
+// passes true on a failed run or a truncated (uc-infra#183) one, false
+// otherwise.
+//
+// Both effects share one lock acquisition deliberately (independent
+// review's finding on this function's first version, which released
+// in-flight and cleared the throttle as two separate critical sections):
+// a window between them would let a concurrent RunConcurrent poller's
+// shouldPostDepreciation see "not in-flight" (this call's own release
+// already ran) but still throttled by the about-to-be-cleared
+// timestamp, start ITS OWN run, and record ITS OWN fresh timestamp —
+// which this call's own second, unconditional lock/delete would then
+// discard, with no way to tell its own stale intent apart from the new
+// state.
+func (r *Runner) finishDepreciationPost(tenantID string, clearThrottle bool) {
 	r.depMu.Lock()
 	defer r.depMu.Unlock()
 	delete(r.depreciationInFlight, tenantID)
-}
-
-// forgetDepreciationPost clears the throttle after a FAILED run, so the
-// next tick retries instead of waiting out the interval on an error.
-// finishDepreciationPost already released the in-flight claim (it must
-// run first — see tickTenant) — this only resets the start-time
-// throttle, a separate concern.
-func (r *Runner) forgetDepreciationPost(tenantID string) {
-	r.depMu.Lock()
-	defer r.depMu.Unlock()
-	delete(r.lastDepreciationPost, tenantID)
+	if clearThrottle {
+		delete(r.lastDepreciationPost, tenantID)
+	}
 }
