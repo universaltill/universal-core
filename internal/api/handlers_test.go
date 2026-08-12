@@ -1424,6 +1424,53 @@ func TestWriteCrudErrorLocalized_ValidationErrorFallsThroughTranslated(t *testin
 	}
 }
 
+// TestValidationErrorMessage_HiddenFieldGetsGenericMessage is a direct,
+// pure-function test of validationErrorMessage's hidden branch
+// (uc-infra#178) — no HTTP round trip, no DB: the same synthetic-
+// ValidationError technique TestWriteCrudErrorLocalized_
+// ValidationErrorFallsThroughTranslated above uses, isolating the one
+// thing this fix changes from everything EffectiveWriteFields/HTTP
+// plumbing around it (covered separately, end to end, by
+// authz_fieldperm_test.go's
+// TestAPI_FieldPermission_LegacyHiddenRequiredBlankDoesNotNameHiddenField).
+func TestValidationErrorMessage_HiddenFieldGetsGenericMessage(t *testing.T) {
+	router := newTestRouter(t)
+	h := testHandler(t, router)
+
+	verr := &entity.ValidationError{
+		Kind:       entity.KindRequired,
+		EntityType: "SalariedStaff",
+		FieldName:  "salary",
+		Detail:     `field "salary" is required`,
+	}
+
+	// Hidden from this actor: the generic message, no field name/label.
+	hidden := map[string]bool{"salary": true}
+	got := h.validationErrorMessage("en", verr, hidden)
+	if strings.Contains(got, "salary") {
+		t.Fatalf("hidden field name leaked into the message: %q", got)
+	}
+	want := "administrator"
+	if !strings.Contains(got, want) {
+		t.Fatalf("expected the generic hidden_field_blocked message (containing %q), got: %q", want, got)
+	}
+
+	// Same error, nil hidden set (every pre-existing call site's
+	// behavior, and this same field once no rule hides it from this
+	// actor): unchanged, names the field as it always has.
+	got = h.validationErrorMessage("en", verr, nil)
+	if want := "salary is required."; got != want {
+		t.Fatalf("validationErrorMessage(nil hidden) = %q, want %q (regression: hidden=nil must not change existing behavior)", got, want)
+	}
+
+	// A DIFFERENT field hidden, not the one this error is about: also
+	// unchanged — hidden narrows disclosure per-field, not per-request.
+	got = h.validationErrorMessage("en", verr, map[string]bool{"other_field": true})
+	if want := "salary is required."; got != want {
+		t.Fatalf("validationErrorMessage(unrelated field hidden) = %q, want %q", got, want)
+	}
+}
+
 // checkInEntityDef/checkInFormDef are a throwaway (employee_id,
 // entry_date) shape for the Unique-constraint HTTP test below — same
 // reasoning groupedItemEntityDef's own doc comment gives for not

@@ -149,7 +149,8 @@ func (h *Handler) extSQLSourceSave(w http.ResponseWriter, r *http.Request, id st
 	if err != nil {
 		log.Printf("api: build ExternalSQLSource fields (id=%q): %v", id, err)
 		view := h.extSQLSourcesPageView(locale, records)
-		h.attachExtSQLError(&view, id, h.validationErrorMessage(locale, err))
+		// nil: no EffectiveWriteFields call on this path either (uc-infra#178).
+		h.attachExtSQLError(&view, id, h.validationErrorMessage(locale, err, nil))
 		h.writeExtSQLSourcesFragment(w, view)
 		return
 	}

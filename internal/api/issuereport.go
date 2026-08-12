@@ -340,7 +340,8 @@ func (h *Handler) issueReportSubmit(w http.ResponseWriter, r *http.Request) {
 
 	if err := entity.ValidateRecord(def, fields); err != nil {
 		log.Printf("api: validate new IssueReport: %v", err)
-		httpx.WriteError(w, http.StatusBadRequest, h.validationErrorMessage(locale, err))
+		// nil: no EffectiveWriteFields call on this path either (uc-infra#178).
+		httpx.WriteError(w, http.StatusBadRequest, h.validationErrorMessage(locale, err, nil))
 		return
 	}
 	rec, err := ts.crud.Create(r.Context(), def, fields, rc.Actor)
