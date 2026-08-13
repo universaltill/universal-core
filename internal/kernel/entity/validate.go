@@ -3,6 +3,7 @@ package entity
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"slices"
 	"strings"
@@ -177,8 +178,58 @@ func ApplyDefaults(def *Definition, data map[string]any) {
 		if v, present := data[f.Name]; present && v != nil {
 			continue
 		}
-		data[f.Name] = f.Default
+		data[f.Name] = cloneDefault(f.Default)
 	}
+}
+
+// cloneDefault returns a value safe to write into a record's data map
+// without aliasing the Definition's own stored Field.Default (uc-infra
+// #219). Every Default value today is either a Go scalar (string/
+// float64/bool — copied by value on assignment already, so sharing is
+// harmless) or FieldI18nText's map[string]any (a reference type):
+// without this, `data[f.Name] = f.Default` would hand out the exact same
+// map every Create call defaults that field, and crud.Engine.Create
+// returns that same map back as data.Record.Data straight into any
+// registered Hook (internal/kernel/crud/crud.go's runHook). A hook that
+// mutated it in place — none does today; no shipped module Definition
+// even declares a map-typed Default (grepped) — would corrupt the
+// Definition's Default for every subsequent record of that type created
+// in the same process, including every row of a single csvimport/
+// sqlsource batch that reuses one *Definition across many rows. Worse,
+// under concurrent Creates against one shared *Definition, the old code
+// was a genuine data race (two hooks writing the same map from different
+// goroutines), not just a logic bug — this function makes ApplyDefaults
+// strictly read-only on def, which is what TestApplyDefaults_
+// ConcurrentCreatesDoNotRace below actually exercises.
+//
+// A shallow copy is enough: an i18n_text Default only ever holds
+// locale->string scalar values (Definition.Validate's own FieldI18nText
+// shape check enforces this — see validateFieldValue's FieldI18nText
+// case), never a further-nested reference type a shallow copy wouldn't
+// reach. Stays generic on purpose (dispatches on the Go value's shape,
+// not on Field.Type or entity_type) per this package's own kernel/
+// deterministic-core boundary rule — the same reason the FieldI18nText
+// shape check itself doesn't switch on Field.Type either. That also
+// means this function's protection is scoped to map[string]any
+// specifically, not "any reference type" — today that's exactly the set
+// of shapes a published Default can legally carry (see the point
+// above), but it would silently stop being complete if a future
+// FieldType's Default were ever validated to allow a slice or nested
+// map; nothing currently enforces that coupling.
+//
+// maps.Clone, not a hand-rolled loop, for one behavioral reason beyond
+// brevity: maps.Clone(nil) returns nil, preserving a typed-nil map
+// Default's existing "notes":null persisted shape. A hand-rolled
+// `make(map[string]any, len(m))` would instead normalize it to
+// "notes":{} — not wrong (both read back as "no translation"), but an
+// unintended, undocumented shape change this function has no reason to
+// introduce.
+func cloneDefault(v any) any {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return v
+	}
+	return maps.Clone(m)
 }
 
 // ValidateRecord checks a record's data against its Definition — the

@@ -248,6 +248,84 @@ func TestEngine_Create_ExplicitValueNotOverriddenByDefault(t *testing.T) {
 	}
 }
 
+// TestEngine_Create_HookMutatingI18nDefaultDoesNotLeakToNextCreate is the
+// integration-level proof for uc-infra#219, end to end through the real
+// path a shipped Hook would take: data.Record.Data is the very map
+// entity.ApplyDefaults wrote a FieldI18nText Default into
+// (data.RecordRepo.CreateTx returns the same map it was handed), and
+// runHook passes that same rec straight to any registered Hook. Before
+// the fix, a hook mutating rec.Data[i18nField] in place here would
+// corrupt the shared *entity.Definition's own Field.Default for every
+// later Create against that Definition — this simulates exactly that
+// hook shape and proves it can no longer happen. See
+// internal/kernel/entity's TestApplyDefaults/TestCloneDefault for the
+// pure per-function unit coverage this exercises through the real
+// database-backed write path.
+func TestEngine_Create_HookMutatingI18nDefaultDoesNotLeakToNextCreate(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	def := &entity.Definition{
+		EntityType: "Asset",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "name", Type: entity.FieldString, Required: true},
+			{Name: "notes", Type: entity.FieldI18nText, Default: map[string]any{"en": "No notes yet"}},
+		},
+	}
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	// A hook that mutates the record's own i18n_text field in place —
+	// not a hypothetical, just an ordinary in-place edit a real Hook
+	// could plausibly make (e.g. appending an audit note to a shared
+	// text field) with no reason to suspect it's touching Definition
+	// state rather than its own record's data.
+	engine.SetHook("Asset", func(_ context.Context, _ *sql.Tx, _ *entity.Definition, rec data.Record, _ audit.Action, _ audit.Actor) error {
+		if notes, ok := rec.Data["notes"].(map[string]any); ok {
+			notes["en"] = "mutated by record #1's hook"
+		}
+		return nil
+	})
+
+	rec1, err := engine.Create(ctx, def, map[string]any{"name": "Forklift"}, actor)
+	if err != nil {
+		t.Fatalf("Create #1: %v", err)
+	}
+	// The hook fires after data.RecordRepo.CreateTx has already inserted
+	// (marshaled-to-JSON) record #1's row, so its in-place mutation of
+	// rec.Data never reaches what's actually stored for record #1 either
+	// way — that's not the invariant this test is after. What matters is
+	// whether the hook's mutation reached the map ApplyDefaults handed
+	// out, i.e. the *Definition's own Default, checked directly below.
+	rec1Notes, ok := rec1.Data["notes"].(map[string]any)
+	if !ok || rec1Notes["en"] != "mutated by record #1's hook" {
+		t.Fatalf("expected the hook's own mutation to have actually landed on rec1.Data (sanity check on the test itself): %v", rec1.Data["notes"])
+	}
+
+	// The Definition's own Default must be untouched by record #1's
+	// hook — this is the actual invariant uc-infra#219 protects.
+	defDefault, ok := def.Fields[1].Default.(map[string]any)
+	if !ok {
+		t.Fatalf("def.Fields[1].Default = %v (%T), want map[string]any", def.Fields[1].Default, def.Fields[1].Default)
+	}
+	if defDefault["en"] != "No notes yet" {
+		t.Fatalf("def.Fields[1].Default[\"en\"] = %v, want the Definition's own stored Default left untouched by record #1's hook", defDefault["en"])
+	}
+
+	rec2, err := engine.Create(ctx, def, map[string]any{"name": "Pallet Jack"}, actor)
+	if err != nil {
+		t.Fatalf("Create #2: %v", err)
+	}
+	got2, err := engine.Get(ctx, def, rec2.ID)
+	if err != nil {
+		t.Fatalf("Get #2: %v", err)
+	}
+	notes2, ok := got2.Data["notes"].(map[string]any)
+	if !ok || notes2["en"] != "No notes yet" {
+		t.Errorf(`record #2's notes = %v, want the pristine Default "No notes yet" — record #1's hook mutation must not leak into record #2`, got2.Data["notes"])
+	}
+}
+
 // TestEngine_Create_NilFieldsMapDoesNotPanic proves Create's own nil
 // normalization (immediately above the entity.ApplyDefaults call) does
 // its job. entity.ApplyDefaults writes into the map it's given, and

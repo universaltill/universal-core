@@ -952,4 +952,154 @@ func TestApplyDefaults(t *testing.T) {
 			t.Errorf("notes = %v, want default i18n_text map", data["notes"])
 		}
 	})
+
+	// Regression test for uc-infra#219: a reference-typed Default
+	// (FieldI18nText's map[string]any) must never be handed out by the
+	// same underlying map twice. Before the fix, `data[f.Name] =
+	// f.Default` copied the reference, not the value — mutating the map
+	// ApplyDefaults wrote into a record's data would silently corrupt
+	// the Definition's own Field.Default for every later record of that
+	// type, in-process. This never surfaced through crud.Engine.Create
+	// today only because no shipped Hook mutates rec.Data in place; this
+	// test proves the invariant directly, at the one function actually
+	// responsible for it, rather than relying on that being true forever.
+	t.Run("a FieldI18nText Default is never aliased across two ApplyDefaults calls", func(t *testing.T) {
+		def := &Definition{EntityType: "Asset", Fields: []Field{
+			{Name: "notes", Type: FieldI18nText, Default: map[string]any{"en": "No notes yet"}},
+		}}
+
+		first := map[string]any{}
+		ApplyDefaults(def, first)
+		firstNotes, ok := first["notes"].(map[string]any)
+		if !ok {
+			t.Fatalf("first[\"notes\"] = %v, want an i18n_text map", first["notes"])
+		}
+
+		// Simulate a hook mutating the record's own data map in place —
+		// exactly the shape crud.Engine.Create's runHook would allow,
+		// since data.Record.Data is the very map ApplyDefaults wrote
+		// into (internal/data/records.go's CreateTx returns the same
+		// map it was handed).
+		firstNotes["en"] = "Corrupted by a hook mutating record #1"
+
+		second := map[string]any{}
+		ApplyDefaults(def, second)
+		secondNotes, ok := second["notes"].(map[string]any)
+		if !ok {
+			t.Fatalf("second[\"notes\"] = %v, want an i18n_text map", second["notes"])
+		}
+		if secondNotes["en"] != "No notes yet" {
+			t.Errorf(`second["notes"]["en"] = %v, want the Definition's pristine Default "No notes yet" — record #1's mutation leaked into record #2's default`, secondNotes["en"])
+		}
+
+		// And the Definition's own Default, read directly, must also be
+		// untouched — the actual invariant this function protects: the
+		// Definition is shared, long-lived, reused-across-many-records
+		// state, and no per-record write may ever mutate it.
+		defDefault := def.Fields[0].Default.(map[string]any)
+		if defDefault["en"] != "No notes yet" {
+			t.Errorf(`def.Fields[0].Default["en"] = %v, want the Definition's own stored Default left untouched by any caller's later mutation`, defDefault["en"])
+		}
+	})
+}
+
+// TestApplyDefaults_ConcurrentCreatesDoNotRace is the sharper half of
+// uc-infra#219's independent review (finding S2): before the fix, two
+// goroutines calling ApplyDefaults against one shared *Definition and
+// then mutating their own returned FieldI18nText map were not just
+// risking a logic bug (record #2 silently getting record #1's mutated
+// default) — they were both writing into the exact same underlying map,
+// a genuine concurrent map write that Go's runtime detects as fatal
+// (`fatal error: concurrent map writes`), unrecoverable and uncatchable,
+// unlike a normal panic. cloneDefault makes ApplyDefaults strictly
+// read-only on def, so many goroutines sharing one *Definition (the
+// ordinary case — csvimport/sqlsource reuse one *Definition across many
+// rows, and nothing about that today is single-threaded by contract)
+// must never race. Run with `go test -race` to actually catch a
+// regression here — without -race this test can pass even against the
+// pre-fix code, since a lost update is silent and a concurrent-map-write
+// crash is timing-dependent, not guaranteed on every run.
+func TestApplyDefaults_ConcurrentCreatesDoNotRace(t *testing.T) {
+	def := &Definition{EntityType: "Asset", Fields: []Field{
+		{Name: "notes", Type: FieldI18nText, Default: map[string]any{"en": "No notes yet"}},
+	}}
+
+	const n = 50
+	done := make(chan map[string]any, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			data := map[string]any{}
+			ApplyDefaults(def, data)
+			// Simulate a hook mutating this goroutine's own returned
+			// record data in place — exactly the shape that raced
+			// against def.Fields[0].Default pre-fix.
+			if notes, ok := data["notes"].(map[string]any); ok {
+				notes["en"] = "mutated by a concurrent goroutine"
+			}
+			done <- data
+		}()
+	}
+
+	for i := 0; i < n; i++ {
+		<-done
+	}
+
+	defDefault := def.Fields[0].Default.(map[string]any)
+	if defDefault["en"] != "No notes yet" {
+		t.Errorf(`after %d concurrent ApplyDefaults+mutate calls, def.Fields[0].Default["en"] = %v, want the Definition's own stored Default left untouched`, n, defDefault["en"])
+	}
+}
+
+func TestCloneDefault(t *testing.T) {
+	t.Run("a map value is copied into a distinct map with equal contents", func(t *testing.T) {
+		src := map[string]any{"en": "Hello", "tr": "Merhaba"}
+		got := cloneDefault(src)
+		gotMap, ok := got.(map[string]any)
+		if !ok {
+			t.Fatalf("cloneDefault(map) = %T, want map[string]any", got)
+		}
+		if len(gotMap) != len(src) || gotMap["en"] != "Hello" || gotMap["tr"] != "Merhaba" {
+			t.Errorf("cloneDefault(%v) = %v, want an equal-contents copy", src, gotMap)
+		}
+		gotMap["en"] = "mutated"
+		if src["en"] != "Hello" {
+			t.Errorf("mutating the clone changed the source map: src[\"en\"] = %v, want \"Hello\" untouched", src["en"])
+		}
+	})
+
+	// A typed-nil map[string]any Default (Field{Type: FieldI18nText,
+	// Default: map[string]any(nil)}) passes Definition.Validate (its
+	// FieldI18nText shape check ranges over a nil map without error) and
+	// ApplyDefaults's own `f.Default == nil` guard (a non-nil interface
+	// holding a nil map isn't a nil interface), so this shape does reach
+	// cloneDefault in practice, not just in this test. maps.Clone(nil)
+	// returning nil — not a non-nil empty map — preserves the pre-#219
+	// persisted shape ("notes":null, not "notes":{}) for exactly this
+	// case; a hand-rolled `make(map[string]any, len(m))` would silently
+	// change that (uc-infra#219's own independent review, finding S1).
+	t.Run("a nil map is returned as nil, not normalized to a non-nil empty map", func(t *testing.T) {
+		var src map[string]any
+		got := cloneDefault(src)
+		gotMap, ok := got.(map[string]any)
+		if !ok {
+			t.Fatalf("cloneDefault(nil map) = %T, want map[string]any", got)
+		}
+		if gotMap != nil {
+			t.Errorf("cloneDefault(nil map) = %#v, want nil (preserving the pre-existing persisted shape), not a normalized empty map", gotMap)
+		}
+	})
+
+	t.Run("every scalar Default type is returned unchanged, not wrapped or copied", func(t *testing.T) {
+		for _, v := range []any{"a string", float64(42), true, false, float64(0), ""} {
+			if got := cloneDefault(v); got != v {
+				t.Errorf("cloneDefault(%v) = %v (%T), want the identical scalar back", v, got, got)
+			}
+		}
+	})
+
+	t.Run("nil is returned unchanged", func(t *testing.T) {
+		if got := cloneDefault(nil); got != nil {
+			t.Errorf("cloneDefault(nil) = %v, want nil", got)
+		}
+	})
 }
