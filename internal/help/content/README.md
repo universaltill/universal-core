@@ -68,6 +68,15 @@ renderer is narrower than full CommonMark:
   with the viewer's own `/help/search` endpoint, so don't add one.
   `assets` (see below) is reserved the same way — don't create a topic
   id starting with `assets/`.
+- A `-`/`1.` list item may wrap across multiple source lines for
+  readability (most of this directory's numbered steps do) — a
+  following line folds into the same item as long as it isn't blank,
+  isn't itself a new list marker, and isn't a heading (uc-infra#207).
+  That cuts the other way too: **a real paragraph immediately after a
+  list, with no blank line between them, gets folded into the list's
+  last item instead of starting its own `<p>`.** Always leave a blank
+  line between a list and whatever comes next, the same as you already
+  would between two paragraphs.
 
 ## Images / screenshots (uc-infra#145)
 

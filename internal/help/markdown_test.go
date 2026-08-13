@@ -252,6 +252,123 @@ func TestRenderMarkdown_ConsecutiveListLinesBecomeOneList(t *testing.T) {
 	}
 }
 
+// TestRenderMarkdown_OrderedListItemWrappedAcrossSourceLines is the
+// regression test for uc-infra#207: parseBlocks had no support for the
+// indented-continuation-line convention used throughout this repo's own
+// help content (132 files) to wrap a long list item across multiple
+// source lines for readability. A continuation line fell through to the
+// paragraph branch, which truncated the item mid-sentence, closed the
+// list early, and — worse — made a following list item start a brand
+// new <ol> restarting at "1." instead of continuing the sequence. See
+// the issue for the exact real-content example this reproduces.
+func TestRenderMarkdown_OrderedListItemWrappedAcrossSourceLines(t *testing.T) {
+	md := "1. Type a short title and a description of the problem. You can also record\n" +
+		"   a voice note, which is transcribed automatically and appended to your\n" +
+		"   description — useful when typing out a long explanation is inconvenient.\n" +
+		"2. Submit the report.\n"
+	html, plain := RenderMarkdown(md)
+	s := string(html)
+
+	if strings.Count(s, "<ol>") != 1 || strings.Count(s, "</ol>") != 1 {
+		t.Fatalf("html = %q, expected exactly one <ol>...</ol>, not a second list restarting the numbering", s)
+	}
+	if strings.Count(s, "<li>") != 2 {
+		t.Fatalf("html = %q, expected exactly 2 <li> items (the wrapped one plus item 2), got %d", s, strings.Count(s, "<li>"))
+	}
+	wantFirstItem := "<li>Type a short title and a description of the problem. You can also record " +
+		"a voice note, which is transcribed automatically and appended to your " +
+		"description — useful when typing out a long explanation is inconvenient.</li>"
+	if !strings.Contains(s, wantFirstItem) {
+		t.Errorf("html = %q, expected the wrapped item folded into one complete <li>:\n%s", s, wantFirstItem)
+	}
+	if strings.Contains(s, "<p>") {
+		t.Errorf("html = %q, expected no stray <p> — the continuation line must not split off into its own paragraph", s)
+	}
+	if !strings.Contains(plain, "voice note") || !strings.Contains(plain, "inconvenient") {
+		t.Errorf("plain = %q, expected the continuation text present in the search-indexed plain text too", plain)
+	}
+}
+
+// TestRenderMarkdown_UnorderedListItemWrappedAcrossSourceLines is the
+// unordered-list counterpart of the ordered-list case above — parseBlocks
+// has separate scanning loops for "-"/"*" vs. "1." lists, so the fix (and
+// its regression coverage) needs to cover both independently.
+func TestRenderMarkdown_UnorderedListItemWrappedAcrossSourceLines(t *testing.T) {
+	md := "- The first item wraps across\n  a second source line for readability.\n- The second item is short.\n"
+	html, _ := RenderMarkdown(md)
+	s := string(html)
+
+	if strings.Count(s, "<ul>") != 1 {
+		t.Fatalf("html = %q, expected exactly one <ul> grouping both items", s)
+	}
+	if strings.Count(s, "<li>") != 2 {
+		t.Fatalf("html = %q, expected exactly 2 <li> items, got %d", s, strings.Count(s, "<li>"))
+	}
+	if !strings.Contains(s, "<li>The first item wraps across a second source line for readability.</li>") {
+		t.Errorf("html = %q, expected the wrapped item folded into one complete <li>", s)
+	}
+}
+
+// TestRenderMarkdown_ListItemThenBlankLineThenParagraph_NotFoldedIn locks
+// in the negative case the fix above must not break: a list ended by a
+// genuine blank line, followed by a real new paragraph, must stay two
+// separate blocks — the fix must fold continuation lines without
+// swallowing everything after a list forever.
+func TestRenderMarkdown_ListItemThenBlankLineThenParagraph_NotFoldedIn(t *testing.T) {
+	html, _ := RenderMarkdown("- a\n- b\n\nA real new paragraph, not a continuation.\n")
+	s := string(html)
+
+	if strings.Count(s, "<li>") != 2 {
+		t.Fatalf("html = %q, expected exactly 2 <li> items", s)
+	}
+	if !strings.Contains(s, "<li>b</li>\n</ul>\n<p>A real new paragraph, not a continuation.</p>") {
+		t.Errorf("html = %q, expected the list to close on the blank line and the following text to render as its own paragraph, unfolded", s)
+	}
+}
+
+// TestRenderMarkdown_ListItemThenHeading_NotFoldedIn covers a second
+// negative case not spelled out in the issue but symmetric with it: a
+// heading immediately following a list item (no blank line) is a new
+// block starting with "#", not continuation prose, and must not be
+// folded into the preceding <li> just because there was no blank line.
+func TestRenderMarkdown_ListItemThenHeading_NotFoldedIn(t *testing.T) {
+	html, _ := RenderMarkdown("- a\n## Next section\n")
+	s := string(html)
+
+	if !strings.Contains(s, "<li>a</li>") {
+		t.Errorf("html = %q, expected item a to stay intact, not swallow the heading", s)
+	}
+	if !strings.Contains(s, "<h2>Next section</h2>") {
+		t.Errorf("html = %q, expected the heading to render as its own block, not folded into the list item", s)
+	}
+}
+
+// TestRenderMarkdown_ContinuationLineStartingWithLiteralHash_StillFolds is
+// the regression test for a real edge case independent review found in
+// the fix above: isListContinuationLine originally rejected any line
+// starting with a literal "#" (not just the three recognized heading
+// prefixes "# "/"## "/"### "), which re-created this same truncation bug
+// for a continuation line that happens to start with a "#" token, e.g. an
+// issue/document reference like "#INV-2024-001" wrapped onto its own
+// source line. The check now matches parseBlocks' own heading prefixes
+// exactly, so a bare "#" followed by anything other than a space still
+// folds as ordinary continuation text.
+func TestRenderMarkdown_ContinuationLineStartingWithLiteralHash_StillFolds(t *testing.T) {
+	md := "- Enter the reference in the\n  #INV-2024-001 format shown above.\n- next\n"
+	html, _ := RenderMarkdown(md)
+	s := string(html)
+
+	if strings.Count(s, "<ul>") != 1 {
+		t.Fatalf("html = %q, expected exactly one <ul> — a #-leading continuation line must not close the list early", s)
+	}
+	if strings.Count(s, "<li>") != 2 {
+		t.Fatalf("html = %q, expected exactly 2 <li> items, got %d", s, strings.Count(s, "<li>"))
+	}
+	if !strings.Contains(s, "<li>Enter the reference in the #INV-2024-001 format shown above.</li>") {
+		t.Errorf("html = %q, expected the #-leading continuation folded into the same <li>, not truncated into a stray paragraph", s)
+	}
+}
+
 func TestRenderMarkdown_UnrecognizedInputEscapedAsParagraph(t *testing.T) {
 	html, plain := RenderMarkdown("<script>alert('xss')</script>")
 	s := string(html)
