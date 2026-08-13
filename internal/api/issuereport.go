@@ -624,8 +624,23 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
   var statusEl = document.getElementById("uc-issue-record-status");
   var transcriptEl = document.getElementById("uc-issue-transcript");
   var descriptionEl = document.getElementById("uc-issue-description");
+  // mediaRecorder only ever needs to identify "the currently active
+  // recording" for the Stop branch below (mediaRecorder.stop()) — it is
+  // never read inside onstop/ondataavailable, so reassigning it on every
+  // Record click is safe. chunks is NOT declared here (uc-infra#196): it
+  // used to be a shared outer-scope array, reset in place on every Record
+  // click and read by whichever take's onstop happened to fire, whenever
+  // that was. Stop resets recording/the button label synchronously, but
+  // a real MediaRecorder's onstop/ondataavailable fire asynchronously — a
+  // fast Stop-then-Record-again, before the first take's onstop has
+  // actually run, let the second take's reset wipe the shared array out
+  // from under the first take's still-pending upload. chunks is now
+  // declared fresh with var inside the getUserMedia .then() callback
+  // below instead, so every take gets its own array that its own
+  // ondataavailable/onstop close over — a var inside a function body is
+  // scoped to that specific invocation, not shared across the callback's
+  // repeated invocations, so no other closure machinery is needed.
   var mediaRecorder = null;
-  var chunks = [];
   var recording = false;
 
   // Deliberately an if/else, NOT an early "return" out of the whole IIFE
@@ -700,7 +715,10 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
         // recorder takes none), so this catches any other constructor
         // failure instead.
         try {
-          chunks = [];
+          // Local to this .then() invocation (uc-infra#196) — see the
+          // outer-scope comment above for why this can no longer be the
+          // shared chunks the old code reassigned here.
+          var chunks = [];
           mediaRecorder = new MediaRecorder(stream);
           mediaRecorder.ondataavailable = function(e) { if (e.data.size > 0) chunks.push(e.data); };
           mediaRecorder.onstop = function() {
@@ -776,12 +794,29 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
     var previewWrap = document.getElementById("uc-issue-screenrecord-preview-wrap");
     var previewEl = document.getElementById("uc-issue-screenrecord-preview");
     var fileInput = document.getElementById("uc-issue-screenrecord-file");
+    // screenRecorder identifies "the currently active recording" for the
+    // Stop branch below AND the auto-stop timeout's own guard further
+    // down (unlike the mic handler's mediaRecorder, which only the Stop
+    // branch reads) — both are fine to read the reassigned outer value,
+    // since both only ever act on whatever recording is current right
+    // now. screenChunks/screenTimerId/screenAutoStopId/screenStartedAt
+    // are NOT declared here (uc-infra#196, same defense-in-depth fix as
+    // the mic handler) — each is now declared fresh with var inside the
+    // getDisplayMedia .then() callback below, so every take gets its own
+    // copies. Verified against this handler's actual Stop branch (if
+    // (screenRecording) { screenRecorder.stop(); return; }) that, unlike
+    // the mic handler, screenRecording/the button label are only ever
+    // reset inside onstop, never synchronously on Stop click — so a
+    // screen-record "Stop then Record again" click sequence can't reach a
+    // second recording the way the mic race description depends on (the
+    // second click is read as another Stop, not a new Record, until
+    // onstop has already run). This fix is kept anyway for consistency
+    // with the mic handler and because it closes a latent hazard rather
+    // than a currently-reachable one — if Stop's reset timing is ever
+    // changed to be synchronous (matching the mic handler), this would
+    // otherwise become live at that point instead of being caught here.
     var screenRecorder = null;
-    var screenChunks = [];
     var screenRecording = false;
-    var screenTimerId = null;
-    var screenAutoStopId = null;
-    var screenStartedAt = 0;
 
     // revokePreviousPreview releases the previous recording's blob: URL
     // (if any) before a new one replaces it — independent review,
@@ -821,7 +856,9 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
         screenBtn.disabled = true;
         navigator.mediaDevices.getDisplayMedia({ video: true }).then(function(stream) {
           screenBtn.disabled = false;
-          screenChunks = [];
+          // Local to this .then() invocation (uc-infra#196) — see the
+          // outer-scope comment above.
+          var screenChunks = [];
           // try/catch around everything from the MediaRecorder
           // constructor fallback through screenRecorder.start(), not
           // just the primary constructor call (independent review,
@@ -900,8 +937,19 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
             screenRecorder.start();
             screenRecording = true;
             screenBtn.textContent = {{.StopLabel}};
-            screenStartedAt = Date.now();
-            screenTimerId = setInterval(function() {
+            // Local to this .then() invocation (uc-infra#196), same as
+            // screenChunks above — independent review: this was left
+            // shared in an earlier draft even though only the per-take
+            // interval callback just below reads it, which would have
+            // let a still-running earlier take's ticker read a newer
+            // take's start time once started.
+            var screenStartedAt = Date.now();
+            // Also local (uc-infra#196) — onstop's clearInterval/
+            // clearTimeout calls above (in the onstop handler defined
+            // earlier in this same .then() callback) close over these via
+            // the normal closure/hoisting rules, same as every other
+            // local var in this scope.
+            var screenTimerId = setInterval(function() {
               var elapsed = Math.floor((Date.now() - screenStartedAt) / 1000);
               var m = Math.floor(elapsed / 60);
               var s = elapsed % 60;
@@ -913,7 +961,7 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
             // mid-recording server round-trip; the blob.size check above
             // is what actually bounds the upload, since duration alone
             // doesn't bound bytes at an unpredictable real-world bitrate.
-            screenAutoStopId = setTimeout(function() {
+            var screenAutoStopId = setTimeout(function() {
               if (screenRecording && screenRecorder && screenRecorder.state !== "inactive") {
                 screenRecorder.stop();
               }
