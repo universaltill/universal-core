@@ -341,14 +341,19 @@ func TestUniversalCore_TenantPrefixRoute_RegisteredAndGated(t *testing.T) {
 }
 
 // TestUniversalCore_ReportRoutes_RegisteredAndGated is the smoke layer
-// for the report pages — the RFQ vendor-comparison report (#9) and the
-// purchasing report it shares requireReportRead with: the real compiled
-// binary registers both on the production mux (401 from the auth
+// for the report pages — the RFQ vendor-comparison report (#9), the
+// purchasing report it shares requireReportRead with, and the Project
+// budget planned-vs-actual report (uc-infra#187): the real compiled
+// binary registers all three on the production mux (401 from the auth
 // wrapper, not the mux's own 404) rather than only internal/api's
-// httptest mux knowing about them. The RFQ route is path-parameterised
-// (/reports/rfq/{id}), so a bare registration bug there would surface as
-// a 404 for every id — worth pinning at the binary level, since nothing
-// in the UI links to it yet for a human to notice.
+// httptest mux knowing about them. The RFQ and project-budget routes are
+// path-parameterised (/reports/rfq/{id}, /reports/project-budget/{id}),
+// so a bare registration bug there would surface as a 404 for every id —
+// worth pinning at the binary level even though both are now reachable
+// from the UI (RequestForQuotationForm's "Compare Quotes",
+// ProjectForm's "Budget vs Actual") — those in-app links only prove the
+// route resolves for whatever id they were seeded with, not that
+// registration itself is intact against the real compiled binary.
 func TestUniversalCore_ReportRoutes_RegisteredAndGated(t *testing.T) {
 	controlDSN := testexec.FreshDatabase(t, "uc_test_server_control")
 	baseURL := startServer(t, controlDSN, "INSECURE_DEV_AUTH=true")
@@ -356,6 +361,7 @@ func TestUniversalCore_ReportRoutes_RegisteredAndGated(t *testing.T) {
 	for _, path := range []string{
 		"/reports/purchasing",
 		"/reports/rfq/00000000-0000-0000-0000-000000000000",
+		"/reports/project-budget/00000000-0000-0000-0000-000000000000",
 	} {
 		resp, err := http.Get(baseURL + path)
 		if err != nil {

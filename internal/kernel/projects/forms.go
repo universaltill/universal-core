@@ -10,10 +10,19 @@ import "github.com/universaltill/universal-core/internal/kernel/form"
 // Lines, the identical reasoning applies to Project.budget (uc-infra#79
 // — see the package doc comment for why a computed actual isn't here
 // either). Budget is what the project actually commits to.
+//
+// The "Budget vs Actual" navigate action (v2, uc-infra#187) mirrors
+// RequestForQuotationForm's "Compare Quotes" action: GET
+// /reports/project-budget/{id} (data.ReportingRepo.ProjectBudgetActuals,
+// uc-infra#134) has existed since before this form did, it was just
+// unreachable from any rendered page — the {id} placeholder is
+// formrender's per-record navigate substitution (form.Action.Route's own
+// doc comment), so it's simply absent on the "new" form (nothing to
+// compare on an unsaved Project) rather than a dead link.
 func ProjectForm() *form.Definition {
 	return &form.Definition{
 		EntityType: "Project",
-		Version:    1,
+		Version:    2,
 		Sections: []form.Section{
 			{
 				Title:     "Project",
@@ -48,6 +57,7 @@ func ProjectForm() *form.Definition {
 		},
 		Actions: []form.Action{
 			{Label: "Save", Op: form.OpSave},
+			{Label: "Budget vs Actual", Op: form.OpNavigate, Route: "/reports/project-budget/{id}"},
 		},
 	}
 }

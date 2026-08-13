@@ -65,9 +65,9 @@ func slugifyRoute(route string) string {
 // import wizard, export, reports, admin) — same deterministic-derivation
 // shape, keyed by a caller-supplied stable route name instead of an
 // entity type. Exported and unit-tested by this slice; wiring it onto
-// any specific non-entity page is explicitly deferred to whichever
-// future slice or page touches that route next (ADR-0023) — none of
-// today's Definitions or handlers call it yet.
+// any specific non-entity page was left to whichever future slice or
+// page touched that route next (ADR-0023) — its first production caller
+// is internal/api/project_budget_report.go (uc-infra#187).
 func RouteTopicID(route string) string {
 	return "route/" + slugifyRoute(route)
 }
