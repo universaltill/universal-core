@@ -803,10 +803,9 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
     // are NOT declared here (uc-infra#196, same defense-in-depth fix as
     // the mic handler) — each is now declared fresh with var inside the
     // getDisplayMedia .then() callback below, so every take gets its own
-    // copies. Verified against this handler's actual Stop branch (if
-    // (screenRecording) { screenRecorder.stop(); return; }) that, unlike
-    // the mic handler, screenRecording/the button label are only ever
-    // reset inside onstop, never synchronously on Stop click — so a
+    // copies. Verified against this handler's actual Stop branch that,
+    // unlike the mic handler, screenRecording/the button label are only
+    // ever reset inside onstop, never synchronously on Stop click — so a
     // screen-record "Stop then Record again" click sequence can't reach a
     // second recording the way the mic race description depends on (the
     // second click is read as another Stop, not a new Record, until

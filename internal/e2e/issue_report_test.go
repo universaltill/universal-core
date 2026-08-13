@@ -1302,29 +1302,39 @@ func TestIssueReportPage_ScreenRecord_DoubleClickDoesNotStartTwoStreams(t *testi
 
 // TestIssueReportPage_ScreenRecord_RedundantStopClickDoesNotThrow is the
 // regression test for uc-infra#220, found while verifying uc-infra#196's own
-// "same structure, same bug" claim against the actual code: the screen-record
-// button's Stop branch (`if (screenRecording) { screenRecorder.stop();
-// return; }`) never resets `screenRecording` synchronously — only `onstop`
-// does, and that fires asynchronously — so a second click on Stop before the
-// first click's `onstop` has run reads `screenRecording` as still true and
-// calls `.stop()` again. Per the MediaStream Recording spec,
-// `MediaRecorder.state` transitions to "inactive" *synchronously* as part of
-// the first `.stop()` call, well before `onstop` fires, and `.stop()` is
-// spec'd to throw `InvalidStateError` when called while already "inactive" —
-// an uncaught exception inside this click handler.
+// "same structure, same bug" claim against the actual code. Pre-fix, the
+// screen-record button's Stop branch was a bare `if (screenRecording) {
+// screenRecorder.stop(); return; }`: it never reset `screenRecording`
+// synchronously — only `onstop` does, and that fires asynchronously — so a
+// second click on Stop before the first click's `onstop` had run read
+// `screenRecording` as still true and called `.stop()` again. Per the
+// MediaStream Recording spec, `MediaRecorder.state` transitions to
+// "inactive" *synchronously* as part of the first `.stop()` call, well
+// before `onstop` fires, and `.stop()` is spec'd to throw `InvalidStateError`
+// when called while already "inactive" — an uncaught exception inside the
+// click handler. Fixed by guarding the call with `screenRecorder.state !==
+// "inactive"`, the same guard the auto-stop timeout below it already uses.
 //
-// Every other fake MediaRecorder in this file (including the one just above,
-// in TestIssueReportPage_ScreenRecord_DoubleClickDoesNotStartTwoStreams)
-// fires `onstop` synchronously, inline inside `.stop()` itself — which is
-// exactly why none of them can reach this bug: there is no window between
-// the state transition and `onstop` for a redundant click to land in. This
-// fake instead defers `onstop` to an explicit `window.__fireOnstop()` call
-// the test controls, the same deterministic-timing technique
-// TestIssueReportPage_MicRecord_StopThenRecordAgainDoesNotMixTakes above
-// uses (not a real timer/scheduler race — the flakiness class uc-infra#203
-// already tracks for this file) — and has `.stop()` throw
-// `InvalidStateError` when called on an already-"inactive" recorder, matching
-// the real spec precisely enough to actually pin this bug.
+// Every other *screen-record* fake MediaRecorder in this file (including the
+// one just above, in
+// TestIssueReportPage_ScreenRecord_DoubleClickDoesNotStartTwoStreams) fires
+// `onstop` synchronously, inline inside `.stop()` itself — which is exactly
+// why none of them can reach this bug: there is no window between the state
+// transition and `onstop` for a redundant click to land in. (Two *mic* fakes
+// elsewhere in this file — StopThenRecordAgainDoesNotMixTakes and its
+// LateDataDoesNotLeakAcrossTakes sibling, below — also defer `onstop`, but
+// can't reach this bug either, for an unrelated reason: the mic Stop branch
+// resets `recording` synchronously, so a second click there is read as a new
+// Record, not a second Stop.) This fake instead defers `onstop` to an
+// explicit `window.__fireOnstop()` call the test controls — the same
+// deterministic-timing technique those two mic tests use (not a real
+// timer/scheduler race — the flakiness class uc-infra#203 already tracks for
+// this file) — and has `.stop()` throw `InvalidStateError` when called on an
+// already-"inactive" recorder, matching the real spec closely enough to
+// actually pin this bug (though its initial `state` of "recording" in the
+// constructor, matching every other fake in this file, is not itself
+// spec-accurate — a real MediaRecorder starts "inactive" until `start()` —
+// harmless here since the guard is only ever reached after `start()`).
 func TestIssueReportPage_ScreenRecord_RedundantStopClickDoesNotThrow(t *testing.T) {
 	withDevAuthEnabled(t)
 	srv, tenantID, _ := testServerWithBlobstore(t)
@@ -1358,6 +1368,7 @@ func TestIssueReportPage_ScreenRecord_RedundantStopClickDoesNotThrow(t *testing.
       }
       self.state = "inactive";
     };
+    this.ondataavailable = null;
     window.__recorder = self;
   };
 })();
@@ -1372,8 +1383,47 @@ func TestIssueReportPage_ScreenRecord_RedundantStopClickDoesNotThrow(t *testing.
 	if err := chromedp.Run(ctx,
 		chromedp.Navigate(srv.URL+"/issue-report/new"),
 		chromedp.WaitVisible(`#uc-issue-screenrecord-btn`, chromedp.ByQuery),
-		chromedp.Click(`#uc-issue-screenrecord-btn`, chromedp.ByQuery), // start
 	); err != nil {
+		t.Fatalf("navigate to the issue-report page: %v", err)
+	}
+
+	// Canary, before the real scenario: prove window.addEventListener("error",
+	// ...) actually captures an exception thrown inside a DOM click listener
+	// in this browser/page, before trusting its absence as proof of anything
+	// below. Without this, the whole test would pass just as well if a future
+	// change silently broke the hook (e.g. wrapping the handler body in its
+	// own try/catch, or something clobbering the listener) — the same
+	// vacuous-pass risk TestIssueReportPage_ScreenRecord_DoubleClickDoesNotStartTwoStreams's
+	// synthetic-dispatch step above exists to avoid for a different guard.
+	var canaryCount int
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`
+		(function() {
+			var b = document.createElement("button");
+			b.id = "uc-test-canary-btn";
+			b.addEventListener("click", function() { throw new Error("canary"); });
+			document.body.appendChild(b);
+		})();
+	`, nil)); err != nil {
+		t.Fatalf("inject canary button: %v", err)
+	}
+	if err := chromedp.Run(ctx, chromedp.Click(`#uc-test-canary-btn`, chromedp.ByQuery)); err != nil {
+		t.Fatalf("click canary button: %v", err)
+	}
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`window.__uncaughtErrors.length`, &canaryCount)); err != nil {
+		t.Fatalf("read canary error count: %v", err)
+	}
+	if canaryCount != 1 {
+		t.Fatalf("canary check failed: expected the error listener to capture exactly 1 uncaught exception from a throwing click handler, got %d — the rest of this test's \"no uncaught errors\" assertion would be meaningless if this hook isn't actually working", canaryCount)
+	}
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`
+		document.getElementById("uc-test-canary-btn").remove();
+		window.__uncaughtErrors = [];
+		void 0;
+	`, nil)); err != nil {
+		t.Fatalf("remove canary button and reset captured errors: %v", err)
+	}
+
+	if err := chromedp.Run(ctx, chromedp.Click(`#uc-issue-screenrecord-btn`, chromedp.ByQuery)); err != nil { // start
 		t.Fatalf("start screen recording: %v", err)
 	}
 	var recordBtnText string
@@ -1405,15 +1455,36 @@ func TestIssueReportPage_ScreenRecord_RedundantStopClickDoesNotThrow(t *testing.
 
 	// The recording still completes normally once onstop actually fires —
 	// the fix's guard must skip the redundant .stop() call, not silently
-	// break the real one.
-	if err := chromedp.Run(ctx, chromedp.Evaluate(`window.__fireOnstop(); void 0;`, nil)); err != nil {
-		t.Fatalf("fire the deferred onstop callback: %v", err)
+	// break the real one. Fires a real data chunk first (every other
+	// screen-record fake in this file does) so this proves the actual
+	// attachment path completed, not merely that the button's label changed.
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`
+		window.__recorder.ondataavailable({ data: new Blob(["fake screen recording bytes"]) });
+		window.__fireOnstop();
+		void 0;
+	`, nil)); err != nil {
+		t.Fatalf("fire the deferred data event and onstop callback: %v", err)
 	}
 	if err := chromedp.Run(ctx, chromedp.PollFunction(
 		`function() { var t = document.getElementById("uc-issue-screenrecord-btn").textContent; return t === "Record screen" ? t : null; }`,
 		&recordBtnText,
 	)); err != nil {
 		t.Fatalf("wait for the button to reset after the recording completes: %v", err)
+	}
+
+	var previewHasSrc bool
+	var fileCount int
+	if err := chromedp.Run(ctx,
+		chromedp.EvaluateAsDevTools(`document.getElementById("uc-issue-screenrecord-preview").hasAttribute("src")`, &previewHasSrc),
+		chromedp.EvaluateAsDevTools(`document.getElementById("uc-issue-screenrecord-file").files.length`, &fileCount),
+	); err != nil {
+		t.Fatalf("read the preview/file-input state: %v", err)
+	}
+	if !previewHasSrc {
+		t.Error("expected a preview src once the recording actually completes — the guard must not have interfered with the real stop's own onstop handling")
+	}
+	if fileCount != 1 {
+		t.Errorf("expected the hidden file input to carry exactly 1 file once the recording actually completes, got %d", fileCount)
 	}
 }
 
