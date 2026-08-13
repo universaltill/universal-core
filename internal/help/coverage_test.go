@@ -166,17 +166,12 @@ func requiredEntityTypes() []string {
 // .github/scripts/check-help-allowlist.sh, run against the PR's base
 // ref by ci.yml, does.
 var undocumentedAllowlist = map[string]bool{
-	"DepreciationSchedule":         true,
 	"Facility":                     true,
-	"FixedAsset":                   true,
 	"GoodsReceipt":                 true,
 	"GoodsReceiptLine":             true,
 	"InventoryItem":                true,
 	"Item":                         true,
-	"MaintenanceOrder":             true,
 	"POLine":                       true,
-	"Project":                      true,
-	"ProjectBudgetLine":            true,
 	"PurchaseOrder":                true,
 	"ReorderRule":                  true,
 	"RequestForQuotation":          true,
@@ -184,8 +179,6 @@ var undocumentedAllowlist = map[string]bool{
 	"RequestForQuotationQuoteLine": true,
 	"RequestForQuotationVendor":    true,
 	"StockTransfer":                true,
-	"Task":                         true,
-	"TimeEntry":                    true,
 	"VendorInvoice":                true,
 }
 
