@@ -31,6 +31,8 @@ erkenden kurar.
 ## Bilinmesi gereken kurallar
 
 - Kod ve ad zorunludur. Alt birim 0 ile 6 arasında olmalıdır.
+- Kod benzersiz olmalıdır — sistem, başka bir Para Birimi tarafından zaten
+  kullanılan bir kodu yeniden kullanan ikinci bir Para Birimini reddeder.
 - Tam olarak bir Para Biriminin **Temel Para Birimi** olarak işaretlenmesi
   gerekir. Sistem ikincisini kesin olarak engellemez, bu yüzden bunu bir
   yönetimsel kural olarak görün — temel para birimine dayanan özellikler

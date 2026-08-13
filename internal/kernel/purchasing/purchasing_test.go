@@ -89,6 +89,30 @@ func TestItem_MissingRequiredSKU(t *testing.T) {
 	}
 }
 
+// TestItem_UniqueOnSKU confirms uc-infra#181's Unique declaration: one
+// live Item per sku — the Definition-level half of a duplicate-sku
+// rejection, which relies on crud.WriteUniqueConstraintKeys rejecting a
+// concurrent second CREATE for the same sku (see
+// TestItem_DuplicateSKURejected in ledger_test.go for the real-Postgres
+// end-to-end case).
+func TestItem_UniqueOnSKU(t *testing.T) {
+	def := Item()
+	if def.Version != 3 {
+		t.Errorf("Item is v%d, want v3 — the sku Unique constraint (uc-infra#181)", def.Version)
+	}
+	if len(def.Unique) != 1 {
+		t.Fatalf("Item.Unique = %v, want exactly one declared set", def.Unique)
+	}
+	want := []string{"sku"}
+	got := append([]string(nil), def.Unique[0]...)
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("Item.Unique[0] = %v, want %v", got, want)
+	}
+	if err := def.Validate(); err != nil {
+		t.Fatalf("Item must validate as a Definition: %v", err)
+	}
+}
+
 // TestPurchaseOrder_VendorReferencesPartyDirectly is the whole point of
 // the Party-Role pattern applied to Purchasing (see this package's doc
 // comment on PurchaseOrder): vendor_id targets Party, not a separate

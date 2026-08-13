@@ -54,8 +54,11 @@ func FixedAsset() *entity.Definition {
 		Module:         "assets",
 		StatusTypeCode: "fixed_asset_status",
 		Fields: []entity.Field{
-			// asset_number is the natural key, same application-level
-			// convention as po_number/so_number/Item.sku.
+			// asset_number is the natural key, the same still-unenforced
+			// application-level convention so_number remains (see
+			// sales.SalesOrder's own doc comment) — po_number and Item.sku
+			// used to be this too, closed respectively by uc-infra#121 and
+			// uc-infra#181.
 			{Name: "asset_number", Type: entity.FieldString, Required: true},
 			{Name: "name", Type: entity.FieldI18nText, Required: true},
 			{Name: "acquisition_date", Type: entity.FieldDate, Required: true},

@@ -29,6 +29,8 @@ or reports in. Most tenants set this up once, early on.
 ## Rules to know
 
 - Code and name are required. The minor unit must be between 0 and 6.
+- Code must be unique — the system rejects a second Currency that reuses a
+  code already in use by another one.
 - Exactly one Currency should be marked **Base Currency**. The system does
   not hard-block a second one, so treat this as an administrative
   convention — features that rely on the base currency (like ledger sync

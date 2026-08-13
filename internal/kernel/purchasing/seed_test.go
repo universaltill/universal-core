@@ -197,7 +197,12 @@ func TestPublish_LeavesRolledBackVersionAlone(t *testing.T) {
 	if err := Publish(ctx, db, actor); err != nil {
 		t.Fatalf("first Publish: %v", err)
 	}
-	if err := repo.Rollback(ctx, "Item", 2, actor); err != nil {
+	// Item().Version, not a hardcoded literal: a fresh tenant DB only
+	// ever sees the current version published, so a literal here goes
+	// stale (and this test starts failing for an unrelated reason) the
+	// next time Item's Version bumps — uc-infra#181 hit exactly that
+	// rolling from 2 to 3 (independent review finding).
+	if err := repo.Rollback(ctx, "Item", Item().Version, actor); err != nil {
 		t.Fatalf("Rollback: %v", err)
 	}
 

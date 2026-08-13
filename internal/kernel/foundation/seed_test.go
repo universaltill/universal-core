@@ -247,6 +247,79 @@ func TestPublishForms_IsIdempotent(t *testing.T) {
 	}
 }
 
+// TestCurrency_DuplicateCodeRejected is the real-Postgres end-to-end
+// case for uc-infra#181's Currency.code Unique declaration (the
+// Definition-shape half is TestCurrency_UniqueOnCode in
+// foundation_test.go): a second Currency created with an already-used
+// code must be rejected by crud.Engine itself — record_unique_keys' real
+// Postgres UNIQUE index (ADR-0018 §3(c)), not an application-level
+// convention a caller could bypass. Mirrors purchasing's
+// TestPurchaseOrder_DuplicatePONumberRejected/TestItem_DuplicateSKURejected
+// exactly, one field over.
+func TestCurrency_DuplicateCodeRejected(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	if err := Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	def := currencyDef(t, tenantDB)
+	engine := crud.NewEngine(tenantDB)
+
+	if _, err := engine.Create(ctx, def, map[string]any{
+		"code": "USD", "name": "US Dollar",
+	}, actor); err != nil {
+		t.Fatalf("create first Currency: %v", err)
+	}
+
+	_, err := engine.Create(ctx, def, map[string]any{
+		"code": "USD", "name": "United States Dollar (duplicate)",
+	}, actor)
+	if err == nil {
+		t.Fatal("expected the second Currency with code \"USD\" to be rejected")
+	}
+	var uniqueErr *crud.UniqueConstraintError
+	if !errors.As(err, &uniqueErr) {
+		t.Fatalf("expected a *crud.UniqueConstraintError, got %T: %v", err, err)
+	}
+	if !errors.Is(err, crud.ErrUniqueConstraintViolation) {
+		t.Fatalf("expected errors.Is(err, crud.ErrUniqueConstraintViolation): %v", err)
+	}
+	if uniqueErr.EntityType != "Currency" {
+		t.Errorf("UniqueConstraintError.EntityType = %q, want %q", uniqueErr.EntityType, "Currency")
+	}
+	if len(uniqueErr.Fields) != 1 || uniqueErr.Fields[0] != "code" {
+		t.Errorf("UniqueConstraintError.Fields = %v, want [code]", uniqueErr.Fields)
+	}
+
+	// A DIFFERENT code must still succeed — this isn't "at most one
+	// Currency," only "code itself must be distinct."
+	if _, err := engine.Create(ctx, def, map[string]any{
+		"code": "GBP", "name": "British Pound",
+	}, actor); err != nil {
+		t.Fatalf("expected a Currency with a distinct code to succeed: %v", err)
+	}
+}
+
+// currencyDef fetches the published Currency Definition from tenantDB,
+// the same "read back what Publish actually wrote" pattern
+// TestDepartment_HierarchyResolvesEndToEnd below uses for Department —
+// exercising the real published/unmarshalled shape a crud.Engine call
+// sees, not just the in-process Currency() literal.
+func currencyDef(t *testing.T, tenantDB *sql.DB) *entity.Definition {
+	t.Helper()
+	v, err := data.NewEntityDefinitionRepo(tenantDB).GetPublished(context.Background(), "Currency")
+	if err != nil {
+		t.Fatalf("GetPublished(Currency): %v", err)
+	}
+	def, err := entity.Unmarshal(v.Definition)
+	if err != nil {
+		t.Fatalf("unmarshal Currency definition: %v", err)
+	}
+	return def
+}
+
 // TestDepartment_HierarchyResolvesEndToEnd is the org-chart mirror of
 // finance's TestAccount_HierarchyResolvesEndToEnd: proves
 // parent_department_id round-trips through the real crud.Engine against
