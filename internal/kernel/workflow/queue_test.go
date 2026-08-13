@@ -81,6 +81,85 @@ func humanActor() audit.Actor {
 	return audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
 }
 
+func agentActor() audit.Actor {
+	return audit.Actor{Type: audit.ActorAgent, ID: "kernel-agent", ModelVersion: "claude-fable-5", Input: "run monthly close"}
+}
+
+// TestQueue_ProcessOne_ActorAgentJobActorValidatesInsideStepHandler is
+// uc-infra#190's end-to-end regression test, at the level the issue
+// itself worried about: no real StepHandler authors an audit entry from
+// job.Actor in production yet, but the moment one does, it will call
+// job.Actor.Validate() (directly, or via audit.New) before trusting the
+// actor it was handed. Before ADR-0027's fix, ClaimNext handed every
+// StepHandler an ActorAgent job.Actor with Input == "", so that
+// Validate() call would have failed here even though the actor that
+// enqueued the job (agentActor(), above) was perfectly valid — a bug
+// that would have surfaced inside the handler, not at Enqueue, exactly
+// as uc-infra#190 described. This handler does what a real future one
+// would: validates job.Actor before treating it as trustworthy.
+func TestQueue_ProcessOne_ActorAgentJobActorValidatesInsideStepHandler(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	def := &Definition{
+		Name: "ai_drafted_notify", Version: 1,
+		Trigger: Trigger{Type: TriggerManual},
+		Steps:   []Step{{Kind: StepNotify}},
+	}
+
+	var sawActor audit.Actor
+	var sawActorInputHash string
+	var validateErr error
+	q, err := NewQueue(db, map[StepKind]StepHandler{
+		StepNotify: func(_ context.Context, job data.WorkflowJob, _ Step) error {
+			sawActor = job.Actor
+			sawActorInputHash = job.ActorInputHash
+			validateErr = job.Actor.Validate()
+			return validateErr
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewQueue: %v", err)
+	}
+
+	actor := agentActor()
+	recordID := "33333333-3333-3333-3333-333333333333"
+	if _, err := q.Enqueue(ctx, def, "FiscalYear", recordID, actor); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	claimed, err := q.ProcessOne(ctx, lookupFor(def))
+	if err != nil {
+		t.Fatalf("ProcessOne: %v", err)
+	}
+	if validateErr != nil {
+		t.Fatalf("StepHandler's job.Actor.Validate() failed: %v", validateErr)
+	}
+	if sawActor.Type != audit.ActorAgent || sawActor.ModelVersion != "claude-fable-5" {
+		t.Fatalf("StepHandler saw actor %+v, want type=ai_agent model_version=claude-fable-5", sawActor)
+	}
+	if sawActor.Input != audit.RedactedInput {
+		t.Fatalf("StepHandler saw Actor.Input = %q, want the redaction sentinel %q (never the original raw input — see ADR-0027)", sawActor.Input, audit.RedactedInput)
+	}
+	// The correct way for a real handler to get the *real* input_hash —
+	// never by calling Actor.InputHash() on sawActor, which would hash
+	// the constant RedactedInput sentinel instead (see ADR-0027's
+	// Consequences and uc-infra#217).
+	if sawActorInputHash != actor.InputHash() {
+		t.Fatalf("StepHandler saw job.ActorInputHash = %q, want %q (the real hash, via WorkflowJob.ActorInputHash, not Actor.InputHash())", sawActorInputHash, actor.InputHash())
+	}
+	// ProcessOne's own return value's Status reflects ClaimNext's
+	// "running", not the later MarkDone — same as
+	// TestQueue_ProcessOne_RetriesTransientFailureThenSucceeds above,
+	// re-read the row to see the post-completion status.
+	got, err := data.NewWorkflowJobRepo(db).Get(ctx, claimed.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status != "done" {
+		t.Fatalf("expected status done, got %q", got.Status)
+	}
+}
+
 func TestQueue_ProcessOne_HaltsAtRequireApprovalThenResumesToDone(t *testing.T) {
 	db := freshTenantDB(t)
 	ctx := context.Background()

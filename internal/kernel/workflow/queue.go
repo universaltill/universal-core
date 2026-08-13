@@ -98,7 +98,9 @@ func defaultBackoff(attempt int) time.Duration {
 // Enqueue validates def, then durably schedules a run of it against one
 // record, starting at step 0. An invalid Definition is never queued —
 // fail loud before persisting, same discipline as crud.Engine validating
-// before it writes.
+// before it writes. actor is validated too, but by data.WorkflowJobRepo's
+// own enqueue method, not here — that's the one place both this method
+// and Scheduler.fireOne's EnqueueTx path both go through (uc-infra#190).
 func (q *Queue) Enqueue(ctx context.Context, def *Definition, entityType, recordID string, actor audit.Actor) (data.WorkflowJob, error) {
 	if err := def.Validate(); err != nil {
 		return data.WorkflowJob{}, fmt.Errorf("invalid workflow: %w", err)

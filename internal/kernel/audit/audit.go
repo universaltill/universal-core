@@ -124,6 +124,19 @@ func (a Actor) InputHash() string {
 	return hex.EncodeToString(sum[:])
 }
 
+// RedactedInput is the Actor.Input value used when an actor is
+// reconstructed from a store that persists only Input's hash, never the
+// raw text (internal/data/workflow_jobs.go — see uc-infra ADR-0027), so
+// Validate() can still confirm "this ActorAgent really did carry an
+// input at write time" without resurrecting text this kernel
+// deliberately never stores raw (see the Input field's own doc comment
+// above). It is NOT the original input, and InputHash() computed from
+// an actor whose Input is this sentinel does NOT equal the hash actually
+// persisted when the actor was first written — a caller that needs that
+// real, original hash must read it from wherever the store actually
+// kept it, never by re-hashing a reconstructed actor.
+const RedactedInput = "<redacted: see the record's own stored input_hash>"
+
 // CLIInvocationInput returns a deterministic string representing a CLI
 // invocation, for use as Actor.Input when the actor is an ai_agent CLI
 // caller with no natural-language prompt of its own — a

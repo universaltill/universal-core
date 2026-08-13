@@ -116,3 +116,39 @@ func TestCLIInvocationInput(t *testing.T) {
 		t.Fatalf("expected a single two-word argument to hash differently than two separate arguments, got identical input %q", merged)
 	}
 }
+
+// TestRedactedInput_SatisfiesValidateButNotOriginalHash is uc-infra#190/
+// ADR-0027's own invariant: RedactedInput exists so a store that
+// persists only an actor's input_hash (never the raw text —
+// internal/data/workflow_jobs.go) can still hand back an ActorAgent
+// that passes Validate(), without it being mistaken for the actor's
+// real original input.
+func TestRedactedInput_SatisfiesValidateButNotOriginalHash(t *testing.T) {
+	if RedactedInput == "" {
+		t.Fatal("RedactedInput must be non-empty, or it couldn't satisfy Validate()'s non-empty check")
+	}
+
+	restored := Actor{Type: ActorAgent, ID: "kernel-agent", ModelVersion: "claude-fable-5", Input: RedactedInput}
+	if err := restored.Validate(); err != nil {
+		t.Fatalf("an actor reconstructed with RedactedInput must pass Validate(), got: %v", err)
+	}
+
+	original := Actor{Type: ActorAgent, ID: "kernel-agent", ModelVersion: "claude-fable-5", Input: "run monthly close"}
+	if restored.InputHash() == original.InputHash() {
+		t.Fatal("a reconstructed actor's InputHash() must not coincidentally match the original actor's real input_hash — RedactedInput is a documented stand-in, never the real text")
+	}
+	if restored.InputHash() == "" {
+		t.Fatal("InputHash() on a RedactedInput actor must still be non-empty, so Validate()-adjacent code that also expects a hash doesn't break")
+	}
+	// RedactedInput is a fixed, global constant, not a per-job value — so
+	// this is NOT a "same job's steps correlate" property (independent
+	// review of uc-infra#190 caught an earlier, wrong claim to that
+	// effect): every redacted actor everywhere hashes to this identical
+	// value, which is exactly why a caller needing a real, job-specific
+	// hash must read data.WorkflowJob.ActorInputHash directly rather than
+	// ever calling InputHash() on a restored actor.
+	sameSentinelDifferentActor := Actor{Type: ActorAgent, ID: "a-different-agent", ModelVersion: "claude-fable-5", Input: RedactedInput}
+	if restored.InputHash() != sameSentinelDifferentActor.InputHash() {
+		t.Fatal("RedactedInput's hash must be the same fixed value regardless of which actor/job it's attached to — it carries no job-specific information")
+	}
+}

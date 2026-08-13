@@ -32,7 +32,27 @@ type WorkflowJob struct {
 	// internal/api/workflow.go's userMayApprove. Meaningless outside
 	// status='waiting_approval'; always false otherwise.
 	Escalated bool
-	Actor     audit.Actor
+	// Actor is the enqueue-time actor. Every scan site below restores it
+	// from the row's actor_type/actor_id/model_version/input_hash
+	// columns — but Actor.Input on a *restored* job is never the actor's
+	// real original input: this table persists input_hash only, matching
+	// audit_log's own hash-only policy (uc-infra#190, ADR-0027), so a
+	// restored ActorAgent's Input is audit.RedactedInput, a documented
+	// sentinel that satisfies Actor.Validate() without resurrecting text
+	// this kernel deliberately never stores raw. See ADR-0027 for why.
+	Actor audit.Actor
+	// ActorInputHash is the actor's real, original input_hash — set at
+	// Enqueue time and restored verbatim at every scan site, unlike
+	// Actor.Input above. A caller that needs the genuine hash (e.g. to
+	// author a new audit_log entry that should correlate with this job's
+	// own enqueue-time input) must read this field directly, never
+	// Actor.InputHash() on a restored Actor: InputHash() computed from
+	// the RedactedInput sentinel is a fixed value shared by every
+	// redacted job in every tenant, not this job's own hash (see
+	// ADR-0027's Consequences and uc-infra#217). Empty when the actor had
+	// nothing to hash (human/system actors, or a pre-migration-0008
+	// ai_agent row).
+	ActorInputHash string
 }
 
 // ErrNoJobAvailable is returned by ClaimNext when no job is currently due.
@@ -69,12 +89,32 @@ func (r *WorkflowJobRepo) Enqueue(ctx context.Context, job WorkflowJob) (Workflo
 }
 
 func (r *WorkflowJobRepo) enqueue(ctx context.Context, q querier, job WorkflowJob) (WorkflowJob, error) {
+	// Fail loud before persisting, same discipline Queue.Enqueue's own
+	// doc comment already claims for def.Validate() — this closes the
+	// other half of uc-infra#190: without it, an invalid ActorAgent (no
+	// Input) could still be enqueued today, producing a row that only
+	// surfaces the problem later, at read time, in whichever scan site
+	// happens to rebuild it. Checked here rather than only in
+	// Queue.Enqueue because EnqueueTx (Scheduler.fireOne's own path) goes
+	// straight to this method, bypassing Queue.Enqueue entirely — one
+	// check here covers both callers.
+	if err := job.Actor.Validate(); err != nil {
+		return WorkflowJob{}, fmt.Errorf("enqueue workflow job: invalid actor: %w", err)
+	}
 	if job.MaxAttempts == 0 {
 		job.MaxAttempts = 5
 	}
 	var modelVersion any
 	if job.Actor.ModelVersion != "" {
 		modelVersion = job.Actor.ModelVersion
+	}
+	// Hash only, never the raw Actor.Input — same policy as audit_log's
+	// own input_hash column (uc-infra#190, ADR-0027). InputHash() itself
+	// returns "" when there's nothing to hash (e.g. a human actor).
+	hash := job.Actor.InputHash()
+	var inputHash any
+	if hash != "" {
+		inputHash = hash
 	}
 	// A scheduled run has no triggering record (R18). NULL rather than a
 	// placeholder: record_id is a UUID column, "" is not a UUID, and a
@@ -89,15 +129,16 @@ func (r *WorkflowJobRepo) enqueue(ctx context.Context, q querier, job WorkflowJo
 	err := q.QueryRowContext(ctx,
 		`INSERT INTO workflow_jobs
 		 (workflow_name, workflow_version, entity_type, record_id,
-		  max_attempts, actor_type, actor_id, model_version)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		  max_attempts, actor_type, actor_id, model_version, input_hash)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		 RETURNING id, step_index, status, attempts, run_after`,
 		job.WorkflowName, job.WorkflowVersion, entityType, recordID,
-		job.MaxAttempts, string(job.Actor.Type), job.Actor.ID, modelVersion,
+		job.MaxAttempts, string(job.Actor.Type), job.Actor.ID, modelVersion, inputHash,
 	).Scan(&job.ID, &job.StepIndex, &job.Status, &job.Attempts, &job.RunAfter)
 	if err != nil {
 		return WorkflowJob{}, fmt.Errorf("enqueue workflow job: %w", err)
 	}
+	job.ActorInputHash = hash
 	return job, nil
 }
 
@@ -114,26 +155,24 @@ func (r *WorkflowJobRepo) ClaimNext(ctx context.Context) (WorkflowJob, error) {
 	defer tx.Rollback() //nolint:errcheck // rollback is a no-op after a successful commit
 
 	var j WorkflowJob
-	var modelVersion sql.NullString
+	var modelVersion, inputHash sql.NullString
 	err = tx.QueryRowContext(ctx,
 		`SELECT id, workflow_name, workflow_version, entity_type, record_id,
-		        step_index, attempts, max_attempts, actor_type, actor_id, model_version
+		        step_index, attempts, max_attempts, actor_type, actor_id, model_version, input_hash
 		 FROM workflow_jobs
 		 WHERE status = 'queued' AND run_after <= now()
 		 ORDER BY run_after
 		 FOR UPDATE SKIP LOCKED
 		 LIMIT 1`,
 	).Scan(&j.ID, &j.WorkflowName, &j.WorkflowVersion, &nullEntityType{&j.EntityType}, &nullEntityType{&j.RecordID},
-		&j.StepIndex, &j.Attempts, &j.MaxAttempts, &j.Actor.Type, &j.Actor.ID, &modelVersion)
+		&j.StepIndex, &j.Attempts, &j.MaxAttempts, &j.Actor.Type, &j.Actor.ID, &modelVersion, &inputHash)
 	if errors.Is(err, sql.ErrNoRows) {
 		return WorkflowJob{}, ErrNoJobAvailable
 	}
 	if err != nil {
 		return WorkflowJob{}, fmt.Errorf("claim workflow job: %w", err)
 	}
-	if modelVersion.Valid {
-		j.Actor.ModelVersion = modelVersion.String
-	}
+	restoreActorFields(&j, modelVersion, inputHash)
 
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE workflow_jobs SET status = 'running', updated_at = now() WHERE id = $1`, j.ID,
@@ -248,25 +287,23 @@ func (r *WorkflowJobRepo) ResumeAfterApproval(ctx context.Context, id string) er
 
 func (r *WorkflowJobRepo) Get(ctx context.Context, id string) (WorkflowJob, error) {
 	var j WorkflowJob
-	var modelVersion, lastError sql.NullString
+	var modelVersion, inputHash, lastError sql.NullString
 	err := r.db.QueryRowContext(ctx,
 		`SELECT id, workflow_name, workflow_version, entity_type, record_id,
 		        step_index, status, attempts, max_attempts, last_error, run_after,
-		        updated_at, escalated, actor_type, actor_id, model_version
+		        updated_at, escalated, actor_type, actor_id, model_version, input_hash
 		 FROM workflow_jobs WHERE id = $1`,
 		id,
 	).Scan(&j.ID, &j.WorkflowName, &j.WorkflowVersion, &nullEntityType{&j.EntityType}, &nullEntityType{&j.RecordID},
 		&j.StepIndex, &j.Status, &j.Attempts, &j.MaxAttempts, &lastError, &j.RunAfter,
-		&j.UpdatedAt, &j.Escalated, &j.Actor.Type, &j.Actor.ID, &modelVersion)
+		&j.UpdatedAt, &j.Escalated, &j.Actor.Type, &j.Actor.ID, &modelVersion, &inputHash)
 	if errors.Is(err, sql.ErrNoRows) {
 		return WorkflowJob{}, ErrNotFound
 	}
 	if err != nil {
 		return WorkflowJob{}, fmt.Errorf("get workflow job: %w", err)
 	}
-	if modelVersion.Valid {
-		j.Actor.ModelVersion = modelVersion.String
-	}
+	restoreActorFields(&j, modelVersion, inputHash)
 	if lastError.Valid {
 		j.LastError = lastError.String
 	}
@@ -283,7 +320,7 @@ func (r *WorkflowJobRepo) ListByStatus(ctx context.Context, status string) ([]Wo
 	rows, err := r.db.QueryContext(ctx,
 		`SELECT id, workflow_name, workflow_version, entity_type, record_id,
 		        step_index, status, attempts, max_attempts, last_error, run_after,
-		        updated_at, escalated, actor_type, actor_id, model_version
+		        updated_at, escalated, actor_type, actor_id, model_version, input_hash
 		 FROM workflow_jobs WHERE status = $1 ORDER BY created_at`,
 		status,
 	)
@@ -295,15 +332,13 @@ func (r *WorkflowJobRepo) ListByStatus(ctx context.Context, status string) ([]Wo
 	var out []WorkflowJob
 	for rows.Next() {
 		var j WorkflowJob
-		var modelVersion, lastError sql.NullString
+		var modelVersion, inputHash, lastError sql.NullString
 		if err := rows.Scan(&j.ID, &j.WorkflowName, &j.WorkflowVersion, &nullEntityType{&j.EntityType}, &nullEntityType{&j.RecordID},
 			&j.StepIndex, &j.Status, &j.Attempts, &j.MaxAttempts, &lastError, &j.RunAfter,
-			&j.UpdatedAt, &j.Escalated, &j.Actor.Type, &j.Actor.ID, &modelVersion); err != nil {
+			&j.UpdatedAt, &j.Escalated, &j.Actor.Type, &j.Actor.ID, &modelVersion, &inputHash); err != nil {
 			return nil, fmt.Errorf("scan workflow job: %w", err)
 		}
-		if modelVersion.Valid {
-			j.Actor.ModelVersion = modelVersion.String
-		}
+		restoreActorFields(&j, modelVersion, inputHash)
 		if lastError.Valid {
 			j.LastError = lastError.String
 		}
@@ -324,7 +359,7 @@ func (r *WorkflowJobRepo) ListWaitingApproval(ctx context.Context) ([]WorkflowJo
 	rows, err := r.db.QueryContext(ctx,
 		`SELECT id, workflow_name, workflow_version, entity_type, record_id,
 		        step_index, status, attempts, max_attempts, last_error, run_after,
-		        updated_at, escalated, actor_type, actor_id, model_version
+		        updated_at, escalated, actor_type, actor_id, model_version, input_hash
 		 FROM workflow_jobs WHERE status = 'waiting_approval' AND escalated = false ORDER BY created_at`,
 	)
 	if err != nil {
@@ -335,15 +370,13 @@ func (r *WorkflowJobRepo) ListWaitingApproval(ctx context.Context) ([]WorkflowJo
 	var out []WorkflowJob
 	for rows.Next() {
 		var j WorkflowJob
-		var modelVersion, lastError sql.NullString
+		var modelVersion, inputHash, lastError sql.NullString
 		if err := rows.Scan(&j.ID, &j.WorkflowName, &j.WorkflowVersion, &nullEntityType{&j.EntityType}, &nullEntityType{&j.RecordID},
 			&j.StepIndex, &j.Status, &j.Attempts, &j.MaxAttempts, &lastError, &j.RunAfter,
-			&j.UpdatedAt, &j.Escalated, &j.Actor.Type, &j.Actor.ID, &modelVersion); err != nil {
+			&j.UpdatedAt, &j.Escalated, &j.Actor.Type, &j.Actor.ID, &modelVersion, &inputHash); err != nil {
 			return nil, fmt.Errorf("scan workflow job: %w", err)
 		}
-		if modelVersion.Valid {
-			j.Actor.ModelVersion = modelVersion.String
-		}
+		restoreActorFields(&j, modelVersion, inputHash)
 		if lastError.Valid {
 			j.LastError = lastError.String
 		}
@@ -446,6 +479,30 @@ func (r *WorkflowJobRepo) ReclaimStale(ctx context.Context, leaseTimeout time.Du
 		ids = append(ids, id)
 	}
 	return ids, rows.Err()
+}
+
+// restoreActorFields fills in the parts of a scanned WorkflowJob that
+// Scan can't set directly (ClaimNext/Get/ListByStatus/ListWaitingApproval
+// all share this shape): actor_type/actor_id are scanned straight into
+// Actor.Type/Actor.ID by the caller, but model_version and input_hash
+// are nullable columns needing sql.NullString unwrapping first.
+//
+// ActorInputHash restores as the real, verbatim stored hash — a caller
+// needing the genuine input_hash reads it from there, never from
+// Actor.InputHash() (see WorkflowJob.ActorInputHash's own doc comment).
+// Actor.Input itself restores as audit.RedactedInput, never the raw
+// text — this table only ever persists the hash (uc-infra#190,
+// ADR-0027). A human/system actor's row (or a pre-migration-0008
+// ai_agent row, if one exists) has a NULL input_hash, so both fields
+// stay their zero value.
+func restoreActorFields(j *WorkflowJob, modelVersion, inputHash sql.NullString) {
+	if modelVersion.Valid {
+		j.Actor.ModelVersion = modelVersion.String
+	}
+	if inputHash.Valid {
+		j.ActorInputHash = inputHash.String
+		j.Actor.Input = audit.RedactedInput
+	}
 }
 
 // execRows runs an UPDATE and returns rows affected, so by-ID methods can
