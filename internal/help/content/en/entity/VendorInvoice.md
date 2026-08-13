@@ -30,16 +30,21 @@ Draft, with nothing checked yet.
 
 ## What moving to Matched actually does
 
-The moment you save with Status set to Matched, the system checks two
+The moment you save with Status set to Matched, the system checks three
 things: that the invoice's Vendor really is the Purchase Order's own
-vendor, and that the invoice's Total agrees, to the cent, with the total
-value of everything actually received against that Purchase Order (every
-Goods Receipt Line's quantity times its own line's Unit Price).
+vendor, that the invoice's Currency (when you set one, and the Purchase
+Order also has one) agrees with the Purchase Order's own Currency, and
+that the invoice's Total agrees with the total value of everything
+actually received against that Purchase Order (every Goods Receipt
+Line's quantity times its own line's Unit Price) — to the precision that
+Currency actually uses (most currencies to the cent; some, like Japanese
+Yen, have no fractional unit at all).
 
-If both agree, the invoice becomes Matched. **If they don't, the invoice
-does not stay Draft and does not reject the save — it moves to Match
-Exception instead**, and the **Match Exception Reason** field is filled
-in with why (wrong vendor, nothing received yet, no lines on the Purchase
+If everything agrees, the invoice becomes Matched. **If it doesn't, the
+invoice does not stay Draft and does not reject the save — it moves to
+Match Exception instead**, and the **Match Exception Reason** field is
+filled in with why (wrong vendor, a Currency that doesn't match the
+Purchase Order's own, nothing received yet, no lines on the Purchase
 Order, or a value that doesn't agree). Match Exception is a normal,
 expected stop on the way to being paid, not an error state you need to
 avoid.
@@ -50,10 +55,10 @@ can push it back into Match Exception if the edit no longer agrees.
 
 ## Getting out of Match Exception
 
-Fix whatever the reason describes — correct the Total, wait for the
-missing Goods Receipt to be recorded, or confirm the Vendor — and save
-again with Status set to Matched. If it agrees this time, the reason is
-cleared and the invoice becomes Matched.
+Fix whatever the reason describes — correct the Total, correct the
+Currency, wait for the missing Goods Receipt to be recorded, or confirm
+the Vendor — and save again with Status set to Matched. If it agrees
+this time, the reason is cleared and the invoice becomes Matched.
 
 **There is no direct path from Match Exception to Paid.** That's not an
 oversight — it's the actual control that stops an unresolved invoice from
