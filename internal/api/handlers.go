@@ -889,6 +889,28 @@ func (h *Handler) createRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Applied before this handler's own pre-check below, for the same
+	// reason crud.Engine.Create applies it before its internal one
+	// (uc-infra#212): without this, a Required field that also declares
+	// a Default (e.g. purchasing.StockLevel.qty_on_hand,
+	// projects.Task.planned_amount) would 400 here as "missing" on an
+	// omitting payload that Create itself would go on to accept — the
+	// two checks disagreeing about the identical payload is exactly the
+	// "one Definition, two callers drift apart" failure this repo has
+	// already been burned by (see crud/unique_constraints.go's own
+	// comment on uc-infra#81/#105). Placed after EffectiveWriteFields,
+	// not before: a field this actor can't see was just stripped, and
+	// applying its Default here mirrors what happens next regardless —
+	// crud.Create's own internal ApplyDefaults call sees that same
+	// stripped map and would reintroduce the Default anyway (the
+	// Default is Definition-declared config, not attacker/actor-
+	// controlled data, and the guarded engine redacts the echoed record
+	// on the way back out — not a disclosure). Calling ApplyDefaults
+	// twice (once here, once inside Create) is intentional and cheap: a
+	// field already present after this call is left untouched the
+	// second time.
+	entity.ApplyDefaults(entDef, fields)
+
 	// Validated explicitly here, ahead of crud.Create (which validates
 	// again internally — cheap, no DB round trip, and Create doesn't
 	// expose a way to distinguish "your input was invalid" from "the

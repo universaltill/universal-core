@@ -321,32 +321,24 @@ func TestSyncGLAccountOnWrite_RenamingCodeOrphansThePreviousGLAccountsRow(t *tes
 	}
 }
 
-// TestSyncGLAccountOnWrite_IsActiveOmittedOnCreate_StoresInactive pins
-// down another real gap independent review found (finding 5): a
-// programmatic engine.Create call that omits a field entirely never
-// consults that field's declared entity.Field.Default — nothing in
-// internal/kernel/crud or internal/kernel/entity applies Default at
-// write time, for any field type, not just FieldBool.
+// TestSyncGLAccountOnWrite_IsActiveOmittedOnCreate_StoresActive asserts
+// the fixed behavior uc-infra#212 shipped: crud.Engine.Create now
+// applies entity.Field.Default for any field genuinely absent from the
+// payload, for every field type, before validation/persistence
+// (internal/kernel/entity.ApplyDefaults). Previously named
+// ...StoresInactive and pinned the opposite (buggy) behavior — renamed
+// and flipped once this closed, per this test's own prior doc comment.
 //
-// uc-infra#206 closed the half of this gap that actually reached a real
-// admin: internal/kernel/formrender's new-record rendering now honors a
-// FieldBool's Default the same way it already did for FieldEnum, so the
-// ordinary UI create flow this test's own history worried about (an
-// admin who never touches the "Active" checkbox) now submits
-// is_active=true explicitly — the checkbox itself renders pre-checked,
-// so the browser's own hidden-false/checkbox-true submission trick
-// carries the real value through, and engine.Create receives it SET,
-// not omitted, once the request comes from that fixed form.
-//
-// This test's own path bypasses formrender entirely — engine.Create is
-// called directly with is_active left out of the payload, which is
-// exactly what a non-browser caller (CSV import, a future API create,
-// this test itself) still does. That deeper gap — Default is a
-// Definition-level declaration formrender now reads but crud/entity
-// still never does — is unchanged by #206 and is genuinely a separate,
-// broader change (every field type, every non-form write path), so it
-// stays open rather than folded into #206's narrower rendering fix.
-func TestSyncGLAccountOnWrite_IsActiveOmittedOnCreate_StoresInactive(t *testing.T) {
+// uc-infra#206 already closed the half of this gap that reached a real
+// admin through the UI: internal/kernel/formrender's new-record
+// rendering honors a FieldBool's Default (the checkbox renders
+// pre-checked), so a browser create flow was never actually affected by
+// the deeper gap this test exercises. This test's own path bypasses
+// formrender entirely — engine.Create is called directly with
+// is_active left out of the payload, exactly what a non-browser caller
+// (CSV import, a direct API/engine.Create call) does — and is the case
+// #212 closed.
+func TestSyncGLAccountOnWrite_IsActiveOmittedOnCreate_StoresActive(t *testing.T) {
 	tenantDB := freshTenantDB(t)
 	ctx := context.Background()
 	actor := humanActor()
@@ -363,7 +355,7 @@ func TestSyncGLAccountOnWrite_IsActiveOmittedOnCreate_StoresInactive(t *testing.
 	engine.SetHook("Account", SyncGLAccountOnWrite)
 
 	// is_active deliberately omitted — Account()'s Default:true is a
-	// Definition-level declaration, not something Create fills in.
+	// Definition-level declaration; engine.Create must fill it in now.
 	if _, err := engine.Create(ctx, accountDefinition, map[string]any{
 		"code": "1000", "name": "Assets", "type": "asset",
 	}, actor); err != nil {
@@ -374,8 +366,8 @@ func TestSyncGLAccountOnWrite_IsActiveOmittedOnCreate_StoresInactive(t *testing.
 	if err != nil {
 		t.Fatalf("IDByCode: %v", err)
 	}
-	if isActive {
-		t.Fatal("expected today's real (pre-existing, cross-module) gap to store is_active=false when omitted via a direct engine.Create call — if this now passes with isActive=true, crud/entity started applying Field.Default at write time and this test (and uc-infra#212) should be revisited; formrender's own half of this gap is already closed by uc-infra#206")
+	if !isActive {
+		t.Fatal("expected engine.Create to apply Account's Default:true for the omitted is_active field (uc-infra#212) — got is_active=false")
 	}
 }
 

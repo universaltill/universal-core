@@ -589,18 +589,25 @@ func TestRender_ExplicitFalseBoolFieldOverridesDeclaredDefault(t *testing.T) {
 // uc-infra#206 (finding 2): the fix can only tell "unset" apart from
 // "explicitly false" by whether record[name] has an entry at all — it
 // has no way to also tell "a brand-new record" apart from "an existing
-// record whose bool key is missing because some non-form write path
-// never wrote it" (e.g. a direct engine.Create call, exactly what
+// record whose bool key is missing." uc-infra#212 closed the most
+// common way a non-form write path could produce that missing-key
+// state (crud.Engine.Create now applies Field.Default via entity.
+// ApplyDefaults — no *new* direct engine.Create call, including
 // finance's TestSyncGLAccountOnWrite_IsActiveOmittedOnCreate_
-// StoresInactive exercises). Both render checked here, even though the
-// second case's true stored state is false elsewhere in the system
-// (gl_accounts, ledger.PostTx). This is intentional, bounded (the next
-// save through this form writes the key and self-heals it), and tracked
-// as its own follow-up (uc-infra#212: crud/entity should apply Default
-// at write time so no caller can produce this missing-key state at
-// all) — this test exists so a future change to this fallback doesn't
-// alter that divergence silently in either direction without a test
-// noticing.
+// StoresActive, can produce it anymore), but not every way: crud.
+// Engine.Update is a full replacement and omitting the key there still
+// erases it (an established, unrelated semantic #212 deliberately left
+// alone — see crud.Engine.Create's own uc-infra#212 comment for why),
+// and at least one write path still bypasses crud.Engine.Create
+// entirely (purchasing/ledger.go's direct records.CreateTx call,
+// tracked separately). This render-time fallback stays for all of
+// those cases, not just pre-#212 records. Both render checked here,
+// even though the second case's true stored state is false elsewhere
+// in the system (gl_accounts, ledger.PostTx). This is intentional,
+// bounded (the next save through this form writes the key and self-
+// heals it) — this test exists so a future change to this fallback
+// doesn't alter that divergence silently in either direction without a
+// test noticing.
 func TestRender_ExistingRecordMissingBoolKeyRendersDefaultNotStoredFalsy(t *testing.T) {
 	r := testRenderer(t)
 	ent := &entity.Definition{

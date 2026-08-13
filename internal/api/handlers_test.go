@@ -147,6 +147,36 @@ func quickCreatableVendorEntityDef() *entity.Definition {
 	return def
 }
 
+// requiredWithDefaultEntityDef mirrors the shape of a real Definition
+// affected by uc-infra#212's finding 2 (purchasing.StockLevel.
+// qty_on_hand, projects.Task.planned_amount): a field that is both
+// Required and carries a Default. Standalone (no FieldReference
+// dependency) so the HTTP-level test below doesn't need fixture
+// records for anything else.
+func requiredWithDefaultEntityDef() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "StockyThing",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "name", Type: entity.FieldString, Required: true},
+			{Name: "qty_on_hand", Type: entity.FieldNumber, Required: true, Default: float64(0), Min: entity.Float64Ptr(0)},
+		},
+	}
+}
+
+func requiredWithDefaultFormDef() *form.Definition {
+	return &form.Definition{
+		EntityType: "StockyThing",
+		Version:    1,
+		Sections: []form.Section{
+			{Title: "Details", Component: form.ComponentFields, Fields: []form.FormField{
+				{Name: "name", Label: "Name"},
+				{Name: "qty_on_hand", Label: "Qty On Hand"},
+			}},
+		},
+	}
+}
+
 func vendorFormDef() *form.Definition {
 	return &form.Definition{
 		EntityType: "Vendor",
@@ -437,6 +467,48 @@ func TestAPI_CreateRecord_ValidationFailureIs400(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for a validation failure, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestAPI_CreateRecord_RequiredFieldWithDefaultOmittedSucceeds is the
+// real-HTTP pin for uc-infra#212's finding 2 (independent review): a
+// field that is both Required and carries a Default — e.g. real
+// Definitions purchasing.StockLevel.qty_on_hand or projects.Task.
+// planned_amount — was rejected as 400 "missing" by this handler's own
+// pre-check (entity.ValidateRecord, called before crud.Create) even
+// after crud.Engine.Create itself started applying the Default and
+// would have accepted the identical payload. The two checks disagreeing
+// about the same payload is exactly the "one Definition, two callers"
+// drift this repo has already been burned by (crud/unique_constraints.go's
+// own comment on uc-infra#81/#105) — this pins that they now agree.
+func TestAPI_CreateRecord_RequiredFieldWithDefaultOmittedSucceeds(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, requiredWithDefaultEntityDef(), requiredWithDefaultFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	// qty_on_hand is Required, Default: float64(0) — omitted entirely,
+	// not submitted as 0.
+	req := newRequest("POST", "/api/records/StockyThing", tenantID, "farshid", []byte(`{"name":"Widget"}`))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 (Default satisfies Required when omitted), got %d: %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		Data struct {
+			Data map[string]any `json:"data"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal create response: %v", err)
+	}
+	if created.Data.Data["qty_on_hand"] != float64(0) {
+		t.Fatalf(`expected qty_on_hand's Default (0) to be applied and echoed back, got %+v`, created.Data.Data)
 	}
 }
 

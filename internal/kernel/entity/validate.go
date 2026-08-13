@@ -129,6 +129,58 @@ func (e *ValidationError) Error() string { return e.Detail }
 // Unwrap makes errors.Is(err, ErrValidation) match regardless of Kind.
 func (e *ValidationError) Unwrap() error { return ErrValidation }
 
+// ApplyDefaults fills in each field's declared Field.Default for any
+// field genuinely absent from data — mutating data in place — before
+// validation/persistence sees it (uc-infra#212). "Absent" matches
+// ValidateRecord's own definition just below (map key missing, or
+// present but nil): an explicitly-submitted zero value (false, "", 0)
+// is a real value, not an omission, and is never overridden. Applying
+// Default is uniform across every field type with no per-type branch —
+// Field.Default is already type-checked against its own field's shape
+// for every field type at Definition.Validate time, so there's nothing
+// type-specific to do here.
+//
+// Only crud.Engine.Create calls this, deliberately — crud.Engine.Update
+// is a full replacement of the stored record (data.RecordRepo.UpdateTx's
+// `SET data = $1`), so an omitted field there is already erased, not
+// preserved; applying Default on top would silently force it back to
+// the Definition's declared value on any partial update that never
+// meant to touch it, which is worse than today's erase-on-omit
+// contract, not equivalent to it. See crud.Engine.Create's own call
+// site for the fuller version of this reasoning.
+//
+// Before this, Field.Default was
+// only ever consulted by internal/kernel/formrender's browser rendering
+// (uc-infra#206) and Definition.Validate's own type-checks — never at
+// write time, so any non-form caller (CSV import, a direct API/engine.
+// Create call, tests) got the Go zero value instead of the Definition's
+// declared Default whenever a field was left out of the payload
+// entirely. See TestSyncGLAccountOnWrite_IsActiveOmittedOnCreate_
+// StoresActive in internal/kernel/finance/hooks_test.go — originally
+// named ...StoresInactive while it pinned this gap, renamed once this
+// closed it.
+// data must be non-nil to actually receive any defaults — a Go map
+// can't be turned from nil into non-nil through a plain value parameter,
+// so a nil data is left exactly as it was (no defaults applied, no
+// panic: reading from a nil map is safe, but data[f.Name] = f.Default
+// on one is not). crud.Engine.Create guards this itself by never
+// passing a nil map through; a caller invoking ApplyDefaults directly
+// with a possibly-nil map must initialize it first.
+func ApplyDefaults(def *Definition, data map[string]any) {
+	if data == nil {
+		return
+	}
+	for _, f := range def.Fields {
+		if f.Default == nil {
+			continue
+		}
+		if v, present := data[f.Name]; present && v != nil {
+			continue
+		}
+		data[f.Name] = f.Default
+	}
+}
+
 // ValidateRecord checks a record's data against its Definition — the
 // server-side half of "validation is defined once, applied identically
 // client- and server-side" (ADR-0017 §5). It never inspects entity_type

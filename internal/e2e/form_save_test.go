@@ -172,6 +172,90 @@ func TestPartyStatutoryProfileFields_RealBrowser(t *testing.T) {
 	}
 }
 
+// TestPartyPreferredLanguageDefaultAppliedWhenLeftBlank_RealBrowser is
+// the real-browser proof for independent review finding 1 on
+// uc-infra#212: unlike a FieldBool or FieldEnum, formrender gives a
+// FieldString no create-time Default pre-fill at all (render.go's
+// switch on ef.Type only special-cases FieldMoney/FieldBool/FieldEnum/
+// FieldReference/FieldI18nText) — Party.preferred_language (FieldString,
+// Default: "en") renders as a plain empty <input> on a brand-new form.
+// Before uc-infra#212, an admin who left it blank got no
+// preferred_language stored at all (the field simply absent — raw==""
+// in parseRecordFields collapses a blank submission to "omitted" before
+// crud.Create ever saw it); crud.Engine.Create's new ApplyDefaults call
+// now fills it in from the Definition. This is a genuine, user-visible
+// change to what the create form persists — CLAUDE.md requires a real-
+// browser test for exactly this, not just the entity/crud-level unit
+// and integration tests uc-infra#212's diff already has.
+func TestPartyPreferredLanguageDefaultAppliedWhenLeftBlank_RealBrowser(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, tenantDB := testServer(t)
+	if err := foundation.PublishForms(context.Background(), tenantDB, humanActor()); err != nil {
+		t.Fatalf("foundation.PublishForms: %v", err)
+	}
+	ctx := browserCtx(t, tenantID)
+
+	var preferredLanguageOnLoad string
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/forms/Party/new"),
+		chromedp.WaitVisible(`form.uc-form input[name="preferred_language"]`, chromedp.ByQuery),
+		chromedp.Value(`input[name="preferred_language"]`, &preferredLanguageOnLoad, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("render new Party form: %v", err)
+	}
+	if preferredLanguageOnLoad != "" {
+		t.Fatalf("expected preferred_language to render blank on a brand-new Party form (formrender does not pre-fill a FieldString's Default), got %q", preferredLanguageOnLoad)
+	}
+
+	// Fill only what's Required, deliberately leaving preferred_language
+	// untouched — an empty text input, the real gesture (or
+	// non-gesture) that reached parseRecordFields's raw=="" ->
+	// "treated as absent" path before this landed.
+	if err := chromedp.Run(ctx,
+		chromedp.SetValue(`select[name="party_type"]`, "organization", chromedp.ByQuery),
+		chromedp.SetValue(`input[name="name"]`, "Demo Organization", chromedp.ByQuery),
+		submitForm(),
+	); err != nil {
+		t.Fatalf("fill + save new Party: %v", err)
+	}
+
+	var postHref string
+	if err := chromedp.Run(ctx, chromedp.AttributeValue(`form.uc-form`, "hx-post", &postHref, nil, chromedp.ByQuery)); err != nil {
+		t.Fatalf("read hx-post after save: %v", err)
+	}
+	if postHref == "/api/records/Party" {
+		t.Fatalf("expected the form to now target its own record id (create -> edit), still targets the create route: %s", postHref)
+	}
+	recordID := path.Base(postHref)
+
+	got, err := crud.NewEngine(tenantDB).Get(context.Background(), foundation.Party(), recordID)
+	if err != nil {
+		t.Fatalf("read back Party after save: %v", err)
+	}
+	if lang, _ := got.Data["preferred_language"].(string); lang != "en" {
+		t.Fatalf("expected the saved Party to persist preferred_language's Default \"en\" when the field was left blank, got %q", lang)
+	}
+
+	// Reload the record's own edit URL fresh, same reasoning as
+	// TestPartyStatutoryProfileFields_RealBrowser above: proves the
+	// stored value round-trips back into the rendered input, not just
+	// that the unreloaded page still shows what was typed (nothing was
+	// typed here at all).
+	if err := chromedp.Run(ctx, chromedp.Navigate(srv.URL+"/forms/Party/"+recordID)); err != nil {
+		t.Fatalf("re-navigate to record: %v", err)
+	}
+	var preferredLanguageAfterReload string
+	if err := chromedp.Run(ctx,
+		chromedp.WaitVisible(`form.uc-form`, chromedp.ByQuery),
+		chromedp.Value(`input[name="preferred_language"]`, &preferredLanguageAfterReload, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("read preferred_language after reload: %v", err)
+	}
+	if preferredLanguageAfterReload != "en" {
+		t.Fatalf(`expected preferred_language to reload as "en" after save, got %q`, preferredLanguageAfterReload)
+	}
+}
+
 // TestPurchaseOrderFormStages_RealBrowser (#29): the six staged
 // lead-time date inputs are actually present and *visible* on
 // /forms/PurchaseOrder/new — rendered as real <input type="date">

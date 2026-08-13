@@ -1106,14 +1106,19 @@ func (r *Renderer) buildFields(s form.Section, ent *entity.Definition, record ma
 			// Definition's declared Default (uc-infra#206) — an existing
 			// record's stored value, even false, always wins *when the
 			// key is present*. This can't tell "new record" apart from
-			// "existing record whose bool key is missing because some
-			// non-form write path (e.g. a direct engine.Create, per
-			// TestSyncGLAccountOnWrite_IsActiveOmittedOnCreate_
-			// StoresInactive) never wrote it" — that record renders
-			// checked here too, diverging from its own stored falsy
-			// state, until crud/entity itself starts applying Default at
-			// write time (uc-infra#212; independent review finding 2 on
-			// #206). Bounded impact: the very next save through this form
+			// "existing record whose bool key is missing." uc-infra#212
+			// closed the most common way that happened (crud.Engine.
+			// Create now applies Field.Default via entity.ApplyDefaults —
+			// see finance's TestSyncGLAccountOnWrite_IsActiveOmittedOnCreate_
+			// StoresActive), but not every way: crud.Engine.Update is a
+			// full replacement and omitting the key there still erases
+			// it (an established, unrelated semantic #212 deliberately
+			// left alone), and at least one write path still bypasses
+			// crud.Engine.Create entirely (purchasing/ledger.go's direct
+			// records.CreateTx call, tracked separately). Any record
+			// missing the key — for any of those reasons — renders
+			// checked here, diverging from its own stored falsy state.
+			// Bounded impact: the very next save through this form
 			// writes the key and self-heals the divergence.
 			if v, ok := record[ff.Name].(bool); ok {
 				fv.Checked = v
