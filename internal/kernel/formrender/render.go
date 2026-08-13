@@ -1095,7 +1095,31 @@ func (r *Renderer) buildFields(s form.Section, ent *entity.Definition, record ma
 				fv.Value = m.String()
 			}
 		case entity.FieldBool:
-			fv.Checked, _ = record[ff.Name].(bool)
+			// A new record's map has no entry for an untouched field at
+			// all (renderForm passes an empty map — see the FieldEnum
+			// case below for the same assumption), so the type assertion's
+			// ok tells apart "genuinely unset" from "explicitly false":
+			// unlike FieldEnum's current=="" check, false is bool's own
+			// zero value, so testing the *value* alone could never
+			// distinguish an untouched field from one a caller explicitly
+			// set to false. Only the unset case falls back to the
+			// Definition's declared Default (uc-infra#206) — an existing
+			// record's stored value, even false, always wins *when the
+			// key is present*. This can't tell "new record" apart from
+			// "existing record whose bool key is missing because some
+			// non-form write path (e.g. a direct engine.Create, per
+			// TestSyncGLAccountOnWrite_IsActiveOmittedOnCreate_
+			// StoresInactive) never wrote it" — that record renders
+			// checked here too, diverging from its own stored falsy
+			// state, until crud/entity itself starts applying Default at
+			// write time (uc-infra#212; independent review finding 2 on
+			// #206). Bounded impact: the very next save through this form
+			// writes the key and self-heals the divergence.
+			if v, ok := record[ff.Name].(bool); ok {
+				fv.Checked = v
+			} else if def, ok := ef.Default.(bool); ok {
+				fv.Checked = def
+			}
 		case entity.FieldEnum:
 			current, _ := record[ff.Name].(string)
 			if current == "" {

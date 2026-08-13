@@ -205,3 +205,73 @@ func TestGoodsReceiptForm_FacilityPickerRendersByName(t *testing.T) {
 		t.Errorf("facility picker shows %q, want the facility name — a raw UUID here is the same #16-class regression TestFacility_ListFormAndInventoryPicker guards for InventoryItem", facilityLabel)
 	}
 }
+
+// TestFacility_NewFormChecksActiveByDefault (uc-infra#206) is the real-
+// browser proof that a FieldBool's declared Default now actually reaches
+// a brand-new record's form. A rendered-HTML-string test can't stand in
+// for this: it would prove the `checked` attribute is present in the
+// markup formrender emitted, never that the browser itself treats the
+// checkbox as checked, or — the part that actually matters to an admin —
+// that submitting the form without touching the checkbox at all persists
+// is_active=true rather than the false a checkbox's ordinary unchecked-
+// by-default HTML semantics would otherwise silently store (exactly the
+// gap finance's TestSyncGLAccountOnWrite_IsActiveOmittedOnCreate_
+// StoresInactive documents one layer down, for Account specifically —
+// this is the same fix's UI-facing half, for Facility).
+func TestFacility_NewFormChecksActiveByDefault(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, tenantDB := testServer(t)
+	ctx := browserCtx(t, tenantID)
+
+	var isActiveOnLoad bool
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/forms/Facility/new"),
+		chromedp.WaitVisible(`form.uc-form input[name="is_active"][type="checkbox"]`, chromedp.ByQuery),
+		chromedp.Evaluate(`document.querySelector('form.uc-form input[name="is_active"][type="checkbox"]')?.checked === true`, &isActiveOnLoad),
+	); err != nil {
+		t.Fatalf("render new Facility form: %v", err)
+	}
+	if !isActiveOnLoad {
+		t.Fatal("expected is_active to render checked on a brand-new Facility form (Default: true), got unchecked")
+	}
+
+	// Fill only what's required, deliberately never touching the Active
+	// checkbox — the real gesture (or non-gesture) that reached
+	// ledger.ErrInactiveAccount for Account before uc-infra#206.
+	// facility_type is left alone too: its own Default ("warehouse", a
+	// FieldEnum) was already honored before this fix.
+	if err := chromedp.Run(ctx,
+		chromedp.SetValue(`input[name="code"]`, "MAIN", chromedp.ByQuery),
+		chromedp.SetValue(`input[name="name"]`, "Main Warehouse", chromedp.ByQuery),
+		submitForm(),
+	); err != nil {
+		t.Fatalf("fill + save new Facility: %v", err)
+	}
+	id := savedRecordID(t, ctx, "Facility")
+
+	// crud.Engine.Get only reads def.EntityType (crud.go), so the plain
+	// Facility() Definition constructor is equivalent to (and cheaper
+	// than) fetching and unmarshaling the published Definition here.
+	got, err := crud.NewEngine(tenantDB).Get(context.Background(), purchasing.Facility(), id)
+	if err != nil {
+		t.Fatalf("read back Facility after save: %v", err)
+	}
+	if isActive, _ := got.Data["is_active"].(bool); !isActive {
+		t.Fatal("expected the saved Facility to persist is_active=true without the checkbox ever being touched, got false")
+	}
+
+	// Reload from scratch, same reasoning as TestDelegation_RealBrowser:
+	// proves the stored value round-trips back to a checked box, not
+	// just that the unreloaded page still shows what was typed.
+	var isActiveAfterReload bool
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/forms/Facility/"+id),
+		chromedp.WaitVisible(`form.uc-form input[name="is_active"][type="checkbox"]`, chromedp.ByQuery),
+		chromedp.Evaluate(`document.querySelector('form.uc-form input[name="is_active"][type="checkbox"]')?.checked === true`, &isActiveAfterReload),
+	); err != nil {
+		t.Fatalf("reload saved Facility form: %v", err)
+	}
+	if !isActiveAfterReload {
+		t.Fatal("expected is_active to reload checked after save, got unchecked")
+	}
+}
