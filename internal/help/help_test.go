@@ -155,12 +155,21 @@ func TestAsset_RealEmbeddedFS(t *testing.T) {
 }
 
 func TestHasContent_RealEmbeddedFS(t *testing.T) {
-	// Confirms the actual shipped state as of ADR-0023 landing: no topic
-	// has content yet, so HasContent must be false for everything,
-	// including entity types that definitely exist in this kernel — this
-	// is what makes formrender/listview's "?" render disabled everywhere
-	// today, honestly, rather than by accident.
-	if HasContent("en", TopicID("PurchaseOrder")) {
-		t.Error("HasContent(\"en\", TopicID(\"PurchaseOrder\")) = true, want false — no help content ships in this slice")
+	// Confirms the actual shipped state: uc-infra#148 (the last of
+	// uc-infra#147-152's module slices) shipped real content for every
+	// entity type in the kernel, including PurchaseOrder — this test
+	// originally asserted the opposite (HasContent false for
+	// PurchaseOrder specifically, "no help content ships in this slice"),
+	// back when that was true of the whole product, not just this one
+	// entity. formrender/listview's "?" affordance now renders enabled
+	// for PurchaseOrder because of this, not by accident — see
+	// TestRender_HelpAffordanceRendersDisabledWhenNoContent
+	// (internal/kernel/formrender) for the "still honestly disabled for
+	// a genuinely undocumented entity type" half of this same proof.
+	if !HasContent("en", TopicID("PurchaseOrder")) {
+		t.Error("HasContent(\"en\", TopicID(\"PurchaseOrder\")) = false, want true — uc-infra#148 shipped real PurchaseOrder content")
+	}
+	if HasContent("en", TopicID("DoesNotExist")) {
+		t.Error("HasContent(\"en\", TopicID(\"DoesNotExist\")) = true, want false for a genuinely nonexistent entity type")
 	}
 }

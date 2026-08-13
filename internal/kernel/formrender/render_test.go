@@ -2884,9 +2884,16 @@ func TestRender_SectionTitleWithoutCatalogKeyFallsBackToLiteral(t *testing.T) {
 // TestBuildHelpView_NoContent and TestBuildHelpView_ContentExists
 // (ADR-0023, uc-infra#143) unit-test buildHelpView's two branches
 // directly, rather than only through Render() — Render() always calls
-// the real help.HasContent, which is false for every topic id as of
-// this slice (no content ships yet), so a full end-to-end test alone
-// could never exercise the "content exists" branch at all.
+// the real help.HasContent, and at the time this test was written no
+// topic had content yet (every module's help slice, uc-infra#147-152,
+// has since shipped), so a full end-to-end test alone could not yet
+// exercise the "content exists" branch. Kept as direct unit tests of
+// buildHelpView's own two branches regardless — TestRender_
+// HelpAffordanceRendersDisabledWhenNoContent (below) is this file's
+// end-to-end proof of the "no content" branch specifically, now against
+// a fixture entity type guaranteed to stay undocumented, and
+// internal/e2e's help_real_content_*_test.go files are the real-browser
+// end-to-end proof of the "content exists" branch.
 func TestBuildHelpView_NoContent(t *testing.T) {
 	cat, err := i18n.Load("en")
 	if err != nil {
@@ -2936,30 +2943,40 @@ func TestBuildHelpView_LabelTranslated(t *testing.T) {
 }
 
 // TestRender_HelpAffordanceRendersDisabledWhenNoContent (ADR-0023,
-// uc-infra#143) is the honest end-to-end confirmation of this slice's
-// actual shipped state: no help content exists yet (see
-// internal/help/content/README.md), so every rendered form's "?" must
+// uc-infra#143) is the honest end-to-end confirmation of the "no content
+// for this topic" branch, using a fixture EntityType
+// ("FixtureEntityWithoutHelpTopic") guaranteed to never have a real
+// internal/help/content/*/entity/*.md topic, rather than "PurchaseOrder"
+// (this test's original fixture type, changed by uc-infra#148 once
+// purchasing shipped real PurchaseOrder content — see
+// internal/help/content/README.md and CLAUDE.md's "In-product help
+// manual" section: a real topic existing for "PurchaseOrder" now is the
+// intended end state, not a regression, so this test's own fixture had
+// to stop reusing that name to keep testing the branch it's named for).
+// Every rendered form's "?" for a genuinely undocumented entity type must
 // come out disabled — present, focusable (tabindex="0"), but with no
 // href — never a link to a 404.
 func TestRender_HelpAffordanceRendersDisabledWhenNoContent(t *testing.T) {
 	r := testRenderer(t)
+	entDef := purchaseOrderEntity()
+	entDef.EntityType = "FixtureEntityWithoutHelpTopic"
+	formDef := purchaseOrderForm()
+	formDef.EntityType = "FixtureEntityWithoutHelpTopic"
 	data := Data{Record: map[string]any{"payment_method": "Wire"}, Children: map[string][]map[string]any{}}
 	var buf strings.Builder
-	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
+	if err := r.Render(&buf, formDef, entDef, data, "en"); err != nil {
 		t.Fatalf("render: %v", err)
 	}
 	got := buf.String()
-	// data-help-topic="entity/PurchaseOrder" is the load-bearing
-	// assertion independent review asked for: it proves buildViewModel's
-	// real call site actually passed def.EntityType ("PurchaseOrder")
-	// into help.TopicID, not merely that buildHelpView's own unit tests
-	// handle a hand-supplied topic id correctly. Before this attribute
-	// existed, nothing in this suite could tell a correct call site from
-	// a wrong one (e.g. a typo'd def.Name) — Href, the only other
-	// TopicID-derived output, is empty in every test today because no
-	// help content ships in this slice.
-	if !strings.Contains(got, `<a class="uc-help-affordance" role="link" data-help-topic="entity/PurchaseOrder" aria-disabled="true" tabindex="0" aria-label="Help">?</a>`) {
-		t.Errorf("expected a disabled, focusable, hrefless help affordance for topic entity/PurchaseOrder, got:\n%s", got)
+	// data-help-topic="entity/FixtureEntityWithoutHelpTopic" is the
+	// load-bearing assertion independent review originally asked for: it
+	// proves buildViewModel's real call site actually passed
+	// def.EntityType into help.TopicID, not merely that buildHelpView's
+	// own unit tests handle a hand-supplied topic id correctly. Href, the
+	// only other TopicID-derived output, is empty here because this
+	// fixture entity type deliberately has no real content.
+	if !strings.Contains(got, `<a class="uc-help-affordance" role="link" data-help-topic="entity/FixtureEntityWithoutHelpTopic" aria-disabled="true" tabindex="0" aria-label="Help">?</a>`) {
+		t.Errorf("expected a disabled, focusable, hrefless help affordance for topic entity/FixtureEntityWithoutHelpTopic, got:\n%s", got)
 	}
 	if strings.Contains(got, `uc-help-affordance" href=`) {
 		t.Error("help affordance must not carry an href when its topic has no content yet")

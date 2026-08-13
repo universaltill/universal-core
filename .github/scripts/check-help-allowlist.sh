@@ -24,16 +24,32 @@
 #
 # Removing keys (undocumenting nothing further, or the entity type being
 # renamed away) is always fine — this only ever compares "does head add
-# something base didn't have", never flags a shrink.
+# something base didn't have", never flags a shrink. The allowlist
+# emptying out entirely (map declaration present, zero keys — the last
+# module slice's own end state, uc-infra#148) is the fullest legal case
+# of that shrink, not a special one: has_allowlist_map (below) is what
+# makes "declared with zero keys" distinguishable from "declaration
+# deleted outright", which key-count alone cannot do (independent review
+# of uc-infra#148 caught this: an earlier version of this script only
+# ever checked HEAD_COUNT/BASE_COUNT, so a head file that closed the
+# ratchet by writing `map[string]bool{}` was indistinguishable from one
+# that deleted the map declaration entirely — both counted zero keys —
+# and got the same "could not find undocumentedAllowlist" refusal either
+# way, which made emptying the map out CI-unshippable).
 #
-# Bootstrap case: if base has no undocumentedAllowlist at all (this
-# script's own introducing PR, uc-infra#146, whose base commit predates
-# the map's existence), there is nothing to ratchet against yet — every
-# key in head is accepted rather than flagged as "added". This is safe
-# precisely because it only ever fires once, for the PR that first adds
-# the map: every PR after that has a base commit where the map already
-# exists (this script's own reviewed and merged text), so a real base
-# key set is always available for every future comparison.
+# Bootstrap case: if base has no undocumentedAllowlist DECLARATION at
+# all (this script's own introducing PR, uc-infra#146, whose base commit
+# predates the map's existence), there is nothing to ratchet against
+# yet — every key in head is accepted rather than flagged as "added".
+# This is safe precisely because it only ever fires once, for the PR
+# that first adds the map: every PR after that has a base commit where
+# the map already exists (this script's own reviewed and merged text),
+# so a real base key set is always available for every future
+# comparison — including a base whose map is declared but already empty
+# (BASE_COUNT=0 with the declaration present), which must still run the
+# real head-vs-base comparison below, not be treated as a second
+# bootstrap case: a base that legitimately has zero keys is a real,
+# comparable ratchet state, not "the gate doesn't exist yet".
 #
 # Known, accepted gap, same shape as check-coverage-floor.sh's own
 # documented one: this only catches a key ADDED to undocumentedAllowlist.
@@ -55,49 +71,79 @@ fi
 HEAD_FILE="$1"
 BASE_FILE="$2"
 
+# has_allowlist_map <file> — true (exit 0) iff the file declares the
+# undocumentedAllowlist map AT ALL, regardless of how many keys (zero
+# included) it holds. This is deliberately a SEPARATE question from "how
+# many keys does it have" (extract_keys/HEAD_COUNT/BASE_COUNT below):
+# key-count alone cannot tell "declared with zero keys" apart from
+# "declaration missing entirely" — both count zero — which is exactly
+# the ambiguity independent review of uc-infra#148 found this script
+# collapsing. Matches both the multi-line form (`map[string]bool{` alone
+# on its line, closed by a later `}`) and the single-line empty form
+# (`map[string]bool{}` fully on one line) — both are gofmt-legal
+# spellings of the same declaration, so both must count as "present".
+has_allowlist_map() {
+  local file="$1"
+  [ -f "$file" ] || return 1
+  grep -qE '^var undocumentedAllowlist = map\[string\]bool\{' "$file"
+}
+
 # extract_keys <file> — prints one quoted-string map key per line, taken
 # only from between the `var undocumentedAllowlist = map[string]bool{`
 # line and its closing `}` (anchored at column 0 — the var is top-level
 # Go source, gofmt keeps its closing brace unindented), so a quoted
 # entity-type-shaped string appearing elsewhere in the file (a comment,
 # a different map) is never mistaken for an allowlist entry. Prints
-# nothing (not an error) if the file doesn't exist or has no such map —
-# unlike check-coverage-floor.sh's extract_floor, a missing map is the
-# expected, valid state for the base file the one time this script's own
-# introducing PR runs (see the bootstrap-case comment above), so this
-# function can't tell "missing on purpose" from "missing by mistake" —
-# only the caller (main, below) knows which file is head vs. base and
-# treats the two differently.
+# nothing (not an error) if the file doesn't exist, has no such map, or
+# the map is declared with zero keys — none of those are errors at this
+# layer; has_allowlist_map (above) is what tells "no map" apart from
+# "empty map" for the caller.
+#
+# The single-line empty form (`map[string]bool{}`) needs its own branch:
+# the opening pattern below matches it too (a regex anchored on the line
+# START doesn't care what follows), so without checking for a `}`
+# already on that SAME line, the flag would stay set past `next` and the
+# scan would run on into whatever column-0 `}` comes next in the file —
+# a different top-level declaration's closing brace, not this map's own
+# (independent review of uc-infra#148: this exact bug, though it never
+# produced a wrong key list in practice here only because nothing after
+# an emptied map happened to also start at column 0 before a real `}`
+# turned up).
 extract_keys() {
   local file="$1"
   [ -f "$file" ] || return 0
   # `|| true` at the end: grep exits 1 on "no matches" (a valid outcome
-  # here — the file has no allowlist), and under `set -o pipefail` that
-  # would otherwise make the whole pipeline's exit status 1, which `set
-  # -e` then treats as this function failing outright when it's called
-  # from a `VAR=$(extract_keys ...)` assignment.
+  # here — the file has no allowlist, or has one with zero keys), and
+  # under `set -o pipefail` that would otherwise make the whole
+  # pipeline's exit status 1, which `set -e` then treats as this
+  # function failing outright when it's called from a `VAR=$(extract_keys
+  # ...)` assignment.
   awk '
-    /^var undocumentedAllowlist = map\[string\]bool\{/ { flag=1; next }
-    flag && /^}/ { flag=0 }
+    /^var undocumentedAllowlist = map\[string\]bool\{/ {
+      flag=1
+      if ($0 ~ /}/) { flag=0 }
+      next
+    }
+    flag && /^}/ { flag=0; next }
     flag
   ' "$file" | grep -oE '"[A-Za-z0-9_]+":' | sed -E 's/^"//; s/":$//' | sort -u || true
 }
 
-HEAD_KEYS=$(extract_keys "$HEAD_FILE")
-BASE_KEYS=$(extract_keys "$BASE_FILE")
-
-HEAD_COUNT=$(printf '%s\n' "$HEAD_KEYS" | grep -c . || true)
-BASE_COUNT=$(printf '%s\n' "$BASE_KEYS" | grep -c . || true)
-
-if [ "$HEAD_COUNT" -eq 0 ]; then
-  echo "::error::Could not find undocumentedAllowlist in $HEAD_FILE — refusing to silently pass (deleting the map entirely is not a valid way to close it out)." >&2
+if ! has_allowlist_map "$HEAD_FILE"; then
+  echo "::error::Could not find undocumentedAllowlist in $HEAD_FILE — refusing to silently pass (deleting the map declaration entirely is not a valid way to close it out; leave \`var undocumentedAllowlist = map[string]bool{}\` in place instead)." >&2
   exit 1
 fi
 
-if [ "$BASE_COUNT" -eq 0 ]; then
+HEAD_KEYS=$(extract_keys "$HEAD_FILE")
+HEAD_COUNT=$(printf '%s\n' "$HEAD_KEYS" | grep -c . || true)
+
+if ! has_allowlist_map "$BASE_FILE"; then
   echo "No undocumentedAllowlist found in $BASE_FILE — treating as this gate's introducing PR (bootstrap case, see script header); nothing to ratchet against yet."
   exit 0
 fi
+
+BASE_KEYS=$(extract_keys "$BASE_FILE")
+BASE_COUNT=$(printf '%s\n' "$BASE_KEYS" | grep -c . || true)
 
 # comm -23: lines only in HEAD_KEYS (sorted), i.e. keys head added that
 # base didn't have. Both inputs are already sorted -u by extract_keys.
