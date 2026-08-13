@@ -459,6 +459,18 @@ table.uc-table tbody tr:last-child td {
   font-weight: 700;
 }
 
+/* The project budget report's "some logged hours could not be priced"
+   note (uc-infra#187) — a real computed style (muted, italic), not just
+   a class name in the markup, so the note reads as a caveat attached to
+   the row rather than blending into the plain category label next to
+   it. Same "assert a real computed style, not just a class attribute"
+   reasoning .uc-rfq-lowest's own comment gives. */
+.uc-project-budget-unpriced {
+  color: var(--uc-muted);
+  font-style: italic;
+  font-weight: 400;
+}
+
 /* The rendered 403 (see denied.go). Styled as a real page rather than
    left as unstyled default markup: a permission refusal is one of the
    few pages a user hits without meaning to, so it has to read as part of

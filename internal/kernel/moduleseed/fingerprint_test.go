@@ -297,7 +297,7 @@ var wantHashes = map[string]string{
 	"form:SalesOrder@v2":                     "d220aa6005b1672216179c35a049418f1acec36852d69aaf23c6455768e81754",
 	"form:SOLine@v1":                         "c60736af2fe79691bad7045d666280a1d79a25e299d97f2e7203d2026d536fcd",
 	"form:CustomerInvoice@v2":                "381c85a750a240edfc8d3ea8650979e5206d4e37c1881c57a410a960501f81c9",
-	"form:Project@v1":                        "8f028dde8328bfee2bd2212c15c9ee83efd807f6af63408ada5b7754df5a0d7c",
+	"form:Project@v2":                        "3e4f80ac06af194552d3022f08625eee2ae4fbb1882ef7c1777552438cbc3cc2",
 	"form:Task@v1":                           "fe622d93cc8a695a4b63ae7ba8b3d26545ebbc0ba65bcc6f58bf9517fdd8bedc",
 	"form:TimeEntry@v1":                      "980128ae23584e6a9f5850a6f4a47c7b328b5815a6dec06e1b8696e30a2b9f99",
 	"form:ProjectBudgetLine@v1":              "ad6b11161b17bd957d1bbc13c070338b122c3d1763ce4118b15ea241211b1f6c",

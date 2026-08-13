@@ -403,6 +403,11 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	// entity type — this report is scoped to exactly one RFQ, unlike the
 	// purchasing report above which aggregates across every record.
 	mux.Handle("GET /reports/rfq/{id}", authPage(h.renderRFQComparisonReport))
+	// The Project planned-vs-actual budget report (uc-infra#187) — see
+	// project_budget_report.go's doc comment. {id} is the Project
+	// record's own id, scoped to exactly one project, same shape as the
+	// RFQ report above.
+	mux.Handle("GET /reports/project-budget/{id}", authPage(h.renderProjectBudgetReport))
 	// The in-product help manual viewer (ADR-0023, uc-infra#144) — see
 	// help.go's own doc comment. /help/search is registered as its own
 	// literal route (not folded into the {topicID...} wildcard below) so
