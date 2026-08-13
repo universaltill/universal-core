@@ -837,7 +837,17 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
     } else {
       screenBtn.addEventListener("click", function() {
         if (screenRecording) {
-          screenRecorder.stop();
+          // uc-infra#220: screenRecording is only ever reset inside onstop
+          // (see the outer-scope comment above), never synchronously here,
+          // so a redundant Stop click before the first click's onstop has
+          // fired would otherwise call .stop() a second time on a recorder
+          // the spec already transitioned to "inactive" synchronously as
+          // part of the first .stop() call — an uncaught InvalidStateError
+          // inside this handler. Same guard the auto-stop timeout below
+          // already uses against the same spec behavior.
+          if (screenRecorder && screenRecorder.state !== "inactive") {
+            screenRecorder.stop();
+          }
           return;
         }
         if (screenBtn.disabled) {
