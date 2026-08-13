@@ -322,18 +322,30 @@ func TestSyncGLAccountOnWrite_RenamingCodeOrphansThePreviousGLAccountsRow(t *tes
 }
 
 // TestSyncGLAccountOnWrite_IsActiveOmittedOnCreate_StoresInactive pins
-// down another real gap independent review found (finding 5) that is
-// pre-existing in internal/kernel/formrender (a FieldBool's declared
-// Default is not honored when rendering a NEW record's form — only
-// FieldEnum's Default is, per formrender's own code), not something this
-// change introduces — but this change is what makes the gap reach the
-// ledger: an ordinary UI create where the admin never touches the
-// "Active" checkbox now projects into gl_accounts as inactive, silently
-// making a brand-new account unusable for posting
-// (ledger.ErrInactiveAccount). Filed as its own follow-up card rather
-// than fixed here (fixing formrender's Default handling is a
-// cross-module change well outside this card's scope) — this test only
-// makes sure the interaction can't get worse unnoticed.
+// down another real gap independent review found (finding 5): a
+// programmatic engine.Create call that omits a field entirely never
+// consults that field's declared entity.Field.Default — nothing in
+// internal/kernel/crud or internal/kernel/entity applies Default at
+// write time, for any field type, not just FieldBool.
+//
+// uc-infra#206 closed the half of this gap that actually reached a real
+// admin: internal/kernel/formrender's new-record rendering now honors a
+// FieldBool's Default the same way it already did for FieldEnum, so the
+// ordinary UI create flow this test's own history worried about (an
+// admin who never touches the "Active" checkbox) now submits
+// is_active=true explicitly — the checkbox itself renders pre-checked,
+// so the browser's own hidden-false/checkbox-true submission trick
+// carries the real value through, and engine.Create receives it SET,
+// not omitted, once the request comes from that fixed form.
+//
+// This test's own path bypasses formrender entirely — engine.Create is
+// called directly with is_active left out of the payload, which is
+// exactly what a non-browser caller (CSV import, a future API create,
+// this test itself) still does. That deeper gap — Default is a
+// Definition-level declaration formrender now reads but crud/entity
+// still never does — is unchanged by #206 and is genuinely a separate,
+// broader change (every field type, every non-form write path), so it
+// stays open rather than folded into #206's narrower rendering fix.
 func TestSyncGLAccountOnWrite_IsActiveOmittedOnCreate_StoresInactive(t *testing.T) {
 	tenantDB := freshTenantDB(t)
 	ctx := context.Background()
@@ -363,7 +375,7 @@ func TestSyncGLAccountOnWrite_IsActiveOmittedOnCreate_StoresInactive(t *testing.
 		t.Fatalf("IDByCode: %v", err)
 	}
 	if isActive {
-		t.Fatal("expected today's real (pre-existing, cross-module) gap to store is_active=false when omitted — if this now passes with isActive=true, formrender's Default handling changed and this test (and its follow-up card) should be revisited")
+		t.Fatal("expected today's real (pre-existing, cross-module) gap to store is_active=false when omitted via a direct engine.Create call — if this now passes with isActive=true, crud/entity started applying Field.Default at write time and this test (and uc-infra#212) should be revisited; formrender's own half of this gap is already closed by uc-infra#206")
 	}
 }
 

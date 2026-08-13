@@ -146,6 +146,32 @@ func TestDefinitionValidate(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			// Bool sibling of "enum default not a string" (uc-infra#206,
+			// independent review finding 1): formrender's FieldBool
+			// case now fails safe on a non-bool Default (renders
+			// unchecked), but that means a typo like the string "true"
+			// instead of the bool true would silently do nothing —
+			// caught here instead, same discipline as the enum check.
+			name: "bool default not a bool",
+			def: Definition{
+				EntityType: "Account",
+				Fields: []Field{
+					{Name: "is_active", Type: FieldBool, Default: "true"},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "bool default is a valid bool",
+			def: Definition{
+				EntityType: "Account",
+				Fields: []Field{
+					{Name: "is_active", Type: FieldBool, Default: true},
+				},
+			},
+			wantErr: false,
+		},
+		{
 			// NotBefore only means anything for a date-vs-date comparison
 			// (validateNotBefore time.Parses both sides) — declaring it on
 			// any other type is schema drift to fail loud on.

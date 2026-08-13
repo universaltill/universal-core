@@ -437,6 +437,21 @@ func (d *Definition) Validate() error {
 				return fmt.Errorf("field %q default %q is not one of its enum_values %v", f.Name, def, f.EnumValues)
 			}
 		}
+		if f.Type == FieldBool && f.Default != nil {
+			// Same reasoning as the FieldEnum check just above, for the
+			// same reason: formrender's new-record rendering only started
+			// consulting a FieldBool's Default once uc-infra#206 closed the
+			// gap where only FieldEnum's was honored. Before that, a
+			// typo'd Default (e.g. the string "true" instead of the bool
+			// true) was harmless dead data; now formrender's type
+			// assertion fails safe and silently renders unchecked, which
+			// is exactly the "believes a default was applied but it
+			// wasn't" failure the enum check exists to catch at
+			// definition-validation time instead of at render time.
+			if _, ok := f.Default.(bool); !ok {
+				return fmt.Errorf("field %q is type bool but default %v is not a bool", f.Name, f.Default)
+			}
+		}
 		if f.Type == FieldReference && f.Target == "" {
 			return fmt.Errorf("field %q is type reference but has no target", f.Name)
 		}

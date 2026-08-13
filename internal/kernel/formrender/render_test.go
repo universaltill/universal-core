@@ -511,6 +511,124 @@ func TestRender_UnsetEnumFieldHonorsDeclaredDefault(t *testing.T) {
 	}
 }
 
+// TestRender_UnsetBoolFieldHonorsDeclaredDefault is the FieldBool sibling
+// of TestRender_UnsetEnumFieldHonorsDeclaredDefault above (uc-infra#206):
+// entity.Field.Default is a generic concept, but only the FieldEnum case
+// ever consulted it — a FieldBool field with Default: true (e.g.
+// finance.Account.is_active) rendered unchecked on a brand-new record's
+// form regardless, silently storing false the moment an admin saved
+// without touching the checkbox. Confirms both halves: an unset field
+// with Default: true renders checked, and an unset field with no
+// declared Default (the ordinary case) still renders unchecked exactly
+// as before this fix.
+func TestRender_UnsetBoolFieldHonorsDeclaredDefault(t *testing.T) {
+	r := testRenderer(t)
+	ent := &entity.Definition{
+		EntityType: "Account",
+		Fields: []entity.Field{
+			{Name: "is_active", Type: entity.FieldBool, Default: true},
+			{Name: "is_primary", Type: entity.FieldBool, Default: false},
+		},
+	}
+	def := &form.Definition{
+		EntityType: "Account",
+		Sections: []form.Section{{
+			Title: "Header", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "is_active", Label: "Active"}, {Name: "is_primary", Label: "Primary"}},
+		}},
+	}
+	data := Data{Record: map[string]any{}}
+	var buf strings.Builder
+	if err := r.Render(&buf, def, ent, data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	body := buf.String()
+	if !strings.Contains(body, `name="is_active" value="true" checked`) {
+		t.Fatalf("expected is_active (Default: true) to render checked on an unset new-record form, got:\n%s", body)
+	}
+	if strings.Contains(body, `name="is_primary" value="true" checked`) {
+		t.Fatalf("expected is_primary (Default: false) to still render unchecked, got:\n%s", body)
+	}
+}
+
+// TestRender_ExplicitFalseBoolFieldOverridesDeclaredDefault confirms an
+// existing record's genuinely-stored false always wins over a Default:
+// true — the fallback introduced for uc-infra#206 must only fire when
+// the field is truly absent from the record (a new-record form), never
+// override a real stored value. Without the type-assertion's ok check,
+// this would regress every already-inactive Account/Facility back to
+// checked the moment it's opened for edit.
+func TestRender_ExplicitFalseBoolFieldOverridesDeclaredDefault(t *testing.T) {
+	r := testRenderer(t)
+	ent := &entity.Definition{
+		EntityType: "Account",
+		Fields: []entity.Field{
+			{Name: "is_active", Type: entity.FieldBool, Default: true},
+		},
+	}
+	def := &form.Definition{
+		EntityType: "Account",
+		Sections: []form.Section{{
+			Title: "Header", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "is_active", Label: "Active"}},
+		}},
+	}
+	data := Data{Record: map[string]any{"is_active": false}}
+	var buf strings.Builder
+	if err := r.Render(&buf, def, ent, data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	body := buf.String()
+	if strings.Contains(body, `name="is_active" value="true" checked`) {
+		t.Fatalf("expected a stored false to render unchecked despite Default: true, got:\n%s", body)
+	}
+}
+
+// TestRender_ExistingRecordMissingBoolKeyRendersDefaultNotStoredFalsy
+// pins down a known, documented divergence independent review found on
+// uc-infra#206 (finding 2): the fix can only tell "unset" apart from
+// "explicitly false" by whether record[name] has an entry at all — it
+// has no way to also tell "a brand-new record" apart from "an existing
+// record whose bool key is missing because some non-form write path
+// never wrote it" (e.g. a direct engine.Create call, exactly what
+// finance's TestSyncGLAccountOnWrite_IsActiveOmittedOnCreate_
+// StoresInactive exercises). Both render checked here, even though the
+// second case's true stored state is false elsewhere in the system
+// (gl_accounts, ledger.PostTx). This is intentional, bounded (the next
+// save through this form writes the key and self-heals it), and tracked
+// as its own follow-up (uc-infra#212: crud/entity should apply Default
+// at write time so no caller can produce this missing-key state at
+// all) — this test exists so a future change to this fallback doesn't
+// alter that divergence silently in either direction without a test
+// noticing.
+func TestRender_ExistingRecordMissingBoolKeyRendersDefaultNotStoredFalsy(t *testing.T) {
+	r := testRenderer(t)
+	ent := &entity.Definition{
+		EntityType: "Account",
+		Fields: []entity.Field{
+			{Name: "is_active", Type: entity.FieldBool, Default: true},
+		},
+	}
+	def := &form.Definition{
+		EntityType: "Account",
+		Sections: []form.Section{{
+			Title: "Header", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "is_active", Label: "Active"}},
+		}},
+	}
+	// A record with OTHER fields set (proving this is "existing record,
+	// key missing," not "brand-new record") but no is_active key at all.
+	data := Data{Record: map[string]any{"code": "1000", "name": "Assets"}}
+	var buf strings.Builder
+	if err := r.Render(&buf, def, ent, data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	body := buf.String()
+	if !strings.Contains(body, `name="is_active" value="true" checked`) {
+		t.Fatalf("expected the documented fallback to render checked when the key is absent even on an otherwise-populated record, got:\n%s", body)
+	}
+}
+
 // TestRender_EnumOptionLabelsAreTranslated confirms an enum field's
 // options show a translated label ("field.{EntityType}.{FieldName}.
 // {Value}" in the i18n catalog), not the raw stored value — Farshid
