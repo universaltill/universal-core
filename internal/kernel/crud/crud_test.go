@@ -160,6 +160,94 @@ func TestEngine_Create_RecordsAIActorIdentity(t *testing.T) {
 	}
 }
 
+// defaultingVendorDef mirrors vendorDef but with a Default declared on
+// each non-string field type this package's own Definition.Validate
+// type-checks Default for (bool, enum), used to prove engine.Create
+// applies entity.Field.Default end-to-end against a real tenant
+// database, not just at the entity.ApplyDefaults unit level.
+func defaultingVendorDef() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "Vendor",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "name", Type: entity.FieldString, Required: true},
+			{Name: "lead_time_days", Type: entity.FieldNumber},
+			{Name: "active", Type: entity.FieldBool, Default: true},
+			{Name: "payment_terms", Type: entity.FieldEnum, EnumValues: []string{"prepaid", "DP", "TT", "LC"}, Default: "DP"},
+		},
+	}
+}
+
+// TestEngine_Create_AppliesFieldDefaultForOmittedFields is the
+// integration-level proof for uc-infra#212: a field genuinely absent
+// from the create payload — not just zero-valued — gets its
+// Definition-declared Default, for every field type that carries one,
+// through the real validate-then-persist path against a real tenant
+// database. See internal/kernel/entity's TestApplyDefaults for the pure
+// per-type unit coverage this exercises end-to-end.
+func TestEngine_Create_AppliesFieldDefaultForOmittedFields(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	def := defaultingVendorDef()
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	rec, err := engine.Create(ctx, def, map[string]any{"name": "Acme Textiles"}, actor)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	got, err := engine.Get(ctx, def, rec.ID)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if got.Data["active"] != true {
+		t.Errorf("Data[\"active\"] = %v, want Definition-declared Default true", got.Data["active"])
+	}
+	if got.Data["payment_terms"] != "DP" {
+		t.Errorf(`Data["payment_terms"] = %v, want Definition-declared Default "DP"`, got.Data["payment_terms"])
+	}
+	if _, present := got.Data["lead_time_days"]; present {
+		t.Errorf(`Data["lead_time_days"] = %v, want left absent (no Default declared, field not required)`, got.Data["lead_time_days"])
+	}
+}
+
+// TestEngine_Create_ExplicitValueNotOverriddenByDefault is the
+// companion case: a caller that explicitly submits a value for a
+// defaulted field — including bool's own zero value, false, which
+// entity.ValidateRecord accepts unlike an empty string against
+// FieldEnum's closed EnumValues set — is making a real choice, not
+// omitting the field, and engine.Create must persist exactly that,
+// never substitute the Definition's Default over an explicitly-set
+// value.
+func TestEngine_Create_ExplicitValueNotOverriddenByDefault(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	def := defaultingVendorDef()
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	rec, err := engine.Create(ctx, def, map[string]any{
+		"name":          "Acme Textiles",
+		"active":        false, // bool's own zero value — a real, explicit choice
+		"payment_terms": "TT",  // valid, but not the declared Default "DP"
+	}, actor)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	got, err := engine.Get(ctx, def, rec.ID)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if got.Data["active"] != false {
+		t.Errorf(`Data["active"] = %v, want explicit false preserved, not overridden by Default true`, got.Data["active"])
+	}
+	if got.Data["payment_terms"] != "TT" {
+		t.Errorf(`Data["payment_terms"] = %v, want explicit "TT" preserved, not overridden by Default "DP"`, got.Data["payment_terms"])
+	}
+}
+
 func TestEngine_Create_ValidationFailure_WritesNothing(t *testing.T) {
 	db := freshTenantDB(t)
 	ctx := context.Background()

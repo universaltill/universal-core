@@ -90,6 +90,13 @@ func (e *Engine) runHook(ctx context.Context, tx *sql.Tx, def *entity.Definition
 // never exist without its audit trail (ADR-0017 §14/§16: audit is written
 // from the same transaction as the mutation, never bolted on after).
 func (e *Engine) Create(ctx context.Context, def *entity.Definition, fields map[string]any, actor audit.Actor) (data.Record, error) {
+	// Applied before validation (and, deliberately, only here — never in
+	// Update, where an omitted field means "leave unchanged") so a
+	// Default satisfies its own field's Required check and the defaulted
+	// value is what gets validated, persisted, unique-keyed, and
+	// audited — one materialization of "what this record actually is,"
+	// not defaults bolted on after the fact (uc-infra#212).
+	entity.ApplyDefaults(def, fields)
 	if err := entity.ValidateRecord(def, fields); err != nil {
 		return data.Record{}, fmt.Errorf("validation failed: %w", err)
 	}

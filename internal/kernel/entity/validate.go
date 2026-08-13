@@ -129,6 +129,42 @@ func (e *ValidationError) Error() string { return e.Detail }
 // Unwrap makes errors.Is(err, ErrValidation) match regardless of Kind.
 func (e *ValidationError) Unwrap() error { return ErrValidation }
 
+// ApplyDefaults fills in each field's declared Field.Default for any
+// field genuinely absent from data — mutating data in place — before
+// validation/persistence sees it (uc-infra#212). "Absent" matches
+// ValidateRecord's own definition just below (map key missing, or
+// present but nil): an explicitly-submitted zero value (false, "", 0)
+// is a real value, not an omission, and is never overridden. Applying
+// Default is uniform across every field type with no per-type branch —
+// Field.Default already holds a value of the right shape for its field
+// (FieldEnum/FieldBool's Default is type-checked at Definition.Validate
+// time; other types simply carry whatever the Definition declared) — so
+// there's nothing type-specific to do here.
+//
+// Only crud.Engine.Create calls this, deliberately: an omitted field on
+// Update means "leave unchanged," an established semantic this must not
+// disturb, so Update never calls it. Before this, Field.Default was
+// only ever consulted by internal/kernel/formrender's browser rendering
+// (uc-infra#206) and Definition.Validate's own type-checks — never at
+// write time, so any non-form caller (CSV import, a direct API/engine.
+// Create call, tests) got the Go zero value instead of the Definition's
+// declared Default whenever a field was left out of the payload
+// entirely. See TestSyncGLAccountOnWrite_IsActiveOmittedOnCreate_
+// StoresActive in internal/kernel/finance/hooks_test.go — originally
+// named ...StoresInactive while it pinned this gap, renamed once this
+// closed it.
+func ApplyDefaults(def *Definition, data map[string]any) {
+	for _, f := range def.Fields {
+		if f.Default == nil {
+			continue
+		}
+		if v, present := data[f.Name]; present && v != nil {
+			continue
+		}
+		data[f.Name] = f.Default
+	}
+}
+
 // ValidateRecord checks a record's data against its Definition — the
 // server-side half of "validation is defined once, applied identically
 // client- and server-side" (ADR-0017 §5). It never inspects entity_type

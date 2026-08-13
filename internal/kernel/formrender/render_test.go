@@ -590,17 +590,18 @@ func TestRender_ExplicitFalseBoolFieldOverridesDeclaredDefault(t *testing.T) {
 // "explicitly false" by whether record[name] has an entry at all — it
 // has no way to also tell "a brand-new record" apart from "an existing
 // record whose bool key is missing because some non-form write path
-// never wrote it" (e.g. a direct engine.Create call, exactly what
-// finance's TestSyncGLAccountOnWrite_IsActiveOmittedOnCreate_
-// StoresInactive exercises). Both render checked here, even though the
-// second case's true stored state is false elsewhere in the system
-// (gl_accounts, ledger.PostTx). This is intentional, bounded (the next
-// save through this form writes the key and self-heals it), and tracked
-// as its own follow-up (uc-infra#212: crud/entity should apply Default
-// at write time so no caller can produce this missing-key state at
-// all) — this test exists so a future change to this fallback doesn't
-// alter that divergence silently in either direction without a test
-// noticing.
+// never wrote it." uc-infra#212 closed the write-time half of this
+// (crud.Engine.Create now applies Field.Default via entity.ApplyDefaults,
+// so no *new* engine.Create call — direct or via finance's
+// TestSyncGLAccountOnWrite_IsActiveOmittedOnCreate_StoresActive — can
+// produce this missing-key state anymore); this render-time fallback
+// stays, for records already persisted before #212 landed. Both render
+// checked here, even though the second case's true stored state is
+// false elsewhere in the system (gl_accounts, ledger.PostTx). This is
+// intentional, bounded (the next save through this form writes the key
+// and self-heals it) — this test exists so a future change to this
+// fallback doesn't alter that divergence silently in either direction
+// without a test noticing.
 func TestRender_ExistingRecordMissingBoolKeyRendersDefaultNotStoredFalsy(t *testing.T) {
 	r := testRenderer(t)
 	ent := &entity.Definition{

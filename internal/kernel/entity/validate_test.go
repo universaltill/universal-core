@@ -816,3 +816,116 @@ func TestValidateRecord_ValidationErrorStructured(t *testing.T) {
 		}
 	})
 }
+
+// applyDefaultsDef mirrors vendorDef but with a Default declared on
+// every non-string field type this package actually type-checks
+// Default for (FieldBool, FieldEnum), plus an undefaulted field
+// (lead_time_days) and a Required field with its own Default
+// (is_active) to prove ApplyDefaults runs before ValidateRecord's
+// Required check.
+func applyDefaultsDef() *Definition {
+	return &Definition{
+		EntityType: "Vendor",
+		Version:    1,
+		Fields: []Field{
+			{Name: "name", Type: FieldString, Required: true, Default: "Unnamed Vendor"},
+			{Name: "lead_time_days", Type: FieldNumber},
+			{Name: "active", Type: FieldBool, Required: true, Default: true},
+			{Name: "payment_terms", Type: FieldEnum, EnumValues: []string{"prepaid", "DP", "TT", "LC"}, Default: "DP"},
+		},
+	}
+}
+
+func TestApplyDefaults(t *testing.T) {
+	def := applyDefaultsDef()
+
+	t.Run("omitted fields get their declared Default, per type", func(t *testing.T) {
+		data := map[string]any{}
+		ApplyDefaults(def, data)
+		if data["name"] != "Unnamed Vendor" {
+			t.Errorf("name = %v, want default string", data["name"])
+		}
+		if data["active"] != true {
+			t.Errorf("active = %v, want default bool true", data["active"])
+		}
+		if data["payment_terms"] != "DP" {
+			t.Errorf("payment_terms = %v, want default enum \"DP\"", data["payment_terms"])
+		}
+		if _, present := data["lead_time_days"]; present {
+			t.Errorf("lead_time_days = %v, want left absent (no Default declared)", data["lead_time_days"])
+		}
+	})
+
+	t.Run("nil value is treated as absent, same as a missing key", func(t *testing.T) {
+		data := map[string]any{"active": nil}
+		ApplyDefaults(def, data)
+		if data["active"] != true {
+			t.Errorf("active = %v, want default bool true to replace explicit nil", data["active"])
+		}
+	})
+
+	t.Run("explicit zero values are never overridden", func(t *testing.T) {
+		data := map[string]any{
+			"name":          "",
+			"active":        false,
+			"payment_terms": "",
+		}
+		ApplyDefaults(def, data)
+		if data["name"] != "" {
+			t.Errorf("name = %v, want explicit \"\" preserved", data["name"])
+		}
+		if data["active"] != false {
+			t.Errorf("active = %v, want explicit false preserved", data["active"])
+		}
+		if data["payment_terms"] != "" {
+			t.Errorf(`payment_terms = %v, want explicit "" preserved`, data["payment_terms"])
+		}
+	})
+
+	t.Run("explicitly-set non-zero values are never overridden", func(t *testing.T) {
+		data := map[string]any{
+			"name":          "Acme Textiles",
+			"active":        false,
+			"payment_terms": "LC",
+		}
+		ApplyDefaults(def, data)
+		if data["name"] != "Acme Textiles" || data["active"] != false || data["payment_terms"] != "LC" {
+			t.Fatalf("ApplyDefaults must not touch explicitly-set fields, got: %+v", data)
+		}
+	})
+
+	t.Run("a Required field's own Default satisfies ValidateRecord when omitted", func(t *testing.T) {
+		data := map[string]any{"payment_terms": "TT"}
+		ApplyDefaults(def, data)
+		if err := ValidateRecord(def, data); err != nil {
+			t.Fatalf("expected ApplyDefaults to satisfy Required 'name'/'active', got: %v", err)
+		}
+	})
+
+	t.Run("field with no Default declared is left untouched, present or absent", func(t *testing.T) {
+		data := map[string]any{"lead_time_days": float64(45)}
+		ApplyDefaults(def, data)
+		if data["lead_time_days"] != float64(45) {
+			t.Errorf("lead_time_days = %v, want untouched explicit value", data["lead_time_days"])
+		}
+	})
+
+	t.Run("Default is applied uniformly across every field type, not just bool/enum/string", func(t *testing.T) {
+		def := &Definition{EntityType: "Asset", Fields: []Field{
+			{Name: "quantity", Type: FieldNumber, Default: float64(1)},
+			{Name: "acquired_on", Type: FieldDate, Default: "2026-01-01"},
+			{Name: "cost", Type: FieldMoney, Default: int64(0)},
+		}}
+		data := map[string]any{}
+		ApplyDefaults(def, data)
+		if data["quantity"] != float64(1) {
+			t.Errorf("quantity = %v, want default number", data["quantity"])
+		}
+		if data["acquired_on"] != "2026-01-01" {
+			t.Errorf("acquired_on = %v, want default date", data["acquired_on"])
+		}
+		if data["cost"] != int64(0) {
+			t.Errorf("cost = %v, want default money", data["cost"])
+		}
+	})
+}

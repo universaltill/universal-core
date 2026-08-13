@@ -214,9 +214,9 @@ func TestGoodsReceiptForm_FacilityPickerRendersByName(t *testing.T) {
 // checkbox as checked, or — the part that actually matters to an admin —
 // that submitting the form without touching the checkbox at all persists
 // is_active=true rather than the false a checkbox's ordinary unchecked-
-// by-default HTML semantics would otherwise silently store (exactly the
+// by-default HTML semantics would otherwise silently store (the sibling
 // gap finance's TestSyncGLAccountOnWrite_IsActiveOmittedOnCreate_
-// StoresInactive documents one layer down, for Account specifically —
+// StoresActive documents one layer down, for Account specifically —
 // this is the same fix's UI-facing half, for Facility).
 func TestFacility_NewFormChecksActiveByDefault(t *testing.T) {
 	withDevAuthEnabled(t)
