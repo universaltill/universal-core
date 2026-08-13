@@ -147,6 +147,51 @@ var helpFixtureTopics = []helpFixtureTopic{
 			"ar": "كيفية تهيئة سير عمل نقطة بيع المقهى أو المطعم الخاص بك. تُحفظ إعدادات المقهى ضمن الإعدادات.",
 		},
 	},
+	{
+		// The list-continuation fixture (uc-infra#207): an ordered list
+		// whose second item wraps across two indented source lines, the
+		// exact authoring convention used throughout the real shipped
+		// manual (internal/help/content/en/entity/AIProviderConnection.md's
+		// own numbered steps among them) that parseBlocks used to
+		// mis-handle — independent review confirmed this fix changes the
+		// rendered output of 157 of the 161 shipped content files (a
+		// differential render of every file, not an indentation-heuristic
+		// grep, which undercounts). See internal/help/markdown_test.go's
+		// own unit coverage for the parser-level regression test. This
+		// fixture's job is the one only a real browser can do: prove the
+		// DOM a real client renders is one complete <ol> with the
+		// wrapped item's full text in a single <li>, not markup-string
+		// matching (already covered at the unit layer) and not two
+		// lists split by a stray paragraph. Real translations in every
+		// locale, same as every fixture above — TestHelp_MultiLocaleRender_RealBrowser asserts
+		// each fixture topic's own translated title renders (and never
+		// silently falls back to en) unconditionally across all four
+		// locales; only this topic's en body is what
+		// TestHelp_ListItemWrappedAcrossSourceLines_RealBrowser below
+		// actually drives, since list-item line-folding is locale-
+		// invariant logic and the other fixtures already cover per-locale
+		// body translation/fallback behavior on their own.
+		id:       "route/list-continuation-check",
+		module:   "general",
+		audience: "user",
+		order:    3,
+		title: map[string]string{
+			"en": "List Continuation Check",
+			"tr": "Liste Devamı Kontrolü",
+			"fa": "بررسی ادامهٔ فهرست",
+			"ar": "فحص متابعة القائمة",
+		},
+		body: map[string]string{
+			"en": "1. Choose **Report an Issue** from the navigation bar.\n" +
+				"2. Type a short title and a description of the problem. You can also\n" +
+				"   record a voice note, which is transcribed automatically and appended\n" +
+				"   to your description.\n" +
+				"3. Submit the report.\n",
+			"tr": "Bu konu, uzun bir liste öğesinin birden çok kaynak satırına sarılmasını test eder.",
+			"fa": "این موضوع، پیچیده‌شدن یک مورد فهرست بلند را در چند خط منبع آزمایش می‌کند.",
+			"ar": "يختبر هذا الموضوع التفاف عنصر قائمة طويل عبر عدة أسطر مصدر.",
+		},
+	},
 }
 
 // helpE2EFixtureIndex builds the real help.Index the tests in this file
@@ -317,8 +362,8 @@ func TestHelp_SearchNarrowing_RealBrowser(t *testing.T) {
 		t.Fatalf("navigate /help: %v", err)
 	}
 
-	// Full list to start: 4 fixture topics, nothing filtered yet.
-	waitForHelpTopicCount(t, ctx, 4)
+	// Full list to start: 5 fixture topics, nothing filtered yet.
+	waitForHelpTopicCount(t, ctx, len(helpFixtureTopics))
 
 	// "warehouse" only appears in entity/Item's en body — narrows to 1.
 	if err := chromedp.Run(ctx, chromedp.SendKeys(`#uc-help-search`, "warehouse", chromedp.ByQuery)); err != nil {
@@ -343,7 +388,7 @@ func TestHelp_SearchNarrowing_RealBrowser(t *testing.T) {
 	if err := chromedp.Run(ctx, chromedp.SendKeys(`#uc-help-search`, strings.Repeat("\b", len("warehouse")), chromedp.ByQuery)); err != nil {
 		t.Fatalf("clear #uc-help-search: %v", err)
 	}
-	waitForHelpTopicCount(t, ctx, 4)
+	waitForHelpTopicCount(t, ctx, len(helpFixtureTopics))
 
 	// A query matching nothing narrows to the "no results" state, not an
 	// error or a stale list.
@@ -749,5 +794,60 @@ func TestHelp_AdminBadge_VisibleNotHidden_RealBrowser(t *testing.T) {
 	}
 	if !strings.Contains(detail, "Admin Configuration Guide") {
 		t.Errorf("expected the admin-audience topic's content to render for a non-admin viewer (marked, never restricted), got:\n%s", detail)
+	}
+}
+
+// TestHelp_ListItemWrappedAcrossSourceLines_RealBrowser is the real-
+// browser regression test for uc-infra#207: a list item whose source
+// text wraps across multiple indented lines (route/list-continuation-
+// check's fixture body above) must render, in an actual browser DOM, as
+// one complete <ol> with each item's full text intact — not two lists
+// split by a stray paragraph with the wrapped item truncated mid-
+// sentence, which is what internal/help/markdown.go's parseBlocks used
+// to produce before the fix. internal/help/markdown_test.go already
+// proves the generated HTML string is correct; this proves a real
+// browser parses that HTML into one <ol> DOM node with the right number
+// of list-item children, which a string-contains assertion cannot.
+func TestHelp_ListItemWrappedAcrossSourceLines_RealBrowser(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, _ := testHelpServer(t)
+	ctx := browserCtx(t, tenantID)
+
+	const detailSel = `#uc-help-detail`
+	const liSel = detailSel + ` ol > li`
+	var olCount, liCount int
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/help/route/list-continuation-check"),
+		chromedp.WaitVisible(detailSel+" ol", chromedp.ByQuery),
+		chromedp.EvaluateAsDevTools(`document.querySelectorAll('`+detailSel+` ol').length`, &olCount),
+		chromedp.EvaluateAsDevTools(`document.querySelectorAll('`+liSel+`').length`, &liCount),
+	); err != nil {
+		t.Fatalf("navigate and inspect the wrapped list item: %v", err)
+	}
+	if olCount != 1 {
+		t.Errorf("ol count = %d, want exactly 1 — a wrapped continuation line must not close the list early and start a second <ol>", olCount)
+	}
+	// Fatal, not Error: the pre-fix bug produces 3 total <li> too (2 in a
+	// first <ol> plus 1 in a second one, per the olCount check above), so
+	// this count alone isn't what catches the regression — the item text
+	// below is. But reading li[1] below assumes at least 2 exist; stop
+	// here with a clear message instead of letting a wrong count surface
+	// as an opaque JS "Cannot read properties of undefined" exception
+	// (independent review, uc-infra#207).
+	if liCount != 3 {
+		t.Fatalf("li count = %d, want exactly 3 (one per source list item, the wrapped one folded into a single <li>)", liCount)
+	}
+
+	var secondItemText string
+	if err := chromedp.Run(ctx, chromedp.EvaluateAsDevTools(
+		`document.querySelectorAll('`+liSel+`')[1]?.textContent ?? ''`, &secondItemText,
+	)); err != nil {
+		t.Fatalf("read the wrapped <li>'s textContent: %v", err)
+	}
+	wantSecondItem := "Type a short title and a description of the problem. You can also " +
+		"record a voice note, which is transcribed automatically and appended " +
+		"to your description."
+	if secondItemText != wantSecondItem {
+		t.Errorf("second <li> textContent = %q, want the full wrapped sentence intact:\n%q", secondItemText, wantSecondItem)
 	}
 }

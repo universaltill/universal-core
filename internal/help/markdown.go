@@ -94,6 +94,47 @@ func isOrderedItem(trimmed string) bool {
 	return orderedItemRe.MatchString(trimmed)
 }
 
+// isListContinuationLine reports whether trimmed (already whitespace-
+// trimmed, so this never sees the source indentation itself) is a
+// wrapped-continuation of the list item currently being scanned rather
+// than the start of a new block. This repo's own help content wraps a
+// long list item across multiple indented source lines for readability
+// (uc-infra#207) — parseBlocks' list-scanning loops must fold such a
+// line into the in-progress item instead of falling through to the
+// paragraph branch, which used to truncate the item mid-sentence and
+// close the list early.
+//
+// The trimmed == "" check is load-bearing, not a defensive extra: a
+// blank line is the *only* thing that ends a list today (there is no
+// separate blank-line check in either scan loop), and both loops do
+// call this function with "" on exactly that line, once it fails the
+// isUnorderedItem/isOrderedItem check ahead of it — removing this guard
+// would make a list swallow every following line, blank ones included,
+// for the rest of the document (independent review, uc-infra#207).
+//
+// A line that opens a new block of its own — the other list-marker
+// kind, or a heading — is never continuation text either, even without
+// a blank line separating it: folding a heading into the preceding
+// <li> would be a worse bug than the one this fixes. The heading check
+// mirrors parseBlocks' own three recognized heading prefixes exactly
+// ("# ", "## ", "### ") rather than a bare "#", so a continuation line
+// that happens to start with a literal "#" token (e.g. an issue
+// reference like "#INV-2024-001") still folds normally instead of
+// falling out of the list into a stray paragraph — the same truncation
+// class this function exists to prevent (independent review).
+func isListContinuationLine(trimmed string) bool {
+	if trimmed == "" {
+		return false
+	}
+	if isUnorderedItem(trimmed) || isOrderedItem(trimmed) {
+		return false
+	}
+	if strings.HasPrefix(trimmed, "# ") || strings.HasPrefix(trimmed, "## ") || strings.HasPrefix(trimmed, "### ") {
+		return false
+	}
+	return true
+}
+
 // parseBlocks groups body's lines into headings, blank-line-separated
 // paragraphs (consecutive non-blank, non-list, non-heading lines join
 // into one paragraph), and consecutive-line unordered/ordered lists.
@@ -134,11 +175,17 @@ func parseBlocks(body string) []mdBlock {
 			var items []string
 			for i < len(lines) {
 				t := strings.TrimSpace(strings.TrimRight(lines[i], "\r"))
-				if !isUnorderedItem(t) {
-					break
+				if isUnorderedItem(t) {
+					items = append(items, strings.TrimSpace(t[2:]))
+					i++
+					continue
 				}
-				items = append(items, strings.TrimSpace(t[2:]))
-				i++
+				if isListContinuationLine(t) {
+					items[len(items)-1] += " " + t
+					i++
+					continue
+				}
+				break
 			}
 			blocks = append(blocks, mdBlock{kind: blockUnordered, lines: items})
 		case isOrderedItem(trimmed):
@@ -146,12 +193,18 @@ func parseBlocks(body string) []mdBlock {
 			var items []string
 			for i < len(lines) {
 				t := strings.TrimSpace(strings.TrimRight(lines[i], "\r"))
-				if !isOrderedItem(t) {
-					break
+				if isOrderedItem(t) {
+					loc := orderedItemRe.FindStringIndex(t)
+					items = append(items, strings.TrimSpace(t[loc[1]:]))
+					i++
+					continue
 				}
-				loc := orderedItemRe.FindStringIndex(t)
-				items = append(items, strings.TrimSpace(t[loc[1]:]))
-				i++
+				if isListContinuationLine(t) {
+					items[len(items)-1] += " " + t
+					i++
+					continue
+				}
+				break
 			}
 			blocks = append(blocks, mdBlock{kind: blockOrdered, lines: items})
 		default:
