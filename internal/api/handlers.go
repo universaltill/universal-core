@@ -699,6 +699,32 @@ func (h *Handler) validationErrorMessage(locale string, err error, hidden map[st
 	if err == nil {
 		return ""
 	}
+	// crud.UniqueConstraintError (independent review, uc-infra#181): every
+	// call site above this function (writeCrudError itself, both
+	// createRecord/updateRecord's own branch at this file's top) already
+	// special-cases this before ever reaching here — but the SQL/CSV
+	// import result tables (extsqlimport.go's buildUpsertResultRows,
+	// import.go's buildResultRows) call this function directly, per row,
+	// with no such branch of their own, so a duplicate-key row hit during
+	// a bulk import fell all the way through to the raw err.Error()
+	// fallback below: an untranslated message naming the raw snake_case
+	// field ("Item.sku: value already used by another record") instead of
+	// the same translated-envelope treatment the single-record save path
+	// already gets (this file's own writeCrudError, "crud.error.
+	// unique_constraint_violation") — CLAUDE.md's "no hardcoded
+	// user-facing strings" rule applies here exactly as much as it does to
+	// entity.ValidationError below. Every named field's label resolves
+	// through the same field.{EntityType}.{FieldName} catalog key,
+	// joined for the composite-field case, same as writeCrudError's own
+	// branch.
+	var uce *crud.UniqueConstraintError
+	if errors.As(err, &uce) {
+		labels := make([]string, len(uce.Fields))
+		for i, f := range uce.Fields {
+			labels[i] = h.catalog.TOrDefault(locale, "field."+uce.EntityType+"."+f, f)
+		}
+		return strings.ReplaceAll(h.catalog.T(locale, "crud.error.unique_constraint_violation"), "{fields}", strings.Join(labels, ", "))
+	}
 	var verr *entity.ValidationError
 	if !errors.As(err, &verr) {
 		return err.Error()

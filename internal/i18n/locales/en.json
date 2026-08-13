@@ -720,7 +720,7 @@
   "extsql_import.constants_heading": "Fixed Values",
   "extsql_import.fixed_value": "fixed value",
   "extsql_import.template_note": "Mapping pre-filled from the {vendor} template — review before importing.",
-  "extsql_import.row_cap_note": "Each run imports at most {max} rows in one shot, and the previewed rows are fetched again at commit. Without a key column, re-running creates duplicate records; with one, re-running updates the rows imported earlier.",
+  "extsql_import.row_cap_note": "Each run imports at most {max} rows in one shot, and the previewed rows are fetched again at commit. Without a key column, re-running creates duplicate records (or fails per row if the target has a unique field, like a code or SKU); with one, re-running updates the rows imported earlier.",
   "extsql_import.connection_failed": "Could not read from the external source. Check the connection on the SQL sources settings page — the technical details were logged on the server.",
   "extsql.error_link_local_host": "The host may not point at a link-local address.",
   "extsql_import.key_column_label": "Key column",

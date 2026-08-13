@@ -270,7 +270,7 @@ func UomConversion() *entity.Definition {
 // per-account/per-ledger currency. Exactly one Currency row is expected
 // to hold is_base=true per tenant (ADR-0003: the database is the tenant,
 // so "per tenant" here just means "per database") — an application-level
-// convention, not (yet) a DB constraint the generic entity/crud layer can
+// convention, STILL not a DB constraint the generic entity/crud layer can
 // express: Unique enforces "at most one row per VALUE," and is_base=true
 // is a value many rows could each legitimately claim without a mechanism
 // that scopes uniqueness to only the records where a field holds one
@@ -283,8 +283,21 @@ func UomConversion() *entity.Definition {
 // Currency with is_base=true degrades to the hardcoded fallback rather
 // than guessing which one is correct — fail-safe, the same posture
 // PartyRole's still-open gap has to lean on until a conditional-Unique
-// mechanism exists. Additive field, no data migration: rows written
-// against v3 still hold legal values (is_base defaults false).
+// mechanism exists (tracked as uc-infra#201). Additive field, no data
+// migration: rows written against v3 still hold legal values (is_base
+// defaults false).
+//
+// v5 (uc-infra#181) closes a DIFFERENT gap on this same Definition: code
+// (the ISO 4217 natural key, e.g. "QAR", "USD") was, until now, unique
+// only by application-level convention — the exact shape po_number's own
+// doc comment (purchasing.PurchaseOrder) used to describe before
+// uc-infra#121 closed it the same way this does. Mechanically identical
+// fix: a plain (unconditional, every-row) Unique declaration, closed by
+// crud.Engine/record_unique_keys (ADR-0018 §3(c)) — see
+// hr.AttendanceRecord's Unique doc comment for how the mechanism itself
+// works. Not the same gap as is_base above: code's uniqueness doesn't
+// depend on any OTHER field's value, so it fits the ordinary Unique
+// mechanism directly, no conditional-Unique capability needed.
 func Currency() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "Currency",
@@ -296,7 +309,9 @@ func Currency() *entity.Definition {
 		// every other bound in this sweep uses, instead of only when a
 		// depreciation schedule happens to touch this currency.
 		// Version 4 (uc-infra#120): added is_base, see doc comment above.
-		Version: 4,
+		// Version 5 (uc-infra#181): code gained a Unique declaration, see
+		// doc comment above.
+		Version: 5,
 		Module:  "foundation",
 		Fields: []entity.Field{
 			{Name: "code", Type: entity.FieldString, Required: true}, // ISO 4217, e.g. "QAR", "USD"
@@ -304,6 +319,7 @@ func Currency() *entity.Definition {
 			{Name: "minor_unit", Type: entity.FieldNumber, Default: float64(2), Min: entity.Float64Ptr(0), Max: entity.Float64Ptr(6)},
 			{Name: "is_base", Type: entity.FieldBool, Default: false},
 		},
+		Unique: [][]string{{"code"}},
 	}
 }
 

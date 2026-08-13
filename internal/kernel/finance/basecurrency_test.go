@@ -195,6 +195,22 @@ func TestResolveBaseCurrency_WhitespaceOnlyCode_FallsBackToDefault(t *testing.T)
 // doc comment already makes for own_organization) — counting ROWS
 // instead of distinct CODES used to fall back to DefaultGLCurrency here
 // even though both rows named the same, unambiguous answer.
+//
+// Seeded directly through the repository (no validation/crud.Engine
+// layer), same reasoning and same precedent as the whitespace-only-code
+// test above: as of uc-infra#181, Currency.code is schema-unique going
+// forward, so crud.Engine itself now refuses to create this scenario —
+// a second independent review (uc-infra#181's own) caught the first
+// version of this fix creating both rows through engine.Create, which
+// made this test fail with *crud.UniqueConstraintError instead of
+// exercising ResolveBaseCurrency's degrade-for-legacy-data path at all.
+// Two rows with the same code sharing this shape can still exist for a
+// tenant whose data predates the v5 Definition bump (record_unique_keys
+// is never retroactively rewritten over such a row — see
+// foundation.Currency's own updated doc comment) — this test's whole
+// point is that ResolveBaseCurrency must keep handling that legacy case
+// correctly, which requires actually constructing it, unique constraint
+// and all.
 func TestResolveBaseCurrency_DuplicateRowsSameCode_ResolvesNotFallback(t *testing.T) {
 	tenantDB := freshTenantDB(t)
 	ctx := context.Background()
@@ -203,14 +219,14 @@ func TestResolveBaseCurrency_DuplicateRowsSameCode_ResolvesNotFallback(t *testin
 	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
 		t.Fatalf("foundation.Publish: %v", err)
 	}
-	currencyDef := publishedCurrencyDef(t, tenantDB)
-	engine := crud.NewEngine(tenantDB)
+	publishedCurrencyDef(t, tenantDB)
 
+	records := data.NewRecordRepo(tenantDB)
 	for i := 0; i < 2; i++ {
-		if _, err := engine.Create(ctx, currencyDef, map[string]any{
+		if _, err := records.Create(ctx, "Currency", map[string]any{
 			"code": "GBP", "name": "British Pound", "is_base": true,
-		}, actor); err != nil {
-			t.Fatalf("create duplicate GBP Currency %d: %v", i, err)
+		}); err != nil {
+			t.Fatalf("seed duplicate legacy GBP Currency %d: %v", i, err)
 		}
 	}
 

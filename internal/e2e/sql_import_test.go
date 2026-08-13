@@ -512,10 +512,21 @@ func TestSQLImportWizard_NAVTemplate_RealBrowser(t *testing.T) {
 	}
 
 	// Round 3 — key column explicitly set to "none": the create-only
-	// path must remain intact, duplicating exactly as it always did.
-	// (Set via JS rather than chromedp.SetValue — see the settings test's
-	// note on SetValue and empty strings; hx-include serializes the DOM
-	// value, so no change event is needed.)
+	// path used to duplicate unconditionally, but Item.sku gained a
+	// schema-unique constraint (uc-infra#181, crud.Engine/
+	// record_unique_keys) — the NAV template's own "No_" column maps onto
+	// sku (reference-data-model.md's Item natural key), so a keyless
+	// re-import of the same source rows now collides with the sku values
+	// Round 1 already created, and crud.Engine correctly refuses to
+	// create-only its way past that: every row fails with a translated
+	// *crud.UniqueConstraintError, no new records land, and no identity
+	// rows are written for a row that never actually got created. This is
+	// the deliberate, desired consequence of the card, not a regression —
+	// a bulk import path duplicating a value the record-save UI has always
+	// refused would be a real integrity hole, the exact class of gap
+	// uc-infra#181 closes. (Set via JS rather than chromedp.SetValue — see
+	// the settings test's note on SetValue and empty strings; hx-include
+	// serializes the DOM value, so no change event is needed.)
 	driveToNAVPreview(t, ctx, srv, sourceID, navTable)
 	if err := chromedp.Run(ctx,
 		chromedp.Evaluate(`document.querySelector('#uc-extsql-key-column').value = ''`, nil),
@@ -529,16 +540,29 @@ func TestSQLImportWizard_NAVTemplate_RealBrowser(t *testing.T) {
 	if err := chromedp.Run(ctx,
 		clickAndSettle(`button[hx-post="/import/Item/sql/commit"]`),
 		chromedp.Text(`.uc-extsql-import-result`, &resultText, chromedp.ByQuery),
+		chromedp.InnerHTML(`.uc-extsql-import-result .uc-import-rows`, &resultRowsHTML, chromedp.ByQuery),
 	); err != nil {
 		t.Fatalf("keyless commit: %v", err)
 	}
-	if !strings.Contains(resultText, "2 created, 0 updated, 0 failed (2 total)") {
-		t.Fatalf("expected the keyless commit to create-only, got: %q", resultText)
+	if !strings.Contains(resultText, "0 created, 0 updated, 2 failed (2 total)") {
+		t.Fatalf("expected the keyless commit against a now-unique sku to fail every row, got: %q", resultText)
 	}
-	if count := countTenantRecords(t, tenantDB, "Item"); count != 4 {
-		t.Fatalf("expected the keyless commit to duplicate (4 Item records), got %d", count)
+	if !strings.Contains(resultRowsHTML, ">Error<") || strings.Contains(resultRowsHTML, ">Created<") {
+		t.Fatalf("expected every per-row status to be Error on the keyless commit, got:\n%s", resultRowsHTML)
+	}
+	// The translated crud.error.unique_constraint_violation message
+	// (independent review, uc-infra#181: this used to leak the raw,
+	// untranslated *crud.UniqueConstraintError.Error() text here —
+	// "Item.sku: value already used by another record" — before
+	// validationErrorMessage gained a branch for it), naming the SKU
+	// field's catalog label, not the raw snake_case field name.
+	if !strings.Contains(resultRowsHTML, "This combination of SKU is already used by another record.") {
+		t.Fatalf("expected the translated unique-constraint message naming SKU, got:\n%s", resultRowsHTML)
+	}
+	if count := countTenantRecords(t, tenantDB, "Item"); count != 2 {
+		t.Fatalf("expected the keyless commit to create nothing (sku collides with Round 1's rows), got %d", count)
 	}
 	if got := identityCount(); got != 2 {
-		t.Fatalf("expected the keyless commit to write no identity rows (still 2), got %d", got)
+		t.Fatalf("expected the keyless commit to write no identity rows for rows that never created (still 2), got %d", got)
 	}
 }

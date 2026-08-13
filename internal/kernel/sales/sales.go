@@ -69,10 +69,12 @@ func SalesOrder() *entity.Definition {
 		StatusTypeCode: "sales_order_status",
 		Fields: []entity.Field{
 			// so_number is the natural key, same role po_number plays on
-			// PurchaseOrder — not schema-enforced unique (no such
-			// constraint concept exists yet in entity.Field, same
-			// application-level convention as po_number/Item.sku/
-			// Currency.code).
+			// PurchaseOrder — not schema-enforced unique, the same
+			// application-level convention po_number itself relied on
+			// before uc-infra#121 (and Item.sku/Currency.code relied on
+			// before uc-infra#181). Unlike those three, so_number has no
+			// Unique declaration yet — a separate, not-yet-filed
+			// follow-up, not closed by either of those changes.
 			{Name: "so_number", Type: entity.FieldString, Required: true},
 			{Name: "customer_id", Type: entity.FieldReference, Required: true, Target: "Party", TargetFilter: []entity.TargetFilterCondition{
 				{Entity: "PartyRole", EntityField: "party_id", Field: "role_type", Value: "customer"},

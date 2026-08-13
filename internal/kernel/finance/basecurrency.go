@@ -21,12 +21,29 @@ import (
 // AIProviderConnection's one-row-per-tenant conventions already
 // establish for this kernel (see foundation.Currency's own doc comment).
 // Distinctness is by CODE, not by row count: two is_base=true rows that
-// both carry the same code (a plausible duplicate-entry state, since
-// nothing makes Currency.code unique either) agree on the answer and
-// are not the ambiguity this degrades for — the same reasoning
-// saftCompanyProfile's own doc comment already makes for
-// own_organization (multiple rows naming the same Party isn't a guess;
-// multiple rows naming different Parties is).
+// both carry the same code agree on the answer and are not the
+// ambiguity this degrades for — the same reasoning saftCompanyProfile's
+// own doc comment already makes for own_organization (multiple rows
+// naming the same Party isn't a guess; multiple rows naming different
+// Parties is). As of uc-infra#181, Currency.code is schema-unique
+// (crud.Engine/record_unique_keys) going forward, so crud.Engine itself
+// now refuses to CREATE this duplicate-code scenario — but two rows
+// sharing a code can still exist for a real tenant, for two reasons
+// (independent review, uc-infra#181 follow-up — an earlier version of
+// this comment claimed record_unique_keys is "never" backfilled, which
+// is false: cmd/sync-tenant-modules's backfillNewUniqueConstraints calls
+// crud.BackfillUniqueConstraintKeys for exactly this on every real sync).
+// First, a tenant whose sync hasn't reached the v5 Definition yet has no
+// record_unique_keys rows for code at all, so nothing rejects a
+// duplicate create against the OLD, unconstrained Definition version.
+// Second, and more durably: BackfillUniqueConstraintKeys deliberately
+// leaves already-colliding records UNBACKED rather than repairing them
+// (oldest wins, the rest counted as skipped — see its own doc comment)
+// and never touches records.data, so a tenant that already held two
+// same-code Currency rows before backfill ran keeps both indefinitely;
+// nothing here ever merges or deletes existing data. Either way, this
+// check stays load-bearing for real tenant data, not just a defensive
+// leftover.
 //
 // A candidate code that isn't a well-formed 3-letter ISO 4217 code
 // (after trimming and uppercasing, matching saft.Build's own check) is

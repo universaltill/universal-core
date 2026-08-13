@@ -31,10 +31,18 @@ import "github.com/universaltill/universal-core/internal/kernel/entity"
 // base_uom_id references foundation.UnitOfMeasure — Purchasing depends
 // on the foundation layer already being published for a tenant, the
 // same way every operational module does per ADR-0001 §8.
+//
+// v3 (uc-infra#181) closes the natural-key gap this Definition's own sku
+// field used to carry: unique only by application-level convention,
+// mechanically the same shape PurchaseOrder.po_number had before
+// uc-infra#121, and Currency.code had before this same card (see
+// foundation.Currency's own updated doc comment). Plain (unconditional)
+// Unique declaration, closed by crud.Engine/record_unique_keys
+// (ADR-0018 §3(c)).
 func Item() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "Item",
-		Version:    2,
+		Version:    3,
 		Module:     "purchasing",
 		Fields: []entity.Field{
 			{Name: "sku", Type: entity.FieldString, Required: true},
@@ -43,6 +51,7 @@ func Item() *entity.Definition {
 				EnumValues: []string{"stock", "service", "non_stock"}, Default: "stock"},
 			{Name: "base_uom_id", Type: entity.FieldReference, Target: "UnitOfMeasure"},
 		},
+		Unique: [][]string{{"sku"}},
 	}
 }
 
@@ -127,10 +136,9 @@ func PurchaseOrder() *entity.Definition {
 			// declaration below, closed by crud.Engine/record_unique_keys
 			// (ADR-0018 §3(c)) — see hr.AttendanceRecord's Unique doc
 			// comment for how the mechanism itself works. Currency.code
-			// and Item.sku still rely on the same unenforced
-			// application-level convention this field used to — a
-			// separate, not-yet-filed follow-up, not closed by this
-			// change.
+			// and Item.sku relied on the same unenforced application-
+			// level convention this field used to — closed too, by
+			// uc-infra#181 (see each Definition's own doc comment).
 			{Name: "po_number", Type: entity.FieldString, Required: true},
 			{Name: "vendor_id", Type: entity.FieldReference, Required: true, Target: "Party", TargetFilter: []entity.TargetFilterCondition{
 				{Entity: "PartyRole", EntityField: "party_id", Field: "role_type", Value: "vendor"},
@@ -261,9 +269,12 @@ func Facility() *entity.Definition {
 		Fields: []entity.Field{
 			// The natural key a human quotes, and the handle
 			// cmd/backfill-inventory-facility resolves by. Not
-			// schema-unique — Item.sku is the same still-unenforced
-			// application-level convention (uc-infra#181); po_number
-			// no longer is, as of uc-infra#121.
+			// schema-unique — this field itself is out of scope of
+			// uc-infra#181 (which closed Item.sku and Currency.code
+			// specifically); po_number no longer is, as of uc-infra#121.
+			// Facility.code remains the same unenforced application-level
+			// convention those two used to be — a separate, not-yet-filed
+			// follow-up.
 			{Name: "code", Type: entity.FieldString, Required: true},
 			{Name: "name", Type: entity.FieldString, Required: true},
 			// facility_type, not `type`: bare "type" reads as a kernel

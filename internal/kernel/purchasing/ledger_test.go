@@ -210,6 +210,50 @@ func TestPurchaseOrder_DuplicatePONumberRejected(t *testing.T) {
 	}
 }
 
+// TestItem_DuplicateSKURejected is the real-Postgres end-to-end case for
+// uc-infra#181's Item.sku Unique declaration (the Definition-shape half
+// is TestItem_UniqueOnSKU in purchasing_test.go): a second Item created
+// with an already-used sku must be rejected by crud.Engine itself —
+// record_unique_keys' real Postgres UNIQUE index (ADR-0018 §3(c)), not
+// an application-level convention a caller could bypass. Mirrors
+// TestPurchaseOrder_DuplicatePONumberRejected above exactly, one field
+// over. setUpGoodsReceiptFixture already creates one Item with
+// sku "SKU-1" as part of its own fixture setup, so this test only needs
+// to attempt a second one.
+func TestItem_DuplicateSKURejected(t *testing.T) {
+	fx := setUpGoodsReceiptFixture(t, 10)
+	ctx := context.Background()
+	actor := humanActor()
+
+	_, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "Item"), map[string]any{
+		"sku": "SKU-1", "name": "Duplicate Widget", "item_type": "stock",
+	}, actor)
+	if err == nil {
+		t.Fatal("expected the second Item with sku \"SKU-1\" to be rejected")
+	}
+	var uniqueErr *crud.UniqueConstraintError
+	if !errors.As(err, &uniqueErr) {
+		t.Fatalf("expected a *crud.UniqueConstraintError, got %T: %v", err, err)
+	}
+	if !errors.Is(err, crud.ErrUniqueConstraintViolation) {
+		t.Fatalf("expected errors.Is(err, crud.ErrUniqueConstraintViolation): %v", err)
+	}
+	if uniqueErr.EntityType != "Item" {
+		t.Errorf("UniqueConstraintError.EntityType = %q, want %q", uniqueErr.EntityType, "Item")
+	}
+	if len(uniqueErr.Fields) != 1 || uniqueErr.Fields[0] != "sku" {
+		t.Errorf("UniqueConstraintError.Fields = %v, want [sku]", uniqueErr.Fields)
+	}
+
+	// A DIFFERENT sku must still succeed — this isn't "at most one Item,"
+	// only "sku itself must be distinct."
+	if _, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "Item"), map[string]any{
+		"sku": "SKU-2", "name": "Another Widget", "item_type": "stock",
+	}, actor); err != nil {
+		t.Fatalf("expected an Item with a distinct sku to succeed: %v", err)
+	}
+}
+
 // vendorInvoiceFixture bundles a real PurchaseOrder + POLine + one
 // GoodsReceipt/GoodsReceiptLine already received against it — everything
 // MatchVendorInvoiceOnUpdate's tests need to exercise the match itself,

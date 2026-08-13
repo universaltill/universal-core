@@ -211,6 +211,30 @@ func TestCurrency_IsBaseFieldDefaultsFalse(t *testing.T) {
 	}
 }
 
+// TestCurrency_UniqueOnCode confirms uc-infra#181's Unique declaration:
+// one live Currency per code — the Definition-level half of a duplicate-
+// code rejection, which relies on crud.WriteUniqueConstraintKeys
+// rejecting a concurrent second CREATE for the same code (see
+// TestCurrency_DuplicateCodeRejected in seed_test.go for the real-
+// Postgres end-to-end case).
+func TestCurrency_UniqueOnCode(t *testing.T) {
+	def := Currency()
+	if def.Version != 5 {
+		t.Errorf("Currency is v%d, want v5 — the code Unique constraint (uc-infra#181)", def.Version)
+	}
+	if len(def.Unique) != 1 {
+		t.Fatalf("Currency.Unique = %v, want exactly one declared set", def.Unique)
+	}
+	want := []string{"code"}
+	got := append([]string(nil), def.Unique[0]...)
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("Currency.Unique[0] = %v, want %v", got, want)
+	}
+	if err := def.Validate(); err != nil {
+		t.Fatalf("Currency must validate as a Definition: %v", err)
+	}
+}
+
 // TestAddress_TypedAndMultiplePerParty is the point of Address being its
 // own entity rather than fields on Party: the same party_id can carry a
 // billing address and a shipping address as two independent records.
