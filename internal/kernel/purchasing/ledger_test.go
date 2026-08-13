@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -1834,8 +1835,13 @@ func TestMatchVendorInvoiceOnUpdate_MismatchedTotal_RedirectsToMatchException(t 
 		t.Fatalf("expected the mismatched transition to land in match_exception, got status_id=%v", got.Data["status_id"])
 	}
 	reason, _ := got.Data["match_exception_reason"].(string)
-	if !strings.Contains(reason, "999.00") || !strings.Contains(reason, "125.00") {
-		t.Fatalf("expected match_exception_reason to name both totals, got %q", reason)
+	// %v, not a fixed 2dp format (independent review, uc-infra#193: a
+	// hardcoded %.2f here would truncate a >2dp currency's real total —
+	// see vendorInvoiceMatchDetail's own comment on its reason string),
+	// so a whole-number amount like 999.00 prints as "999", not "999.00".
+	want := fmt.Sprintf("total 999 (99900 minor units) does not match received value 125 (12500 minor units) for PurchaseOrder %s", fx.poID)
+	if reason != want {
+		t.Fatalf("expected match_exception_reason %q, got %q", want, reason)
 	}
 }
 
@@ -1884,6 +1890,424 @@ func TestMatchVendorInvoiceOnUpdate_WrongVendor_RedirectsToMatchException(t *tes
 	reason, _ := got.Data["match_exception_reason"].(string)
 	if !strings.Contains(reason, otherVendor.ID) {
 		t.Fatalf("expected match_exception_reason to name the invoice's own vendor_id %q, got %q", otherVendor.ID, reason)
+	}
+}
+
+// TestMatchVendorInvoiceOnUpdate_CurrencyMismatch_RedirectsToMatchException
+// (uc-infra#193) confirms the new currency_id leg of the 3-way match:
+// an invoice whose currency_id explicitly names a DIFFERENT currency
+// than the PurchaseOrder it's billing against redirects to
+// match_exception even though the plain numeric totals agree exactly —
+// same "a value-only check isn't enough" shape as the existing
+// wrong-vendor test above, for the field this task adds a check for.
+// Before this task, nothing compared these two fields at all: this is a
+// genuinely new check, not a rescale of an existing one.
+func TestMatchVendorInvoiceOnUpdate_CurrencyMismatch_RedirectsToMatchException(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if err := PublishStatuses(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("PublishStatuses: %v", err)
+	}
+	engine := crud.NewEngine(tenantDB)
+
+	usd, err := engine.Create(ctx, defFor(t, tenantDB, "Currency"), map[string]any{
+		"code": "USD", "name": "US Dollar", "minor_unit": float64(2),
+	}, actor)
+	if err != nil {
+		t.Fatalf("create USD Currency: %v", err)
+	}
+	eur, err := engine.Create(ctx, defFor(t, tenantDB, "Currency"), map[string]any{
+		"code": "EUR", "name": "Euro", "minor_unit": float64(2),
+	}, actor)
+	if err != nil {
+		t.Fatalf("create EUR Currency: %v", err)
+	}
+
+	vendor := createVendorParty(t, ctx, engine, tenantDB, "Acme Textiles", actor)
+	item, err := engine.Create(ctx, defFor(t, tenantDB, "Item"), map[string]any{
+		"sku": "SKU-1", "name": "Widget", "item_type": "stock",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create Item: %v", err)
+	}
+	facility, err := engine.Create(ctx, defFor(t, tenantDB, "Facility"), map[string]any{
+		"code": "MAIN", "name": "Main Warehouse", "facility_type": "warehouse", "is_active": true,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create Facility: %v", err)
+	}
+	draftPOStatusID := statusIDByCode(t, engine, tenantDB, "purchase_order_status", "draft")
+	po, err := engine.Create(ctx, defFor(t, tenantDB, "PurchaseOrder"), map[string]any{
+		"po_number": "PO-1", "vendor_id": vendor.ID, "order_date": "2026-01-01",
+		"status_id": draftPOStatusID, "currency_id": usd.ID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create PurchaseOrder: %v", err)
+	}
+	line, err := engine.Create(ctx, defFor(t, tenantDB, "POLine"), map[string]any{
+		"purchase_order_id": po.ID, "item_id": item.ID, "qty": 10.0, "unit_price": ledger.ToMinorUnits(12.50),
+	}, actor)
+	if err != nil {
+		t.Fatalf("create POLine: %v", err)
+	}
+	gr, err := engine.Create(ctx, defFor(t, tenantDB, "GoodsReceipt"), map[string]any{
+		"purchase_order_id": po.ID, "received_date": "2026-01-10", "facility_id": facility.ID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create GoodsReceipt: %v", err)
+	}
+	if _, err := engine.Create(ctx, defFor(t, tenantDB, "GoodsReceiptLine"), map[string]any{
+		"goods_receipt_id": gr.ID, "po_line_id": line.ID, "item_id": item.ID, "qty_received": 10.0,
+	}, actor); err != nil {
+		t.Fatalf("create GoodsReceiptLine: %v", err)
+	}
+
+	draftInvStatusID := statusIDByCode(t, engine, tenantDB, "vendor_invoice_status", "draft")
+	inv, err := engine.Create(ctx, defFor(t, tenantDB, "VendorInvoice"), map[string]any{
+		"invoice_number": "VINV-1", "purchase_order_id": po.ID, "vendor_id": vendor.ID,
+		"invoice_date": "2026-01-15", "status_id": draftInvStatusID, "total": 125.00, // agrees numerically
+		"currency_id": eur.ID, // but disagrees with the PO's own USD
+	}, actor)
+	if err != nil {
+		t.Fatalf("create VendorInvoice: %v", err)
+	}
+
+	engine.SetHook("VendorInvoice", MatchVendorInvoiceOnUpdate)
+	matchedStatusID := statusIDByCode(t, engine, tenantDB, "vendor_invoice_status", "matched")
+	exceptionStatusID := statusIDByCode(t, engine, tenantDB, "vendor_invoice_status", "match_exception")
+	version := inv.Version
+	if _, err := engine.Update(ctx, defFor(t, tenantDB, "VendorInvoice"), inv.ID, map[string]any{
+		"invoice_number": "VINV-1", "purchase_order_id": po.ID, "vendor_id": vendor.ID,
+		"invoice_date": "2026-01-15", "status_id": matchedStatusID, "total": 125.00, "currency_id": eur.ID,
+	}, &version, actor); err != nil {
+		t.Fatalf("expected the redirect to succeed (no rollback), got: %v", err)
+	}
+	got, err := engine.Get(ctx, defFor(t, tenantDB, "VendorInvoice"), inv.ID)
+	if err != nil {
+		t.Fatalf("get VendorInvoice: %v", err)
+	}
+	if got.Data["status_id"] != exceptionStatusID {
+		t.Fatalf("expected the currency mismatch to land in match_exception despite matching totals, got status_id=%v", got.Data["status_id"])
+	}
+	reason, _ := got.Data["match_exception_reason"].(string)
+	if !strings.Contains(reason, eur.ID) || !strings.Contains(reason, usd.ID) {
+		t.Fatalf("expected match_exception_reason to name both currency_ids (invoice %q, PO %q), got %q", eur.ID, usd.ID, reason)
+	}
+}
+
+// TestVendorInvoiceMatch_NonDefaultCurrencyScale_ResolvesRealMinorUnits
+// (uc-infra#193) is the direct regression test for the fix's core claim:
+// resolving minorUnit from the PurchaseOrder's real currency_id, not the
+// package's fixed money.Decimals=2. Uses a 0-decimal-place currency
+// (JPY-style, same fixture shape as assets'
+// TestCurrencyMinorUnit_ResolvesNonDefaultScale) so the two scales are
+// unmistakably different (0 vs 2) rather than coincidentally producing
+// the same minor-unit numbers.
+//
+// The mismatch case is the part that actually distinguishes old
+// behavior from new: before this fix, receivedValueForPurchaseOrder
+// summed POLine.unit_price's raw stored minor-unit integers directly
+// (always effectively 2dp, since money.Money is fixed at that scale),
+// and vendorInvoiceMatchDetail's own total conversion was hardcoded to
+// money.Decimals too — so a mismatch here would have been reported as
+// "13000 minor units" vs "12000 minor units" (both scaled ×100 too
+// large for a real 0dp currency). After this fix, both sides resolve
+// and convert at the PO's real 0dp scale: "130 minor units" vs "120
+// minor units". Asserting on the SMALL numbers is what actually catches
+// a regression back to the old fixed-2dp conversion — asserting only on
+// the matched/match_exception verdict would not, since that verdict is
+// scale-invariant when both sides are (mis)scaled identically, which is
+// exactly what made the old code's bug easy to miss.
+func TestVendorInvoiceMatch_NonDefaultCurrencyScale_ResolvesRealMinorUnits(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if err := PublishStatuses(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("PublishStatuses: %v", err)
+	}
+	engine := crud.NewEngine(tenantDB)
+
+	jpy, err := engine.Create(ctx, defFor(t, tenantDB, "Currency"), map[string]any{
+		"code": "JPY", "name": "Japanese Yen", "minor_unit": float64(0),
+	}, actor)
+	if err != nil {
+		t.Fatalf("create JPY Currency: %v", err)
+	}
+	vendor := createVendorParty(t, ctx, engine, tenantDB, "Acme Textiles", actor)
+	item, err := engine.Create(ctx, defFor(t, tenantDB, "Item"), map[string]any{
+		"sku": "SKU-1", "name": "Widget", "item_type": "stock",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create Item: %v", err)
+	}
+	facility, err := engine.Create(ctx, defFor(t, tenantDB, "Facility"), map[string]any{
+		"code": "MAIN", "name": "Main Warehouse", "facility_type": "warehouse", "is_active": true,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create Facility: %v", err)
+	}
+	draftPOStatusID := statusIDByCode(t, engine, tenantDB, "purchase_order_status", "draft")
+	po, err := engine.Create(ctx, defFor(t, tenantDB, "PurchaseOrder"), map[string]any{
+		"po_number": "PO-1", "vendor_id": vendor.ID, "order_date": "2026-01-01",
+		"status_id": draftPOStatusID, "currency_id": jpy.ID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create PurchaseOrder: %v", err)
+	}
+	// unit_price is entered as a human-typed major-unit amount and
+	// stored via ledger.ToMinorUnits, same convention every other
+	// fixture in this file uses — qty 10 x 12.00 = a real received value
+	// of 120.00 (major units), regardless of which currency it's in.
+	line, err := engine.Create(ctx, defFor(t, tenantDB, "POLine"), map[string]any{
+		"purchase_order_id": po.ID, "item_id": item.ID, "qty": 10.0, "unit_price": ledger.ToMinorUnits(12.00),
+	}, actor)
+	if err != nil {
+		t.Fatalf("create POLine: %v", err)
+	}
+	gr, err := engine.Create(ctx, defFor(t, tenantDB, "GoodsReceipt"), map[string]any{
+		"purchase_order_id": po.ID, "received_date": "2026-01-10", "facility_id": facility.ID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create GoodsReceipt: %v", err)
+	}
+	if _, err := engine.Create(ctx, defFor(t, tenantDB, "GoodsReceiptLine"), map[string]any{
+		"goods_receipt_id": gr.ID, "po_line_id": line.ID, "item_id": item.ID, "qty_received": 10.0,
+	}, actor); err != nil {
+		t.Fatalf("create GoodsReceiptLine: %v", err)
+	}
+
+	engine.SetHook("VendorInvoice", MatchVendorInvoiceOnUpdate)
+	draftInvStatusID := statusIDByCode(t, engine, tenantDB, "vendor_invoice_status", "draft")
+	matchedStatusID := statusIDByCode(t, engine, tenantDB, "vendor_invoice_status", "matched")
+	exceptionStatusID := statusIDByCode(t, engine, tenantDB, "vendor_invoice_status", "match_exception")
+
+	t.Run("agrees at the real 0dp scale", func(t *testing.T) {
+		inv, err := engine.Create(ctx, defFor(t, tenantDB, "VendorInvoice"), map[string]any{
+			"invoice_number": "VINV-OK", "purchase_order_id": po.ID, "vendor_id": vendor.ID,
+			"invoice_date": "2026-01-15", "status_id": draftInvStatusID, "total": 120.00, "currency_id": jpy.ID,
+		}, actor)
+		if err != nil {
+			t.Fatalf("create VendorInvoice: %v", err)
+		}
+		version := inv.Version
+		if _, err := engine.Update(ctx, defFor(t, tenantDB, "VendorInvoice"), inv.ID, map[string]any{
+			"invoice_number": "VINV-OK", "purchase_order_id": po.ID, "vendor_id": vendor.ID,
+			"invoice_date": "2026-01-15", "status_id": matchedStatusID, "total": 120.00, "currency_id": jpy.ID,
+		}, &version, actor); err != nil {
+			t.Fatalf("expected the transition to succeed, got: %v", err)
+		}
+		got, err := engine.Get(ctx, defFor(t, tenantDB, "VendorInvoice"), inv.ID)
+		if err != nil {
+			t.Fatalf("get VendorInvoice: %v", err)
+		}
+		if got.Data["status_id"] != matchedStatusID {
+			t.Fatalf("expected a genuinely-agreeing 0dp-currency invoice to match, got status_id=%v", got.Data["status_id"])
+		}
+	})
+
+	t.Run("mismatch reports the real 0dp minor-unit counts, not the 2dp-inflated ones", func(t *testing.T) {
+		inv, err := engine.Create(ctx, defFor(t, tenantDB, "VendorInvoice"), map[string]any{
+			"invoice_number": "VINV-BAD", "purchase_order_id": po.ID, "vendor_id": vendor.ID,
+			"invoice_date": "2026-01-15", "status_id": draftInvStatusID, "total": 130.00, "currency_id": jpy.ID,
+		}, actor)
+		if err != nil {
+			t.Fatalf("create VendorInvoice: %v", err)
+		}
+		version := inv.Version
+		if _, err := engine.Update(ctx, defFor(t, tenantDB, "VendorInvoice"), inv.ID, map[string]any{
+			"invoice_number": "VINV-BAD", "purchase_order_id": po.ID, "vendor_id": vendor.ID,
+			"invoice_date": "2026-01-15", "status_id": matchedStatusID, "total": 130.00, "currency_id": jpy.ID,
+		}, &version, actor); err != nil {
+			t.Fatalf("expected the redirect to succeed (no rollback), got: %v", err)
+		}
+		got, err := engine.Get(ctx, defFor(t, tenantDB, "VendorInvoice"), inv.ID)
+		if err != nil {
+			t.Fatalf("get VendorInvoice: %v", err)
+		}
+		if got.Data["status_id"] != exceptionStatusID {
+			t.Fatalf("expected the real mismatch to land in match_exception, got status_id=%v", got.Data["status_id"])
+		}
+		reason, _ := got.Data["match_exception_reason"].(string)
+		// Full expected string, not just the two "N minor units" substrings
+		// (independent review, uc-infra#193's own first draft: a narrow
+		// substring check like the old one here didn't catch that the
+		// major-unit figures were wrong — money.Money(receivedMinor).Major()
+		// misreported "120 minor units" as received value "1.20" instead
+		// of "120", since it unconditionally divides by money's fixed 2dp
+		// scale rather than the resolved 0dp one. Asserting the FULL
+		// string is what actually catches that class of bug.)
+		want := fmt.Sprintf("total 130 (130 minor units) does not match received value 120 (120 minor units) for PurchaseOrder %s", po.ID)
+		if reason != want {
+			t.Fatalf("expected match_exception_reason %q, got %q — a 2dp-inflated 13000/12000 or a wrong "+
+				"major-unit figure here would mean minorUnit resolution or its display regressed", want, reason)
+		}
+	})
+}
+
+// TestVendorInvoiceMatch_UnresolvableCurrencyID_FallsBackToDefaultScale
+// (uc-infra#193) confirms the "unresolvable currency degrades to
+// money.Decimals, not a hard failure" fallback — same posture
+// assets.PostDueDepreciation already established for the identical
+// situation — using a currency_id that doesn't resolve to any real
+// Currency row (a dangling reference, tolerated per ADR-0007) rather
+// than an empty one, so this exercises the currencyMinorUnitTx error
+// path specifically, not just the "no currency_id at all" path every
+// other test in this file already covers.
+func TestVendorInvoiceMatch_UnresolvableCurrencyID_FallsBackToDefaultScale(t *testing.T) {
+	fx := setUpVendorInvoiceFixture(t, 10, 12.50, 10) // received value 125.00 at the default 2dp scale
+	ctx := context.Background()
+
+	// Give the PurchaseOrder a currency_id that doesn't resolve to any
+	// real Currency row.
+	poDef := defFor(t, fx.tenantDB, "PurchaseOrder")
+	po, err := fx.engine.Get(ctx, poDef, fx.poID)
+	if err != nil {
+		t.Fatalf("get PurchaseOrder: %v", err)
+	}
+	poVersion := po.Version
+	if _, err := fx.engine.Update(ctx, poDef, fx.poID, map[string]any{
+		"po_number": "PO-1", "vendor_id": fx.vendorID, "order_date": "2026-01-01",
+		"status_id": po.Data["status_id"], "currency_id": "00000000-0000-0000-0000-000000000000",
+	}, &poVersion, humanActor()); err != nil {
+		t.Fatalf("update PurchaseOrder currency_id: %v", err)
+	}
+
+	fx.engine.SetHook("VendorInvoice", MatchVendorInvoiceOnUpdate)
+	inv := createDraftVendorInvoice(t, fx, 125.00) // agrees at the 2dp fallback scale
+
+	matchedStatusID := statusIDByCode(t, fx.engine, fx.tenantDB, "vendor_invoice_status", "matched")
+	version := inv.Version
+	if _, err := fx.engine.Update(ctx, defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID, map[string]any{
+		"invoice_number": "VINV-1", "purchase_order_id": fx.poID, "vendor_id": fx.vendorID,
+		"invoice_date": "2026-01-15", "status_id": matchedStatusID, "total": 125.00,
+	}, &version, humanActor()); err != nil {
+		t.Fatalf("expected the transition to succeed despite the unresolvable currency_id, got: %v", err)
+	}
+	got, err := fx.engine.Get(ctx, defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID)
+	if err != nil {
+		t.Fatalf("get VendorInvoice: %v", err)
+	}
+	if got.Data["status_id"] != matchedStatusID {
+		t.Fatalf("expected an unresolvable PO currency_id to fall back to the 2dp default (not fail the match), got status_id=%v", got.Data["status_id"])
+	}
+}
+
+// TestMatchVendorInvoiceOnUpdate_OutOfRangeCurrencyMinorUnit_FallsBackToDefaultScale
+// (uc-infra#193, independent review) confirms currencyMinorUnitTx's
+// range check: a Currency row whose minor_unit is OUTSIDE
+// [0, money.MaxMinorUnitScale] — reachable only via a legacy row written
+// before Currency's own [0,6] bound landed (Version 3, uc-infra#80), not
+// through the ordinary entity.ValidateRecord-guarded Create path, so
+// this writes it directly via data.RecordRepo, bypassing entity
+// validation the same way this file's own
+// TestPostGoodsReceiptLineToLedger_DuplicateLegacyRows_ReturnsDiagnosableError
+// simulates a legacy row — degrades to the money.Decimals fallback, the
+// same as an unresolvable/missing currency_id, rather than hard-failing
+// the whole match via money.FromMajorUnits's own range check.
+func TestMatchVendorInvoiceOnUpdate_OutOfRangeCurrencyMinorUnit_FallsBackToDefaultScale(t *testing.T) {
+	fx := setUpVendorInvoiceFixture(t, 10, 12.50, 10) // received value 125.00 at the default 2dp scale
+	ctx := context.Background()
+
+	records := data.NewRecordRepo(fx.tenantDB)
+	corrupt, err := records.Create(ctx, "Currency", map[string]any{
+		"code": "XXX", "name": "Corrupt Legacy Currency", "minor_unit": float64(9), // outside [0,6]
+	})
+	if err != nil {
+		t.Fatalf("create corrupt Currency row: %v", err)
+	}
+
+	poDef := defFor(t, fx.tenantDB, "PurchaseOrder")
+	po, err := fx.engine.Get(ctx, poDef, fx.poID)
+	if err != nil {
+		t.Fatalf("get PurchaseOrder: %v", err)
+	}
+	poVersion := po.Version
+	if _, err := fx.engine.Update(ctx, poDef, fx.poID, map[string]any{
+		"po_number": "PO-1", "vendor_id": fx.vendorID, "order_date": "2026-01-01",
+		"status_id": po.Data["status_id"], "currency_id": corrupt.ID,
+	}, &poVersion, humanActor()); err != nil {
+		t.Fatalf("update PurchaseOrder currency_id: %v", err)
+	}
+
+	fx.engine.SetHook("VendorInvoice", MatchVendorInvoiceOnUpdate)
+	inv := createDraftVendorInvoice(t, fx, 125.00) // agrees at the 2dp fallback scale
+
+	matchedStatusID := statusIDByCode(t, fx.engine, fx.tenantDB, "vendor_invoice_status", "matched")
+	version := inv.Version
+	if _, err := fx.engine.Update(ctx, defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID, map[string]any{
+		"invoice_number": "VINV-1", "purchase_order_id": fx.poID, "vendor_id": fx.vendorID,
+		"invoice_date": "2026-01-15", "status_id": matchedStatusID, "total": 125.00,
+	}, &version, humanActor()); err != nil {
+		t.Fatalf("expected the transition to succeed despite the corrupt minor_unit (fallback, not a hard failure), got: %v", err)
+	}
+	got, err := fx.engine.Get(ctx, defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID)
+	if err != nil {
+		t.Fatalf("get VendorInvoice: %v", err)
+	}
+	if got.Data["status_id"] != matchedStatusID {
+		t.Fatalf("expected an out-of-range Currency.minor_unit to fall back to the 2dp default (not fail the match), got status_id=%v", got.Data["status_id"])
+	}
+}
+
+// TestMatchVendorInvoiceOnUpdate_InvoiceCurrencySetPOCurrencyBlank_NotAMismatch
+// (uc-infra#193, independent review) confirms the currency_id mismatch
+// check only fires when BOTH sides assert a currency — unlike vendor_id
+// (where an empty invoice vendor_id IS itself a mismatch), a
+// PurchaseOrder written before uc-infra#193 (or any tenant that hasn't
+// adopted per-document currencies) has a blank currency_id, and that
+// blank isn't a claim the invoice's own currency_id can disagree with.
+// The regression this guards: an early version of this check compared
+// invoiceCurrencyID != poCurrencyID without also requiring poCurrencyID
+// non-empty, which would have redirected every such existing PO/invoice
+// pairing to match_exception on its very next save.
+func TestMatchVendorInvoiceOnUpdate_InvoiceCurrencySetPOCurrencyBlank_NotAMismatch(t *testing.T) {
+	fx := setUpVendorInvoiceFixture(t, 10, 12.50, 10) // received value 125.00; PO has no currency_id
+	ctx := context.Background()
+
+	usd, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "Currency"), map[string]any{
+		"code": "USD", "name": "US Dollar", "minor_unit": float64(2),
+	}, humanActor())
+	if err != nil {
+		t.Fatalf("create USD Currency: %v", err)
+	}
+
+	fx.engine.SetHook("VendorInvoice", MatchVendorInvoiceOnUpdate)
+	draftStatusID := statusIDByCode(t, fx.engine, fx.tenantDB, "vendor_invoice_status", "draft")
+	inv, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "VendorInvoice"), map[string]any{
+		"invoice_number": "VINV-1", "purchase_order_id": fx.poID, "vendor_id": fx.vendorID,
+		"invoice_date": "2026-01-15", "status_id": draftStatusID, "total": 125.00, "currency_id": usd.ID,
+	}, humanActor())
+	if err != nil {
+		t.Fatalf("create VendorInvoice: %v", err)
+	}
+
+	matchedStatusID := statusIDByCode(t, fx.engine, fx.tenantDB, "vendor_invoice_status", "matched")
+	version := inv.Version
+	if _, err := fx.engine.Update(ctx, defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID, map[string]any{
+		"invoice_number": "VINV-1", "purchase_order_id": fx.poID, "vendor_id": fx.vendorID,
+		"invoice_date": "2026-01-15", "status_id": matchedStatusID, "total": 125.00, "currency_id": usd.ID,
+	}, &version, humanActor()); err != nil {
+		t.Fatalf("expected the transition to succeed (no currency mismatch), got: %v", err)
+	}
+	got, err := fx.engine.Get(ctx, defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID)
+	if err != nil {
+		t.Fatalf("get VendorInvoice: %v", err)
+	}
+	if got.Data["status_id"] != matchedStatusID {
+		t.Fatalf("expected an invoice currency_id with no PO currency_id to set to match (not flagged as a mismatch), got status_id=%v", got.Data["status_id"])
 	}
 }
 
@@ -2278,8 +2702,11 @@ func TestMatchVendorInvoiceOnUpdate_SecondConsecutiveFailure_UpdatesReason(t *te
 		t.Fatalf("get VendorInvoice: %v", err)
 	}
 	firstReason, _ := first.Data["match_exception_reason"].(string)
-	if !strings.Contains(firstReason, "999.00") {
-		t.Fatalf("expected the first reason to mention 999.00, got %q", firstReason)
+	// "999", not "999.00" — %v formatting, not a fixed 2dp format
+	// (independent review, uc-infra#193, see the MismatchedTotal test
+	// above for why).
+	if !strings.Contains(firstReason, "999") {
+		t.Fatalf("expected the first reason to mention 999, got %q", firstReason)
 	}
 
 	// Retry with a DIFFERENT wrong total — still disagrees, but not the
@@ -2298,11 +2725,11 @@ func TestMatchVendorInvoiceOnUpdate_SecondConsecutiveFailure_UpdatesReason(t *te
 		t.Fatalf("get VendorInvoice: %v", err)
 	}
 	secondReason, _ := second.Data["match_exception_reason"].(string)
-	if !strings.Contains(secondReason, "777.00") {
-		t.Fatalf("expected the second reason to mention the new total 777.00, got %q", secondReason)
+	if !strings.Contains(secondReason, "777") {
+		t.Fatalf("expected the second reason to mention the new total 777, got %q", secondReason)
 	}
-	if strings.Contains(secondReason, "999.00") {
-		t.Fatalf("expected the reason to be replaced, not accumulated — still mentions the old 999.00: %q", secondReason)
+	if strings.Contains(secondReason, "999") {
+		t.Fatalf("expected the reason to be replaced, not accumulated — still mentions the old 999: %q", secondReason)
 	}
 }
 
