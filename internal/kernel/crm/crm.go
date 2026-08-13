@@ -49,7 +49,8 @@
 //   - that a referenced Party holds the role its field name implies:
 //     Case.customer_id, Opportunity.customer_id, Lead.owner_id,
 //     Opportunity.owner_id and Case.assignee_id all take any Party at
-//     all, the same gap sales.SalesOrder.customer_id has (#78).
+//     all (#78) — unlike sales.SalesOrder.customer_id, which closed
+//     this exact gap for itself via a TargetFilter (v2, uc-infra#78).
 //
 // Case:
 //   - that the referenced SalesOrder actually belongs to the
