@@ -4,14 +4,16 @@ import (
 	"testing"
 
 	"github.com/chromedp/chromedp"
+
+	"github.com/universaltill/universal-core/internal/kernel/entity"
+	"github.com/universaltill/universal-core/internal/kernel/form"
 )
 
 // TestHelpAffordance_RealBrowser (ADR-0023 in uc-infra, uc-infra#143) is
 // the real-browser proof for the "?" help affordance's accessibility
 // contract on both a generated form page and a generated list page:
-// present, and — even in its disabled state, since no help content ships
-// in this slice (see internal/help/content/README.md) — still focusable
-// and keyboard-reachable. A rendered-HTML-string test (see
+// present, and — even in its disabled state — still focusable and
+// keyboard-reachable. A rendered-HTML-string test (see
 // TestRender_HelpAffordanceRendersDisabledWhenNoContent in
 // internal/kernel/formrender and its listview.go sibling in
 // internal/api) proves the markup is there; it can't prove a real
@@ -21,18 +23,50 @@ import (
 // tab order in every current browser without it, so this is exactly the
 // kind of "CSS/DOM actually behaves as claimed" gap CLAUDE.md's e2e
 // testing rule exists to catch.
+//
+// Originally exercised this against the real "Item" entity, back when
+// no help content shipped for it yet (see internal/help/content/
+// README.md at the time). uc-infra#148 — the last of uc-infra#147-152's
+// module slices — shipped real content for every entity type in the
+// product, including Item, so this test now publishes its own throwaway
+// entity+form Definition (publishDef, i18n_text_test.go) under an
+// EntityType guaranteed to never have a real help topic, the same fix
+// TestRender_HelpAffordanceRendersDisabledWhenNoContent's own doc
+// comment describes for its unit-test sibling — proving the disabled-
+// state DOM/accessibility contract still needs a page that is genuinely
+// undocumented, and there is no longer a real shipped entity that
+// qualifies.
 func TestHelpAffordance_RealBrowser(t *testing.T) {
 	withDevAuthEnabled(t)
-	srv, tenantID, _ := testServer(t)
+	srv, tenantID, tenantDB := testServer(t)
 	ctx := browserCtx(t, tenantID)
+
+	fixtureType := "FixtureEntityWithoutHelpTopic"
+	publishDef(t, tenantDB,
+		&entity.Definition{
+			EntityType: fixtureType,
+			Version:    1,
+			Fields:     []entity.Field{{Name: "name", Type: entity.FieldString, Required: true}},
+		},
+		&form.Definition{
+			EntityType: fixtureType,
+			Version:    1,
+			Sections: []form.Section{{
+				Title:     "Details",
+				Component: form.ComponentFields,
+				Fields:    []form.FormField{{Name: "name", Label: "Name"}},
+			}},
+			Actions: []form.Action{{Label: "Save", Op: form.OpSave}},
+		},
+	)
 
 	cases := []struct {
 		name    string
 		url     string
 		topicID string
 	}{
-		{"form page", srv.URL + "/forms/Item/new", "entity/Item"},
-		{"list page", srv.URL + "/records/Item", "entity/Item"},
+		{"form page", srv.URL + "/forms/" + fixtureType + "/new", "entity/" + fixtureType},
+		{"list page", srv.URL + "/records/" + fixtureType, "entity/" + fixtureType},
 	}
 
 	for _, c := range cases {
@@ -56,7 +90,7 @@ func TestHelpAffordance_RealBrowser(t *testing.T) {
 				// that buildHelpView handles a hand-supplied id correctly
 				// in a unit test (independent review, uc-infra#143) — the
 				// only other TopicID-derived output, Href, is empty on
-				// every page today (no help content ships in this slice).
+				// every page here because fixtureType deliberately has no real content.
 				chromedp.AttributeValue(`.uc-help-affordance`, `data-help-topic`, &topicID, nil),
 				// role="link" makes the affordance spec-correct in ARIA's
 				// accessible-name/state model even in its disabled state
@@ -90,7 +124,7 @@ func TestHelpAffordance_RealBrowser(t *testing.T) {
 				t.Errorf("%s: expected a .uc-help-affordance element, found none", c.name)
 			}
 			if !disabled {
-				t.Errorf("%s: expected aria-disabled=\"true\" — no help content ships in this slice", c.name)
+				t.Errorf("%s: expected aria-disabled=\"true\" — fixtureType has no real help content", c.name)
 			}
 			if !noHref {
 				t.Errorf("%s: expected no href attribute while disabled — a disabled affordance must never link to a 404", c.name)

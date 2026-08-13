@@ -165,35 +165,32 @@ func requiredEntityTypes() []string {
 // package doc comment above for why a same-commit Go check can't) —
 // .github/scripts/check-help-allowlist.sh, run against the PR's base
 // ref by ci.yml, does.
-var undocumentedAllowlist = map[string]bool{
-	"Facility":                     true,
-	"GoodsReceipt":                 true,
-	"GoodsReceiptLine":             true,
-	"InventoryItem":                true,
-	"Item":                         true,
-	"POLine":                       true,
-	"PurchaseOrder":                true,
-	"ReorderRule":                  true,
-	"RequestForQuotation":          true,
-	"RequestForQuotationLine":      true,
-	"RequestForQuotationQuoteLine": true,
-	"RequestForQuotationVendor":    true,
-	"StockTransfer":                true,
-	"VendorInvoice":                true,
-}
+// Empty as of uc-infra#148 (the purchasing/RFQ/inventory content slice,
+// the last of uc-infra#147-152's module slices to ship) — every entity
+// type that ever appeared here now has real topics in all four locales.
+// Left as an empty map literal, not deleted, so a future module that
+// needs to stage content incrementally has somewhere to add entries —
+// see this map's own doc comment above for the "only ever shrinks"
+// discipline that still applies the moment it's non-empty again.
+var undocumentedAllowlist = map[string]bool{}
 
 // missingTopic is one (entity type, locale) pair with no real content —
 // undocumentedTopics' return shape, factored out so the failure path
 // itself has a fast, hand-driven unit test independent of the real
-// embedded content ever changing shape. As of this slice's landing
-// every required entity type is allowlisted, so
+// embedded content ever changing shape. At this map's introduction every
+// required entity type was still allowlisted, so
 // TestHelpCoverage_EveryDefinitionHasATopic's own loop body never
-// executes anything that would fail — without a table test exercising
-// undocumentedTopics directly, the gate's failure path would be
+// executed anything that would fail — without a table test exercising
+// undocumentedTopics directly, the gate's failure path would have been
 // entirely unrun (and therefore unverified) until uc-infra#147 first
-// shrinks the allowlist, which independent review flagged as exactly
-// the kind of untested-by-construction gate CLAUDE.md's testing
-// discipline exists to prevent.
+// shrunk the allowlist, which independent review flagged as exactly the
+// kind of untested-by-construction gate CLAUDE.md's testing discipline
+// exists to prevent. The allowlist is empty now (uc-infra#148 shrunk the
+// last entries), so TestHelpCoverage_EveryDefinitionHasATopic's loop
+// body runs for real on every required entity type — this table test
+// stays regardless, as the fast, no-real-content-required regression
+// coverage for undocumentedTopics' own branches (see
+// TestUndocumentedTopics_TableDriven below).
 type missingTopic struct {
 	entityType string
 	locale     string

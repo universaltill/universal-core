@@ -8,12 +8,16 @@
 // narrows the visible list, and clicking a topic link is a real browser
 // navigation whose URL/back-forward behavior is native, not simulated.
 //
-// No real help content ships in this slice (internal/help/content/ is
-// still just its own README.md, uc-infra#147-152's scope) — every
+// This file's own topics are never the real shipped content — every
 // fixture topic here is small, genuine-looking placeholder content
 // authored for this test, wired in via help.SetIndexForTesting
-// (internal/help/index.go), never written under
-// internal/help/content/ itself.
+// (internal/help/index.go), which swaps out the real embedded
+// internal/help/content/ index entirely for the duration of each test.
+// That stays true regardless of how much real content has since shipped
+// under internal/help/content/ itself (uc-infra#147-152's module
+// slices, now all landed) — this file deliberately never depends on
+// what's really there; see help_real_content_test.go and its per-module
+// siblings for the tests that do.
 package e2e
 
 import (

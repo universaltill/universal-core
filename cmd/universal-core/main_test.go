@@ -439,13 +439,13 @@ func TestUniversalCore_HelpAssetRoute_ServedUnauthenticated(t *testing.T) {
 // proves the route exists and is auth-gated, not that a real logged-in
 // request gets a real page back) — the same "RegisteredAndGated" vs.
 // "ServedByRealBinary" split this file already uses for SAF-T/UBL/stock
-// transfer. No real help content ships yet (internal/help/content/ is
-// still just its own README.md, uc-infra#147-152's scope), so this
-// confirms the honest content-free state renders correctly against a
-// real running process — the two-pane shell (topic tree container,
-// search box, detail pane) present with a 200, not just a 401 boundary
-// check or an in-process httptest.Server the way internal/api/help_test.go
-// already covers this.
+// transfer. This confirms the shell itself renders correctly against a
+// real running process, independent of how much real content exists for
+// the tenant's own published modules (this test only publishes
+// foundation) — the two-pane shell (topic tree container, search box,
+// detail pane) present with a 200, not just a 401 boundary check or an
+// in-process httptest.Server the way internal/api/help_test.go already
+// covers this.
 func TestUniversalCore_HelpRoute_ServedByRealBinary(t *testing.T) {
 	controlDSN := testexec.FreshDatabase(t, "uc_test_server_control")
 

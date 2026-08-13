@@ -303,10 +303,15 @@ func Facility() *entity.Definition {
 // that, asserting all pre-existing stock sat at one location — safe by
 // construction, since the old model could not express anything else.
 //
-// **(item_id, facility_id) uniqueness is NOT enforced** (#81). Two rows
-// for the same pair are accepted; every aggregate over this entity sums
-// rather than picking a winner, so a duplicate inflates a quantity
-// rather than hiding one.
+// **(item_id, facility_id) uniqueness was NOT enforced** at first (#81).
+// Two rows for the same pair were accepted; every aggregate over this
+// entity sums rather than picking a winner, so a duplicate inflated a
+// quantity rather than hiding one. Closed by the Version 5 Unique
+// declaration below (uc-infra#126) — a second row for an already-stocked
+// pair is rejected outright now, not merely discouraged; this paragraph
+// is kept for the historical reasoning (why sum-not-pick was the right
+// posture for the gap while it existed), not as a claim about current
+// behavior — see this Definition's own Version 5 doc comment.
 func InventoryItem() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "InventoryItem",

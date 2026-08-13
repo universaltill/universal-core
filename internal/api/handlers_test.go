@@ -3796,10 +3796,15 @@ func TestBuildHelpView_ContentExists(t *testing.T) {
 }
 
 // TestAPI_RecordList_HelpAffordanceRendersDisabledWhenNoContent
-// (ADR-0023, uc-infra#143) is the honest end-to-end confirmation of this
-// slice's actual shipped state, mirroring formrender's own test of the
-// same name/shape for form pages: no help content exists yet, so a real
-// list page's "?" must render disabled — present and focusable, no href.
+// (ADR-0023, uc-infra#143) mirrors formrender's own test of the same
+// name/shape for form pages: a real list page's "?" must render
+// disabled — present and focusable, no href — for a genuinely
+// undocumented entity type. Uses the fixture-only "Vendor" entity type
+// (vendorEntityDef/vendorFormDef — not a real kernel entity; see
+// PurchaseOrder's own doc comment on why vendors are a Party role, not
+// a separate entity) specifically because it's guaranteed to never gain
+// a real internal/help/content/*/entity/Vendor.md topic, unlike every
+// real entity type in the product, which now has one (uc-infra#147-152).
 func TestAPI_RecordList_HelpAffordanceRendersDisabledWhenNoContent(t *testing.T) {
 	router := newTestRouter(t)
 	withDevAuthEnabled(t)
@@ -3821,7 +3826,7 @@ func TestAPI_RecordList_HelpAffordanceRendersDisabledWhenNoContent(t *testing.T)
 	// site passed the actual entityType ("Vendor") into help.TopicID —
 	// independent review found this wiring was otherwise unobservable by
 	// any test, since Href (the only other TopicID-derived output) is
-	// empty in every test today (no help content ships in this slice).
+	// empty here because "Vendor" deliberately has no real content.
 	if !strings.Contains(body, `<a class="uc-help-affordance" role="link" data-help-topic="entity/Vendor" aria-disabled="true" tabindex="0" aria-label="Help">?</a>`) {
 		t.Fatalf("expected a disabled, focusable, hrefless help affordance for topic entity/Vendor, got:\n%s", body)
 	}

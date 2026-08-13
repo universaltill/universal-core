@@ -8,11 +8,11 @@
 // this package, and this package never branches on entity type either
 // (CLAUDE.md's kernel/deterministic-core boundary rule).
 //
-// This slice (uc-infra#143) establishes the topic-id convention and the
-// disabled-until-content-exists rendering contract only. No manual
-// content ships here yet (uc-infra#147-152) and there is no viewer yet
-// (uc-infra#144) — see this package's content/README.md and ADR-0023 for
-// the full rationale.
+// This slice (uc-infra#143) established the topic-id convention and the
+// disabled-until-content-exists rendering contract, ahead of any real
+// content or viewer existing yet. Both followed: the viewer (uc-infra
+// #144), then real content for every module (uc-infra#147-152) — see
+// this package's content/README.md and ADR-0023 for the full rationale.
 package help
 
 import (
