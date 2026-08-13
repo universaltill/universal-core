@@ -1,0 +1,11 @@
+-- uc-infra#190 / ADR-0027: workflow_jobs persists an ai_agent actor's
+-- input as a hash only, never the raw text — same type/nullability as
+-- audit_log.input_hash (0001_init.sql), same hash-only policy. NULL for
+-- every actor with nothing to hash (human/system actors, and any
+-- ai_agent row enqueued before this column existed).
+--
+-- internal/data/workflow_jobs.go's scan sites (ClaimNext, Get,
+-- ListByStatus, ListWaitingApproval) restore this into the rebuilt
+-- Actor as audit.RedactedInput, a documented sentinel — never the raw
+-- text, which this table never had to begin with.
+ALTER TABLE workflow_jobs ADD COLUMN input_hash TEXT;
