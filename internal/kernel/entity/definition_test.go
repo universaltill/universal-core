@@ -172,6 +172,76 @@ func TestDefinitionValidate(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			// Regression coverage for independent review finding 4 on
+			// uc-infra#212: before that fix, only FieldEnum/FieldBool
+			// Defaults were type-checked here — a wrong-shaped Default on
+			// any other type was harmless dead data (nothing ever read
+			// it). Once crud.Engine.Create started applying Default at
+			// write time for every field type, a wrong-shaped Default
+			// like this one would fail every single Create that omits
+			// the field, at runtime, with no publish-time signal — this
+			// proves it's now caught here instead, the same "fail loud
+			// on schema drift" standard FieldEnum/FieldBool's own checks
+			// already applied.
+			name: "string default not a string",
+			def: Definition{
+				EntityType: "Party",
+				Fields: []Field{
+					{Name: "preferred_language", Type: FieldString, Default: float64(1)},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "string default is a valid string",
+			def: Definition{
+				EntityType: "Party",
+				Fields: []Field{
+					{Name: "preferred_language", Type: FieldString, Default: "en"},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			// Same generic-check coverage, for a bounded numeric field: a
+			// Default violating its own field's Min is exactly the kind
+			// of mistake that used to be inert (Default was never
+			// consulted for FieldNumber) and is now a real, per-write
+			// failure without this check.
+			name: "number default below its own field's min",
+			def: Definition{
+				EntityType: "StockLevel",
+				Fields: []Field{
+					{Name: "qty_on_hand", Type: FieldNumber, Default: float64(-1), Min: Float64Ptr(0)},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "number default within its own field's bounds",
+			def: Definition{
+				EntityType: "StockLevel",
+				Fields: []Field{
+					{Name: "qty_on_hand", Type: FieldNumber, Default: float64(0), Min: Float64Ptr(0)},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			// FieldMoney's Default is subject to the same whole-minor-
+			// units rule a submitted value is (money.FromAny) — a
+			// fractional Default was never checked before this became
+			// generic.
+			name: "money default is not a whole number of minor units",
+			def: Definition{
+				EntityType: "POLine",
+				Fields: []Field{
+					{Name: "line_total", Type: FieldMoney, Default: float64(10.5)},
+				},
+			},
+			wantErr: true,
+		},
+		{
 			// NotBefore only means anything for a date-vs-date comparison
 			// (validateNotBefore time.Parses both sides) — declaring it on
 			// any other type is schema drift to fail loud on.

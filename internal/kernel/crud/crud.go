@@ -90,12 +90,34 @@ func (e *Engine) runHook(ctx context.Context, tx *sql.Tx, def *entity.Definition
 // never exist without its audit trail (ADR-0017 §14/§16: audit is written
 // from the same transaction as the mutation, never bolted on after).
 func (e *Engine) Create(ctx context.Context, def *entity.Definition, fields map[string]any, actor audit.Actor) (data.Record, error) {
+	// A nil fields map (a Definition with every field optional allows
+	// this — entity.ValidateRecord reads a nil map safely) can't receive
+	// entity.ApplyDefaults's writes: a Go map can't be turned from nil
+	// into non-nil through a value parameter, and writing into one
+	// panics. Normalize before ApplyDefaults ever sees it, once, here —
+	// the one place every Create call passes through — rather than
+	// asking every current and future caller to remember not to pass nil.
+	if fields == nil {
+		fields = map[string]any{}
+	}
 	// Applied before validation (and, deliberately, only here — never in
-	// Update, where an omitted field means "leave unchanged") so a
-	// Default satisfies its own field's Required check and the defaulted
-	// value is what gets validated, persisted, unique-keyed, and
-	// audited — one materialization of "what this record actually is,"
-	// not defaults bolted on after the fact (uc-infra#212).
+	// Update) so a Default satisfies its own field's Required check and
+	// the defaulted value is what gets validated, persisted, unique-
+	// keyed, and audited — one materialization of "what this record
+	// actually is," not defaults bolted on after the fact (uc-infra#212).
+	//
+	// Update is excluded on purpose, and for a sharper reason than
+	// "an omitted field means leave unchanged" — that's Create's
+	// intuition, not Update's: data.RecordRepo.UpdateTx is a full
+	// replacement (`SET data = $1`), so a field genuinely omitted from
+	// an Update payload is already erased, not preserved. Layering
+	// ApplyDefaults onto that would make it worse, not neutral: any
+	// partial update that doesn't intend to touch a defaulted field
+	// would silently force it back to the Definition's Default instead
+	// of erasing it — reverting a deliberately-set value a caller never
+	// meant to change. That failure mode is strictly worse than today's
+	// already-known "Update replaces the whole record, resend
+	// everything" contract, so Update stays as-is.
 	entity.ApplyDefaults(def, fields)
 	if err := entity.ValidateRecord(def, fields); err != nil {
 		return data.Record{}, fmt.Errorf("validation failed: %w", err)

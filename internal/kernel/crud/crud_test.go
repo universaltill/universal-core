@@ -248,6 +248,44 @@ func TestEngine_Create_ExplicitValueNotOverriddenByDefault(t *testing.T) {
 	}
 }
 
+// TestEngine_Create_NilFieldsMapDoesNotPanic proves Create's own nil
+// normalization (immediately above the entity.ApplyDefaults call) does
+// its job. entity.ApplyDefaults writes into the map it's given, and
+// writing into a nil map panics — a Definition with no Required fields
+// was previously a valid nil-fields Create (entity.ValidateRecord reads
+// a nil map safely, and there's nothing Required to fail on), so it
+// must not start panicking now that Create also writes into that map to
+// apply Defaults. Every field here is optional and has a Default, so
+// this test only passes if the nil map actually got normalized AND
+// Defaults actually got applied to the (former-nil) map — either
+// omitted step would either panic or leave the record undefaulted.
+func TestEngine_Create_NilFieldsMapDoesNotPanic(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	def := &entity.Definition{
+		EntityType: "Vendor",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "active", Type: entity.FieldBool, Default: true},
+		},
+	}
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	rec, err := engine.Create(ctx, def, nil, actor)
+	if err != nil {
+		t.Fatalf("Create with a nil fields map should succeed (no Required fields), got: %v", err)
+	}
+
+	got, err := engine.Get(ctx, def, rec.ID)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if got.Data["active"] != true {
+		t.Errorf(`Data["active"] = %v, want the Default true applied to the normalized (former-nil) map`, got.Data["active"])
+	}
+}
+
 func TestEngine_Create_ValidationFailure_WritesNothing(t *testing.T) {
 	db := freshTenantDB(t)
 	ctx := context.Background()

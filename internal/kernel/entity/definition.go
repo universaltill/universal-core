@@ -417,39 +417,27 @@ func (d *Definition) Validate() error {
 		if f.Type == FieldEnum && len(f.EnumValues) == 0 {
 			return fmt.Errorf("field %q is type enum but has no enum_values", f.Name)
 		}
-		if f.Type == FieldEnum && f.Default != nil {
-			// Default only started being consulted by
-			// internal/kernel/formrender's form rendering once reference/
-			// enum fields got real "unselected" empty-option handling
-			// (2026-07-20) — before that it was declared but inert
-			// everywhere, so a typo'd Default was harmless dead data.
-			// Now it sets the pre-selected <option>, and a Default that
-			// isn't one of EnumValues would silently produce a <select>
-			// with nothing selected despite formrender believing a
-			// default was applied — catch it at definition-validation
-			// time instead, the same "fail loud on schema drift" this
-			// method already applies to enum_values/target.
-			def, ok := f.Default.(string)
-			if !ok {
-				return fmt.Errorf("field %q is type enum but default %v is not a string", f.Name, f.Default)
-			}
-			if !slices.Contains(f.EnumValues, def) {
-				return fmt.Errorf("field %q default %q is not one of its enum_values %v", f.Name, def, f.EnumValues)
-			}
-		}
-		if f.Type == FieldBool && f.Default != nil {
-			// Same reasoning as the FieldEnum check just above, for the
-			// same reason: formrender's new-record rendering only started
-			// consulting a FieldBool's Default once uc-infra#206 closed the
-			// gap where only FieldEnum's was honored. Before that, a
-			// typo'd Default (e.g. the string "true" instead of the bool
-			// true) was harmless dead data; now formrender's type
-			// assertion fails safe and silently renders unchecked, which
-			// is exactly the "believes a default was applied but it
-			// wasn't" failure the enum check exists to catch at
-			// definition-validation time instead of at render time.
-			if _, ok := f.Default.(bool); !ok {
-				return fmt.Errorf("field %q is type bool but default %v is not a bool", f.Name, f.Default)
+		if f.Default != nil {
+			// A Default's value must match its own field's shape —
+			// checked here, at definition-validation/publish time,
+			// against every field type generically, not just FieldEnum/
+			// FieldBool by hand. Originally only those two were checked
+			// (formrender's browser rendering started consulting a
+			// FieldEnum Default on 2026-07-20, then a FieldBool one via
+			// uc-infra#206 — before each, a typo'd Default of the wrong
+			// shape was harmless dead data nothing ever read). uc-infra#212
+			// made this a generic gap, not a two-type one: crud.Engine.
+			// Create's ApplyDefaults now trusts Field.Default verbatim,
+			// for every field type, on every write that omits the field —
+			// so a wrong-shaped Default (a fractional FieldMoney amount,
+			// a non-string FieldReference, an enum value not in
+			// EnumValues) would otherwise fail every single such write at
+			// runtime instead of being caught once, here, at the point
+			// the mistake was actually made. Reuses validateFieldValue —
+			// the identical structural check a submitted value gets — so
+			// a Default is held to the same standard as real record data.
+			if verr := validateFieldValue(d.EntityType, f, f.Default); verr != nil {
+				return fmt.Errorf("field %q: invalid default: %s", f.Name, verr.Detail)
 			}
 		}
 		if f.Type == FieldReference && f.Target == "" {

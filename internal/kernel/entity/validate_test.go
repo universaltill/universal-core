@@ -856,6 +856,14 @@ func TestApplyDefaults(t *testing.T) {
 		}
 	})
 
+	t.Run("a nil map is left alone, not panicked on", func(t *testing.T) {
+		var data map[string]any // nil, deliberately — not map[string]any{}
+		ApplyDefaults(def, data)
+		if data != nil {
+			t.Errorf("expected data to remain nil (a value parameter can't turn a caller's nil map non-nil), got %#v", data)
+		}
+	})
+
 	t.Run("nil value is treated as absent, same as a missing key", func(t *testing.T) {
 		data := map[string]any{"active": nil}
 		ApplyDefaults(def, data)
@@ -914,7 +922,16 @@ func TestApplyDefaults(t *testing.T) {
 		def := &Definition{EntityType: "Asset", Fields: []Field{
 			{Name: "quantity", Type: FieldNumber, Default: float64(1)},
 			{Name: "acquired_on", Type: FieldDate, Default: "2026-01-01"},
-			{Name: "cost", Type: FieldMoney, Default: int64(0)},
+			// float64, not int64: a published Definition's Default is
+			// always a JSON-round-tripped value by the time a real
+			// caller sees it (entity.Unmarshal decodes every JSON
+			// number as float64 — handlers.go's own decoder), so
+			// int64(0) here would assert a shape no real Definition can
+			// actually carry, however Go-legal it is to construct one
+			// in a test literal directly.
+			{Name: "cost", Type: FieldMoney, Default: float64(0)},
+			{Name: "owner_id", Type: FieldReference, Target: "Party", Default: "party-default-id"},
+			{Name: "notes", Type: FieldI18nText, Default: map[string]any{"en": "No notes yet"}},
 		}}
 		data := map[string]any{}
 		ApplyDefaults(def, data)
@@ -924,8 +941,15 @@ func TestApplyDefaults(t *testing.T) {
 		if data["acquired_on"] != "2026-01-01" {
 			t.Errorf("acquired_on = %v, want default date", data["acquired_on"])
 		}
-		if data["cost"] != int64(0) {
+		if data["cost"] != float64(0) {
 			t.Errorf("cost = %v, want default money", data["cost"])
+		}
+		if data["owner_id"] != "party-default-id" {
+			t.Errorf("owner_id = %v, want default reference id", data["owner_id"])
+		}
+		notes, ok := data["notes"].(map[string]any)
+		if !ok || notes["en"] != "No notes yet" {
+			t.Errorf("notes = %v, want default i18n_text map", data["notes"])
 		}
 	})
 }
