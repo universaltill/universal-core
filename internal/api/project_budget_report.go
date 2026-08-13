@@ -103,13 +103,30 @@ func (h *Handler) renderProjectBudgetReport(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// ProjectBudgetLine.planned_amount can be hidden per-role via a
+	// FieldPermission (ADR-0006) — same mechanism export.go/import.go
+	// already check. ts.crud.ListByField above has already stripped the
+	// key from every budgetLines row's Data for an actor this applies
+	// to, which is exactly why projectBudgetPlannedMinor can't tell
+	// "redacted" from "genuinely zero" on its own (uc-infra#216): it
+	// only ever sees the already-redacted Data map. Resolved once here,
+	// for the whole report, not per-row — HiddenFields answers for one
+	// (actor, entity type) pair, and every ProjectBudgetLine row on this
+	// page belongs to the same entity type.
+	hiddenBudgetFields, err := ts.crud.HiddenFields(ctx, "ProjectBudgetLine")
+	if err != nil {
+		writeInternalError(w, "resolve ProjectBudgetLine field visibility", err)
+		return
+	}
+	plannedRedacted := projectBudgetLinePlannedRedacted(hiddenBudgetFields)
+
 	actuals, err := ts.reporting.ProjectBudgetActuals(ctx, id)
 	if err != nil {
 		writeInternalError(w, "project budget actuals", err)
 		return
 	}
 
-	view := h.buildProjectBudgetReportView(project, budgetLines, actuals, locale)
+	view := h.buildProjectBudgetReportView(project, budgetLines, actuals, locale, plannedRedacted)
 	topicID := help.RouteTopicID("reports/project-budget")
 	view.Help = h.buildHelpView(locale, topicID, help.HasContent(locale, topicID))
 
@@ -143,6 +160,26 @@ func (h *Handler) renderProjectBudgetReport(w http.ResponseWriter, r *http.Reque
 // doc comment applies at the SQL layer, kept consistent here at the Go
 // layer (an earlier version of this function aborted the whole report
 // on the second case, undermining its own doc comment's claim).
+// projectBudgetLinePlannedRedacted (uc-infra#216, independent review
+// finding) decides whether this actor's view of a report row's Planned
+// figure is trustworthy, given the set of ProjectBudgetLine fields a
+// FieldPermission hides from them. It is NOT just "is planned_amount
+// hidden": projectBudgetPlannedMinor also reads "category" out of the
+// same already-redacted budgetLines Data map to decide which rows to
+// sum for a given actuals category — a FieldPermission hiding category
+// alone makes every row's stored category compare empty against the
+// real category ProjectBudgetActuals' un-redacted SQL query still
+// reports, so NO row is ever matched and money.Sum returns a fabricated
+// 0, indistinguishable from a genuine zero-budget category, exactly the
+// failure this whole mechanism exists to prevent. An earlier version of
+// this function gated on planned_amount alone and let a category-only
+// redaction sail straight through as a confidently-wrong Planned=0.00
+// (and, worse, a confidently-wrong non-zero Variance) — reproduced by
+// independent review before this fix.
+func projectBudgetLinePlannedRedacted(hidden map[string]bool) bool {
+	return hidden["planned_amount"] || hidden["category"]
+}
+
 func projectBudgetPlannedMinor(budgetLines []data.Record, category string) money.Money {
 	var amounts []money.Money
 	for _, line := range budgetLines {
@@ -175,7 +212,18 @@ func projectBudgetPlannedMinor(budgetLines []data.Record, category string) money
 // the same ProjectBudgetLine rows this handler already fetched), so a
 // row here always has a real planned amount to pair with, never a
 // synthesized zero for a category nobody budgeted.
-func (h *Handler) buildProjectBudgetReportView(project data.Record, budgetLines []data.Record, actuals []data.ProjectCategoryActual, locale string) projectBudgetReportView {
+//
+// plannedRedacted (uc-infra#216) is true when the acting role's
+// FieldPermission hides ProjectBudgetLine.planned_amount — a single
+// tenant-and-actor-wide answer, not a per-row one (see the handler's own
+// comment on why it's resolved once). When true, every row's Planned
+// column renders NotAvailable instead of projectBudgetPlannedMinor's sum
+// — which, over an already-redacted budgetLines slice, would otherwise
+// be indistinguishable from a real, confirmed planned amount of zero
+// (the exact fabricated-number failure Actual/Available already guards
+// against). Variance also becomes unavailable in that case: it's a
+// function of Planned, so it can't be a real number when Planned isn't.
+func (h *Handler) buildProjectBudgetReportView(project data.Record, budgetLines []data.Record, actuals []data.ProjectCategoryActual, locale string, plannedRedacted bool) projectBudgetReportView {
 	projectCode, _ := project.Data["project_code"].(string)
 
 	view := projectBudgetReportView{
@@ -194,12 +242,17 @@ func (h *Handler) buildProjectBudgetReportView(project data.Record, budgetLines 
 		plannedMinor := projectBudgetPlannedMinor(budgetLines, a.Category)
 		row := projectBudgetCategoryRowView{
 			Category: h.catalog.TOrDefault(locale, "field.ProjectBudgetLine.category."+a.Category, a.Category),
-			Planned:  plannedMinor.String(),
+		}
+		if !plannedRedacted {
+			row.PlannedAvailable = true
+			row.Planned = plannedMinor.String()
 		}
 		if a.Actual != nil {
 			row.Available = true
 			row.Actual = a.Actual.String()
-			row.Variance = (plannedMinor - *a.Actual).String()
+			if row.PlannedAvailable {
+				row.Variance = (plannedMinor - *a.Actual).String()
+			}
 		}
 		if a.Category == "labour" && (a.UnpricedHours > 0 || a.UnpricedEntries > 0) {
 			row.UnpricedNote = h.catalog.T(locale, "report.project_budget.unpriced_note")
@@ -232,6 +285,13 @@ type projectBudgetReportView struct {
 type projectBudgetCategoryRowView struct {
 	Category string
 	Planned  string
+	// PlannedAvailable distinguishes a real planned_amount sum from
+	// "not available" (the acting role's FieldPermission hides
+	// planned_amount, uc-infra#216) — collapsing the two would render a
+	// fabricated Planned=0.00 for an actor who genuinely can't see
+	// planned_amount at all, the same under-reporting risk Available
+	// (below) already guards against for Actual.
+	PlannedAvailable bool
 	// Available distinguishes a real, computed Actual/Variance (even a
 	// genuine 0) from "not available" (no source exists for this
 	// category at all) — collapsing the two would reproduce the exact
@@ -239,7 +299,10 @@ type projectBudgetCategoryRowView struct {
 	// warns about.
 	Available bool
 	Actual    string
-	Variance  string
+	// Variance is only set when BOTH Available and PlannedAvailable —
+	// it's Planned minus Actual, so it can't be a real number when
+	// either half is unavailable.
+	Variance string
 	// UnpricedNote is set only on the "labour" row when
 	// UnpricedHours/UnpricedEntries is non-zero — a labour actual that
 	// silently omitted unpriced hours would read as a smaller, complete
@@ -265,9 +328,9 @@ var projectBudgetReportTmpl = template.Must(template.New("projectBudgetReport").
 {{range .Rows}}
 <tr>
   <td>{{.Category}}{{if .UnpricedNote}} <span class="uc-project-budget-unpriced">({{.UnpricedNote}})</span>{{end}}</td>
-  <td>{{.Planned}}</td>
+  <td>{{if .PlannedAvailable}}{{.Planned}}{{else}}{{$.NotAvailable}}{{end}}</td>
   <td>{{if .Available}}{{.Actual}}{{else}}{{$.NotAvailable}}{{end}}</td>
-  <td>{{if .Available}}{{.Variance}}{{else}}{{$.NotAvailable}}{{end}}</td>
+  <td>{{if and .Available .PlannedAvailable}}{{.Variance}}{{else}}{{$.NotAvailable}}{{end}}</td>
 </tr>
 {{end}}
 </tbody>

@@ -40,6 +40,13 @@ projenin karşılaştırılacak bir şeyi olması için Bütçe Kalemleri'ne ve,
   kişinin kayıtlı bir maliyet oranı yoksa) İşçilik satırı bunu doğrudan
   belirtir. Bu durumda İşçilik için gösterilen Gerçekleşen değeri yine de
   gerçektir, ancak kısmidir — fiyatlandırılamayan saatleri içermez.
+- Rolünüzün Bütçe Kalemlerinin planlanan tutarlarını görme izni yoksa,
+  **Planlanan** her satırda bir rakam yerine **Mevcut değil** gösterir —
+  doğrulanmış sıfır bütçe olarak yanlış anlaşılabilecek bir **0**
+  asla gösterilmez. **Fark** da bu durumda, Gerçekleşen'i gösterilen bir
+  satırda bile, her satırda **Mevcut değil** gösterir: Fark, Planlanan
+  ile Gerçekleşen'in karşılaştırılmasıdır, dolayısıyla Planlanan sizin
+  için görünür değilken gerçek bir rakam olamaz.
 
 ## Bilinmesi gereken kurallar
 
