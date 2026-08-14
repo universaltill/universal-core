@@ -73,6 +73,7 @@
   "report.rfq.footer_total": "Teklif Edilen Toplam",
   "report.rfq.empty": "Bu teklif talebinde henüz satır ve/veya davet edilmiş tedarikçi yok — karşılaştırılacak bir şey yok.",
   "report.rfq.missing_quote": "—",
+  "report.rfq.not_available": "Mevcut değil",
   "report.project_budget.title": "Proje Bütçesi: Planlanan ve Gerçekleşen",
   "report.project_budget.actual_col": "Gerçekleşen",
   "report.project_budget.variance_col": "Fark",

@@ -73,6 +73,7 @@
   "report.rfq.footer_total": "جمع کل قیمت پیشنهادی",
   "report.rfq.empty": "این استعلام قیمت هنوز هیچ ردیف یا تأمین‌کننده دعوت‌شده‌ای ندارد — چیزی برای مقایسه وجود ندارد.",
   "report.rfq.missing_quote": "—",
+  "report.rfq.not_available": "در دسترس نیست",
   "report.project_budget.title": "بودجه پروژه: برنامه‌ریزی‌شده در برابر واقعی",
   "report.project_budget.actual_col": "واقعی",
   "report.project_budget.variance_col": "تفاوت",

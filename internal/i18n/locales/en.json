@@ -73,6 +73,7 @@
   "report.rfq.footer_total": "Quoted Total",
   "report.rfq.empty": "This RFQ has no lines and/or no invited vendors yet — nothing to compare.",
   "report.rfq.missing_quote": "—",
+  "report.rfq.not_available": "Not available",
   "report.project_budget.title": "Project Budget: Planned vs. Actual",
   "report.project_budget.actual_col": "Actual",
   "report.project_budget.variance_col": "Variance",
