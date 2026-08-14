@@ -68,6 +68,7 @@
   "report.purchasing.reorder_expect_days": "اطلب الآن — الوصول المتوقع خلال {days} يومًا تقريبًا",
   "report.purchasing.reorder_expect_days_overall": "اطلب الآن — الوصول المتوقع خلال {days} يومًا تقريبًا (جميع الموردين)",
   "report.purchasing.reorder_insufficient": "سجل مدة التوريد غير كافٍ",
+  "report.purchasing.not_available": "غير متوفر",
   "report.rfq.title": "مقارنة عروض أسعار الموردين",
   "report.rfq.footer_total": "إجمالي السعر المعروض",
   "report.rfq.empty": "لا توجد بنود و/أو موردون مدعوون لطلب عرض الأسعار هذا بعد — لا يوجد ما يمكن مقارنته.",

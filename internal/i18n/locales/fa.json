@@ -68,6 +68,7 @@
   "report.purchasing.reorder_expect_days": "اکنون سفارش دهید — حدود {days} روز دیگر می‌رسد",
   "report.purchasing.reorder_expect_days_overall": "اکنون سفارش دهید — حدود {days} روز دیگر می‌رسد (همه تأمین‌کنندگان)",
   "report.purchasing.reorder_insufficient": "سابقه زمان تأمین ناکافی است",
+  "report.purchasing.not_available": "در دسترس نیست",
   "report.rfq.title": "مقایسه تأمین‌کنندگان استعلام قیمت",
   "report.rfq.footer_total": "جمع کل قیمت پیشنهادی",
   "report.rfq.empty": "این استعلام قیمت هنوز هیچ ردیف یا تأمین‌کننده دعوت‌شده‌ای ندارد — چیزی برای مقایسه وجود ندارد.",

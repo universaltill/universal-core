@@ -127,6 +127,26 @@ func (h *Handler) renderPurchasingReport(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// InventoryItem.qty_on_hand/qty_available_to_promise can be hidden
+	// per-role via a FieldPermission (ADR-0006) — same mechanism
+	// project_budget_report.go already resolves once for the whole
+	// report (see that file's own comment on why: HiddenFields answers
+	// for one (actor, entity type) pair, and every quantity on this page
+	// comes from the same entity type). uc-infra#230: StockSummary/
+	// StockoutRiskItems/buildReorderSignals all read these two fields via
+	// ts.reporting's raw SQL (data.ReportingRepo), entirely outside the
+	// ts.crud-redacted path CRUD pages use, so without this check a
+	// restricted actor's real qty_on_hand/qty_available_to_promise sails
+	// straight into this report regardless of what their role hides on
+	// /api/records/InventoryItem or any generated form.
+	hiddenInventoryFields, err := ts.crud.HiddenFields(ctx, "InventoryItem")
+	if err != nil {
+		writeInternalError(w, "resolve InventoryItem field visibility", err)
+		return
+	}
+	onHandRedacted := hiddenInventoryFields["qty_on_hand"]
+	atpRedacted := hiddenInventoryFields["qty_available_to_promise"]
+
 	statusRows, err := ts.reporting.PurchaseOrderStatusBreakdown(ctx)
 	if err != nil {
 		writeInternalError(w, "purchase order status breakdown", err)
@@ -176,7 +196,7 @@ func (h *Handler) renderPurchasingReport(w http.ResponseWriter, r *http.Request)
 	}
 	qualityStats := forecast.ComputeQuality(qualitySamples(qualityLines))
 
-	signals, err := h.buildReorderSignals(ctx, ts, stats, locale)
+	signals, err := h.buildReorderSignals(ctx, ts, stats, locale, onHandRedacted)
 	if err != nil {
 		writeInternalError(w, "build reorder signals", err)
 		return
@@ -184,6 +204,7 @@ func (h *Handler) renderPurchasingReport(w http.ResponseWriter, r *http.Request)
 
 	view := purchasingReportView{
 		Title:         h.catalog.T(locale, "report.purchasing.title"),
+		NotAvailable:  h.catalog.T(locale, "report.purchasing.not_available"),
 		StatusHeading: h.catalog.T(locale, "report.purchasing.status_heading"),
 		VendorHeading: h.catalog.T(locale, "report.purchasing.vendor_heading"),
 		VendorEmpty:   h.catalog.T(locale, "report.purchasing.vendor_empty"),
@@ -207,8 +228,6 @@ func (h *Handler) renderPurchasingReport(w http.ResponseWriter, r *http.Request)
 		StockoutOnHandCol: h.catalog.TOrDefault(locale, "field.InventoryItem.qty_on_hand", "Qty On Hand"),
 		StockoutATPCol:    h.catalog.TOrDefault(locale, "field.InventoryItem.qty_available_to_promise", "Qty Available to Promise"),
 		StockItemCount:    strconv.Itoa(stock.ItemCount),
-		StockOnHand:       formrender.FormatFieldValue(stock.TotalOnHand),
-		StockATP:          formrender.FormatFieldValue(stock.TotalATP),
 		StockoutCount:     strconv.Itoa(stock.StockoutCount),
 
 		LeadTimeHeading:    h.catalog.T(locale, "report.purchasing.leadtime_heading"),
@@ -240,6 +259,21 @@ func (h *Handler) renderPurchasingReport(w http.ResponseWriter, r *http.Request)
 		ReorderExpectedCol: h.catalog.T(locale, "report.purchasing.reorder_expected_col"),
 		ReorderRows:        signals,
 	}
+	// StockOnHand/StockATP are aggregates over the same
+	// FieldPermission-hidden InventoryItem fields as every per-row
+	// quantity on this report (uc-infra#230) — a role that can't see
+	// qty_on_hand on one InventoryItem record can't see it summed across
+	// all of them either, so the card renders NotAvailable instead of a
+	// real total the same way a redacted ProjectBudgetLine.planned_amount
+	// sum does (project_budget_report.go's plannedRedacted).
+	if !onHandRedacted {
+		view.StockOnHandAvailable = true
+		view.StockOnHand = formrender.FormatFieldValue(stock.TotalOnHand)
+	}
+	if !atpRedacted {
+		view.StockATPAvailable = true
+		view.StockATP = formrender.FormatFieldValue(stock.TotalATP)
+	}
 	view.LeadTimeRows = h.buildLeadTimeRows(stats, leadTimes, locale)
 	view.OnTimeRows = h.buildOnTimeRows(onTimeStats, leadTimes, locale)
 	view.QualityRows = h.buildQualityRows(qualityStats, qualityLines, locale)
@@ -267,13 +301,26 @@ func (h *Handler) renderPurchasingReport(w http.ResponseWriter, r *http.Request)
 		})
 	}
 	for _, item := range stockouts {
-		view.Stockouts = append(view.Stockouts, stockoutRowView{
-			SKU:    item.SKU,
-			Name:   item.Name,
-			OnHand: formrender.FormatFieldValue(item.QtyOnHand),
-			ATP:    formrender.FormatFieldValue(item.QtyATP),
-			Href:   "/forms/Item/" + item.ItemID,
-		})
+		row := stockoutRowView{
+			SKU:  item.SKU,
+			Name: item.Name,
+			Href: "/forms/Item/" + item.ItemID,
+		}
+		// Same per-field redaction as the stock summary card above
+		// (uc-infra#230): StockoutRiskItems is a raw-SQL data.ReportingRepo
+		// aggregate, entirely outside the ts.crud-redacted path, so
+		// OnHand/ATP must be checked against InventoryItem's
+		// FieldPermission individually rather than assumed safe just
+		// because the item itself is readable.
+		if !onHandRedacted {
+			row.OnHandAvailable = true
+			row.OnHand = formrender.FormatFieldValue(item.QtyOnHand)
+		}
+		if !atpRedacted {
+			row.ATPAvailable = true
+			row.ATP = formrender.FormatFieldValue(item.QtyATP)
+		}
+		view.Stockouts = append(view.Stockouts, row)
 	}
 
 	var buf bytes.Buffer
@@ -590,7 +637,22 @@ func (h *Handler) buildQualityRows(stats forecast.QualityResult, rows []data.Goo
 // somehow did arrive would still correctly hard-fail below, same as any
 // other unexpected error, rather than silently showing a wrong "no
 // signals" state to someone who might otherwise have seen real ones.
-func (h *Handler) buildReorderSignals(ctx context.Context, ts tenantScope, stats forecast.Result, locale string) ([]reorderRowView, error) {
+//
+// onHandRedacted (uc-infra#230, resolved once by the caller — see
+// renderPurchasingReport's own comment) gates the row's rendered
+// On Hand AND Position cells together, not just On Hand alone: Position
+// is on_hand+on_order, and OnOrder is always rendered on this same row,
+// so leaving Position visible while blanking On Hand would let an actor
+// simply subtract the two visible numbers to recover the real on-hand
+// figure their FieldPermission hides. This deliberately does NOT change
+// whether a rule fires: the redaction question here is about what a
+// restricted actor is SHOWN, not what the report computes — the
+// fire/no-fire decision below always uses the real on-hand quantity
+// (same "compute for real, only widen the display redaction" fix shape
+// uc-infra#230 itself describes as the mechanical option, distinct from
+// the actual business-behavior call uc-infra#231 left to Farshid for the
+// analogous safety_stock question).
+func (h *Handler) buildReorderSignals(ctx context.Context, ts tenantScope, stats forecast.Result, locale string, onHandRedacted bool) ([]reorderRowView, error) {
 	reorderDef, err := ts.entityDef(ctx, "ReorderRule")
 	if errors.Is(err, data.ErrNotFound) {
 		return nil, nil
@@ -672,15 +734,20 @@ func (h *Handler) buildReorderSignals(ctx context.Context, ts tenantScope, stats
 			expected = strings.ReplaceAll(contextTmpl, "{days}", formatDays(days))
 		}
 
-		out = append(out, reorderRowView{
+		row := reorderRowView{
 			Item:         itemName,
 			Href:         "/forms/Item/" + itemID,
-			OnHand:       formrender.FormatFieldValue(onHandByItem[itemID]),
 			OnOrder:      formrender.FormatFieldValue(onOrderByItem[itemID]),
-			Position:     formrender.FormatFieldValue(position),
 			ReorderPoint: formrender.FormatFieldValue(reorderPoint),
 			Expected:     expected,
-		})
+		}
+		if !onHandRedacted {
+			row.OnHandAvailable = true
+			row.OnHand = formrender.FormatFieldValue(onHandByItem[itemID])
+			row.PositionAvailable = true
+			row.Position = formrender.FormatFieldValue(position)
+		}
+		out = append(out, row)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Item != out[j].Item {
@@ -693,6 +760,13 @@ func (h *Handler) buildReorderSignals(ctx context.Context, ts tenantScope, stats
 
 type purchasingReportView struct {
 	Title string
+
+	// NotAvailable (uc-infra#230) is the placeholder every quantity cell
+	// on this report renders instead of a real number when the acting
+	// role's FieldPermission hides the InventoryItem field it comes
+	// from — same "resolved once, reused by every guard on the page"
+	// shape as project_budget_report.go's own NotAvailable.
+	NotAvailable string
 
 	StatusHeading string
 	StatusCards   []statusCardView
@@ -709,8 +783,15 @@ type purchasingReportView struct {
 	StockOnHandLabel string
 	StockATPLabel    string
 	StockItemCount   string
-	StockOnHand      string
-	StockATP         string
+	// StockOnHandAvailable/StockATPAvailable (uc-infra#230) distinguish a
+	// real aggregate from "not available" (qty_on_hand/
+	// qty_available_to_promise hidden from this actor) — collapsing the
+	// two would render a real total to an actor whose FieldPermission
+	// hides the per-record field it's summed from.
+	StockOnHandAvailable bool
+	StockOnHand          string
+	StockATPAvailable    bool
+	StockATP             string
 
 	StockoutHeading   string
 	StockoutEmpty     string
@@ -774,13 +855,21 @@ type qualityRowView struct {
 }
 
 type reorderRowView struct {
-	Item         string
-	Href         string
-	OnHand       string
-	OnOrder      string
-	Position     string
-	ReorderPoint string
-	Expected     string
+	Item string
+	Href string
+	// OnHandAvailable/PositionAvailable (uc-infra#230) are set together,
+	// never independently — see buildReorderSignals' own comment on why
+	// Position must be redacted whenever OnHand is: OnOrder is always
+	// rendered on this same row, and Position is on_hand+on_order, so a
+	// visible Position next to a visible OnOrder would let an actor
+	// recover the real on-hand figure their FieldPermission hides.
+	OnHandAvailable   bool
+	OnHand            string
+	OnOrder           string
+	PositionAvailable bool
+	Position          string
+	ReorderPoint      string
+	Expected          string
 }
 
 type statusCardView struct {
@@ -796,11 +885,18 @@ type vendorRowView struct {
 }
 
 type stockoutRowView struct {
-	SKU    string
-	Name   string
-	OnHand string
-	ATP    string
-	Href   string
+	SKU  string
+	Name string
+	// OnHandAvailable/ATPAvailable (uc-infra#230) are independent, unlike
+	// reorderRowView's OnHandAvailable/PositionAvailable pair: this table
+	// has no visible OnOrder column to combine with OnHand and recover a
+	// hidden figure, so qty_on_hand and qty_available_to_promise are
+	// gated on their own FieldPermission independently.
+	OnHandAvailable bool
+	OnHand          string
+	ATPAvailable    bool
+	ATP             string
+	Href            string
 }
 
 var purchasingReportTmpl = template.Must(template.New("purchasingReport").Parse(`
@@ -839,11 +935,11 @@ var purchasingReportTmpl = template.Must(template.New("purchasingReport").Parse(
 </div>
 <div class="uc-report-card">
   <div class="uc-report-card-label">{{.StockOnHandLabel}}</div>
-  <div class="uc-report-card-value">{{.StockOnHand}}</div>
+  <div class="uc-report-card-value">{{if .StockOnHandAvailable}}{{.StockOnHand}}{{else}}{{.NotAvailable}}{{end}}</div>
 </div>
 <div class="uc-report-card">
   <div class="uc-report-card-label">{{.StockATPLabel}}</div>
-  <div class="uc-report-card-value">{{.StockATP}}</div>
+  <div class="uc-report-card-value">{{if .StockATPAvailable}}{{.StockATP}}{{else}}{{.NotAvailable}}{{end}}</div>
 </div>
 </div>
 
@@ -853,7 +949,7 @@ var purchasingReportTmpl = template.Must(template.New("purchasingReport").Parse(
 <thead><tr><th>{{.StockoutSKUCol}}</th><th>{{.StockoutNameCol}}</th><th>{{.StockoutOnHandCol}}</th><th>{{.StockoutATPCol}}</th></tr></thead>
 <tbody>
 {{range .Stockouts}}
-<tr><td><a href="{{.Href}}">{{.SKU}}</a></td><td>{{.Name}}</td><td>{{.OnHand}}</td><td>{{.ATP}}</td></tr>
+<tr><td><a href="{{.Href}}">{{.SKU}}</a></td><td>{{.Name}}</td><td>{{if .OnHandAvailable}}{{.OnHand}}{{else}}{{$.NotAvailable}}{{end}}</td><td>{{if .ATPAvailable}}{{.ATP}}{{else}}{{$.NotAvailable}}{{end}}</td></tr>
 {{end}}
 </tbody>
 </table>
@@ -909,7 +1005,7 @@ var purchasingReportTmpl = template.Must(template.New("purchasingReport").Parse(
 <thead><tr><th>{{.ReorderItemCol}}</th><th>{{.ReorderOnHandCol}}</th><th>{{.ReorderOnOrderCol}}</th><th>{{.ReorderPositionCol}}</th><th>{{.ReorderPointCol}}</th><th>{{.ReorderExpectedCol}}</th></tr></thead>
 <tbody>
 {{range .ReorderRows}}
-<tr><td><a href="{{.Href}}">{{.Item}}</a></td><td>{{.OnHand}}</td><td>{{.OnOrder}}</td><td>{{.Position}}</td><td>{{.ReorderPoint}}</td><td>{{.Expected}}</td></tr>
+<tr><td><a href="{{.Href}}">{{.Item}}</a></td><td>{{if .OnHandAvailable}}{{.OnHand}}{{else}}{{$.NotAvailable}}{{end}}</td><td>{{.OnOrder}}</td><td>{{if .PositionAvailable}}{{.Position}}{{else}}{{$.NotAvailable}}{{end}}</td><td>{{.ReorderPoint}}</td><td>{{.Expected}}</td></tr>
 {{end}}
 </tbody>
 </table>
