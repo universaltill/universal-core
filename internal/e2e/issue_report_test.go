@@ -1249,6 +1249,517 @@ func TestIssueReportPage_MicRecord_LateOnstopFromEndedTakeDoesNotResetNewerTakes
 	}
 }
 
+// TestIssueReportPage_MicRecord_LateOnstopFromEndedTakeDoesNotClobberStatusOrTranscript
+// is the companion to LateOnstopFromEndedTakeDoesNotResetNewerTakesButton
+// just above, for uc-infra#221 specifically (independent review of this
+// fix's first draft): that test already builds the exact interleaving this
+// one needs — take #1's stream ends on its own and its `onstop` is fired
+// LATE, well after take #2 has already started — but only ever reads
+// `#uc-issue-record-btn`, never the status line or transcript field, so it
+// pins uc-infra#223's button-label guard without touching any of uc-infra
+// #221's three guarded write sites at all. The two StaleTranscribe* tests
+// below this one use a DIFFERENT (synchronous-onstop) fake MediaRecorder
+// specifically so they can control fetch resolution timing independently —
+// which means `mediaRecorder === thisRecorder` is trivially true at their
+// own "Transcribing…" write (issuereport.go's line just after the blob is
+// built), and deleting that particular guard would leave both of them, and
+// every other existing test, still green. Only a deferred-`onstop` harness
+// like this one's actually exercises that specific guard.
+func TestIssueReportPage_MicRecord_LateOnstopFromEndedTakeDoesNotClobberStatusOrTranscript(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, _ := testServer(t)
+	ctx := browserCtx(t, tenantID)
+
+	const fakeScript = `
+(function() {
+  navigator.mediaDevices = navigator.mediaDevices || {};
+  navigator.mediaDevices.getUserMedia = function() {
+    return Promise.resolve({ getTracks: function() { return []; } });
+  };
+  window.__recorders = [];
+  window.MediaRecorder = function() {
+    var self = this;
+    this.state = "recording";
+    this.start = function() { self.state = "recording"; };
+    // Deliberately does nothing on .stop() beyond flipping state — this
+    // take's onstop is fired later, explicitly, by the test (same fake
+    // shape as LateOnstopFromEndedTakeDoesNotResetNewerTakesButton above).
+    this.stop = function() { self.state = "inactive"; };
+    this.ondataavailable = null;
+    window.__recorders.push(self);
+  };
+  window.__fireLateOnstop = function(index) {
+    var self = window.__recorders[index];
+    self.state = "inactive";
+    if (self.onstop) { self.onstop(); }
+  };
+  window.__transcribeCallCount = 0;
+  var realFetch = window.fetch;
+  window.fetch = function(url, opts) {
+    if (String(url).indexOf("/issue-report/transcribe") !== -1) {
+      window.__transcribeCallCount++;
+      return Promise.resolve(new Response("LATE-ONSTOP-STALE-MARKER", { status: 200 }));
+    }
+    return realFetch.apply(window, arguments);
+  };
+})();
+`
+	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		_, err := page.AddScriptToEvaluateOnNewDocument(fakeScript).Do(ctx)
+		return err
+	})); err != nil {
+		t.Fatalf("inject fake deferred-onstop media/fetch script: %v", err)
+	}
+
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/issue-report/new"),
+		chromedp.WaitVisible(`#uc-issue-record-btn`, chromedp.ByQuery),
+		chromedp.Click(`#uc-issue-record-btn`, chromedp.ByQuery), // take #1: start
+	); err != nil {
+		t.Fatalf("start take #1: %v", err)
+	}
+	var recordBtnText string
+	if err := chromedp.Run(ctx, chromedp.PollFunction(
+		`function() { var t = document.getElementById("uc-issue-record-btn").textContent; return t === "Stop recording" ? t : null; }`,
+		&recordBtnText,
+	)); err != nil {
+		t.Fatalf("wait for take #1 to start: %v", err)
+	}
+
+	// Take #1 ends on its own, without firing onstop yet — same setup as
+	// LateOnstopFromEndedTakeDoesNotResetNewerTakesButton above.
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`window.__recorders[0].state = "inactive"; void 0;`, nil)); err != nil {
+		t.Fatalf("end take #1's stream on its own, without firing onstop yet: %v", err)
+	}
+	if err := chromedp.Run(ctx, chromedp.Click(`#uc-issue-record-btn`, chromedp.ByQuery)); err != nil { // take #1: guarded-skip stop
+		t.Fatalf("stop take #1: %v", err)
+	}
+	if err := chromedp.Run(ctx, chromedp.PollFunction(
+		`function() { var t = document.getElementById("uc-issue-record-btn").textContent; return t === "Record voice note" ? t : null; }`,
+		&recordBtnText,
+	)); err != nil {
+		t.Fatalf("wait for the button to reset after stopping take #1: %v", err)
+	}
+
+	if err := chromedp.Run(ctx, chromedp.Click(`#uc-issue-record-btn`, chromedp.ByQuery)); err != nil { // take #2: start
+		t.Fatalf("start take #2: %v", err)
+	}
+	if err := chromedp.Run(ctx, chromedp.PollFunction(
+		`function() { var t = document.getElementById("uc-issue-record-btn").textContent; return t === "Stop recording" ? t : null; }`,
+		&recordBtnText,
+	)); err != nil {
+		t.Fatalf("wait for take #2 to start: %v", err)
+	}
+	var statusBeforeLateOnstop string
+	if err := chromedp.Run(ctx, chromedp.Text(`#uc-issue-record-status`, &statusBeforeLateOnstop, chromedp.ByQuery)); err != nil {
+		t.Fatalf("read status line before take #1's late onstop: %v", err)
+	}
+	if statusBeforeLateOnstop != "" {
+		t.Fatalf("status line = %q with take #2 actively recording, want empty (idle) before even firing take #1's late onstop", statusBeforeLateOnstop)
+	}
+
+	// Take #1's onstop finally fires — late, after take #2 has already
+	// started and reassigned issuereport.go's shared mediaRecorder variable
+	// to take #2's instance. Pre-fix, this unconditionally wrote
+	// "Transcribing…" over take #2's own idle status line, then (once the
+	// fake fetch above resolves) unconditionally overwrote the transcript/
+	// description fields too — exactly the uc-infra#221 bug, reached via a
+	// genuinely late onstop rather than a controlled-fetch-resolution
+	// timing trick.
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`window.__fireLateOnstop(0); void 0;`, nil)); err != nil {
+		t.Fatalf("fire take #1's late onstop: %v", err)
+	}
+
+	var statusRightAfterLateOnstop string
+	if err := chromedp.Run(ctx, chromedp.Text(`#uc-issue-record-status`, &statusRightAfterLateOnstop, chromedp.ByQuery)); err != nil {
+		t.Fatalf("read status line immediately after take #1's late onstop: %v", err)
+	}
+	if statusRightAfterLateOnstop != "" {
+		t.Fatalf(`status line = %q immediately after take #1's late onstop (before its fetch even resolved), want empty (idle) — a stale take's "Transcribing…" write must be guarded the same way its button-label reset already is (regression: uc-infra#221)`, statusRightAfterLateOnstop)
+	}
+
+	// Flush the late onstop's own fetch-and-respond promise chain (same
+	// real-macrotask-boundary technique the StaleTranscribe* tests below
+	// use) before asserting the stale result never landed.
+	if err := chromedp.Run(ctx, chromedp.Evaluate(
+		`new Promise(function(resolve) { setTimeout(resolve, 50); })`, nil,
+		func(p *cdpruntime.EvaluateParams) *cdpruntime.EvaluateParams {
+			return p.WithAwaitPromise(true)
+		},
+	)); err != nil {
+		t.Fatalf("flush take #1's late-onstop transcribe call: %v", err)
+	}
+	var transcribeCallCount int
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`window.__transcribeCallCount`, &transcribeCallCount)); err != nil {
+		t.Fatalf("read transcribe call count: %v", err)
+	}
+	if transcribeCallCount != 1 {
+		t.Fatalf("transcribe call count = %d, want exactly 1 (take #1's late onstop still uploads — dropping the STALE UI write is not the same as skipping the request itself)", transcribeCallCount)
+	}
+	var transcriptAfterLateOnstop, descriptionAfterLateOnstop, statusAfterFlush string
+	if err := chromedp.Run(ctx, chromedp.Value(`#uc-issue-transcript`, &transcriptAfterLateOnstop, chromedp.ByQuery)); err != nil {
+		t.Fatalf("read transcript field after take #1's late-onstop transcribe resolved: %v", err)
+	}
+	if transcriptAfterLateOnstop != "" {
+		t.Fatalf("transcript field = %q after take #1's late-onstop transcribe resolved, want empty — a stale take's result must be dropped (regression: uc-infra#221)", transcriptAfterLateOnstop)
+	}
+	if err := chromedp.Run(ctx, chromedp.Value(`#uc-issue-description`, &descriptionAfterLateOnstop, chromedp.ByQuery)); err != nil {
+		t.Fatalf("read description field after take #1's late-onstop transcribe resolved: %v", err)
+	}
+	if descriptionAfterLateOnstop != "" {
+		t.Fatalf("description field = %q after take #1's late-onstop transcribe resolved, want empty — a stale take's result must be dropped (regression: uc-infra#221)", descriptionAfterLateOnstop)
+	}
+	if err := chromedp.Run(ctx, chromedp.Text(`#uc-issue-record-status`, &statusAfterFlush, chromedp.ByQuery)); err != nil {
+		t.Fatalf("read status line after take #1's late-onstop transcribe resolved: %v", err)
+	}
+	if statusAfterFlush != "" {
+		t.Fatalf("status line = %q after take #1's late-onstop transcribe resolved, want empty (idle) — take #2 is still actively recording", statusAfterFlush)
+	}
+
+	// Take #2 still completes normally afterward — the guard must drop a
+	// STALE take's result, not disable the fields for every take from then
+	// on. This fake's onstop is deferred (same as take #1's above), so
+	// stopping take #2 needs its own explicit __fireLateOnstop call too —
+	// unlike the synchronous-onstop fakes elsewhere in this file, .stop()
+	// alone does not trigger it here.
+	if err := chromedp.Run(ctx, chromedp.Click(`#uc-issue-record-btn`, chromedp.ByQuery)); err != nil { // take #2: stop
+		t.Fatalf("stop take #2: %v", err)
+	}
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`window.__fireLateOnstop(1); void 0;`, nil)); err != nil {
+		t.Fatalf("fire take #2's onstop: %v", err)
+	}
+	var transcriptAfterTake2 string
+	if err := chromedp.Run(ctx, chromedp.PollFunction(
+		`function() {
+			var v = document.getElementById("uc-issue-transcript").value;
+			return v === "LATE-ONSTOP-STALE-MARKER" ? v : null;
+		}`,
+		&transcriptAfterTake2,
+	)); err != nil {
+		t.Fatalf("wait for take #2's own transcript to apply: %v", err)
+	}
+	if transcriptAfterTake2 != "LATE-ONSTOP-STALE-MARKER" {
+		t.Fatalf("take #2's own transcribe result did not apply after it stopped normally — the guard must not disable the fields for every take going forward, got %q", transcriptAfterTake2)
+	}
+}
+
+// TestIssueReportPage_MicRecord_StaleTranscribeSuccessDoesNotClobberNewerTake
+// is the real-browser regression test for uc-infra#221: independent review
+// of uc-infra#196's fix (which stopped two overlapping takes' *audio bytes*
+// from mixing) found that the same now-legitimized "two takes in flight"
+// scenario still let one take's *transcribe result* clobber another's, even
+// though the underlying data was by then correctly isolated. Pre-fix,
+// issuereport.go's transcribe `.then()` wrote `transcriptEl`/`descriptionEl`
+// unconditionally — whichever take's `/issue-report/transcribe` request
+// happened to resolve LAST won, regardless of which take the user actually
+// started most recently or was still looking at.
+//
+// window.fetch is faked to defer resolution of each transcribe call
+// separately (`window.__transcribeResolvers`, a resolver per call, not
+// fired until the test explicitly calls `window.__resolveTranscribe`) —
+// deterministic control over which take's result arrives first, the same
+// "control the moment explicitly rather than race a real timer" approach
+// TestIssueReportPage_MicRecord_StopThenRecordAgainDoesNotMixTakes already
+// uses for onstop/ondataavailable. Each take's own MediaRecorder fires
+// ondataavailable/onstop synchronously on .stop() (same simple fake
+// TestIssueReportPage_TranscriptAndDescriptionAreClampedOnTranscribe uses) —
+// only the fetch response itself is held back, since that is the part this
+// bug's timing actually depends on.
+func TestIssueReportPage_MicRecord_StaleTranscribeSuccessDoesNotClobberNewerTake(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, _ := testServer(t)
+	ctx := browserCtx(t, tenantID)
+
+	const fakeScript = `
+(function() {
+  navigator.mediaDevices = navigator.mediaDevices || {};
+  navigator.mediaDevices.getUserMedia = function() {
+    return Promise.resolve({ getTracks: function() { return []; } });
+  };
+  window.MediaRecorder = function() {
+    var self = this;
+    this.start = function() {};
+    this.stop = function() {
+      if (self.ondataavailable) { self.ondataavailable({ data: new Blob(["fake"]) }); }
+      if (self.onstop) { self.onstop(); }
+    };
+  };
+  window.__transcribeResolvers = [];
+  var realFetch = window.fetch;
+  window.fetch = function(url, opts) {
+    if (String(url).indexOf("/issue-report/transcribe") !== -1) {
+      return new Promise(function(resolve) {
+        window.__transcribeResolvers.push(resolve);
+      });
+    }
+    return realFetch.apply(window, arguments);
+  };
+  window.__resolveTranscribe = function(index, text) {
+    window.__transcribeResolvers[index](new Response(text, { status: 200 }));
+  };
+})();
+`
+	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		_, err := page.AddScriptToEvaluateOnNewDocument(fakeScript).Do(ctx)
+		return err
+	})); err != nil {
+		t.Fatalf("inject fake media/deferred-fetch script: %v", err)
+	}
+
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/issue-report/new"),
+		chromedp.WaitVisible(`#uc-issue-record-btn`, chromedp.ByQuery),
+		chromedp.Click(`#uc-issue-record-btn`, chromedp.ByQuery), // take #1: start
+		chromedp.Click(`#uc-issue-record-btn`, chromedp.ByQuery), // take #1: stop -> transcribe call #0, left pending
+	); err != nil {
+		t.Fatalf("start then stop take #1: %v", err)
+	}
+	var resolverCount int
+	if err := chromedp.Run(ctx, chromedp.PollFunction(
+		`function() { return window.__transcribeResolvers.length >= 1 ? window.__transcribeResolvers.length : null; }`,
+		&resolverCount,
+	)); err != nil {
+		t.Fatalf("wait for take #1's transcribe call to be pending: %v", err)
+	}
+
+	// Take #2 starts — and, per issuereport.go's own Record-click handler,
+	// takes over the shared status line — while take #1's transcribe call
+	// is still unresolved.
+	if err := chromedp.Run(ctx,
+		chromedp.Click(`#uc-issue-record-btn`, chromedp.ByQuery), // take #2: start
+		chromedp.Click(`#uc-issue-record-btn`, chromedp.ByQuery), // take #2: stop -> transcribe call #1, also left pending
+	); err != nil {
+		t.Fatalf("start then stop take #2: %v", err)
+	}
+	if err := chromedp.Run(ctx, chromedp.PollFunction(
+		`function() { return window.__transcribeResolvers.length >= 2 ? window.__transcribeResolvers.length : null; }`,
+		&resolverCount,
+	)); err != nil {
+		t.Fatalf("wait for take #2's transcribe call to be pending: %v", err)
+	}
+
+	// Take #1's call resolves LAST-STARTED-FIRST-RESOLVED relative to real
+	// time, but it's the STALE take: by the time this fires, take #2 has
+	// already started (and stopped), so take #1 no longer owns the shared
+	// fields. Pre-fix, this unconditionally overwrote transcriptEl/
+	// descriptionEl anyway.
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`window.__resolveTranscribe(0, "STALE-TAKE-ONE-TRANSCRIPT"); void 0;`, nil)); err != nil {
+		t.Fatalf("resolve take #1's (stale) transcribe call: %v", err)
+	}
+
+	// Give the stale resolution's promise chain (fetch -> .then -> .then,
+	// each a real microtask hop) a chance to fully run before asserting it
+	// did NOT land — polling for its own absence isn't possible (there's
+	// nothing to wait FOR), so this instead awaits a real macrotask
+	// boundary (a setTimeout) from inside the page: every microtask queued
+	// by the earlier Evaluate call above, however many hops deep, is
+	// guaranteed to have drained before a subsequent timer callback fires
+	// (a plain `return 1` round trip is NOT equivalent — proven false
+	// pre-fix, where it let this exact assertion pass by accident because
+	// resp.text()'s own promise hadn't settled yet when read that early).
+	if err := chromedp.Run(ctx, chromedp.Evaluate(
+		`new Promise(function(resolve) { setTimeout(resolve, 50); })`, nil,
+		func(p *cdpruntime.EvaluateParams) *cdpruntime.EvaluateParams {
+			return p.WithAwaitPromise(true)
+		},
+	)); err != nil {
+		t.Fatalf("flush the stale resolution's promise chain: %v", err)
+	}
+	var transcriptAfterStale string
+	if err := chromedp.Run(ctx, chromedp.Value(`#uc-issue-transcript`, &transcriptAfterStale, chromedp.ByQuery)); err != nil {
+		t.Fatalf("read transcript field after the stale resolution: %v", err)
+	}
+	if strings.Contains(transcriptAfterStale, "STALE-TAKE-ONE") {
+		t.Fatalf("transcript field = %q after take #1's STALE transcribe result resolved — a stale, superseded take's result must be dropped, not applied (regression: uc-infra#221)", transcriptAfterStale)
+	}
+	var descriptionAfterStale string
+	if err := chromedp.Run(ctx, chromedp.Value(`#uc-issue-description`, &descriptionAfterStale, chromedp.ByQuery)); err != nil {
+		t.Fatalf("read description field after the stale resolution: %v", err)
+	}
+	if strings.Contains(descriptionAfterStale, "STALE-TAKE-ONE") {
+		t.Fatalf("description field = %q after take #1's STALE transcribe result resolved — a stale, superseded take's result must be dropped, not applied (regression: uc-infra#221)", descriptionAfterStale)
+	}
+
+	// Take #2's own (current) call still resolves normally afterward — the
+	// guard must drop a STALE take's result, not disable the field for
+	// every take from then on.
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`window.__resolveTranscribe(1, "CURRENT-TAKE-TWO-TRANSCRIPT"); void 0;`, nil)); err != nil {
+		t.Fatalf("resolve take #2's (current) transcribe call: %v", err)
+	}
+	var transcriptAfterCurrent string
+	if err := chromedp.Run(ctx, chromedp.PollFunction(
+		`function() {
+			var v = document.getElementById("uc-issue-transcript").value;
+			return v === "CURRENT-TAKE-TWO-TRANSCRIPT" ? v : null;
+		}`,
+		&transcriptAfterCurrent,
+	)); err != nil {
+		t.Fatalf("wait for take #2's own (current) transcript to apply: %v", err)
+	}
+	var descriptionAfterCurrent string
+	if err := chromedp.Run(ctx, chromedp.Value(`#uc-issue-description`, &descriptionAfterCurrent, chromedp.ByQuery)); err != nil {
+		t.Fatalf("read description field after take #2's current resolution: %v", err)
+	}
+	// Exact equality, not Contains (independent review): descriptionEl
+	// starts empty, so a leaked stale write from take #1 would land FIRST
+	// (its resolver fires strictly before take #2's, above) and take #2's
+	// own write would then *append* to it (issuereport.go's own "combined"
+	// logic), producing "STALE-TAKE-ONE-TRANSCRIPT\n\nCURRENT-TAKE-TWO-
+	// TRANSCRIPT" — which a mere Contains(..., "CURRENT-TAKE-TWO-
+	// TRANSCRIPT") check would NOT catch, silently losing this as a second
+	// line of defense behind the earlier, timing-sensitive assertion.
+	if descriptionAfterCurrent != "CURRENT-TAKE-TWO-TRANSCRIPT" {
+		t.Fatalf("description field = %q after take #2's own transcribe result resolved, want exactly %q (a mismatch here — e.g. a stale prefix — means the earlier stale-write assertion above didn't actually catch a leak, only this equality check would)", descriptionAfterCurrent, "CURRENT-TAKE-TWO-TRANSCRIPT")
+	}
+	var statusAfterCurrent string
+	if err := chromedp.Run(ctx, chromedp.Text(`#uc-issue-record-status`, &statusAfterCurrent, chromedp.ByQuery)); err != nil {
+		t.Fatalf("read status line after take #2's current resolution: %v", err)
+	}
+	if statusAfterCurrent != "" {
+		t.Fatalf("status line = %q after take #2's own transcribe result resolved, want empty (idle)", statusAfterCurrent)
+	}
+}
+
+// TestIssueReportPage_MicRecord_StaleTranscribeErrorDoesNotClobberStatus is
+// the companion regression test for uc-infra#221's error path: a stale
+// take's transcribe request can fail (network blip, a disabled
+// speechassist.Client) just as easily as it can succeed, and pre-fix that
+// failure's message was written to the shared status line just as
+// unconditionally as a success — capable of showing a confusing, unrelated
+// error on top of a newer take that is, from the user's point of view,
+// currently recording fine.
+func TestIssueReportPage_MicRecord_StaleTranscribeErrorDoesNotClobberStatus(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, _ := testServer(t)
+	ctx := browserCtx(t, tenantID)
+
+	const fakeScript = `
+(function() {
+  navigator.mediaDevices = navigator.mediaDevices || {};
+  navigator.mediaDevices.getUserMedia = function() {
+    return Promise.resolve({ getTracks: function() { return []; } });
+  };
+  window.MediaRecorder = function() {
+    var self = this;
+    this.start = function() {};
+    this.stop = function() {
+      if (self.ondataavailable) { self.ondataavailable({ data: new Blob(["fake"]) }); }
+      if (self.onstop) { self.onstop(); }
+    };
+  };
+  window.__transcribeResolvers = [];
+  var realFetch = window.fetch;
+  window.fetch = function(url, opts) {
+    if (String(url).indexOf("/issue-report/transcribe") !== -1) {
+      return new Promise(function(resolve) {
+        window.__transcribeResolvers.push(resolve);
+      });
+    }
+    return realFetch.apply(window, arguments);
+  };
+  // Same httpx {"data":null,"error":"..."} envelope shape
+  // TestIssueReportPage_VoiceRecordShowsCleanErrorNotRawJSON already fakes,
+  // so this exercises the real extractErrorMessage parsing path, not a
+  // synthetic shortcut.
+  window.__rejectTranscribe = function(index, errMsg) {
+    window.__transcribeResolvers[index](
+      new Response(JSON.stringify({ data: null, error: errMsg }), { status: 500 })
+    );
+  };
+})();
+`
+	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		_, err := page.AddScriptToEvaluateOnNewDocument(fakeScript).Do(ctx)
+		return err
+	})); err != nil {
+		t.Fatalf("inject fake media/deferred-fetch script: %v", err)
+	}
+
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/issue-report/new"),
+		chromedp.WaitVisible(`#uc-issue-record-btn`, chromedp.ByQuery),
+		chromedp.Click(`#uc-issue-record-btn`, chromedp.ByQuery), // take #1: start
+		chromedp.Click(`#uc-issue-record-btn`, chromedp.ByQuery), // take #1: stop -> transcribe call #0, left pending
+	); err != nil {
+		t.Fatalf("start then stop take #1: %v", err)
+	}
+	var resolverCount int
+	if err := chromedp.Run(ctx, chromedp.PollFunction(
+		`function() { return window.__transcribeResolvers.length >= 1 ? window.__transcribeResolvers.length : null; }`,
+		&resolverCount,
+	)); err != nil {
+		t.Fatalf("wait for take #1's transcribe call to be pending: %v", err)
+	}
+
+	// Take #2 starts (still recording, not yet stopped) — takes over the
+	// shared status line, which the Record-click handler clears.
+	if err := chromedp.Run(ctx, chromedp.Click(`#uc-issue-record-btn`, chromedp.ByQuery)); err != nil { // take #2: start
+		t.Fatalf("start take #2: %v", err)
+	}
+	var buttonAfterTake2Start string
+	if err := chromedp.Run(ctx, chromedp.PollFunction(
+		`function() {
+			var t = document.getElementById("uc-issue-record-btn").textContent;
+			return t === "Stop recording" ? t : null;
+		}`,
+		&buttonAfterTake2Start,
+	)); err != nil {
+		t.Fatalf("wait for take #2 to start: %v", err)
+	}
+
+	// Take #1's (stale) transcribe call now fails.
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`window.__rejectTranscribe(0, "stale asr failure"); void 0;`, nil)); err != nil {
+		t.Fatalf("reject take #1's (stale) transcribe call: %v", err)
+	}
+
+	// Flush the rejection's promise chain (same real-macrotask-boundary
+	// technique as the success-path test's own comment explains — a bare
+	// round trip is NOT sufficient here either) before asserting the stale
+	// error never reached the status line — take #2 is still actively
+	// recording, so the status line must stay idle ("").
+	if err := chromedp.Run(ctx, chromedp.Evaluate(
+		`new Promise(function(resolve) { setTimeout(resolve, 50); })`, nil,
+		func(p *cdpruntime.EvaluateParams) *cdpruntime.EvaluateParams {
+			return p.WithAwaitPromise(true)
+		},
+	)); err != nil {
+		t.Fatalf("flush the stale rejection's promise chain: %v", err)
+	}
+	var statusAfterStaleError string
+	if err := chromedp.Run(ctx, chromedp.Text(`#uc-issue-record-status`, &statusAfterStaleError, chromedp.ByQuery)); err != nil {
+		t.Fatalf("read status line after take #1's stale rejection: %v", err)
+	}
+	if strings.Contains(statusAfterStaleError, "stale asr failure") {
+		t.Fatalf("status line = %q after take #1's STALE transcribe call failed — a stale, superseded take's error must be dropped, not shown over a still-active newer take (regression: uc-infra#221)", statusAfterStaleError)
+	}
+
+	// Take #2 still completes normally afterward — the guard must drop a
+	// STALE take's error, not leave the newer, current take unable to ever
+	// show its own status.
+	if err := chromedp.Run(ctx, chromedp.Click(`#uc-issue-record-btn`, chromedp.ByQuery)); err != nil { // take #2: stop
+		t.Fatalf("stop take #2: %v", err)
+	}
+	if err := chromedp.Run(ctx, chromedp.PollFunction(
+		`function() { return window.__transcribeResolvers.length >= 2 ? window.__transcribeResolvers.length : null; }`,
+		&resolverCount,
+	)); err != nil {
+		t.Fatalf("wait for take #2's transcribe call to be pending: %v", err)
+	}
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`window.__rejectTranscribe(1, "take two's own failure"); void 0;`, nil)); err != nil {
+		t.Fatalf("reject take #2's (current) transcribe call: %v", err)
+	}
+	var statusAfterCurrentError string
+	if err := chromedp.Run(ctx, chromedp.PollFunction(
+		`function() {
+			var t = document.getElementById("uc-issue-record-status").textContent;
+			return t === "take two's own failure" ? t : null;
+		}`,
+		&statusAfterCurrentError,
+	)); err != nil {
+		t.Fatalf("wait for take #2's own (current) transcribe error to surface: %v", err)
+	}
+}
+
 // TestIssueReportPage_ConsoleLogCapturedFromEarlierPageAndPrefilled is the
 // real-browser proof for universaltill/uc-infra#46's log-capture slice:
 // internal/api/layout.go's shellTmpl installs a console/error listener on

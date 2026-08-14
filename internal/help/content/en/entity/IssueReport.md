@@ -35,6 +35,7 @@ type gets — it is not the submission screen itself, only the triage view.
 - Title, description, and status are required; the voice transcript, console log, page, and browser fields are optional and only present when the browser actually captured them.
 - The optional screen recording is capped at about three minutes; if the resulting file ends up too large to attach, the report is still submitted, just without the recording.
 - Every field on a report has a generous but real length limit, so pasting an unreasonably large amount of text into a report is rejected rather than silently accepted.
+- If you start a new voice recording before an earlier one has finished being transcribed, only the newer recording's transcript is kept once it actually starts — the earlier one is discarded rather than appearing later and overwriting what you already have.
 
 ## What it connects to
 
