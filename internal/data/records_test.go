@@ -222,6 +222,74 @@ func TestRecordRepo_ListTx_SeesUncommittedWritesInSameTx(t *testing.T) {
 	}
 }
 
+// TestRecordRepo_ListByFieldTx_ParticipatesInCallerTransaction mirrors
+// TestRecordRepo_ListTx_ParticipatesInCallerTransaction for the
+// field-filtered variant — same reasoning, same fixture shape.
+func TestRecordRepo_ListByFieldTx_ParticipatesInCallerTransaction(t *testing.T) {
+	tdb := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(tdb)
+
+	if _, err := repo.Create(ctx, "Widget", map[string]any{"name": "a", "group": "x"}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := repo.Create(ctx, "Widget", map[string]any{"name": "b", "group": "y"}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	tx, err := tdb.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	got, err := repo.ListByFieldTx(ctx, tx, "Widget", "group", "x")
+	if err != nil {
+		t.Fatalf("ListByFieldTx: %v", err)
+	}
+	if len(got) != 1 || got[0].Data["name"] != "a" {
+		t.Fatalf("expected exactly the 1 Widget in group x, got %+v", got)
+	}
+}
+
+// TestRecordRepo_ListByFieldTx_SeesUncommittedWritesInSameTx mirrors
+// TestRecordRepo_ListTx_SeesUncommittedWritesInSameTx — the property
+// assets.GenerateDepreciationScheduleOnWrite's Update path actually
+// depends on: it must see any DepreciationSchedule rows already written
+// earlier in the SAME FixedAsset write's transaction, not just rows
+// already committed before this transaction began.
+func TestRecordRepo_ListByFieldTx_SeesUncommittedWritesInSameTx(t *testing.T) {
+	tdb := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(tdb)
+
+	tx, err := tdb.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	if _, err := repo.CreateTx(ctx, tx, "Widget", map[string]any{"name": "uncommitted", "group": "x"}); err != nil {
+		t.Fatalf("CreateTx: %v", err)
+	}
+
+	got, err := repo.ListByFieldTx(ctx, tx, "Widget", "group", "x")
+	if err != nil {
+		t.Fatalf("ListByFieldTx: %v", err)
+	}
+	if len(got) != 1 || got[0].Data["name"] != "uncommitted" {
+		t.Fatalf("expected ListByFieldTx to see the uncommitted write within the same tx, got %+v", got)
+	}
+
+	outside, err := repo.ListByField(ctx, "Widget", "group", "x")
+	if err != nil {
+		t.Fatalf("ListByField: %v", err)
+	}
+	if len(outside) != 0 {
+		t.Fatalf("expected the uncommitted write to be invisible outside the tx, got %+v", outside)
+	}
+}
+
 // ListPageFiltered/CountFiltered: sorting, substring filtering, and — the
 // property that matters most for a JSONB query built from user input — no
 // injection through the field name.

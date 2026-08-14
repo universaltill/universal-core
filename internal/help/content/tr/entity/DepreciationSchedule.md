@@ -11,9 +11,10 @@ kadar amortismana tabi tutulacağı ve sonrasında kalan defter değeri.
 
 ## Ne zaman kullanılır
 
-Bir kıymet kaydettiğinizde veya yanlış bir dönemi düzeltmeniz
-gerektiğinde **Sabit Kıymet** formunun Amortisman Planı bölümünde plan
-satırları ekleyin veya düzeltin. Doğrusal bir plan, bir kıymetin
+Bu satırları normalde elle eklemezsiniz — bir **Sabit Kıymet**'i
+kaydetmek onun tüm planını otomatik olarak oluşturur (o kaydın kendi
+yardım konusuna bakın). Buraya planı incelemek veya işlenmeden önce
+yanlış bir dönemi düzeltmek için gelin. Doğrusal bir plan, bir kıymetin
 amortismana tabi tutarını (maliyet eksi hurda değeri) kullanım ömrü
 boyunca ay ay eşit olarak yayar; her satırın defter değeri, bir önceki
 satırın defter değeri eksi o satırın amortisman tutarına eşittir ve

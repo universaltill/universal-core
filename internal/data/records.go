@@ -742,7 +742,22 @@ func (r *RecordRepo) ListPageFiltered(ctx context.Context, entityType string, op
 // parameter to the ->> operator, never concatenated into the query text,
 // so a caller-controlled field name can't alter the query's structure.
 func (r *RecordRepo) ListByField(ctx context.Context, entityType, fieldName, value string) ([]Record, error) {
-	rows, err := r.db.QueryContext(ctx,
+	return r.listByField(ctx, r.db, entityType, fieldName, value)
+}
+
+// ListByFieldTx is ListByField against a caller-supplied querier/tx
+// instead of r.db — same "same shape as the Tx write methods, now needed
+// for a read too" reasoning GetTx/ListTx's own doc comments give. First
+// real caller: assets.GenerateDepreciationScheduleOnWrite, which needs to
+// read a FixedAsset's existing DepreciationSchedule rows from within the
+// same transaction as the FixedAsset write that triggered it, to decide
+// whether the schedule needs regenerating.
+func (r *RecordRepo) ListByFieldTx(ctx context.Context, q querier, entityType, fieldName, value string) ([]Record, error) {
+	return r.listByField(ctx, q, entityType, fieldName, value)
+}
+
+func (r *RecordRepo) listByField(ctx context.Context, q querier, entityType, fieldName, value string) ([]Record, error) {
+	rows, err := q.QueryContext(ctx,
 		`SELECT id, data, version FROM records
 		 WHERE entity_type = $1 AND data->>$2 = $3 AND deleted_at IS NULL
 		 ORDER BY created_at, id`,
