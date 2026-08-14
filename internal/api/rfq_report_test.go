@@ -409,7 +409,7 @@ func TestBuildRFQReportView_EdgeCasePrices(t *testing.T) {
 		{ID: "l2", ItemName: "Rebate", Qty: 1, QuotesByVendor: map[string]money.Money{"v1": -200, "v2": 300}},
 		{ID: "l3", ItemName: "Unquoted", Qty: 1, QuotesByVendor: nil},
 	}
-	view := h.buildRFQReportView(context.Background(), tenantScope{}, data.Record{Data: map[string]any{}}, lines, vendors, "en")
+	view := h.buildRFQReportView(context.Background(), tenantScope{}, data.Record{Data: map[string]any{}}, lines, vendors, "en", false, false)
 
 	if len(view.Rows) != 3 {
 		t.Fatalf("expected 3 rows, got %d", len(view.Rows))
@@ -434,6 +434,54 @@ func TestBuildRFQReportView_EdgeCasePrices(t *testing.T) {
 	}
 	if view.FooterCells[1].Value != "6.00" || !view.FooterCells[1].Present {
 		t.Errorf("vendor B footer = %+v, want 6.00", view.FooterCells[1])
+	}
+}
+
+// TestBuildRFQReportView_ItemAndVendorNameRedaction (uc-infra#234,
+// independent review) pins itemNameHidden/vendorNameHidden's effect
+// directly at the buildRFQReportView layer, not just transitively
+// through rendered HTML — the api-level HTTP test
+// (TestRFQComparisonReport_HiddenItemPartyFieldsRenderNotAvailable)
+// already proves the real values never reach the page; this proves the
+// view MODEL itself carries the redaction (ItemAvailable/NameAvailable
+// false, the string fields left blank, never just "hidden by the
+// template"), and that price/lowest-mark/footer data is completely
+// unaffected by either flag.
+func TestBuildRFQReportView_ItemAndVendorNameRedaction(t *testing.T) {
+	catalog, err := i18n.Load("en")
+	if err != nil {
+		t.Fatalf("load i18n catalog: %v", err)
+	}
+	h := &Handler{catalog: catalog}
+	vendors := []data.RFQComparisonVendor{{ID: "v1", Name: "Vendor A"}}
+	lines := []data.RFQComparisonLine{
+		{ID: "l1", ItemName: "Widget", Qty: 1, QuotesByVendor: map[string]money.Money{"v1": 500}},
+	}
+
+	view := h.buildRFQReportView(context.Background(), tenantScope{}, data.Record{Data: map[string]any{}}, lines, vendors, "en", true, true)
+
+	if view.Rows[0].ItemAvailable || view.Rows[0].Item != "" {
+		t.Errorf("itemNameHidden=true: row = %+v, want ItemAvailable=false and Item=\"\"", view.Rows[0])
+	}
+	if view.Vendors[0].NameAvailable || view.Vendors[0].Name != "" {
+		t.Errorf("vendorNameHidden=true: vendor col = %+v, want NameAvailable=false and Name=\"\"", view.Vendors[0])
+	}
+	// A different field (unit_price) — completely unaffected by either
+	// redaction flag.
+	if c := view.Rows[0].Cells[0]; !c.Present || !c.Lowest || c.Value != "5.00" {
+		t.Errorf("price cell = %+v, want a present, lowest 5.00 regardless of name redaction", c)
+	}
+	if view.FooterCells[0].Value != "5.00" || !view.FooterCells[0].Present {
+		t.Errorf("footer = %+v, want 5.00 regardless of name redaction", view.FooterCells[0])
+	}
+
+	// Unrestricted: both real values carry through.
+	openView := h.buildRFQReportView(context.Background(), tenantScope{}, data.Record{Data: map[string]any{}}, lines, vendors, "en", false, false)
+	if !openView.Rows[0].ItemAvailable || openView.Rows[0].Item != "Widget" {
+		t.Errorf("itemNameHidden=false: row = %+v, want ItemAvailable=true and Item=\"Widget\"", openView.Rows[0])
+	}
+	if !openView.Vendors[0].NameAvailable || openView.Vendors[0].Name != "Vendor A" {
+		t.Errorf("vendorNameHidden=false: vendor col = %+v, want NameAvailable=true and Name=\"Vendor A\"", openView.Vendors[0])
 	}
 }
 
@@ -476,6 +524,136 @@ func TestRFQComparisonReport_RBACDeniedOnQuoteLineAlone(t *testing.T) {
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 for an actor denied RequestForQuotationQuoteLine read (quoted prices are exactly what this report exposes), got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestRFQComparisonReport_HiddenItemPartyFieldsRenderNotAvailable
+// (uc-infra#234) is this report's own version of reporting.go's
+// TestAPI_PurchasingReport_HiddenPurchaseOrderPartyItemFieldsRenderNotAvailable
+// (uc-infra#230/#233): Item.name (the grid's row label) and Party.name
+// (the vendor column header) are both read straight out of
+// data.ReportingRepo.RFQComparison's raw SQL, entirely outside the
+// ts.crud-redacted path a form/CRUD page would otherwise apply — the
+// same FieldPermission-bypass shape, now confirmed on a third report
+// family. Neither field drives row/column MEMBERSHIP here: every
+// requested line still gets a row and every invited vendor still gets a
+// column, redacted or not — only the label text changes, mirroring the
+// "gate structure only when the hidden value itself drives which rows
+// appear" distinction uc-infra#230's own fix had to learn (Item.name/
+// Party.name are pure display fields here, unlike qty_on_hand there).
+func TestRFQComparisonReport_HiddenItemPartyFieldsRenderNotAvailable(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	rfqID, lineAID, _, vendorXID, _ := setupRFQTenant(t, db)
+	// A real quote line (uc-infra#234 independent review): redacting
+	// Item.name/Party.name must leave the price grid itself untouched —
+	// with setupRFQTenant's fixture alone (zero quotes) every cell would
+	// render the missing-quote blank for every actor regardless of
+	// redaction, which would prove nothing about that claim.
+	if _, err := crud.NewEngine(db).Create(context.Background(), purchasing.RequestForQuotationQuoteLine(),
+		map[string]any{"rfq_line_id": lineAID, "vendor_id": vendorXID, "unit_price": 950},
+		humanActor()); err != nil {
+		t.Fatalf("seed quote line: %v", err)
+	}
+
+	seedFieldRule(t, db, "itemname-restricted", "user-itemname-hidden", "Item", "name")
+	seedFieldRule(t, db, "partyname-restricted", "user-partyname-hidden", "Party", "name")
+	// One role with FieldPermission rows on BOTH fields, not two
+	// single-field roles granted to the same user: authz.Resolver.
+	// HiddenFields' own contract is a field is hidden only when EVERY
+	// role the actor holds has a hidden=true row for it — see
+	// reporting_test.go's own identical comment on this exact pitfall.
+	allRoleID := seedFieldRule(t, db, "all-restricted", "user-all-hidden", "Item", "name")
+	if _, err := crud.NewEngine(db).Create(context.Background(), foundation.FieldPermission(),
+		map[string]any{"role_id": allRoleID, "entity_type": "Party", "field_name": "name", "hidden": true},
+		humanActor()); err != nil {
+		t.Fatalf("create second FieldPermission: %v", err)
+	}
+
+	get := func(actorID string) string {
+		t.Helper()
+		req := newRequest("GET", "/reports/rfq/"+rfqID, tenantID, actorID, nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("actor %s: expected 200, got %d: %s", actorID, rec.Code, rec.Body.String())
+		}
+		return rec.Body.String()
+	}
+
+	// Unrestricted actor: both real labels render, NotAvailable appears
+	// nowhere.
+	openBody := get("farshid")
+	for _, want := range []string{"Widget A", "Widget B", "Vendor X", "Vendor Y"} {
+		if !strings.Contains(openBody, want) {
+			t.Errorf("unrestricted actor: expected %q in body:\n%s", want, openBody)
+		}
+	}
+	if strings.Contains(openBody, "Not available") {
+		t.Errorf("unrestricted actor: NotAvailable must not appear:\n%s", openBody)
+	}
+	if !strings.Contains(openBody, "9.50") {
+		t.Errorf("unrestricted actor: expected the real quoted price 9.50:\n%s", openBody)
+	}
+
+	// Item.name hidden: both row labels blank (2 rows -> 2 NotAvailable
+	// cells); vendor column headers stay real.
+	itemBody := get("user-itemname-hidden")
+	for _, leaked := range []string{"Widget A", "Widget B"} {
+		if strings.Contains(itemBody, leaked) {
+			t.Errorf("item-name-restricted actor: %q must not appear anywhere:\n%s", leaked, itemBody)
+		}
+	}
+	for _, want := range []string{"Vendor X", "Vendor Y"} {
+		if !strings.Contains(itemBody, want) {
+			t.Errorf("item-name-restricted actor: expected %q in body:\n%s", want, itemBody)
+		}
+	}
+	if got := strings.Count(itemBody, "Not available"); got != 2 {
+		t.Errorf("item-name-restricted actor: expected 2 NotAvailable cells (one per row), got %d:\n%s", got, itemBody)
+	}
+	if !strings.Contains(itemBody, "9.50") {
+		t.Errorf("item-name-restricted actor: expected the real quoted price 9.50 (a different field) to still render:\n%s", itemBody)
+	}
+
+	// Party.name hidden: both vendor column headers blank (2 vendors ->
+	// 2 NotAvailable cells); row labels stay real.
+	vendorBody := get("user-partyname-hidden")
+	for _, leaked := range []string{"Vendor X", "Vendor Y"} {
+		if strings.Contains(vendorBody, leaked) {
+			t.Errorf("party-name-restricted actor: %q must not appear anywhere:\n%s", leaked, vendorBody)
+		}
+	}
+	for _, want := range []string{"Widget A", "Widget B"} {
+		if !strings.Contains(vendorBody, want) {
+			t.Errorf("party-name-restricted actor: expected %q in body:\n%s", want, vendorBody)
+		}
+	}
+	if got := strings.Count(vendorBody, "Not available"); got != 2 {
+		t.Errorf("party-name-restricted actor: expected 2 NotAvailable cells (one per vendor), got %d:\n%s", got, vendorBody)
+	}
+	if !strings.Contains(vendorBody, "9.50") {
+		t.Errorf("party-name-restricted actor: expected the real quoted price 9.50 (a different field) to still render:\n%s", vendorBody)
+	}
+
+	// Both hidden: neither real value appears anywhere, and the grid
+	// keeps its full 2-row x 2-vendor shape (row/column membership never
+	// depended on either field) -> 4 NotAvailable cells total.
+	allBody := get("user-all-hidden")
+	for _, leaked := range []string{"Widget A", "Widget B", "Vendor X", "Vendor Y"} {
+		if strings.Contains(allBody, leaked) {
+			t.Errorf("all-restricted actor: %q must not appear anywhere:\n%s", leaked, allBody)
+		}
+	}
+	if !strings.Contains(allBody, "9.50") {
+		t.Errorf("all-restricted actor: expected the real quoted price 9.50 (a different field) to still render:\n%s", allBody)
+	}
+	if got := strings.Count(allBody, "Not available"); got != 4 {
+		t.Errorf("all-restricted actor: expected 4 NotAvailable cells (2 rows + 2 vendor headers), got %d:\n%s", got, allBody)
 	}
 }
 

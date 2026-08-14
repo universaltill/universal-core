@@ -85,7 +85,37 @@ func (h *Handler) renderRFQComparisonReport(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	view := h.buildRFQReportView(ctx, ts, rfq, lines, vendors, locale)
+	// Item.name (the grid's row label) and Party.name (the vendor column
+	// header) are both read straight through data.ReportingRepo.
+	// RFQComparison's raw SQL — entirely outside the ts.crud-redacted
+	// path a form/CRUD page would otherwise apply. Same FieldPermission-
+	// bypass shape reporting.go's purchasing report already fixed twice
+	// (uc-infra#230/#233); reusing its exact itemNameRedacted/
+	// partyNameRedacted predicates rather than re-declaring them, since
+	// this file lives in the same api package. Neither field drives row
+	// or column MEMBERSHIP here (every requested line and every invited
+	// vendor still gets a row/column regardless of whether its label is
+	// hidden) — this is pure cell-level redaction, the same scope #234
+	// itself called for. Resolved here, after the id is validated and the
+	// RFQ is loaded (not ahead of requireReportRead, like an earlier
+	// draft did) — matching project_budget_report.go's own ordering: a
+	// malformed id or a nonexistent RFQ is handled by the checks above
+	// before spending two extra authz lookups, and an authz failure here
+	// stays a 500 on a REAL RFQ rather than masking a 404 on a bad one.
+	hiddenItemFields, err := ts.crud.HiddenFields(ctx, "Item")
+	if err != nil {
+		writeInternalError(w, "resolve Item field visibility", err)
+		return
+	}
+	hiddenPartyFields, err := ts.crud.HiddenFields(ctx, "Party")
+	if err != nil {
+		writeInternalError(w, "resolve Party field visibility", err)
+		return
+	}
+	itemNameHidden := itemNameRedacted(hiddenItemFields)
+	vendorNameHidden := partyNameRedacted(hiddenPartyFields)
+
+	view := h.buildRFQReportView(ctx, ts, rfq, lines, vendors, locale, itemNameHidden, vendorNameHidden)
 
 	var buf bytes.Buffer
 	if err := rfqReportTmpl.Execute(&buf, view); err != nil {
@@ -110,7 +140,33 @@ func (h *Handler) renderRFQComparisonReport(w http.ResponseWriter, r *http.Reque
 // code (or blank, if unresolvable) rather than failing the whole page: a
 // dangling/malformed status_id on the header is not a reason to hide the
 // comparison grid itself.
-func (h *Handler) buildRFQReportView(ctx context.Context, ts tenantScope, rfq data.Record, lines []data.RFQComparisonLine, vendors []data.RFQComparisonVendor, locale string) rfqReportView {
+//
+// itemNameHidden/vendorNameHidden (uc-infra#234) blank the Item/vendor-
+// name cells to NotAvailable when this actor's FieldPermission hides
+// Item.name/Party.name respectively — mirroring reporting.go's own
+// vendorNameRedacted threading into buildLeadTimeRows/buildOnTimeRows/
+// buildQualityRows. Neither flag touches row/column membership.
+//
+// Deliberately NOT covered here, same class, not fixed (uc-infra#235):
+// the price cells, the lowest-price mark, and the footer totals are all
+// computed from RequestForQuotationQuoteLine.unit_price, which is
+// FieldPermission-hideable exactly like Item.name/Party.name but reaches
+// this page through this exact same unredacted raw-SQL path — #234's own
+// scope was Item.name/Party.name specifically; #235 tracks unit_price
+// (and RequestForQuotationLine.qty) as their own follow-up, same "flag,
+// don't chase" precedent reporting.go's own NOT-fixed-here notes use.
+//
+// Also NOT addressed: vendors are ordered ORDER BY p.data->>'name' (data.
+// ReportingRepo.RFQComparison) even when vendorNameHidden — so a
+// restricted actor still learns every invited vendor's alphabetical rank
+// by name from column POSITION alone, a residual channel over the exact
+// value being redacted. Same documented, deliberately out-of-scope shape
+// reporting.go's own vendor-spend/lead-time tables carry for Party.name
+// ordering (see reporting.go's "Sort ORDER is still computed from the
+// real, un-redacted vendor names" comment) — not fixed here for the same
+// reason: changing the sort key is a behavior call, not a mechanical
+// redaction.
+func (h *Handler) buildRFQReportView(ctx context.Context, ts tenantScope, rfq data.Record, lines []data.RFQComparisonLine, vendors []data.RFQComparisonVendor, locale string, itemNameHidden, vendorNameHidden bool) rfqReportView {
 	rfqNumber, _ := rfq.Data["rfq_number"].(string)
 	dueDate, _ := rfq.Data["due_date"].(string)
 
@@ -138,6 +194,7 @@ func (h *Handler) buildRFQReportView(ctx context.Context, ts tenantScope, rfq da
 		FooterLabel:    h.catalog.T(locale, "report.rfq.footer_total"),
 		Empty:          h.catalog.T(locale, "report.rfq.empty"),
 		Missing:        h.catalog.T(locale, "report.rfq.missing_quote"),
+		NotAvailable:   h.catalog.T(locale, "report.rfq.not_available"),
 	}
 
 	// Zero lines or zero invited vendors: nothing to cross into a grid —
@@ -149,7 +206,12 @@ func (h *Handler) buildRFQReportView(ctx context.Context, ts tenantScope, rfq da
 	}
 
 	for _, v := range vendors {
-		view.Vendors = append(view.Vendors, rfqVendorColView{ID: v.ID, Name: v.Name})
+		col := rfqVendorColView{ID: v.ID}
+		if !vendorNameHidden {
+			col.NameAvailable = true
+			col.Name = v.Name
+		}
+		view.Vendors = append(view.Vendors, col)
 	}
 
 	// totals accumulates in money.Money (minor-unit int64), not float64
@@ -163,7 +225,11 @@ func (h *Handler) buildRFQReportView(ctx context.Context, ts tenantScope, rfq da
 	totals := make(map[string]money.Money, len(vendors))
 	quoted := make(map[string]bool, len(vendors))
 	for _, line := range lines {
-		row := rfqLineRowView{Item: line.ItemName, Qty: formrender.FormatFieldValue(line.Qty)}
+		row := rfqLineRowView{Qty: formrender.FormatFieldValue(line.Qty)}
+		if !itemNameHidden {
+			row.ItemAvailable = true
+			row.Item = line.ItemName
+		}
 		var lowest money.Money
 		haveLowest := false
 		for _, v := range vendors {
@@ -218,19 +284,22 @@ type rfqReportView struct {
 	FooterLabel string
 	FooterCells []rfqCellView
 
-	Empty   string
-	Missing string
+	Empty        string
+	Missing      string
+	NotAvailable string
 }
 
 type rfqVendorColView struct {
-	ID   string
-	Name string
+	ID            string
+	Name          string
+	NameAvailable bool
 }
 
 type rfqLineRowView struct {
-	Item  string
-	Qty   string
-	Cells []rfqCellView
+	Item          string
+	ItemAvailable bool
+	Qty           string
+	Cells         []rfqCellView
 }
 
 // rfqCellView is one (line, vendor) cell — Present distinguishes a real
@@ -257,13 +326,13 @@ var rfqReportTmpl = template.Must(template.New("rfqReport").Parse(`
 <tr>
   <th>{{.ItemCol}}</th>
   <th>{{.QtyCol}}</th>
-  {{range .Vendors}}<th class="uc-rfq-vendor-col">{{.Name}}</th>{{end}}
+  {{range .Vendors}}<th class="uc-rfq-vendor-col">{{if .NameAvailable}}{{.Name}}{{else}}{{$.NotAvailable}}{{end}}</th>{{end}}
 </tr>
 </thead>
 <tbody>
 {{range .Rows}}
 <tr>
-  <td>{{.Item}}</td>
+  <td>{{if .ItemAvailable}}{{.Item}}{{else}}{{$.NotAvailable}}{{end}}</td>
   <td>{{.Qty}}</td>
   {{range .Cells}}<td{{if .Lowest}} class="uc-rfq-lowest"{{end}}>{{if .Present}}{{.Value}}{{else}}{{$.Missing}}{{end}}</td>{{end}}
 </tr>
