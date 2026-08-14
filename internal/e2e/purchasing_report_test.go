@@ -13,6 +13,164 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/purchasing"
 )
 
+// TestPurchasingReport_HiddenPurchaseOrderPartyItemFields_RealBrowser
+// (uc-infra#233) is the real-browser proof that hiding
+// PurchaseOrder.total/Party.name/Item.sku/Item.name via a FieldPermission
+// removes each real value from the live DOM entirely — not merely from a
+// rendered-HTML-string assertion (internal/api's own
+// TestAPI_PurchasingReport_HiddenPurchaseOrderPartyItemFieldsRenderNotAvailable,
+// which already pins per-field independence one field at a time). Same
+// class of proof TestFieldPermission_HiddenFieldAbsentFromLiveDOM gives
+// for a form field, and the same discipline this report's own
+// InventoryItem.qty_on_hand/qty_available_to_promise fix will need when
+// it lands (uc-infra#230, a separate, still-open card — not covered by
+// this test) — ReportingRepo's raw SQL reads all four of these fields
+// entirely outside the ts.crud-redacted path, so nothing short of an
+// actual browser DOM scan proves the real values never reach the page.
+//
+// All four fields are hidden from the SAME browser actor at once here
+// (unlike the internal/api test's one-field-at-a-time actors): browserCtx
+// always authenticates as the one fixed e2eActorID, and this test's job
+// is to prove the real DOM never leaks any of the four, together, not to
+// re-litigate their independence (already covered at the HTTP level).
+func TestPurchasingReport_HiddenPurchaseOrderPartyItemFields_RealBrowser(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, tenantDB := testServer(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	if err := purchasing.PublishStatuses(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("PublishStatuses: %v", err)
+	}
+	// ONE role holding all four FieldPermission rows, not four
+	// single-field roles granted to the same actor: authz.Resolver.
+	// HiddenFields' own contract (authz.go) is a field is hidden only
+	// when EVERY role the actor holds has a hidden=true row for it — four
+	// single-field roles would each fail that unanimity test for the
+	// OTHER three roles' fields, hiding NONE of them (caught by this
+	// test's own first run: every value leaked with four separate
+	// grantE2ERole/seedFieldPermission calls, exactly this gotcha).
+	roleID := grantE2ERole(t, tenantDB, "e2e_233_all_redacted")
+	engine := crud.NewEngine(tenantDB)
+	for _, fp := range []struct{ entityType, field string }{
+		{"PurchaseOrder", "total"}, {"Party", "name"}, {"Item", "sku"}, {"Item", "name"},
+	} {
+		if _, err := engine.Create(ctx, foundation.FieldPermission(), map[string]any{
+			"role_id": roleID, "entity_type": fp.entityType, "field_name": fp.field, "hidden": true,
+		}, actor); err != nil {
+			t.Fatalf("create FieldPermission %s.%s: %v", fp.entityType, fp.field, err)
+		}
+	}
+	vendor, err := engine.Create(ctx, foundation.Party(), map[string]any{
+		"name": "E2E Leak Vendor Co", "party_type": "organization", "status": "active",
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed vendor: %v", err)
+	}
+	if _, err := engine.Create(ctx, foundation.PartyRole(), map[string]any{
+		"party_id": vendor.ID, "role_type": "vendor",
+	}, actor); err != nil {
+		t.Fatalf("seed vendor PartyRole: %v", err)
+	}
+	approvedID := publishedStatusID(t, tenantDB, "purchase_order_status", "approved")
+	// total is FieldMoney (minor units, uc-infra#136): 246800 -> "2468.00"
+	// — deliberately not a bare integer, so a coincidental hex-substring
+	// match inside a seeded record's own random UUID can't produce a
+	// false POSITIVE on the leak scan below (a bare "246800"-style digit
+	// run is exactly the kind of thing a random UUID could coincidentally
+	// contain; the decimal-point rendering of a real FieldMoney value
+	// isn't).
+	if _, err := engine.Create(ctx, purchasing.PurchaseOrder(), map[string]any{
+		"po_number": "PO-E2E-LEAK233", "vendor_id": vendor.ID, "order_date": "2026-08-01",
+		"status_id": approvedID, "total": 246800,
+	}, actor); err != nil {
+		t.Fatalf("seed PurchaseOrder: %v", err)
+	}
+	item, err := engine.Create(ctx, purchasing.Item(), map[string]any{
+		"sku": "SKU-E2E-LEAK233", "name": "E2E Leak Widget 233", "item_type": "stock",
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed Item: %v", err)
+	}
+	facility, err := engine.Create(ctx, purchasing.Facility(), map[string]any{
+		"code": "E2E-LEAK233-MAIN", "name": "E2E Leak Warehouse 233", "facility_type": "warehouse", "is_active": true,
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed Facility: %v", err)
+	}
+	// qty_available_to_promise -3.5 (<=0, and not a bare integer for the
+	// same leak-scan reason as total above) puts the item on the
+	// Stockout Risk table, so its SKU/Name cells are exercised too.
+	if _, err := engine.Create(ctx, purchasing.InventoryItem(), map[string]any{
+		"item_id": item.ID, "facility_id": facility.ID,
+		"qty_on_hand": 12, "qty_available_to_promise": -3.5,
+	}, actor); err != nil {
+		t.Fatalf("seed InventoryItem: %v", err)
+	}
+	// A SECOND, completed PurchaseOrder for the SAME vendor — feeding the
+	// Supplier Lead Times/On-Time Delivery tables, whose Vendor column
+	// reads Party.name through this exact same unredacted raw-SQL path.
+	// Independent review of an earlier version of this fix caught it
+	// missing these tables (and the Quality table, covered separately at
+	// the HTTP level by TestAPI_PurchasingReport_HiddenPurchaseOrderPartyItemFieldsRenderNotAvailable,
+	// whose GoodsReceiptLine fixture doesn't need the real crud.Engine
+	// hooks a browser-driven Quality fixture here would) entirely — this
+	// fixture (and the leak scan below) is what proves the real DOM
+	// never leaks the vendor name on the other two either, not just on
+	// the vendor-spend table.
+	receivedID := publishedStatusID(t, tenantDB, "purchase_order_status", "received")
+	if _, err := engine.Create(ctx, purchasing.PurchaseOrder(), map[string]any{
+		"po_number": "PO-E2E-LEAK233-LT", "vendor_id": vendor.ID, "status_id": receivedID,
+		"order_date": "2026-08-01", "received_at": "2026-08-05", "promised_delivery_date": "2026-08-05",
+	}, actor); err != nil {
+		t.Fatalf("seed completed PurchaseOrder: %v", err)
+	}
+
+	bctx := browserCtx(t, tenantID)
+	var bodyText string
+	if err := chromedp.Run(bctx,
+		chromedp.Navigate(srv.URL+"/reports/purchasing"),
+		chromedp.WaitVisible(`table.uc-table`, chromedp.ByQuery),
+		chromedp.Text(`body`, &bodyText, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("open /reports/purchasing: %v", err)
+	}
+
+	for _, leaked := range []string{"2468.00", "E2E Leak Vendor Co", "SKU-E2E-LEAK233", "E2E Leak Widget 233"} {
+		if strings.Contains(bodyText, leaked) {
+			t.Errorf("redacted value %q reached the live page for an actor with it hidden:\n%s", leaked, bodyText)
+		}
+	}
+	if !strings.Contains(bodyText, "Not available") {
+		t.Errorf("expected at least one 'Not available' placeholder (status card, vendor row, stockout row):\n%s", bodyText)
+	}
+	// qty_on_hand/qty_available_to_promise are DIFFERENT fields, not
+	// hidden by this actor's role — their real numbers, and the item's
+	// presence on the Stockout Risk table they drive, must still render.
+	if !strings.Contains(bodyText, "12") || !strings.Contains(bodyText, "-3.5") {
+		t.Errorf("expected qty_on_hand (12) and qty_available_to_promise (-3.5) — fields this actor CAN see — to still render:\n%s", bodyText)
+	}
+
+	// Belt-and-braces, same reasoning TestFieldPermission_HiddenFieldAbsentFromLiveDOM's
+	// own leak check already uses for a form field (internal/e2e/field_permission_test.go)
+	// — confirm none of the four figures are sitting anywhere in the
+	// document outside the visible text either. (This report's own
+	// InventoryItem quantities will need the equivalent check when
+	// uc-infra#230 lands — not yet, since that fix isn't in this
+	// codebase.)
+	for _, leaked := range []string{"2468.00", "E2E Leak Vendor Co", "SKU-E2E-LEAK233", "E2E Leak Widget 233"} {
+		var leaks bool
+		if err := chromedp.Run(bctx, chromedp.EvaluateAsDevTools(
+			`document.documentElement.outerHTML.includes("`+leaked+`")`, &leaks,
+		)); err != nil {
+			t.Fatalf("scan document for %q: %v", leaked, err)
+		}
+		if leaks {
+			t.Errorf("redacted value %q reached the browser somewhere in the document", leaked)
+		}
+	}
+}
+
 // TestPurchasingReport_LeadTimeAndReorderSections_RealBrowser (#30):
 // /reports/purchasing renders the two new sections — "Supplier Lead
 // Times" and "Reorder Signals" — in a real headless Chrome, with a
