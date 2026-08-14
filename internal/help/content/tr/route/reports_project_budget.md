@@ -47,6 +47,15 @@ projenin karşılaştırılacak bir şeyi olması için Bütçe Kalemleri'ne ve,
   satırda bile, her satırda **Mevcut değil** gösterir: Fark, Planlanan
   ile Gerçekleşen'in karşılaştırılmasıdır, dolayısıyla Planlanan sizin
   için görünür değilken gerçek bir rakam olamaz.
+- Rolünüzün Bütçe Kalemlerinin kategorisini görme izni yoksa, **Kategori**
+  sütununun kendisi de her satırda kategori adı yerine **Mevcut değil**
+  gösterir — kategori aynı zamanda hangi Bütçe Kalemi satırlarının
+  planlanan toplamına dahil edildiğini belirlediğinden, bu durumda
+  **Planlanan** ve **Fark** da, tıpkı rolünüzün planlanan tutarları
+  doğrudan görme izni olmadığındaki gibi, **Mevcut değil** gösterir.
+  Yukarıdaki fiyatlandırılamayan saat notu bu durumda da kendi satırında
+  görünmeye devam eder — bu not saatlerle ilgilidir, hangi kategoriye ait
+  olduklarıyla değil.
 
 ## Bilinmesi gereken kurallar
 

@@ -307,3 +307,160 @@ func TestProjectBudgetReport_PlannedRedacted_RealBrowser(t *testing.T) {
 		t.Fatal("redacted planned amount reached the browser somewhere in the document")
 	}
 }
+
+// TestProjectBudgetReport_CategoryRedacted_RealBrowser (uc-infra#222) is
+// the real-browser proof that hiding ProjectBudgetLine.category via a
+// FieldPermission removes the real "Labour"/"Materials" category names
+// from the live DOM entirely — not merely from a rendered-HTML-string
+// assertion (internal/api's own HTTP-level tests for this fix) — the
+// same class of proof TestProjectBudgetReport_PlannedRedacted_RealBrowser
+// already gives for planned_amount above, applied to the leak
+// independent review found in that fix's own review pass:
+// ProjectBudgetActuals' raw SQL reads category outside the
+// FieldPermission-redacted budgetLines slice, so nothing short of an
+// actual browser DOM scan proves the real string never reaches the page.
+func TestProjectBudgetReport_CategoryRedacted_RealBrowser(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, tenantDB := testServer(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	for _, step := range []struct {
+		name string
+		fn   func() error
+	}{
+		{"projects", func() error { return projects.Publish(ctx, tenantDB, actor) }},
+		{"projects statuses", func() error { return projects.PublishStatuses(ctx, tenantDB, actor) }},
+		{"hr", func() error { return hr.Publish(ctx, tenantDB, actor) }},
+		{"hr statuses", func() error { return hr.PublishStatuses(ctx, tenantDB, actor) }},
+	} {
+		if err := step.fn(); err != nil {
+			t.Fatalf("publish %s: %v", step.name, err)
+		}
+	}
+
+	// Hide ProjectBudgetLine.category from the browser's own actor BEFORE
+	// seeding data, same ordering as the planned_amount e2e test above.
+	seedFieldPermission(t, tenantDB, "e2e_budget_category_redacted", "ProjectBudgetLine", "category")
+
+	engine := crud.NewEngine(tenantDB)
+	planned := publishedStatusID(t, tenantDB, "project_status", "planned")
+	todo := publishedStatusID(t, tenantDB, "task_status", "todo")
+	probation := publishedStatusID(t, tenantDB, "employee_status", "probation")
+
+	project, err := engine.Create(ctx, projects.Project(), map[string]any{
+		"project_code": "PRJ-E2E-CATREDACT", "name": map[string]any{"en": "E2E Category-Redacted Budget Project"},
+		"start_date": "2026-01-01", "status_id": planned,
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed Project: %v", err)
+	}
+	if _, err := engine.Create(ctx, projects.ProjectBudgetLine(), map[string]any{
+		"project_id": project.ID, "category": "labour", "planned_amount": 500.0,
+	}, actor); err != nil {
+		t.Fatalf("seed labour ProjectBudgetLine: %v", err)
+	}
+	if _, err := engine.Create(ctx, projects.ProjectBudgetLine(), map[string]any{
+		"project_id": project.ID, "category": "materials", "planned_amount": 200.0,
+	}, actor); err != nil {
+		t.Fatalf("seed materials ProjectBudgetLine: %v", err)
+	}
+
+	task, err := engine.Create(ctx, projects.Task(), map[string]any{
+		"project_id": project.ID, "title": map[string]any{"en": "E2E Category-Redacted Work"}, "status_id": todo,
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed Task: %v", err)
+	}
+	alice, err := engine.Create(ctx, foundation.Party(), map[string]any{
+		"name": "E2E CatRedact Alice", "party_type": "person",
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed Party Alice: %v", err)
+	}
+	if _, err := engine.Create(ctx, foundation.PartyRole(), map[string]any{
+		"party_id": alice.ID, "role_type": "employee",
+	}, actor); err != nil {
+		t.Fatalf("grant employee PartyRole: %v", err)
+	}
+	if _, err := engine.Create(ctx, hr.Employee(), map[string]any{
+		"employee_number": "E2E-CATREDACT-ALICE", "party_id": alice.ID, "hire_date": "2020-01-01",
+		"status_id": probation, "cost_rate": int64(2500), // $25.00/hr
+	}, actor); err != nil {
+		t.Fatalf("seed Employee Alice: %v", err)
+	}
+	if _, err := engine.Create(ctx, projects.TimeEntry(), map[string]any{
+		"task_id": task.ID, "employee_id": alice.ID, "entry_date": "2026-02-01", "hours": 2.0,
+	}, actor); err != nil {
+		t.Fatalf("seed TimeEntry: %v", err)
+	}
+
+	// Bob's unpriced hour — the unpriced-note assertion below only means
+	// something with a real unpriced source to surface (uc-infra#222
+	// independent review: an earlier draft of this fix silently dropped
+	// this note whenever category was redacted, which a body-text-only
+	// check without a genuinely unpriced entry could not have caught).
+	bob, err := engine.Create(ctx, foundation.Party(), map[string]any{
+		"name": "E2E CatRedact Bob", "party_type": "person",
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed Party Bob: %v", err)
+	}
+	if _, err := engine.Create(ctx, foundation.PartyRole(), map[string]any{
+		"party_id": bob.ID, "role_type": "employee",
+	}, actor); err != nil {
+		t.Fatalf("grant employee PartyRole (Bob): %v", err)
+	}
+	if _, err := engine.Create(ctx, hr.Employee(), map[string]any{
+		"employee_number": "E2E-CATREDACT-BOB", "party_id": bob.ID, "hire_date": "2021-01-01",
+		"status_id": probation,
+	}, actor); err != nil {
+		t.Fatalf("seed Employee Bob: %v", err)
+	}
+	if _, err := engine.Create(ctx, projects.TimeEntry(), map[string]any{
+		"task_id": task.ID, "employee_id": bob.ID, "entry_date": "2026-02-01", "hours": 1.0,
+	}, actor); err != nil {
+		t.Fatalf("seed TimeEntry Bob: %v", err)
+	}
+
+	bctx := browserCtx(t, tenantID)
+	var bodyText string
+	if err := chromedp.Run(bctx,
+		chromedp.Navigate(srv.URL+"/reports/project-budget/"+project.ID),
+		chromedp.WaitVisible(`table.uc-table`, chromedp.ByQuery),
+		chromedp.Text(`body`, &bodyText, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("open /reports/project-budget/%s: %v", project.ID, err)
+	}
+
+	if strings.Contains(bodyText, "Labour") || strings.Contains(bodyText, "Materials") {
+		t.Errorf("the real category names reached the live page for an actor with category redacted:\n%s", bodyText)
+	}
+	if !strings.Contains(bodyText, "50.00") {
+		t.Errorf("labour's Actual (50.00, unaffected by category's redaction) should still render:\n%s", bodyText)
+	}
+	// The unpriced-hours note is a fact about hours, not the category
+	// name — it must survive category's redaction (uc-infra#222
+	// independent review finding; internal/api's own HTTP-level test
+	// pins the same fact against the raw response body, this pins it
+	// against the real rendered DOM text).
+	if !strings.Contains(bodyText, "some logged hours could not be priced") {
+		t.Errorf("the unpriced-hours note is missing from the live page for an actor with category redacted:\n%s", bodyText)
+	}
+
+	// Belt-and-braces full-document scan, same as
+	// TestProjectBudgetReport_PlannedRedacted_RealBrowser's own leak
+	// check above: confirm neither real category name is sitting
+	// anywhere in the document outside the visible body text either
+	// (an HTML comment, an attribute, a hidden node).
+	var leaksLabour, leaksMaterials bool
+	if err := chromedp.Run(bctx,
+		chromedp.EvaluateAsDevTools(`document.documentElement.outerHTML.includes("Labour")`, &leaksLabour),
+		chromedp.EvaluateAsDevTools(`document.documentElement.outerHTML.includes("Materials")`, &leaksMaterials),
+	); err != nil {
+		t.Fatalf("scan document for the redacted category names: %v", err)
+	}
+	if leaksLabour || leaksMaterials {
+		t.Fatalf("redacted category name reached the browser somewhere in the document (Labour=%v Materials=%v)", leaksLabour, leaksMaterials)
+	}
+}

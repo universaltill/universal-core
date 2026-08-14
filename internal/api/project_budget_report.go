@@ -119,6 +119,7 @@ func (h *Handler) renderProjectBudgetReport(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	plannedRedacted := projectBudgetLinePlannedRedacted(hiddenBudgetFields)
+	categoryRedacted := projectBudgetLineCategoryRedacted(hiddenBudgetFields)
 
 	actuals, err := ts.reporting.ProjectBudgetActuals(ctx, id)
 	if err != nil {
@@ -126,7 +127,7 @@ func (h *Handler) renderProjectBudgetReport(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	view := h.buildProjectBudgetReportView(project, budgetLines, actuals, locale, plannedRedacted)
+	view := h.buildProjectBudgetReportView(project, budgetLines, actuals, locale, plannedRedacted, categoryRedacted)
 	topicID := help.RouteTopicID("reports/project-budget")
 	view.Help = h.buildHelpView(locale, topicID, help.HasContent(locale, topicID))
 
@@ -180,6 +181,22 @@ func projectBudgetLinePlannedRedacted(hidden map[string]bool) bool {
 	return hidden["planned_amount"] || hidden["category"]
 }
 
+// projectBudgetLineCategoryRedacted (uc-infra#222) answers the narrower,
+// single-field question of whether THIS ACTOR's FieldPermission hides
+// ProjectBudgetLine.category specifically — kept as its own named,
+// unit-tested predicate (mirroring projectBudgetLinePlannedRedacted just
+// above) rather than an inline map lookup at the call site, so the two
+// field-name gates this report cares about live in one place and at the
+// same unit-test level. Deliberately NOT the same predicate as
+// projectBudgetLinePlannedRedacted: that one is broader by design (true
+// whenever EITHER planned_amount OR category is hidden), but only a
+// hidden category itself should blank the Category column — a
+// planned_amount-only redaction must leave Category showing the real
+// name.
+func projectBudgetLineCategoryRedacted(hidden map[string]bool) bool {
+	return hidden["category"]
+}
+
 func projectBudgetPlannedMinor(budgetLines []data.Record, category string) money.Money {
 	var amounts []money.Money
 	for _, line := range budgetLines {
@@ -223,7 +240,44 @@ func projectBudgetPlannedMinor(budgetLines []data.Record, category string) money
 // (the exact fabricated-number failure Actual/Available already guards
 // against). Variance also becomes unavailable in that case: it's a
 // function of Planned, so it can't be a real number when Planned isn't.
-func (h *Handler) buildProjectBudgetReportView(project data.Record, budgetLines []data.Record, actuals []data.ProjectCategoryActual, locale string, plannedRedacted bool) projectBudgetReportView {
+//
+// categoryRedacted (uc-infra#222) is the same shape of answer for
+// ProjectBudgetLine.category specifically, and is deliberately NOT
+// derived from plannedRedacted here — plannedRedacted is true whenever
+// EITHER planned_amount OR category is hidden (projectBudgetLinePlanned
+// Redacted's own contract), but only a hidden category itself should
+// blank the Category column; a planned_amount-only redaction must leave
+// Category showing the real name. When categoryRedacted is true, a
+// row's Category is left the zero value and CategoryAvailable is false
+// — the real category NAME (a.Category resolved through the catalog) is
+// never even looked up via the catalog in that case, let alone assigned.
+//
+// This does NOT mean every category-derived value on the row is
+// suppressed: UnpricedNote (below) is still set from a.Category=="labour"
+// regardless of categoryRedacted, and stays visible in the template even
+// when Category itself renders NotAvailable (independent review,
+// uc-infra#222 — an earlier version of this fix nested UnpricedNote's
+// template guard inside CategoryAvailable's, silently dropping the note
+// for a category-redacted actor, contradicting this row's own doc
+// comment below and the help topic's claim that the labour row always
+// says so). That's a deliberate choice, not an oversight: the note is a
+// boolean, not the category name, so showing it doesn't leak what #222
+// asked to be hidden — and per ProjectBudgetActuals' own doc comment
+// only "labour" can ever have a non-nil Actual, so which row is labour
+// is already inferable from Actual/Available alone, redacted category
+// name or not. Suppressing the note would buy no real confidentiality
+// while reintroducing the exact silent-undercount risk the note exists
+// to prevent (same reasoning UnpricedNote's own field doc gives).
+//
+// Also worth naming plainly: hiding the category NAME doesn't hide
+// STRUCTURE. Rows stay ordered by the real category value
+// (data.ReportingRepo.ProjectBudgetActuals' own `ORDER BY 1`), and the
+// row count still reveals how many distinct categories are budgeted.
+// Closing that is out of scope for a per-field redaction (option (a) in
+// #222's own report) — it would need the raw-SQL query itself to stop
+// selecting/ordering by category for a redacted actor, tracked as a
+// separate, broader mechanism (#222's option (b), not implemented here).
+func (h *Handler) buildProjectBudgetReportView(project data.Record, budgetLines []data.Record, actuals []data.ProjectCategoryActual, locale string, plannedRedacted, categoryRedacted bool) projectBudgetReportView {
 	projectCode, _ := project.Data["project_code"].(string)
 
 	view := projectBudgetReportView{
@@ -240,8 +294,10 @@ func (h *Handler) buildProjectBudgetReportView(project data.Record, budgetLines 
 
 	for _, a := range actuals {
 		plannedMinor := projectBudgetPlannedMinor(budgetLines, a.Category)
-		row := projectBudgetCategoryRowView{
-			Category: h.catalog.TOrDefault(locale, "field.ProjectBudgetLine.category."+a.Category, a.Category),
+		row := projectBudgetCategoryRowView{}
+		if !categoryRedacted {
+			row.CategoryAvailable = true
+			row.Category = h.catalog.TOrDefault(locale, "field.ProjectBudgetLine.category."+a.Category, a.Category)
 		}
 		if !plannedRedacted {
 			row.PlannedAvailable = true
@@ -284,7 +340,18 @@ type projectBudgetReportView struct {
 
 type projectBudgetCategoryRowView struct {
 	Category string
-	Planned  string
+	// CategoryAvailable distinguishes a real category name from "not
+	// available" (the acting role's FieldPermission hides
+	// ProjectBudgetLine.category, uc-infra#222) — collapsing the two
+	// would render the real category text to an actor who cannot see
+	// it, since data.ReportingRepo.ProjectBudgetActuals' raw SQL reads
+	// category directly out of `records`, entirely outside the
+	// FieldPermission-redacted budgetLines slice this handler otherwise
+	// relies on. Same shape as PlannedAvailable/Available below, kept as
+	// its own independent bool rather than folded into plannedRedacted:
+	// a planned_amount-only redaction must NOT also blank Category.
+	CategoryAvailable bool
+	Planned           string
 	// PlannedAvailable distinguishes a real planned_amount sum from
 	// "not available" (the acting role's FieldPermission hides
 	// planned_amount, uc-infra#216) — collapsing the two would render a
@@ -327,7 +394,7 @@ var projectBudgetReportTmpl = template.Must(template.New("projectBudgetReport").
 <tbody>
 {{range .Rows}}
 <tr>
-  <td>{{.Category}}{{if .UnpricedNote}} <span class="uc-project-budget-unpriced">({{.UnpricedNote}})</span>{{end}}</td>
+  <td>{{if .CategoryAvailable}}{{.Category}}{{else}}{{$.NotAvailable}}{{end}}{{if .UnpricedNote}} <span class="uc-project-budget-unpriced">({{.UnpricedNote}})</span>{{end}}</td>
   <td>{{if .PlannedAvailable}}{{.Planned}}{{else}}{{$.NotAvailable}}{{end}}</td>
   <td>{{if .Available}}{{.Actual}}{{else}}{{$.NotAvailable}}{{end}}</td>
   <td>{{if and .Available .PlannedAvailable}}{{.Variance}}{{else}}{{$.NotAvailable}}{{end}}</td>
