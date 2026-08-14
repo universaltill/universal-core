@@ -1063,6 +1063,17 @@ func newlyAddedUniqueSets(c change, newDef *entity.Definition, oldNamesFor func(
 // crud.BackfillUniqueConstraintKeys' own doc comment) and are exactly
 // what uniqueConstraintWarnings above already reports — the two never
 // disagree about which records need attention.
+//
+// The error WARNING below deliberately does not say "until this is
+// retried" (uc-infra#228, fixing the wording independent review of
+// uc-infra#201 found copied verbatim into backfillNewConditionalUnique
+// Constraints without noticing the overclaim): a re-run of this command
+// only re-attempts a backfill for an entity type whose Definition
+// version actually moved again (newlyAddedUniqueSets, via diffVersions)
+// — there is no operator-facing path today to force a retry against an
+// unchanged version, so promising one would be inaccurate. Matches
+// backfillNewConditionalUniqueConstraints' own wording below for the
+// identical gap.
 func backfillNewUniqueConstraints(
 	ctx context.Context,
 	tenantDB *sql.DB,
@@ -1082,7 +1093,7 @@ func backfillNewUniqueConstraints(
 			name := entity.UniqueConstraintName(set)
 			backfilled, skipped, err := crud.BackfillUniqueConstraintKeys(ctx, tenantDB, records, keys, c.entityType, set)
 			if err != nil {
-				log.Printf("WARNING: %s: %s — could not backfill unique constraint %q, existing records are unprotected until this is retried: %v",
+				log.Printf("WARNING: %s: %s — could not backfill unique constraint %q, existing records are unprotected: %v",
 					tenantName, c.entityType, name, err)
 				continue
 			}
@@ -1238,13 +1249,11 @@ func backfillNewConditionalUniqueConstraints(
 				// type whose Definition version actually moved again
 				// (newlyAddedConditionalUniqueSets, via diffVersions) —
 				// there is currently no operator-facing path to force a
-				// retry against an unchanged version. Same gap
-				// backfillNewUniqueConstraints' own log line already has
-				// (independent review of uc-infra#201 found the wording
-				// copied verbatim into this new code without noticing);
-				// filed as a follow-up card rather than fixed here to
-				// avoid widening this change's scope into the pre-existing
-				// Unique backfill path too.
+				// retry against an unchanged version.
+				// backfillNewUniqueConstraints' own log line had the same
+				// overclaim (independent review of uc-infra#201 found the
+				// wording copied verbatim into this new code without
+				// noticing) — fixed there too, uc-infra#228.
 				log.Printf("WARNING: %s: %s — could not backfill conditional unique constraint %q, existing records are unprotected: %v",
 					tenantName, c.entityType, name, err)
 				continue

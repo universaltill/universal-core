@@ -472,3 +472,52 @@ func TestConditionalUniqueConstraintWarnings_ZeroCountStaysSilent(t *testing.T) 
 		t.Errorf("zero violations (no error) must stay silent, got log output: %q", logged)
 	}
 }
+
+// TestBackfillNewUniqueConstraints_ErrorDoesNotOverclaimARetryPath is the
+// regression test for uc-infra#228: backfillNewUniqueConstraints' error
+// WARNING said "existing records are unprotected until this is retried",
+// but re-running this command only re-attempts a backfill for an entity
+// type whose Definition version actually moved again (newlyAddedUniqueSets,
+// via diffVersions) — there is no operator-facing path to force a retry
+// against an unchanged version, so the wording promised a mechanism that
+// doesn't exist. backfillNewConditionalUniqueConstraints already avoids
+// this overclaim (uc-infra#201's own review pass caught it there); this
+// brings the pre-existing Unique path's wording in line. Uses the same
+// closedDB+captureLog fault-injection this file's other tests use: a
+// closed *sql.DB makes records.ListPage fail deterministically, no live
+// Postgres needed to reach the error branch.
+func TestBackfillNewUniqueConstraints_ErrorDoesNotOverclaimARetryPath(t *testing.T) {
+	def := &entity.Definition{
+		EntityType: "Voucher",
+		Unique: [][]string{
+			{"code"},
+		},
+	}
+	defFor := func(entityType string) (*entity.Definition, bool) {
+		if entityType != "Voucher" {
+			return nil, false
+		}
+		return def, true
+	}
+	// from: 0 (new-to-registry) so newlyAddedUniqueSets treats "code" as
+	// newly-added without needing oldNamesFor to resolve anything real.
+	changes := []change{{entityType: "Voucher", from: 0, to: 1}}
+	oldNamesFor := func(change) map[string]bool { return nil }
+
+	logged := captureLog(t, func() {
+		backfillNewUniqueConstraints(context.Background(), closedDB(t), "Demo Organization", changes, defFor, oldNamesFor)
+	})
+
+	if strings.Contains(logged, "until this is retried") {
+		t.Errorf("WARNING must not promise a retry path that doesn't exist, got: %q", logged)
+	}
+	want := `could not backfill unique constraint "code", existing records are unprotected: `
+	if !strings.Contains(logged, want) {
+		t.Errorf("expected %q, got: %q", want, logged)
+	}
+	for _, want := range []string{"WARNING", "Demo Organization", "database is closed"} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("expected the WARNING to mention %q, got: %q", want, logged)
+		}
+	}
+}
