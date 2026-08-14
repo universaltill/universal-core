@@ -107,12 +107,9 @@ func FixedAsset() *entity.Definition {
 // hand-entered. Nothing structurally prevents a manual correction
 // through the ordinary CRUD path (these are ordinary records through
 // the same guarded engine, so a correction is auditable like any other
-// change), but be aware: an unposted row's correction can be silently
-// overwritten the next time its FixedAsset is saved for any reason, and
-// once any row is posted, an unrelated edit to the asset can be rejected
-// even without the correction being the cause — schedule_hook.go's own
-// hook doc comment and uc-infra#236 have the full explanation and why
-// it isn't fixed yet.
+// change): a correction to an unposted row now survives a later,
+// unrelated save of its FixedAsset (uc-infra#236, fixed by the
+// `overridden` field below) rather than being silently regenerated away.
 //
 // Amounts are stored as ordinary FieldNumber values (the engine's
 // float64) because that is what every other money field in this kernel
@@ -122,10 +119,11 @@ func FixedAsset() *entity.Definition {
 func DepreciationSchedule() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "DepreciationSchedule",
-		// Version 2 (uc-infra#80): depreciation_amount and book_value
-		// gained Min:0 bounds. sequence is left unbounded — it is a
+		// Version 3 (uc-infra#236): gained `overridden`. Version 2
+		// (uc-infra#80): depreciation_amount and book_value gained
+		// Min:0 bounds. sequence is left unbounded — it is a
 		// display/ordering hint, not a quantity or money value.
-		Version: 2,
+		Version: 3,
 		Module:  "assets",
 		Fields: []entity.Field{
 			{Name: "fixed_asset_id", Type: entity.FieldReference, Required: true, Target: "FixedAsset"},
@@ -141,6 +139,27 @@ func DepreciationSchedule() *entity.Definition {
 			// idempotent — the same foresight PurchaseOrder's own
 			// status_id doc comment says was missing there.
 			{Name: "posted_at", Type: entity.FieldDate},
+			// overridden (uc-infra#236) is not an editable field on
+			// DepreciationScheduleForm (forms.go) — it's a fact
+			// MarkDepreciationScheduleOverriddenOnWrite (schedule_hook.go)
+			// RECOMPUTES on every write to a row (Create or Update, not
+			// just a human correction through the form — see that hook's
+			// own doc comment for why it's not a caller-trusted flag) by
+			// comparing the row against what its FixedAsset's current
+			// terms would independently generate. GenerateDepreciationScheduleOnWrite
+			// then skips an overridden row's own content when deciding
+			// whether the stored schedule still matches what the asset's
+			// current terms compute — see that hook's own doc comment
+			// for why this is what actually closes the gap. It IS shown,
+			// though: FixedAssetForm's own master-detail Depreciation
+			// Schedule section renders every DepreciationSchedule field
+			// as a read-only summary column regardless of this form's
+			// own field list, so a correction surfaces as a genuine
+			// "Overridden" column rather than staying invisible.
+			// Default false: a freshly hook-generated row (bypasses this
+			// hook entirely — see MarkDepreciationScheduleOverriddenOnWrite's
+			// own doc comment) is never itself an override.
+			{Name: "overridden", Type: entity.FieldBool, Default: false},
 		},
 	}
 }

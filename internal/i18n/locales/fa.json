@@ -500,6 +500,7 @@
   "field.DepreciationSchedule.depreciation_amount": "استهلاک",
   "field.DepreciationSchedule.book_value": "ارزش دفتری",
   "field.DepreciationSchedule.posted_at": "ثبت‌شده",
+  "field.DepreciationSchedule.overridden": "اصلاح‌شدهٔ دستی",
   "field.FixedAsset.status_id.draft": "پیش‌نویس",
   "field.FixedAsset.status_id.in_service": "در حال استفاده",
   "field.FixedAsset.status_id.fully_depreciated": "مستهلک‌شده",

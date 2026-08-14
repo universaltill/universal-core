@@ -500,6 +500,7 @@
   "field.DepreciationSchedule.depreciation_amount": "الإهلاك",
   "field.DepreciationSchedule.book_value": "القيمة الدفترية",
   "field.DepreciationSchedule.posted_at": "مُرحَّل",
+  "field.DepreciationSchedule.overridden": "مُصحَّح يدوياً",
   "field.FixedAsset.status_id.draft": "مسودة",
   "field.FixedAsset.status_id.in_service": "قيد الاستخدام",
   "field.FixedAsset.status_id.fully_depreciated": "مستهلك بالكامل",

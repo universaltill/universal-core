@@ -54,10 +54,15 @@ Acquisition Date or Currency (the save is rejected) — posted rows are
 real, already-recorded ledger entries, and changing what produced them
 would silently invalidate that history. An edit that doesn't touch the
 schedule (Location, Name, the posting accounts) normally goes through
-fine; if a save is unexpectedly rejected after posting has started even
-though you only touched one of those, a stored schedule that no longer
-matches what the asset's current terms compute is the most likely
-cause — for instance, an earlier manual correction to a schedule row.
+fine — including when an earlier period was manually corrected by hand
+(see the Depreciation Schedule topic's own note on corrections): a
+correction is remembered as exactly that, so it no longer causes an
+unrelated save to be rejected, or gets silently overwritten the next
+time the asset happens to be saved. It can still be rejected if the
+schedule's own row count no longer matches the asset's terms (a period
+added or removed by hand outside the normal generated flow) — the same
+underlying check this section describes, just not one a correction
+alone can trigger anymore.
 
 ## Rules to know
 

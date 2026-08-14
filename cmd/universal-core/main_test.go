@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"mime/multipart"
 	"net"
 	"net/http"
@@ -1101,6 +1102,60 @@ func TestUniversalCore_FixedAsset_SavedByRealBinaryGeneratesDepreciationSchedule
 	}
 	if len(list.Data) != 3 {
 		t.Fatalf("expected 3 DepreciationSchedule rows (one per useful_life_months) right after the real server's create — RegisterHook(\"FixedAsset\", ...) may not be wired in main(): got %d: %s", len(list.Data), listRespBody)
+	}
+
+	// uc-infra#236: the same real-binary proof, for
+	// handler.RegisterHook("DepreciationSchedule",
+	// assets.MarkDepreciationScheduleOverriddenOnWrite) — every test
+	// proving that hook actually works
+	// (internal/kernel/assets/schedule_override_hook_test.go) registers
+	// it against its own crud.Engine directly, none of them prove
+	// main()'s own RegisterHook call is really wired on the production
+	// mux. Correct one schedule row through the real running server —
+	// full-replacement JSON body built from the row's own current Data,
+	// matching updateRecord's documented "resend everything" contract —
+	// and confirm the read-back row comes back overridden.
+	target := list.Data[0]
+	corrected := map[string]any{}
+	maps.Copy(corrected, target.Data)
+	corrected["depreciation_amount"] = 950.0
+	correctedBody, err := json.Marshal(corrected)
+	if err != nil {
+		t.Fatalf("marshal corrected DepreciationSchedule body: %v", err)
+	}
+	updateResp, updateRespBody := post("/api/records/DepreciationSchedule/"+target.ID, string(correctedBody))
+	if updateResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 correcting DepreciationSchedule via the real running server, got %d: %s", updateResp.StatusCode, updateRespBody)
+	}
+
+	getReq, err := http.NewRequest(http.MethodGet, baseURL+"/api/records/DepreciationSchedule/"+target.ID, nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	getReq.Header.Set("X-Tenant-ID", tenantID)
+	getReq.Header.Set("X-Actor-ID", "smoke-test")
+	getResp, err := http.DefaultClient.Do(getReq)
+	if err != nil {
+		t.Fatalf("GET /api/records/DepreciationSchedule/%s: %v", target.ID, err)
+	}
+	defer getResp.Body.Close()
+	getRespBody, _ := io.ReadAll(getResp.Body)
+	if getResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 reading back the corrected DepreciationSchedule row, got %d: %s", getResp.StatusCode, getRespBody)
+	}
+	var got struct {
+		Data struct {
+			Data map[string]any `json:"data"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(getRespBody, &got); err != nil {
+		t.Fatalf("unmarshal DepreciationSchedule get response: %v", err)
+	}
+	if got.Data.Data["depreciation_amount"] != 950.0 {
+		t.Fatalf("expected the correction to be stored, got %v", got.Data.Data["depreciation_amount"])
+	}
+	if overridden, _ := got.Data.Data["overridden"].(bool); !overridden {
+		t.Fatalf("expected overridden=true after a real correction through the running server — RegisterHook(\"DepreciationSchedule\", ...) may not be wired in main(): %s", getRespBody)
 	}
 }
 

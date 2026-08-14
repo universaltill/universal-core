@@ -54,7 +54,9 @@ Hurda Değeri, Kullanım Ömrü, Amortisman Yöntemi, Edinme Tarihi veya Para
 Birimi'ni değiştiremezsiniz (kayıt reddedilir) — işlenmiş satırlar
 gerçek, zaten kaydedilmiş defter kayıtlarıdır ve onları üreten şeyi
 değiştirmek o geçmişi sessizce geçersiz kılar. Kıymet üzerindeki diğer
-her alan (Konum, Ad, muhasebe hesapları) hâlâ serbestçe düzenlenebilir.
+her alan (Konum, Ad, muhasebe hesapları) hâlâ serbestçe düzenlenebilir —
+daha önce bir dönemi elle düzelttiyseniz bile (bkz. Amortisman Planı
+konusunun düzeltmelerle ilgili notu).
 
 ## Bilinmesi gereken kurallar
 
