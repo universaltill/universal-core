@@ -44,6 +44,138 @@ func TestGLAccountRepo_UpsertByCode_CreatesThenUpdates(t *testing.T) {
 	}
 }
 
+// TestGLAccountRepo_UpsertBySourceRecord_CreatesThenUpdatesInPlace
+// covers uc-infra#205's actual repository-level fix: two calls with the
+// SAME sourceRecordID but a DIFFERENT code must update one row in
+// place (same id), not create a second row — the mechanism that lets a
+// renamed Account update its existing gl_accounts row instead of
+// orphaning it.
+func TestGLAccountRepo_UpsertBySourceRecord_CreatesThenUpdatesInPlace(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewGLAccountRepo(db)
+	const sourceRecordID = "11111111-1111-1111-1111-111111111111"
+
+	id1, err := repo.UpsertBySourceRecord(ctx, sourceRecordID, "1000", "Assets", "asset", "USD", true)
+	if err != nil {
+		t.Fatalf("first UpsertBySourceRecord: %v", err)
+	}
+	if id1 == "" {
+		t.Fatal("expected a non-empty id")
+	}
+
+	// Same sourceRecordID, renamed code — the exact shape a real Account
+	// rename produces.
+	id2, err := repo.UpsertBySourceRecord(ctx, sourceRecordID, "1100", "Assets", "asset", "USD", true)
+	if err != nil {
+		t.Fatalf("second UpsertBySourceRecord (renamed code): %v", err)
+	}
+	if id2 != id1 {
+		t.Fatalf("expected the rename to update the SAME row (id %q), got a different row (id %q)", id1, id2)
+	}
+
+	// The old code must no longer resolve to anything.
+	if _, _, err := repo.IDByCode(ctx, "1000"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected old code 1000 to no longer resolve after rename, got: %v", err)
+	}
+	gotID, isActive, err := repo.IDByCode(ctx, "1100")
+	if err != nil {
+		t.Fatalf("expected new code 1100 to resolve: %v", err)
+	}
+	if gotID != id1 || !isActive {
+		t.Fatalf("expected new code to resolve to the same row (id=%q active=true), got id=%q active=%v", id1, gotID, isActive)
+	}
+
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM gl_accounts WHERE source_record_id = $1`, sourceRecordID).
+		Scan(&count); err != nil {
+		t.Fatalf("count rows for source_record_id: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 row for this source_record_id, got %d", count)
+	}
+}
+
+// TestGLAccountRepo_UpsertBySourceRecord_DoesNotCollideWithUpsertByCode
+// confirms the two upsert paths coexist as designed: UpsertByCode
+// (unrelated ledger-posting tests, no Account record to link to) keeps
+// working unchanged alongside UpsertBySourceRecord (the real
+// finance.Account sync paths) — different rows, both reachable by code.
+func TestGLAccountRepo_UpsertBySourceRecord_DoesNotCollideWithUpsertByCode(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewGLAccountRepo(db)
+
+	codeOnlyID, err := repo.UpsertByCode(ctx, "2000", "Liabilities", "liability", "USD", true)
+	if err != nil {
+		t.Fatalf("UpsertByCode: %v", err)
+	}
+
+	linkedID, err := repo.UpsertBySourceRecord(ctx, "22222222-2222-2222-2222-222222222222", "3000", "Equity", "equity", "USD", true)
+	if err != nil {
+		t.Fatalf("UpsertBySourceRecord: %v", err)
+	}
+	if linkedID == codeOnlyID {
+		t.Fatalf("expected two distinct rows, got the same id %q for both", linkedID)
+	}
+
+	var sourceRecordID sql.NullString
+	if err := db.QueryRowContext(ctx, `SELECT source_record_id FROM gl_accounts WHERE id = $1`, codeOnlyID).
+		Scan(&sourceRecordID); err != nil {
+		t.Fatalf("read back UpsertByCode row's source_record_id: %v", err)
+	}
+	if sourceRecordID.Valid {
+		t.Fatalf("expected UpsertByCode's row to have no source_record_id, got %q", sourceRecordID.String)
+	}
+}
+
+// TestGLAccountRepo_UpsertBySourceRecord_CodeHeldByUnrelatedRow_FailsLoud
+// covers uc-infra#205 review finding 4: ON CONFLICT (source_record_id)
+// only arbitrates a collision on that column — it does nothing to stop
+// the UPDATE it performs from itself violating the pre-existing
+// UNIQUE(code) constraint against a DIFFERENT, unrelated row (the shape
+// a pre-uc-infra#205 orphaned row, or any other row already sitting on
+// that code, produces). This must fail loud with ErrGLAccountCodeConflict
+// rather than silently reassigning the unrelated row's identity.
+func TestGLAccountRepo_UpsertBySourceRecord_CodeHeldByUnrelatedRow_FailsLoud(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewGLAccountRepo(db)
+
+	// An unrelated, unlinked row already sitting on code "1100" — e.g.
+	// a pre-fix orphan, or a row seeded via UpsertByCode.
+	unrelatedID, err := repo.UpsertByCode(ctx, "1100", "Old Orphan", "asset", "USD", true)
+	if err != nil {
+		t.Fatalf("seed unrelated row: %v", err)
+	}
+
+	linkedID, err := repo.UpsertBySourceRecord(ctx, "33333333-3333-3333-3333-333333333333", "1000", "Assets", "asset", "USD", true)
+	if err != nil {
+		t.Fatalf("create linked row: %v", err)
+	}
+
+	// Renaming the linked row onto the code the unrelated row already
+	// holds must fail, not silently succeed.
+	if _, err := repo.UpsertBySourceRecord(ctx, "33333333-3333-3333-3333-333333333333", "1100", "Assets", "asset", "USD", true); !errors.Is(err, ErrGLAccountCodeConflict) {
+		t.Fatalf("expected ErrGLAccountCodeConflict, got: %v", err)
+	}
+
+	// Neither row was touched by the failed attempt.
+	var linkedCode, unrelatedCode string
+	if err := db.QueryRowContext(ctx, `SELECT code FROM gl_accounts WHERE id = $1`, linkedID).Scan(&linkedCode); err != nil {
+		t.Fatalf("read back linked row: %v", err)
+	}
+	if linkedCode != "1000" {
+		t.Fatalf("expected the failed attempt to leave the linked row's code unchanged at 1000, got %q", linkedCode)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT code FROM gl_accounts WHERE id = $1`, unrelatedID).Scan(&unrelatedCode); err != nil {
+		t.Fatalf("read back unrelated row: %v", err)
+	}
+	if unrelatedCode != "1100" {
+		t.Fatalf("expected the unrelated row's code to be untouched at 1100, got %q", unrelatedCode)
+	}
+}
+
 func TestGLAccountRepo_IDByCode_NotFound(t *testing.T) {
 	db := freshTenantDB(t)
 	ctx := context.Background()
