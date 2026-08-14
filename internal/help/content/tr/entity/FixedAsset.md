@@ -37,13 +37,24 @@ amortismanının hangi hesaplara işleneceğini girin.
 
 Kıymet formundaki **Amortisman Planı** bölümü, kıymetin dönemlerini
 listeler — her biri amortismana tabi tutulacak tutar ve sonucunda ortaya
-çıkan defter değeriyle birlikte, ayda bir satır. **Bu bölüm kendiliğinden
-dolmaz**: plan satırları, herhangi bir kompozisyon alt kaydı ekler gibi
-eklenen ve düzenlenen, diğer her kayıt gibi kayıtlardır ve kıymet
-Hizmette olduğunda bir amortisman işleme çalışmasının okuyup işlediği
-şey — kıymetin maliyeti ve kullanım ömrü tek başına değil — bu bölümdeki
-satırlardır. Bir satır yanlışsa, tüm planı yeniden girmek yerine
-doğrudan burada düzeltin.
+çıkan defter değeriyle birlikte, ayda bir satır. Kıymeti kaydetmek bu
+bölümü otomatik olarak oluşturur: Maliyet, Hurda Değeri, Kullanım Ömrü,
+Amortisman Yöntemi, Edinme Tarihi ve Para Birimi ayarlanır ayarlanmaz,
+kıymetin kullanım ömrünün her dönemi sizin için tek seferde, doğrusal
+olarak oluşturulur — satırları elle eklemezsiniz. Bu alanlardan
+herhangi birini daha sonra düzenlemek, henüz hiçbir şey işlenmemiş
+olduğu sürece, tüm planı buna uyacak şekilde yeniden oluşturur; planı
+değiştirmeyen bir düzenleme (örneğin Konum'u değiştirmek) ona hiç
+dokunmaz. Kıymet Hizmette olduğunda bir amortisman işleme çalışmasının
+okuyup işlediği şey — kıymetin maliyeti ve kullanım ömrü tek başına
+değil — bu bölümdeki satırlardır.
+
+**Herhangi bir satır işlendiğinde**, plan kilitlenir: artık Maliyet,
+Hurda Değeri, Kullanım Ömrü, Amortisman Yöntemi, Edinme Tarihi veya Para
+Birimi'ni değiştiremezsiniz (kayıt reddedilir) — işlenmiş satırlar
+gerçek, zaten kaydedilmiş defter kayıtlarıdır ve onları üreten şeyi
+değiştirmek o geçmişi sessizce geçersiz kılar. Kıymet üzerindeki diğer
+her alan (Konum, Ad, muhasebe hesapları) hâlâ serbestçe düzenlenebilir.
 
 ## Bilinmesi gereken kurallar
 

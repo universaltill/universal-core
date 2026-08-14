@@ -12,12 +12,13 @@ afterward.
 
 ## When to use it
 
-Add or correct schedule rows on the **Fixed Asset** form's Depreciation
-Schedule section when you register an asset or need to fix a period
-that's wrong. A straight-line schedule spreads an asset's depreciable
-amount (cost minus salvage value) evenly across its useful life in
-months, with each row's book value equal to the previous row's book
-value minus that row's depreciation amount, ending at the salvage
+You won't normally add these rows by hand — saving a **Fixed Asset**
+generates its whole schedule automatically (see that entity's own help
+topic). Come here to review it, or to correct a period that's wrong
+before it's posted. A straight-line schedule spreads an asset's
+depreciable amount (cost minus salvage value) evenly across its useful
+life in months, with each row's book value equal to the previous row's
+book value minus that row's depreciation amount, ending at the salvage
 value.
 
 ## Rules to know

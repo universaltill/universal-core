@@ -222,6 +222,138 @@ func TestRecordRepo_ListTx_SeesUncommittedWritesInSameTx(t *testing.T) {
 	}
 }
 
+// TestRecordRepo_ListByFieldForUpdateTx_BlocksConcurrentUpdate confirms
+// ListByFieldForUpdateTx's whole reason to exist: a real Postgres row
+// lock, not just correct data. Without FOR UPDATE, a caller deciding
+// "is it safe to delete this row?" based on a plain read can race a
+// concurrent writer — this is the exact interleaving
+// assets.GenerateDepreciationScheduleOnWrite's posted-row guard must not
+// allow against internal/worker.Runner's depreciation-posting tick.
+func TestRecordRepo_ListByFieldForUpdateTx_BlocksConcurrentUpdate(t *testing.T) {
+	tdb := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(tdb)
+
+	rec, err := repo.Create(ctx, "Widget", map[string]any{"name": "a", "group": "x"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	txA, err := tdb.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin txA: %v", err)
+	}
+	defer txA.Rollback() //nolint:errcheck
+
+	if _, err := repo.ListByFieldForUpdateTx(ctx, txA, "Widget", "group", "x"); err != nil {
+		t.Fatalf("ListByFieldForUpdateTx: %v", err)
+	}
+
+	// A concurrent transaction trying to update the SAME row must block
+	// until txA ends — proven by racing a "did it complete yet?" check
+	// against an explicit release of txA's lock, not by timing alone.
+	updated := make(chan error, 1)
+	go func() {
+		txB, err := tdb.BeginTx(ctx, nil)
+		if err != nil {
+			updated <- fmt.Errorf("begin txB: %w", err)
+			return
+		}
+		defer txB.Rollback() //nolint:errcheck
+		_, err = repo.UpdateTx(ctx, txB, "Widget", rec.ID, map[string]any{"name": "b", "group": "x"}, nil)
+		updated <- err
+	}()
+
+	select {
+	case err := <-updated:
+		t.Fatalf("expected txB's update to block behind txA's FOR UPDATE lock, but it completed (err=%v)", err)
+	case <-time.After(300 * time.Millisecond):
+		// Still blocked, as expected — release the lock and confirm txB
+		// then proceeds.
+	}
+
+	if err := txA.Rollback(); err != nil {
+		t.Fatalf("rollback txA: %v", err)
+	}
+
+	select {
+	case err := <-updated:
+		if err != nil {
+			t.Fatalf("txB's update failed after txA released the lock: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("txB's update never completed after txA released the lock")
+	}
+}
+
+// TestRecordRepo_ListByFieldTx_ParticipatesInCallerTransaction mirrors
+// TestRecordRepo_ListTx_ParticipatesInCallerTransaction for the
+// field-filtered variant — same reasoning, same fixture shape.
+func TestRecordRepo_ListByFieldTx_ParticipatesInCallerTransaction(t *testing.T) {
+	tdb := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(tdb)
+
+	if _, err := repo.Create(ctx, "Widget", map[string]any{"name": "a", "group": "x"}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := repo.Create(ctx, "Widget", map[string]any{"name": "b", "group": "y"}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	tx, err := tdb.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	got, err := repo.ListByFieldTx(ctx, tx, "Widget", "group", "x")
+	if err != nil {
+		t.Fatalf("ListByFieldTx: %v", err)
+	}
+	if len(got) != 1 || got[0].Data["name"] != "a" {
+		t.Fatalf("expected exactly the 1 Widget in group x, got %+v", got)
+	}
+}
+
+// TestRecordRepo_ListByFieldTx_SeesUncommittedWritesInSameTx mirrors
+// TestRecordRepo_ListTx_SeesUncommittedWritesInSameTx — the property
+// assets.GenerateDepreciationScheduleOnWrite's Update path actually
+// depends on: it must see any DepreciationSchedule rows already written
+// earlier in the SAME FixedAsset write's transaction, not just rows
+// already committed before this transaction began.
+func TestRecordRepo_ListByFieldTx_SeesUncommittedWritesInSameTx(t *testing.T) {
+	tdb := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(tdb)
+
+	tx, err := tdb.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	if _, err := repo.CreateTx(ctx, tx, "Widget", map[string]any{"name": "uncommitted", "group": "x"}); err != nil {
+		t.Fatalf("CreateTx: %v", err)
+	}
+
+	got, err := repo.ListByFieldTx(ctx, tx, "Widget", "group", "x")
+	if err != nil {
+		t.Fatalf("ListByFieldTx: %v", err)
+	}
+	if len(got) != 1 || got[0].Data["name"] != "uncommitted" {
+		t.Fatalf("expected ListByFieldTx to see the uncommitted write within the same tx, got %+v", got)
+	}
+
+	outside, err := repo.ListByField(ctx, "Widget", "group", "x")
+	if err != nil {
+		t.Fatalf("ListByField: %v", err)
+	}
+	if len(outside) != 0 {
+		t.Fatalf("expected the uncommitted write to be invisible outside the tx, got %+v", outside)
+	}
+}
+
 // ListPageFiltered/CountFiltered: sorting, substring filtering, and — the
 // property that matters most for a JSONB query built from user input — no
 // injection through the field name.

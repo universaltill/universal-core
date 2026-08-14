@@ -37,13 +37,27 @@ its depreciation should post to.
 
 The **Depreciation Schedule** section on the asset form lists the
 asset's periods — one row per month, each with the amount to depreciate
-and the resulting book value. **This section does not fill itself in
-automatically**: schedule rows are records like any other, added and
-edited the same way you'd add any composition child, and it's this
-section's rows — not the asset's cost and useful life alone — that a
-depreciation posting run reads and posts from once the asset is In
-Service. If a row is wrong, correct it directly here rather than
-re-entering the whole schedule.
+and the resulting book value. Saving the asset generates this section
+automatically: as soon as Cost, Salvage Value, Useful Life, Depreciation
+Method, Acquisition Date and Currency are set, every period of the
+asset's useful life is created for you, straight-line, all at once —
+you don't add rows by hand. Editing any of those fields later
+regenerates the whole schedule to match, as long as nothing has posted
+yet; an edit that leaves the schedule unchanged (changing Location, say)
+never touches it. It's these rows — not the asset's cost and useful life
+alone — that a depreciation posting run reads and posts from once the
+asset is In Service.
+
+**Once any row has posted**, the schedule is locked: you can no longer
+change Cost, Salvage Value, Useful Life, Depreciation Method,
+Acquisition Date or Currency (the save is rejected) — posted rows are
+real, already-recorded ledger entries, and changing what produced them
+would silently invalidate that history. An edit that doesn't touch the
+schedule (Location, Name, the posting accounts) normally goes through
+fine; if a save is unexpectedly rejected after posting has started even
+though you only touched one of those, a stored schedule that no longer
+matches what the asset's current terms compute is the most likely
+cause — for instance, an earlier manual correction to a schedule row.
 
 ## Rules to know
 
