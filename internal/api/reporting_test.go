@@ -467,6 +467,134 @@ func TestAPI_PurchasingReport_InsufficientHistoryStates(t *testing.T) {
 	}
 }
 
+// TestAPI_PurchasingReport_ReorderSignalHonorsHiddenSafetyStock is
+// uc-infra#229's own regression test. That issue was a secondhand flag
+// from #222's independent reviewer, raised by analogy ("same shape as
+// #222's ProjectBudgetLine.category leak") but never itself reproduced
+// against real Postgres — this test is that reproduction attempt.
+//
+// safety_stock itself does NOT reproduce as a value-in-output leak:
+// unlike #222's ProjectBudgetActuals (a raw-SQL data.ReportingRepo
+// aggregate with no FieldPermission awareness at all), buildReorderSignals
+// reads ReorderRule through ts.crud — authz.GuardedEngine, which redacts
+// every hidden field out of a row's Data before this handler ever sees it
+// (see GuardedEngine.List/redact). And reorderRowView (this file) has no
+// SafetyStock field to begin with — the number is used only internally, to
+// decide whether a rule fires, and is never rendered as text on any signal
+// row. That is narrower than it might sound: this report's On Hand/
+// Position columns a few lines below (qty_on_hand/qty_available_to_promise,
+// read via the SAME ts.reporting.* raw-SQL path #222 fixed for a different
+// entity) do NOT get this protection — confirmed, independently, as a real
+// leak and filed separately as uc-infra#230. This test's "not a leak"
+// finding is specific to safety_stock; it says nothing about the rest of
+// this report's columns.
+//
+// What this test pins instead is the real, adjacent behavior a hidden
+// safety_stock actually gets: because GuardedEngine.redact deletes the
+// key outright, rule.Data["safety_stock"] misses its type assertion and
+// falls back to the same 0 this file's own doc comment already
+// documents for a genuinely-never-set safety_stock ("missing = 0, per
+// the design") — a redacted actor and a "no safety stock configured"
+// tenant are indistinguishable to this function. That is a real,
+// separate, lower-severity question from a value leak (does a
+// FieldPermission-restricted buyer sometimes silently NOT see a
+// signal an unrestricted buyer sees, because their view of safety_stock
+// collapsed to 0?) — filed as its own follow-up, uc-infra#231, rather
+// than folded into this card: unlike #222's fix, resolving it means
+// picking a business behavior (show the signal anyway? show it with a
+// "some criteria hidden" note? something else?), not just widening an
+// existing redaction predicate.
+func TestAPI_PurchasingReport_ReorderSignalHonorsHiddenSafetyStock(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := purchasing.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("purchasing.Publish: %v", err)
+	}
+	records := data.NewRecordRepo(db)
+
+	mustCreate := func(entityType string, fields map[string]any) string {
+		t.Helper()
+		rec, err := records.Create(ctx, entityType, fields)
+		if err != nil {
+			t.Fatalf("create %s: %v", entityType, err)
+		}
+		return rec.ID
+	}
+
+	// qty_available_to_promise 2 (not 0) deliberately keeps both items off
+	// the stockout-risk table below (internal/data/reporting.go's
+	// StockoutRiskItems filters WHERE atp <= 0) — same fixture-coupling
+	// TestAPI_PurchasingReport_ReorderSignalsDegradeWhenItemDefinitionUnavailable
+	// documents above. Only the reorder-signal path is under test here.
+	itemSS := mustCreate("Item", map[string]any{"sku": "SKU-SS", "name": "Safety Stock Widget", "item_type": "stock"})
+	mustCreate("InventoryItem", map[string]any{"item_id": itemSS, "qty_on_hand": 2, "qty_available_to_promise": 2})
+	// position (2) > reorder_point (1) alone -> only fires if safety_stock
+	// (5) is actually counted: 2 <= 1+5. Chosen deliberately so the two
+	// actors below can only differ on whether THIS rule fires, not on any
+	// rendered number a hidden field might otherwise leak.
+	mustCreate("ReorderRule", map[string]any{
+		"item_id": itemSS, "reorder_point": 1, "safety_stock": 5, "target_lead_time_confidence": "p90",
+	})
+
+	// A second item whose rule fires on reorder_point ALONE (safety_stock
+	// 0, real and redacted alike) — the severity-bearing half uc-infra#231's
+	// own review flagged as missing: a restricted buyer must still see
+	// every signal that doesn't depend on the hidden field, with the real
+	// OnHand/Position/ReorderPoint numbers on that row (reorder_point
+	// itself is never subject to this actor's FieldPermission at all,
+	// unlike safety_stock).
+	itemRP := mustCreate("Item", map[string]any{"sku": "SKU-RP", "name": "Reorder Point Widget", "item_type": "stock"})
+	mustCreate("InventoryItem", map[string]any{"item_id": itemRP, "qty_on_hand": 3, "qty_available_to_promise": 3})
+	mustCreate("ReorderRule", map[string]any{
+		"item_id": itemRP, "reorder_point": 10, "safety_stock": 0, "target_lead_time_confidence": "p90",
+	})
+
+	seedFieldRule(t, db, "restricted-buyer", "user-restricted", "ReorderRule", "safety_stock")
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	// Unrestricted actor: real safety_stock counted, both signals fire.
+	recOpen := getAs(t, mux, "/reports/purchasing", tenantID, "farshid")
+	if recOpen.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recOpen.Code, recOpen.Body.String())
+	}
+	if !strings.Contains(recOpen.Body.String(), "Safety Stock Widget") {
+		t.Errorf("expected the signal to fire for an actor who can see safety_stock (position 2 <= reorder_point 1 + safety_stock 5):\n%s", recOpen.Body.String())
+	}
+	if !strings.Contains(recOpen.Body.String(), "Reorder Point Widget") {
+		t.Errorf("expected the reorder_point-only signal to fire regardless:\n%s", recOpen.Body.String())
+	}
+
+	// Restricted actor: safety_stock is redacted out of ReorderRule.Data
+	// before buildReorderSignals ever reads it, so it falls back to the
+	// same 0 a genuinely-unset safety_stock would use -> 2 <= 1+0 is
+	// false, the Safety Stock Widget signal does not fire. This is the
+	// current, intentional-looking (if debatable — see uc-infra#231)
+	// behavior. It is NOT a value leak: safety_stock has no rendered
+	// column on this report (reorderRowView, above) for the real number 5
+	// to appear in, for either actor.
+	recRestricted := getAs(t, mux, "/reports/purchasing", tenantID, "user-restricted")
+	if recRestricted.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recRestricted.Code, recRestricted.Body.String())
+	}
+	restrictedBody := recRestricted.Body.String()
+	if strings.Contains(restrictedBody, "Safety Stock Widget") {
+		t.Errorf("actor with safety_stock hidden must not see a signal that only fires by counting the real safety_stock value:\n%s", restrictedBody)
+	}
+	// The reorder_point-only signal is NOT affected by safety_stock being
+	// hidden: it must still fire, with its real OnHand/Position/
+	// ReorderPoint numbers, exactly as for the unrestricted actor above —
+	// a hidden safety_stock must not blank signals that never depended on
+	// it (uc-infra#231's own review, finding 3d).
+	wantRPSignal := "<tr><td><a href=\"/forms/Item/" + itemRP + "\">Reorder Point Widget</a></td><td>3</td><td>0</td><td>3</td><td>10</td>"
+	if !strings.Contains(restrictedBody, wantRPSignal) {
+		t.Errorf("expected the reorder_point-only signal row %q to survive safety_stock being hidden:\n%s", wantRPSignal, restrictedBody)
+	}
+}
+
 // TestAPI_PurchasingReport_OnTimeDeliverySection (#11) exercises the
 // on-time-delivery table end to end: a vendor with enough promised-date
 // samples to show a real rate, a vendor with only one (insufficient),
