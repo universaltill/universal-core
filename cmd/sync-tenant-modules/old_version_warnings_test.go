@@ -398,3 +398,195 @@ func TestNewlyAddedUniqueSets_AlreadyDeclaredSetIsSkipped(t *testing.T) {
 		t.Errorf("expected the newly-added set %q, got %q (%v)", want, got, sets[0])
 	}
 }
+
+// --- ConditionalUnique / UniqueWhen (uc-infra#201, ADR-0028) ---
+// Mirrors the oldUniqueNameLookup/newlyAddedUniqueSets tests above,
+// one-for-one, for their oldConditionalUniqueNameLookup/
+// newlyAddedConditionalUniqueSets counterparts.
+
+func TestOldConditionalUniqueNameLookup_NewToRegistryStaysSilent(t *testing.T) {
+	entityDefs := data.NewEntityDefinitionRepo(closedDB(t))
+	lookup := oldConditionalUniqueNameLookup(context.Background(), entityDefs, "Demo Organization")
+
+	logged := captureLog(t, func() {
+		if names := lookup(change{entityType: "Voucher", from: 0, to: 1}); names != nil {
+			t.Errorf("expected nil for a brand-new-to-the-registry change, got %v", names)
+		}
+	})
+	if logged != "" {
+		t.Errorf("from == 0 is not an error and must not warn, got log output: %q", logged)
+	}
+}
+
+func TestOldConditionalUniqueNameLookup_GetVersionErrorIsSurfaced(t *testing.T) {
+	entityDefs := data.NewEntityDefinitionRepo(closedDB(t))
+	lookup := oldConditionalUniqueNameLookup(context.Background(), entityDefs, "Demo Organization")
+
+	var names map[string]bool
+	logged := captureLog(t, func() {
+		names = lookup(change{entityType: "Voucher", from: 5, to: 6})
+	})
+
+	if names != nil {
+		t.Errorf("expected a nil result on a GetVersion error, got %v", names)
+	}
+	for _, want := range []string{
+		"WARNING", "Demo Organization", "Voucher v5",
+		"could not re-read the previous published version",
+		"conditional unique constraint",
+		"database is closed",
+	} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("expected the WARNING to mention %q, got: %q", want, logged)
+		}
+	}
+}
+
+func TestOldConditionalUniqueNameLookup_UnmarshalErrorIsSurfaced(t *testing.T) {
+	_, control, router := controlPlane(t)
+	const name = "Demo Organization"
+	_, tenantDB := newTenant(t, control, router, name)
+	entityDefs := data.NewEntityDefinitionRepo(tenantDB)
+	ctx := context.Background()
+
+	bad := []byte(`{"entity_type":"Voucher","version":5,"fields":"not-an-array"}`)
+	if _, err := entityDefs.CreateDraft(ctx, "Voucher", 5, bad, setupActor); err != nil {
+		t.Fatalf("CreateDraft: %v", err)
+	}
+
+	lookup := oldConditionalUniqueNameLookup(ctx, entityDefs, name)
+	var names map[string]bool
+	logged := captureLog(t, func() {
+		names = lookup(change{entityType: "Voucher", from: 5, to: 6})
+	})
+
+	if names != nil {
+		t.Errorf("expected a nil result on an unmarshal error, got %v", names)
+	}
+	for _, want := range []string{
+		"WARNING", name, "Voucher v5",
+		"could not be decoded",
+		"conditional unique constraint",
+	} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("expected the WARNING to mention %q, got: %q", want, logged)
+		}
+	}
+}
+
+func TestOldConditionalUniqueNameLookup_RepeatedFailureForSameEntityTypeWarnsOnce(t *testing.T) {
+	entityDefs := data.NewEntityDefinitionRepo(closedDB(t))
+	lookup := oldConditionalUniqueNameLookup(context.Background(), entityDefs, "Demo Organization")
+	c := change{entityType: "Voucher", from: 5, to: 6}
+
+	logged := captureLog(t, func() {
+		lookup(c)
+		lookup(c)
+	})
+
+	if n := strings.Count(logged, "WARNING"); n != 1 {
+		t.Errorf("expected exactly one WARNING for two failing calls against the same entity type, got %d in: %q", n, logged)
+	}
+}
+
+func TestOldConditionalUniqueNameLookup_DifferentEntityTypesEachWarnOnce(t *testing.T) {
+	entityDefs := data.NewEntityDefinitionRepo(closedDB(t))
+	lookup := oldConditionalUniqueNameLookup(context.Background(), entityDefs, "Demo Organization")
+
+	logged := captureLog(t, func() {
+		lookup(change{entityType: "Voucher", from: 5, to: 6})
+		lookup(change{entityType: "Voucher", from: 5, to: 6}) // repeat: must not add a second WARNING
+		lookup(change{entityType: "Invoice", from: 2, to: 3}) // different type: must warn independently
+	})
+
+	if n := strings.Count(logged, "WARNING"); n != 2 {
+		t.Errorf("expected one WARNING per distinct entity type (2 total), got %d in: %q", n, logged)
+	}
+	for _, want := range []string{"Voucher", "Invoice"} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("expected a WARNING naming %q, got: %q", want, logged)
+		}
+	}
+}
+
+func TestOldConditionalUniqueNameLookup_SuccessResolvesNamesAndStaysSilent(t *testing.T) {
+	_, control, router := controlPlane(t)
+	const name = "Demo Organization"
+	_, tenantDB := newTenant(t, control, router, name)
+	entityDefs := data.NewEntityDefinitionRepo(tenantDB)
+	ctx := context.Background()
+
+	good := []byte(`{"entity_type":"Voucher","version":5,"unique_when":[{"fields":["role_type"],"when_field":"role_type","when_value":"own_organization"}]}`)
+	if _, err := entityDefs.CreateDraft(ctx, "Voucher", 5, good, setupActor); err != nil {
+		t.Fatalf("CreateDraft: %v", err)
+	}
+
+	lookup := oldConditionalUniqueNameLookup(ctx, entityDefs, name)
+	var names map[string]bool
+	logged := captureLog(t, func() {
+		names = lookup(change{entityType: "Voucher", from: 5, to: 6})
+	})
+
+	if logged != "" {
+		t.Errorf("a successful lookup must stay silent, got log output: %q", logged)
+	}
+	want := entity.ConditionalUniqueConstraintName(entity.ConditionalUnique{
+		Fields: []string{"role_type"}, WhenField: "role_type", WhenValue: "own_organization",
+	})
+	if !names[want] {
+		t.Errorf("expected the old version's declared conditional unique set %q to resolve, got %v", want, names)
+	}
+}
+
+// TestNewlyAddedConditionalUniqueSets_LookupFailureFailsOpen confirms the
+// promise newlyAddedConditionalUniqueSets' own doc comment makes: when
+// oldNamesFor can't resolve the old version, every declared UniqueWhen
+// entry on the new Definition is still treated as newly-added.
+func TestNewlyAddedConditionalUniqueSets_LookupFailureFailsOpen(t *testing.T) {
+	newDef := &entity.Definition{
+		EntityType: "Voucher",
+		UniqueWhen: []entity.ConditionalUnique{
+			{Fields: []string{"role_type"}, WhenField: "role_type", WhenValue: "own_organization"},
+			{Fields: []string{"is_base"}, WhenField: "is_base", WhenValue: "true"},
+		},
+	}
+	c := change{entityType: "Voucher", from: 5, to: 6}
+	failingLookup := func(change) map[string]bool { return nil }
+
+	sets := newlyAddedConditionalUniqueSets(c, newDef, failingLookup)
+
+	if len(sets) != 2 {
+		t.Fatalf("expected both declared conditional sets to be treated as new when the old version can't be resolved, got %v", sets)
+	}
+}
+
+// TestNewlyAddedConditionalUniqueSets_AlreadyDeclaredSetIsSkipped is
+// TestNewlyAddedConditionalUniqueSets_LookupFailureFailsOpen's other
+// half: a conditional set already present on the old version must be
+// excluded, not re-reported.
+func TestNewlyAddedConditionalUniqueSets_AlreadyDeclaredSetIsSkipped(t *testing.T) {
+	newDef := &entity.Definition{
+		EntityType: "Voucher",
+		UniqueWhen: []entity.ConditionalUnique{
+			{Fields: []string{"role_type"}, WhenField: "role_type", WhenValue: "own_organization"}, // already declared
+			{Fields: []string{"is_base"}, WhenField: "is_base", WhenValue: "true"},                 // genuinely new
+		},
+	}
+	c := change{entityType: "Voucher", from: 5, to: 6}
+	oldNames := map[string]bool{
+		entity.ConditionalUniqueConstraintName(entity.ConditionalUnique{
+			Fields: []string{"role_type"}, WhenField: "role_type", WhenValue: "own_organization",
+		}): true,
+	}
+	successfulLookup := func(change) map[string]bool { return oldNames }
+
+	sets := newlyAddedConditionalUniqueSets(c, newDef, successfulLookup)
+
+	if len(sets) != 1 {
+		t.Fatalf("expected exactly the one NOT-already-declared conditional set, got %v", sets)
+	}
+	want := entity.ConditionalUniqueConstraintName(entity.ConditionalUnique{Fields: []string{"is_base"}, WhenField: "is_base", WhenValue: "true"})
+	if got := entity.ConditionalUniqueConstraintName(sets[0]); got != want {
+		t.Errorf("expected the newly-added conditional set %q, got %q (%v)", want, got, sets[0])
+	}
+}

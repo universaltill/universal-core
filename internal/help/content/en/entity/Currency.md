@@ -31,11 +31,12 @@ or reports in. Most tenants set this up once, early on.
 - Code and name are required. The minor unit must be between 0 and 6.
 - Code must be unique — the system rejects a second Currency that reuses a
   code already in use by another one.
-- Exactly one Currency should be marked **Base Currency**. The system does
-  not hard-block a second one, so treat this as an administrative
-  convention — features that rely on the base currency (like ledger sync
-  and statutory export) fall back safely rather than guessing if it is ever
-  ambiguous.
+- Exactly one Currency can be marked **Base Currency** — the system rejects
+  a second attempt to mark one outright. Features that rely on the base
+  currency (like ledger sync and statutory export) still fall back safely
+  rather than guessing in the rare case of older data from before this rule
+  applied. To change which Currency is the base, first clear the flag on
+  the current one and save, then set it on the new one.
 - A Currency record does not carry exchange rates itself — those are
   separate, dated **Exchange Rate** records, since rates change daily while
   a currency's own code and name do not.

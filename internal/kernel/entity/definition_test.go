@@ -636,6 +636,129 @@ func TestDefinitionValidate(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			name: "valid conditional unique constraint (uc-infra#201)",
+			def: Definition{
+				EntityType: "PartyRole",
+				Fields: []Field{
+					{Name: "role_type", Type: FieldEnum, EnumValues: []string{"customer", "vendor", "own_organization"}},
+				},
+				UniqueWhen: []ConditionalUnique{
+					{Fields: []string{"role_type"}, WhenField: "role_type", WhenValue: "own_organization"},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "conditional unique constraint with an empty field set",
+			def: Definition{
+				EntityType: "PartyRole",
+				Fields: []Field{
+					{Name: "role_type", Type: FieldEnum, EnumValues: []string{"own_organization"}},
+				},
+				UniqueWhen: []ConditionalUnique{
+					{Fields: nil, WhenField: "role_type", WhenValue: "own_organization"},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "conditional unique constraint referencing an unknown field",
+			def: Definition{
+				EntityType: "PartyRole",
+				Fields: []Field{
+					{Name: "role_type", Type: FieldEnum, EnumValues: []string{"own_organization"}},
+				},
+				UniqueWhen: []ConditionalUnique{
+					{Fields: []string{"no_such_field"}, WhenField: "role_type", WhenValue: "own_organization"},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "conditional unique constraint repeats a field within one set",
+			def: Definition{
+				EntityType: "PartyRole",
+				Fields: []Field{
+					{Name: "role_type", Type: FieldEnum, EnumValues: []string{"own_organization"}},
+				},
+				UniqueWhen: []ConditionalUnique{
+					{Fields: []string{"role_type", "role_type"}, WhenField: "role_type", WhenValue: "own_organization"},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "conditional unique constraint with no when_field",
+			def: Definition{
+				EntityType: "PartyRole",
+				Fields: []Field{
+					{Name: "role_type", Type: FieldEnum, EnumValues: []string{"own_organization"}},
+				},
+				UniqueWhen: []ConditionalUnique{
+					{Fields: []string{"role_type"}, WhenField: "", WhenValue: "own_organization"},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "conditional unique constraint referencing an unknown when_field",
+			def: Definition{
+				EntityType: "PartyRole",
+				Fields: []Field{
+					{Name: "role_type", Type: FieldEnum, EnumValues: []string{"own_organization"}},
+				},
+				UniqueWhen: []ConditionalUnique{
+					{Fields: []string{"role_type"}, WhenField: "no_such_field", WhenValue: "own_organization"},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "conditional unique constraint with no when_value",
+			def: Definition{
+				EntityType: "PartyRole",
+				Fields: []Field{
+					{Name: "role_type", Type: FieldEnum, EnumValues: []string{"own_organization"}},
+				},
+				UniqueWhen: []ConditionalUnique{
+					{Fields: []string{"role_type"}, WhenField: "role_type", WhenValue: ""},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			// Same Fields/WhenField but different WhenValue are two
+			// DIFFERENT constraints (e.g. two enum values each getting
+			// their own conditional-uniqueness rule would be legitimate,
+			// even though this repo has no such case yet) — only an exact
+			// (Fields, WhenField, WhenValue) repeat is a duplicate.
+			name: "conditional unique constraint declared twice with the same condition is a duplicate",
+			def: Definition{
+				EntityType: "PartyRole",
+				Fields: []Field{
+					{Name: "role_type", Type: FieldEnum, EnumValues: []string{"own_organization"}},
+				},
+				UniqueWhen: []ConditionalUnique{
+					{Fields: []string{"role_type"}, WhenField: "role_type", WhenValue: "own_organization"},
+					{Fields: []string{"role_type"}, WhenField: "role_type", WhenValue: "own_organization"},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "conditional unique constraint on a bool field (Currency.is_base shape)",
+			def: Definition{
+				EntityType: "Currency",
+				Fields: []Field{
+					{Name: "is_base", Type: FieldBool},
+				},
+				UniqueWhen: []ConditionalUnique{
+					{Fields: []string{"is_base"}, WhenField: "is_base", WhenValue: "true"},
+				},
+			},
+			wantErr: false,
+		},
+		{
 			name: "valid max_length on a string field",
 			def: Definition{
 				EntityType: "IssueReport",
@@ -806,5 +929,58 @@ func TestUniqueConstraintName(t *testing.T) {
 	_ = UniqueConstraintName(original)
 	if original[0] != "entry_date" || original[1] != "employee_id" {
 		t.Fatalf("UniqueConstraintName mutated its input slice: %v", original)
+	}
+}
+
+// TestConditionalUniqueConstraintName covers uc-infra#201/ADR-0028's
+// namespacing: same Fields canonicalization as UniqueConstraintName, plus
+// the condition appended so a UniqueWhen constraint can never collide
+// with an ordinary Unique constraint (or a differently-conditioned
+// UniqueWhen constraint) declaring the same Fields.
+func TestConditionalUniqueConstraintName(t *testing.T) {
+	cases := []struct {
+		name string
+		cu   ConditionalUnique
+		want string
+	}{
+		{
+			name: "role_type own_organization",
+			cu:   ConditionalUnique{Fields: []string{"role_type"}, WhenField: "role_type", WhenValue: "own_organization"},
+			want: "role_type?role_type=own_organization",
+		},
+		{
+			name: "is_base true",
+			cu:   ConditionalUnique{Fields: []string{"is_base"}, WhenField: "is_base", WhenValue: "true"},
+			want: "is_base?is_base=true",
+		},
+		{
+			name: "reverse-order Fields canonicalizes the same",
+			cu:   ConditionalUnique{Fields: []string{"b", "a"}, WhenField: "status", WhenValue: "active"},
+			want: "a+b?status=active",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ConditionalUniqueConstraintName(tc.cu); got != tc.want {
+				t.Fatalf("ConditionalUniqueConstraintName(%+v) = %q, want %q", tc.cu, got, tc.want)
+			}
+		})
+	}
+
+	// Never collides with an ordinary UniqueConstraintName on the same
+	// Fields — the whole reason for the "?"-condition suffix.
+	fields := []string{"role_type"}
+	plain := UniqueConstraintName(fields)
+	conditional := ConditionalUniqueConstraintName(ConditionalUnique{Fields: fields, WhenField: "role_type", WhenValue: "own_organization"})
+	if plain == conditional {
+		t.Fatalf("UniqueConstraintName and ConditionalUniqueConstraintName collided on the same Fields: %q", plain)
+	}
+
+	// Two different conditions on the same Fields must never collide
+	// with each other either.
+	a := ConditionalUniqueConstraintName(ConditionalUnique{Fields: fields, WhenField: "role_type", WhenValue: "own_organization"})
+	b := ConditionalUniqueConstraintName(ConditionalUnique{Fields: fields, WhenField: "role_type", WhenValue: "vendor"})
+	if a == b {
+		t.Fatalf("two different conditions on the same Fields collided: %q", a)
 	}
 }

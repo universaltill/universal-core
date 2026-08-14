@@ -394,3 +394,81 @@ func TestUniqueConstraintWarnings_ZeroCountStaysSilent(t *testing.T) {
 		t.Errorf("zero violations (no error) must stay silent, got log output: %q", logged)
 	}
 }
+
+func TestConditionalUniqueConstraintWarnings_CountErrorIsSurfacedNotSwallowed(t *testing.T) {
+	// Two declared UniqueWhen entries, not one — same "the loop must keep
+	// going past a transient error" reasoning as
+	// TestUniqueConstraintWarnings_CountErrorIsSurfacedNotSwallowed.
+	def := &entity.Definition{
+		EntityType: "Voucher",
+		UniqueWhen: []entity.ConditionalUnique{
+			{Fields: []string{"role_type"}, WhenField: "role_type", WhenValue: "own_organization"},
+			{Fields: []string{"is_base"}, WhenField: "is_base", WhenValue: "true"},
+		},
+	}
+	defFor := func(entityType string) (*entity.Definition, bool) {
+		if entityType != "Voucher" {
+			return nil, false
+		}
+		return def, true
+	}
+	changes := []change{{entityType: "Voucher", from: 0, to: 1}}
+	entityDefs := data.NewEntityDefinitionRepo(closedDB(t))
+
+	ctx := context.Background()
+	var out []string
+	logged := captureLog(t, func() {
+		out = conditionalUniqueConstraintWarnings(ctx, closedDB(t), "Demo Organization", changes, defFor, oldConditionalUniqueNameLookup(ctx, entityDefs, "Demo Organization"))
+	})
+
+	if len(out) != 0 {
+		t.Errorf("conditionalUniqueConstraintWarnings on a count error must not report a fabricated violation count, got %v", out)
+	}
+	for _, cu := range def.UniqueWhen {
+		name := entity.ConditionalUniqueConstraintName(cu)
+		want := `could not check existing records against the new conditional unique constraint "` + name + `"`
+		if !strings.Contains(logged, want) {
+			t.Errorf("expected the WARNING for %q to contain %q, got: %q", name, want, logged)
+		}
+	}
+	for _, want := range []string{"WARNING", "Demo Organization"} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("expected the operator-facing WARNING to mention %q, got: %q", want, logged)
+		}
+	}
+	if !strings.Contains(logged, "database is closed") {
+		t.Errorf("expected the WARNING to carry the underlying error, got: %q", logged)
+	}
+}
+
+func TestConditionalUniqueConstraintWarnings_ZeroCountStaysSilent(t *testing.T) {
+	_, control, router := controlPlane(t)
+	const name = "Demo Organization"
+	_, tenantDB := newTenant(t, control, router, name)
+	entityDefs := data.NewEntityDefinitionRepo(tenantDB)
+
+	def := &entity.Definition{
+		EntityType: "Voucher",
+		UniqueWhen: []entity.ConditionalUnique{
+			{Fields: []string{"role_type"}, WhenField: "role_type", WhenValue: "own_organization"},
+		},
+	}
+	defFor := func(entityType string) (*entity.Definition, bool) {
+		if entityType != "Voucher" {
+			return nil, false
+		}
+		return def, true
+	}
+	changes := []change{{entityType: "Voucher", from: 0, to: 1}}
+	ctx := context.Background()
+
+	logged := captureLog(t, func() {
+		out := conditionalUniqueConstraintWarnings(ctx, tenantDB, name, changes, defFor, oldConditionalUniqueNameLookup(ctx, entityDefs, name))
+		if len(out) != 0 {
+			t.Errorf("expected no warnings against an empty table, got %v", out)
+		}
+	})
+	if logged != "" {
+		t.Errorf("zero violations (no error) must stay silent, got log output: %q", logged)
+	}
+}

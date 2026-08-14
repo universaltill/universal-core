@@ -57,36 +57,40 @@ func Party() *entity.Definition {
 // internal/api/saftexport.go's saftCompanyProfile to populate
 // internal/kernel/saft.Input's RegistrationNumber/TaxRegistrationNumber/
 // ContactFirstName/ContactLastName instead of the spec's "NA" markers.
-// Exactly one Party is expected to hold it per tenant, but that is still
-// an application-level convention, not a DB constraint the generic
-// entity/crud layer can express — unlike AIProviderConnection
-// (uc-infra#180), which fixed its own equivalent gap: that one is an
-// UNCONDITIONAL singleton (every row should be unique), which the
-// ordinary Unique mechanism can enforce via a marker field. This one
-// needs uniqueness CONDITIONAL on role_type=="own_organization"
-// specifically (a plain Unique on role_type would wrongly cap every
-// role_type — vendor, customer, ... — at one row each), which the
-// mechanism as it exists cannot express at all; nor is there any
-// uniqueness mechanism today to stop the same Party holding the role
-// twice. Tracked as uc-infra#201 (split from #180) — a declarative
-// conditional-Unique kernel capability, Architect's call when picked up;
-// foundation.Currency.is_base has the identical shape (that Definition's
-// own doc comment cross-references this one) and would migrate onto the
-// same mechanism. Until then, a caller finding zero, or rows naming more
-// than one DISTINCT Party, degrades to treating it as absent rather than
-// guessing, the same fail-safe posture SystemOfRecord's own doc comment
-// already argues for. Additive
-// enum value, no data migration: rows written against v2 still hold
-// legal values.
+// Exactly one Party is expected to hold it per tenant — unlike
+// AIProviderConnection (uc-infra#180), an UNCONDITIONAL singleton the
+// ordinary Unique mechanism enforces via a marker field, this needs
+// uniqueness CONDITIONAL on role_type=="own_organization" specifically
+// (a plain Unique on role_type would wrongly cap every role_type —
+// vendor, customer, ... — at one row each).
+//
+// v4 (uc-infra#201, ADR-0028) closes that gap: UniqueWhen declares
+// exactly that condition, enforced by crud.Write/UpdateUniqueConstraintKeys
+// against record_unique_keys the same way Unique is — a second
+// own_organization PartyRole (create OR a role_type edit that produces
+// one) now fails with *crud.UniqueConstraintError instead of silently
+// saving. foundation.Currency.is_base has the identical shape (that
+// Definition's own doc comment cross-references this one) and migrates
+// onto the same mechanism in the same change. A caller finding zero, or
+// (for records predating this version, before cmd/sync-tenant-modules'
+// backfill runs) rows naming more than one DISTINCT Party, still
+// degrades to treating it as absent rather than guessing — defense in
+// depth for pre-existing data, not the primary guarantee anymore, the
+// same fail-safe posture SystemOfRecord's own doc comment argues for.
+// Additive enum value/constraint, no data migration: rows written
+// against v2/v3 still hold legal values.
 func PartyRole() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "PartyRole",
-		Version:    3,
+		Version:    4,
 		Module:     "foundation",
 		Fields: []entity.Field{
 			{Name: "party_id", Type: entity.FieldReference, Required: true, Target: "Party"},
 			{Name: "role_type", Type: entity.FieldEnum, Required: true,
 				EnumValues: []string{"customer", "vendor", "employee", "contact", "prospect", "own_organization"}},
+		},
+		UniqueWhen: []entity.ConditionalUnique{
+			{Fields: []string{"role_type"}, WhenField: "role_type", WhenValue: "own_organization"},
 		},
 	}
 }
@@ -269,23 +273,14 @@ func UomConversion() *entity.Definition {
 // finance.SyncGLAccounts and the SAF-T export use in place of a
 // per-account/per-ledger currency. Exactly one Currency row is expected
 // to hold is_base=true per tenant (ADR-0003: the database is the tenant,
-// so "per tenant" here just means "per database") — an application-level
-// convention, STILL not a DB constraint the generic entity/crud layer can
-// express: Unique enforces "at most one row per VALUE," and is_base=true
-// is a value many rows could each legitimately claim without a mechanism
-// that scopes uniqueness to only the records where a field holds one
-// specific value — the same shape PartyRole.own_organization's
-// uniqueness-conditional-on-role_type needs (see PartyRole's own doc
-// comment) and split off from AIProviderConnection's simpler true-
-// singleton case (which reused the ordinary Unique mechanism via a
-// marker field, uc-infra#180) precisely because it doesn't fit that
-// mechanism either. A caller finding zero, or more than one, DISTINCT
-// Currency with is_base=true degrades to the hardcoded fallback rather
-// than guessing which one is correct — fail-safe, the same posture
-// PartyRole's still-open gap has to lean on until a conditional-Unique
-// mechanism exists (tracked as uc-infra#201). Additive field, no data
-// migration: rows written against v3 still hold legal values (is_base
-// defaults false).
+// so "per tenant" here just means "per database") — the same
+// uniqueness-conditional-on-a-field's-value shape PartyRole.
+// own_organization needs (see PartyRole's own doc comment) and split off
+// from AIProviderConnection's simpler true-singleton case (which reused
+// the ordinary Unique mechanism via a marker field, uc-infra#180)
+// precisely because it doesn't fit that mechanism either. Additive
+// field, no data migration: rows written against v3 still hold legal
+// values (is_base defaults false).
 //
 // v5 (uc-infra#181) closes a DIFFERENT gap on this same Definition: code
 // (the ISO 4217 natural key, e.g. "QAR", "USD") was, until now, unique
@@ -298,6 +293,17 @@ func UomConversion() *entity.Definition {
 // works. Not the same gap as is_base above: code's uniqueness doesn't
 // depend on any OTHER field's value, so it fits the ordinary Unique
 // mechanism directly, no conditional-Unique capability needed.
+//
+// v6 (uc-infra#201, ADR-0028) closes v4's is_base gap: UniqueWhen
+// declares "unique when is_base==true," enforced by
+// crud.Write/UpdateUniqueConstraintKeys against record_unique_keys the
+// same way Unique/code is — a second is_base=true row (create OR an
+// is_base edit that produces one) now fails with
+// *crud.UniqueConstraintError instead of silently saving.
+// finance.ResolveBaseCurrency's degrade-to-fallback-on-zero-or-multiple
+// behavior stays, unchanged, as defense in depth for records that
+// predate this version (before cmd/sync-tenant-modules' backfill runs) —
+// not the primary guarantee anymore.
 func Currency() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "Currency",
@@ -311,7 +317,9 @@ func Currency() *entity.Definition {
 		// Version 4 (uc-infra#120): added is_base, see doc comment above.
 		// Version 5 (uc-infra#181): code gained a Unique declaration, see
 		// doc comment above.
-		Version: 5,
+		// Version 6 (uc-infra#201): is_base gained a UniqueWhen
+		// declaration, see doc comment above.
+		Version: 6,
 		Module:  "foundation",
 		Fields: []entity.Field{
 			{Name: "code", Type: entity.FieldString, Required: true}, // ISO 4217, e.g. "QAR", "USD"
@@ -320,6 +328,9 @@ func Currency() *entity.Definition {
 			{Name: "is_base", Type: entity.FieldBool, Default: false},
 		},
 		Unique: [][]string{{"code"}},
+		UniqueWhen: []entity.ConditionalUnique{
+			{Fields: []string{"is_base"}, WhenField: "is_base", WhenValue: "true"},
+		},
 	}
 }
 

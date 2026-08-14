@@ -1035,11 +1035,20 @@ func TestUBLExport_NoOwnOrganizationLeavesTenantTaxIDEmpty(t *testing.T) {
 // (not just inherited from the shared function's own SAF-T coverage),
 // since UBL's degrade is a silently-omitted element rather than SAF-T's
 // visible NA marker (independent review finding, uc-infra#119).
+//
+// As of uc-infra#201/ADR-0028 (PartyRole v4), a second own_organization
+// PartyRole can no longer be produced through the ordinary crud.Engine
+// path — foundation.PartyRole.UniqueWhen rejects it (see
+// TestSAFTExport_SecondOwnOrganizationRoleRejectedByEngine for the
+// regression test proving that). The second role here is written
+// straight via data.NewRecordRepo, bypassing crud.Engine, simulating
+// legacy data that predates the constraint.
 func TestUBLExport_AmbiguousOwnOrganizationLeavesTenantTaxIDEmpty(t *testing.T) {
 	f := setupUBLTenant(t)
 	ctx := context.Background()
 	engine := crud.NewEngine(f.db)
 	defs := entityDefLookup(t, f.db)
+	records := data.NewRecordRepo(f.db)
 	actor := humanActor()
 
 	for i, taxID := range []string{"AMBIG-TAX-1", "AMBIG-TAX-2"} {
@@ -1049,10 +1058,18 @@ func TestUBLExport_AmbiguousOwnOrganizationLeavesTenantTaxIDEmpty(t *testing.T) 
 		if err != nil {
 			t.Fatalf("create own-organization Party %d: %v", i, err)
 		}
-		if _, err := engine.Create(ctx, defs("PartyRole"), map[string]any{
+		if i == 0 {
+			if _, err := engine.Create(ctx, defs("PartyRole"), map[string]any{
+				"party_id": org.ID, "role_type": "own_organization",
+			}, actor); err != nil {
+				t.Fatalf("create own_organization PartyRole %d: %v", i, err)
+			}
+			continue
+		}
+		if _, err := records.Create(ctx, "PartyRole", map[string]any{
 			"party_id": org.ID, "role_type": "own_organization",
-		}, actor); err != nil {
-			t.Fatalf("create own_organization PartyRole %d: %v", i, err)
+		}); err != nil {
+			t.Fatalf("create pre-existing own_organization PartyRole %d: %v", i, err)
 		}
 	}
 
