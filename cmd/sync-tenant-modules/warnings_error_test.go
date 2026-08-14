@@ -480,17 +480,30 @@ func TestConditionalUniqueConstraintWarnings_ZeroCountStaysSilent(t *testing.T) 
 // type whose Definition version actually moved again (newlyAddedUniqueSets,
 // via diffVersions) — there is no operator-facing path to force a retry
 // against an unchanged version, so the wording promised a mechanism that
-// doesn't exist. backfillNewConditionalUniqueConstraints already avoids
+// doesn't exist. backfillNewConditionalUniqueConstraints already avoided
 // this overclaim (uc-infra#201's own review pass caught it there); this
-// brings the pre-existing Unique path's wording in line. Uses the same
-// closedDB+captureLog fault-injection this file's other tests use: a
-// closed *sql.DB makes records.ListPage fail deterministically, no live
-// Postgres needed to reach the error branch.
+// brings the pre-existing Unique path's wording in line.
+//
+// Two declared Unique sets, not one — same "the loop must keep going past
+// a transient error" reasoning as this file's other CountError tests
+// (independent review of this exact change caught that a single-set
+// fixture can't distinguish a correct `continue` from a regression to
+// `return`, which would silently abort every remaining backfill in this
+// tenant's sync on the first transient error).
+//
+// Uses the same closedDB+captureLog fault-injection this file's other
+// tests use: a closed *sql.DB makes records.ListPage fail deterministically,
+// no live Postgres needed to reach the error branch. Passes the real
+// oldUniqueNameLookup (over the same closed DB, never actually called
+// here since c.from == 0) rather than a stub, matching every sibling
+// test in this file — c.from == 0 means newlyAddedUniqueSets treats both
+// sets as newly-added without consulting it at all.
 func TestBackfillNewUniqueConstraints_ErrorDoesNotOverclaimARetryPath(t *testing.T) {
 	def := &entity.Definition{
 		EntityType: "Voucher",
 		Unique: [][]string{
 			{"code"},
+			{"batch_id", "sequence"},
 		},
 	}
 	defFor := func(entityType string) (*entity.Definition, bool) {
@@ -499,21 +512,72 @@ func TestBackfillNewUniqueConstraints_ErrorDoesNotOverclaimARetryPath(t *testing
 		}
 		return def, true
 	}
-	// from: 0 (new-to-registry) so newlyAddedUniqueSets treats "code" as
-	// newly-added without needing oldNamesFor to resolve anything real.
 	changes := []change{{entityType: "Voucher", from: 0, to: 1}}
-	oldNamesFor := func(change) map[string]bool { return nil }
+	ctx := context.Background()
+	entityDefs := data.NewEntityDefinitionRepo(closedDB(t))
 
 	logged := captureLog(t, func() {
-		backfillNewUniqueConstraints(context.Background(), closedDB(t), "Demo Organization", changes, defFor, oldNamesFor)
+		backfillNewUniqueConstraints(ctx, closedDB(t), "Demo Organization", changes, defFor, oldUniqueNameLookup(ctx, entityDefs, "Demo Organization"))
 	})
 
 	if strings.Contains(logged, "until this is retried") {
 		t.Errorf("WARNING must not promise a retry path that doesn't exist, got: %q", logged)
 	}
-	want := `could not backfill unique constraint "code", existing records are unprotected: `
-	if !strings.Contains(logged, want) {
-		t.Errorf("expected %q, got: %q", want, logged)
+	for _, name := range []string{
+		entity.UniqueConstraintName([]string{"code"}),
+		entity.UniqueConstraintName([]string{"batch_id", "sequence"}),
+	} {
+		want := `could not backfill unique constraint "` + name + `", existing records are unprotected: `
+		if !strings.Contains(logged, want) {
+			t.Errorf("expected the WARNING for %q to contain %q, got: %q", name, want, logged)
+		}
+	}
+	for _, want := range []string{"WARNING", "Demo Organization", "database is closed"} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("expected the WARNING to mention %q, got: %q", want, logged)
+		}
+	}
+}
+
+// TestBackfillNewConditionalUniqueConstraints_ErrorDoesNotOverclaimARetryPath
+// is TestBackfillNewUniqueConstraints_ErrorDoesNotOverclaimARetryPath's
+// UniqueWhen counterpart — the same bug class was copy-paste-identical
+// between these two functions (this file's own commentary on the fix
+// above), yet only the Unique side had a regression test guarding the
+// wording. Independent review of this change flagged that as leaving the
+// overclaim reintroducible on the conditional side with a fully green
+// suite. Closes that gap.
+func TestBackfillNewConditionalUniqueConstraints_ErrorDoesNotOverclaimARetryPath(t *testing.T) {
+	def := &entity.Definition{
+		EntityType: "Voucher",
+		UniqueWhen: []entity.ConditionalUnique{
+			{Fields: []string{"role_type"}, WhenField: "role_type", WhenValue: "own_organization"},
+			{Fields: []string{"is_base"}, WhenField: "is_base", WhenValue: "true"},
+		},
+	}
+	defFor := func(entityType string) (*entity.Definition, bool) {
+		if entityType != "Voucher" {
+			return nil, false
+		}
+		return def, true
+	}
+	changes := []change{{entityType: "Voucher", from: 0, to: 1}}
+	ctx := context.Background()
+	entityDefs := data.NewEntityDefinitionRepo(closedDB(t))
+
+	logged := captureLog(t, func() {
+		backfillNewConditionalUniqueConstraints(ctx, closedDB(t), "Demo Organization", changes, defFor, oldConditionalUniqueNameLookup(ctx, entityDefs, "Demo Organization"))
+	})
+
+	if strings.Contains(logged, "until this is retried") {
+		t.Errorf("WARNING must not promise a retry path that doesn't exist, got: %q", logged)
+	}
+	for _, cu := range def.UniqueWhen {
+		name := entity.ConditionalUniqueConstraintName(cu)
+		want := `could not backfill conditional unique constraint "` + name + `", existing records are unprotected: `
+		if !strings.Contains(logged, want) {
+			t.Errorf("expected the WARNING for %q to contain %q, got: %q", name, want, logged)
+		}
 	}
 	for _, want := range []string{"WARNING", "Demo Organization", "database is closed"} {
 		if !strings.Contains(logged, want) {

@@ -1060,20 +1060,17 @@ func newlyAddedUniqueSets(c change, newDef *entity.Definition, oldNamesFor func(
 // any Definition's Unique sets — no entity-specific knowledge needed,
 // the same "generic, no entity knowledge required" bar publishing itself
 // already clears. Colliding records are left unbacked (oldest wins,
-// crud.BackfillUniqueConstraintKeys' own doc comment) and are exactly
-// what uniqueConstraintWarnings above already reports — the two never
-// disagree about which records need attention.
-//
-// The error WARNING below deliberately does not say "until this is
-// retried" (uc-infra#228, fixing the wording independent review of
-// uc-infra#201 found copied verbatim into backfillNewConditionalUnique
-// Constraints without noticing the overclaim): a re-run of this command
-// only re-attempts a backfill for an entity type whose Definition
-// version actually moved again (newlyAddedUniqueSets, via diffVersions)
-// — there is no operator-facing path today to force a retry against an
-// unchanged version, so promising one would be inaccurate. Matches
-// backfillNewConditionalUniqueConstraints' own wording below for the
-// identical gap.
+// crud.BackfillUniqueConstraintKeys' own doc comment) and are USUALLY
+// exactly what uniqueConstraintWarnings above already reports — but NOT
+// when a re-backfill re-attempts an entity type that's already fully
+// backed (the fail-open re-check path below, or a future retry
+// mechanism re-running against an unchanged version): record_unique_keys
+// has no per-record uniqueness carve-out (its UNIQUE constraint is
+// entity_type+constraint_name+key_value, no record_id — see
+// 0006_record_unique_keys.sql), so an already-keyed record's own
+// re-insert collides with ITSELF and is misreported as "skipped" /
+// "unprotected" even though it already is protected. Known gap, tracked
+// (not fixed here) as uc-infra#237.
 func backfillNewUniqueConstraints(
 	ctx context.Context,
 	tenantDB *sql.DB,
@@ -1093,6 +1090,17 @@ func backfillNewUniqueConstraints(
 			name := entity.UniqueConstraintName(set)
 			backfilled, skipped, err := crud.BackfillUniqueConstraintKeys(ctx, tenantDB, records, keys, c.entityType, set)
 			if err != nil {
+				// "until this is retried" would overclaim: a re-run of
+				// this command only re-attempts a backfill for an entity
+				// type whose Definition version actually moved again
+				// (newlyAddedUniqueSets, via diffVersions) — there is
+				// currently no operator-facing path to force a retry
+				// against an unchanged version.
+				// backfillNewConditionalUniqueConstraints below already
+				// had the correct wording (this line is where the
+				// overclaim originated and was copied FROM, per
+				// independent review of uc-infra#201) — fixed here too,
+				// uc-infra#228.
 				log.Printf("WARNING: %s: %s — could not backfill unique constraint %q, existing records are unprotected: %v",
 					tenantName, c.entityType, name, err)
 				continue
