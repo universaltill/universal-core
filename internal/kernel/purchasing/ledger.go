@@ -366,12 +366,35 @@ func creditInventoryOnReceipt(ctx context.Context, tx *sql.Tx, records *data.Rec
 		if found {
 			existingOnHand, _ := numberFieldValue(existing.Data["qty_on_hand"])
 			existingATP, _ := numberFieldValue(existing.Data["qty_available_to_promise"])
-			fields := map[string]any{
+			// overrides is what THIS credit actually changes — kept
+			// separate from the merged write map below so the audit
+			// entry records only the real diff, matching this file's own
+			// mergedRecordData convention (clearVendorInvoiceMatchException/
+			// MatchVendorInvoiceOnUpdate above) rather than every field on
+			// the row appearing "changed" on every receipt.
+			overrides := map[string]any{
 				"item_id":                  itemID,
 				"facility_id":              facilityID,
 				"qty_on_hand":              existingOnHand + qty,
 				"qty_available_to_promise": existingATP + qty,
 			}
+			// mergedRecordData, not overrides alone (uc-infra#226):
+			// data.RecordRepo.UpdateTx is a full replacement (`SET data =
+			// $1`), so writing just these four keys silently erased every
+			// other field on the row — latent before uc-infra#218 made a
+			// tenant-added defaulted field reachable via the create
+			// branch in the first place, live the moment a second
+			// receipt for the same (item, facility) took this branch.
+			fields := mergedRecordData(existing.Data, overrides)
+			// Validates the FULL merged row, not just overrides — a
+			// stored value on some other field that already violates the
+			// tenant's current published def (e.g. a Min/MaxLength/enum
+			// tightened since this row was written) now fails this
+			// receipt loudly instead of silently carrying the stale
+			// value forward. Deliberate (this kernel fails loud over
+			// silent elsewhere in this file — see unitPriceMinor above),
+			// but worth knowing: it can block a goods receipt over a
+			// data-quality problem on a field this credit never touches.
 			if err := entity.ValidateRecord(def, fields); err != nil {
 				return fmt.Errorf("build InventoryItem credit for GoodsReceiptLine %s: %w", goodsReceiptLineID, err)
 			}
@@ -388,6 +411,24 @@ func creditInventoryOnReceipt(ctx context.Context, tx *sql.Tx, records *data.Rec
 			if err := crud.UpdateUniqueConstraintKeys(ctx, tx, keys, def, existing.ID, fields); err != nil {
 				var uce *crud.UniqueConstraintError
 				if errors.As(err, &uce) {
+					if uce.ConstraintName != requiredUnique {
+						// A DIFFERENT Unique set the tenant added to
+						// InventoryItem (not the (item_id, facility_id)
+						// this function's own upsert/retry design depends
+						// on) rejected this write — e.g. two live rows
+						// already share a tenant-added unique field's
+						// value. Passing the full merged `fields` above
+						// (rather than the old bare 4-key map) is what
+						// makes this newly reachable: a tenant-added
+						// Unique set's key field is now genuinely present
+						// with its real value instead of always absent.
+						// Not the duplicate-(item,facility)-rows case
+						// below, and a sync-tenant-modules backfill
+						// against THAT constraint wouldn't fix this one —
+						// name the constraint that actually conflicted
+						// instead of misattributing it.
+						return fmt.Errorf("credit InventoryItem for GoodsReceiptLine %s: tenant-added Unique constraint %q rejected this InventoryItem update: %w", goodsReceiptLineID, uce.ConstraintName, err)
+					}
 					// GetByFieldsQ picked `existing` as the oldest live
 					// row for this (item, facility), but ANOTHER live
 					// row already holds this pair's record_unique_keys
@@ -406,7 +447,7 @@ func creditInventoryOnReceipt(ctx context.Context, tx *sql.Tx, records *data.Rec
 				}
 				return fmt.Errorf("reconcile InventoryItem %s unique keys: %w", existing.ID, err)
 			}
-			auditEntry, err := audit.New("InventoryItem", existing.ID, audit.ActionUpdate, actor, fields)
+			auditEntry, err := audit.New("InventoryItem", existing.ID, audit.ActionUpdate, actor, overrides)
 			if err != nil {
 				return fmt.Errorf("build audit entry for InventoryItem %s: %w", existing.ID, err)
 			}

@@ -863,6 +863,107 @@ func TestPostGoodsReceiptLineToLedger_SecondReceiptUpsertsInventoryItem(t *testi
 	}
 }
 
+// TestPostGoodsReceiptLineToLedger_SecondReceiptPreservesUntouchedFields is
+// the regression test for uc-infra#226 (split from uc-infra#218's
+// independent review): creditInventoryOnReceipt's update-existing branch
+// used to build a brand-new 4-key fields map
+// (item_id/facility_id/qty_on_hand/qty_available_to_promise) and hand it
+// straight to data.RecordRepo.UpdateTx, which is a full replacement
+// (`SET data = $1`) — so any field on the stored InventoryItem row
+// outside those four was silently erased on every second-and-later
+// receipt for the same (item, facility). This is deliberately NOT about
+// entity.ApplyDefaults/Field.Default (uc-infra#218/#227 cover that): it
+// sets the extra field via a plain generic Update, the same way any
+// other writer of InventoryItem (a form edit, an import) would, to prove
+// the update branch preserves a field it never itself touches, not just
+// one a Default happens to supply.
+func TestPostGoodsReceiptLineToLedger_SecondReceiptPreservesUntouchedFields(t *testing.T) {
+	fx := setUpGoodsReceiptFixture(t, 12.50)
+	fx.engine.SetHook("GoodsReceiptLine", PostGoodsReceiptLineToLedger)
+	ctx := context.Background()
+	actor := humanActor()
+
+	compiledIn := InventoryItem()
+	withLotNote := *compiledIn
+	withLotNote.Version = compiledIn.Version + 1
+	withLotNote.Fields = append(append([]entity.Field{}, compiledIn.Fields...),
+		entity.Field{Name: "lot_note", Type: entity.FieldString},
+	)
+	raw, err := json.Marshal(&withLotNote)
+	if err != nil {
+		t.Fatalf("marshal InventoryItem with lot_note: %v", err)
+	}
+	repo := data.NewEntityDefinitionRepo(fx.tenantDB)
+	if _, err := repo.CreateDraft(ctx, withLotNote.EntityType, withLotNote.Version, raw, actor); err != nil {
+		t.Fatalf("CreateDraft: %v", err)
+	}
+	if err := repo.Approve(ctx, withLotNote.EntityType, withLotNote.Version, actor); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	if err := repo.Publish(ctx, withLotNote.EntityType, withLotNote.Version, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	gr, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceipt"), map[string]any{
+		"purchase_order_id": fx.poID, "received_date": "2026-01-10", "facility_id": fx.facilityID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create GoodsReceipt: %v", err)
+	}
+
+	if _, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"), map[string]any{
+		"goods_receipt_id": gr.ID, "po_line_id": fx.poLineID,
+		"item_id": fx.itemID, "qty_received": float64(4),
+	}, actor); err != nil {
+		t.Fatalf("create first GoodsReceiptLine: %v", err)
+	}
+
+	// Simulate a tenant-added field getting a real value on the row via
+	// some OTHER write path — a plain generic Update, the same shape a
+	// form edit or import would produce — deliberately not this credit
+	// hook itself, which never sets lot_note.
+	invDef := defFor(t, fx.tenantDB, "InventoryItem")
+	invRecs, err := fx.engine.List(ctx, invDef)
+	if err != nil {
+		t.Fatalf("list InventoryItem: %v", err)
+	}
+	if len(invRecs) != 1 {
+		t.Fatalf("expected exactly 1 InventoryItem row after the first receipt, got %d", len(invRecs))
+	}
+	inv := invRecs[0]
+	version := inv.Version
+	if _, err := fx.engine.Update(ctx, invDef, inv.ID, map[string]any{
+		"item_id": inv.Data["item_id"], "facility_id": inv.Data["facility_id"],
+		"qty_on_hand": inv.Data["qty_on_hand"], "qty_available_to_promise": inv.Data["qty_available_to_promise"],
+		"lot_note": "batch 42",
+	}, &version, actor); err != nil {
+		t.Fatalf("set lot_note on InventoryItem: %v", err)
+	}
+
+	// Second receipt for the SAME (item, facility) — takes the update
+	// branch this issue is about.
+	if _, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"), map[string]any{
+		"goods_receipt_id": gr.ID, "po_line_id": fx.poLineID,
+		"item_id": fx.itemID, "qty_received": float64(6),
+	}, actor); err != nil {
+		t.Fatalf("create second GoodsReceiptLine: %v", err)
+	}
+
+	after, err := fx.engine.Get(ctx, invDef, inv.ID)
+	if err != nil {
+		t.Fatalf("re-read InventoryItem: %v", err)
+	}
+	if got, _ := after.Data["lot_note"].(string); got != "batch 42" {
+		t.Fatalf(`InventoryItem.lot_note = %q after a second receipt for the same (item, facility), want "batch 42" — a field the credit path itself doesn't touch must survive the update, not be erased by a full-replacement write`, got)
+	}
+	if got, _ := after.Data["qty_on_hand"].(float64); got != 10 {
+		t.Errorf("InventoryItem.qty_on_hand = %v, want 10 (4 + 6, upserted)", got)
+	}
+	if got, _ := after.Data["qty_available_to_promise"].(float64); got != 10 {
+		t.Errorf("InventoryItem.qty_available_to_promise = %v, want 10 (4 + 6, upserted)", got)
+	}
+}
+
 // TestPostGoodsReceiptLineToLedger_ThirdFacilityReceiptCreatesNewRow
 // confirms the upsert is scoped to (item_id, facility_id), not item_id
 // alone — a receipt at a DIFFERENT facility for the same item must still
@@ -1061,6 +1162,241 @@ func TestPostGoodsReceiptLineToLedger_DuplicateLegacyRows_ReturnsDiagnosableErro
 	}
 	if len(lines) != 0 {
 		t.Fatalf("expected the GoodsReceiptLine create to roll back entirely alongside the failed credit, got %d lines", len(lines))
+	}
+}
+
+// TestPostGoodsReceiptLineToLedger_TenantUniqueConstraintConflict_NamesTheRightConstraint
+// is the regression test for uc-infra#226's independent review finding 3:
+// creditInventoryOnReceipt's update branch now merges the FULL stored row
+// (uc-infra#226's own fix) before calling crud.UpdateUniqueConstraintKeys,
+// which makes a tenant-added Unique set (beyond the (item_id, facility_id)
+// this function's own upsert/retry design depends on) genuinely evaluated
+// for the first time — previously the bare 4-key map made any such
+// constraint permanently "inapplicable," so it could never conflict (and,
+// as an unwanted side effect, silently DROPPED the updated row's own key
+// for it every time — the erasure bug's unique-key twin). A real conflict
+// on that OTHER constraint must be reported as itself, not misattributed
+// to the (item_id, facility_id) duplicate-legacy-rows case the sibling
+// branch below handles.
+func TestPostGoodsReceiptLineToLedger_TenantUniqueConstraintConflict_NamesTheRightConstraint(t *testing.T) {
+	fx := setUpGoodsReceiptFixture(t, 12.50)
+	fx.engine.SetHook("GoodsReceiptLine", PostGoodsReceiptLineToLedger)
+	ctx := context.Background()
+	actor := humanActor()
+
+	compiledIn := InventoryItem()
+	withLotCode := *compiledIn
+	withLotCode.Version = compiledIn.Version + 1
+	withLotCode.Fields = append(append([]entity.Field{}, compiledIn.Fields...),
+		entity.Field{Name: "lot_code", Type: entity.FieldString},
+	)
+	withLotCode.Unique = append(append([][]string{}, compiledIn.Unique...), []string{"lot_code"})
+	raw, err := json.Marshal(&withLotCode)
+	if err != nil {
+		t.Fatalf("marshal InventoryItem with lot_code: %v", err)
+	}
+	repo := data.NewEntityDefinitionRepo(fx.tenantDB)
+	if _, err := repo.CreateDraft(ctx, withLotCode.EntityType, withLotCode.Version, raw, actor); err != nil {
+		t.Fatalf("CreateDraft: %v", err)
+	}
+	if err := repo.Approve(ctx, withLotCode.EntityType, withLotCode.Version, actor); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	if err := repo.Publish(ctx, withLotCode.EntityType, withLotCode.Version, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	invDef := defFor(t, fx.tenantDB, "InventoryItem")
+
+	otherItem, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "Item"), map[string]any{
+		"sku": "SKU-2", "name": "Widget 2", "item_type": "stock",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create second Item: %v", err)
+	}
+	otherFacility, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "Facility"), map[string]any{
+		"code": "OTHER", "name": "Other Warehouse", "facility_type": "warehouse", "is_active": true,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create second Facility: %v", err)
+	}
+
+	// rowB: a genuinely different InventoryItem that legitimately owns
+	// lot_code "L1" — created through the engine, so it gets a real
+	// record_unique_keys row for the lot_code constraint.
+	rowB, err := fx.engine.Create(ctx, invDef, map[string]any{
+		"item_id": otherItem.ID, "facility_id": otherFacility.ID,
+		"qty_on_hand": float64(0), "qty_available_to_promise": float64(0),
+		"lot_code": "L1",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create InventoryItem rowB with lot_code L1: %v", err)
+	}
+
+	// rowA: the row the real receipt below will upsert into. Created with
+	// its own distinct lot_code first (so ITS OWN creation doesn't
+	// collide with rowB), then its stored data is rewritten directly to
+	// "L1" and its own lot_code unique-key entry is dropped — reproducing
+	// exactly the state this test's own doc comment describes: a row
+	// whose stored value already reads "L1" but whose own key for that
+	// constraint is missing, while another live row (rowB) genuinely
+	// holds it.
+	rowA, err := fx.engine.Create(ctx, invDef, map[string]any{
+		"item_id": fx.itemID, "facility_id": fx.facilityID,
+		"qty_on_hand": float64(0), "qty_available_to_promise": float64(0),
+		"lot_code": "L1-rowA-placeholder",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create InventoryItem rowA: %v", err)
+	}
+	if _, err := fx.tenantDB.ExecContext(ctx,
+		`UPDATE records SET data = jsonb_set(data, '{lot_code}', to_jsonb('L1'::text)) WHERE id = $1`,
+		rowA.ID,
+	); err != nil {
+		t.Fatalf("rewrite rowA lot_code: %v", err)
+	}
+	lotCodeConstraint := entity.UniqueConstraintName([]string{"lot_code"})
+	if err := data.NewRecordUniqueKeyRepo(fx.tenantDB).DeleteForConstraintTx(ctx, fx.tenantDB, "InventoryItem", lotCodeConstraint, rowA.ID); err != nil {
+		t.Fatalf("drop rowA's own lot_code unique key: %v", err)
+	}
+
+	gr, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceipt"), map[string]any{
+		"purchase_order_id": fx.poID, "received_date": "2026-01-10", "facility_id": fx.facilityID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create GoodsReceipt: %v", err)
+	}
+	_, err = fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"), map[string]any{
+		"goods_receipt_id": gr.ID, "po_line_id": fx.poLineID,
+		"item_id": fx.itemID, "qty_received": float64(4),
+	}, actor)
+	if err == nil {
+		t.Fatal("expected the receipt to fail: rowA's own lot_code now collides with rowB's live unique key")
+	}
+	if !strings.Contains(err.Error(), "tenant-added Unique constraint") {
+		t.Fatalf("expected the tenant-added-constraint error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), lotCodeConstraint) {
+		t.Fatalf("expected the error to name the lot_code constraint (%s), got: %v", lotCodeConstraint, err)
+	}
+	if strings.Contains(err.Error(), "duplicate live InventoryItem rows for (item_id, facility_id)") {
+		t.Fatalf("must NOT misattribute this to the (item_id, facility_id) duplicate-rows case, got: %v", err)
+	}
+
+	// Rolled back cleanly: rowB untouched, no GoodsReceiptLine landed.
+	unchangedB, err := fx.engine.Get(ctx, invDef, rowB.ID)
+	if err != nil {
+		t.Fatalf("get rowB: %v", err)
+	}
+	if got, _ := unchangedB.Data["lot_code"].(string); got != "L1" {
+		t.Errorf("rowB.lot_code = %q, want unchanged \"L1\"", got)
+	}
+	lines, err := fx.engine.List(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"))
+	if err != nil {
+		t.Fatalf("list GoodsReceiptLine: %v", err)
+	}
+	if len(lines) != 0 {
+		t.Fatalf("expected the GoodsReceiptLine create to roll back entirely alongside the failed credit, got %d lines", len(lines))
+	}
+}
+
+// TestPostGoodsReceiptLineToLedger_SecondReceiptUpdateAuditDiffIsNarrow is
+// the regression test for uc-infra#226's independent review finding 2:
+// the update branch's audit entry must record only what THIS credit
+// actually changed (item_id/facility_id/qty_on_hand/
+// qty_available_to_promise), matching every sibling merge site in this
+// file (clearVendorInvoiceMatchException, MatchVendorInvoiceOnUpdate) —
+// not the full merged row uc-infra#226's fix now writes to the record
+// itself. Passing the full row to audit.New would make every tenant-added
+// field look "changed" in audit_log on every receipt, even though the
+// credit never touches it.
+func TestPostGoodsReceiptLineToLedger_SecondReceiptUpdateAuditDiffIsNarrow(t *testing.T) {
+	fx := setUpGoodsReceiptFixture(t, 12.50)
+	fx.engine.SetHook("GoodsReceiptLine", PostGoodsReceiptLineToLedger)
+	ctx := context.Background()
+	actor := humanActor()
+
+	compiledIn := InventoryItem()
+	withLotNote := *compiledIn
+	withLotNote.Version = compiledIn.Version + 1
+	withLotNote.Fields = append(append([]entity.Field{}, compiledIn.Fields...),
+		entity.Field{Name: "lot_note", Type: entity.FieldString},
+	)
+	raw, err := json.Marshal(&withLotNote)
+	if err != nil {
+		t.Fatalf("marshal InventoryItem with lot_note: %v", err)
+	}
+	repo := data.NewEntityDefinitionRepo(fx.tenantDB)
+	if _, err := repo.CreateDraft(ctx, withLotNote.EntityType, withLotNote.Version, raw, actor); err != nil {
+		t.Fatalf("CreateDraft: %v", err)
+	}
+	if err := repo.Approve(ctx, withLotNote.EntityType, withLotNote.Version, actor); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	if err := repo.Publish(ctx, withLotNote.EntityType, withLotNote.Version, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	invDef := defFor(t, fx.tenantDB, "InventoryItem")
+
+	gr, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceipt"), map[string]any{
+		"purchase_order_id": fx.poID, "received_date": "2026-01-10", "facility_id": fx.facilityID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create GoodsReceipt: %v", err)
+	}
+	if _, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"), map[string]any{
+		"goods_receipt_id": gr.ID, "po_line_id": fx.poLineID,
+		"item_id": fx.itemID, "qty_received": float64(4),
+	}, actor); err != nil {
+		t.Fatalf("create first GoodsReceiptLine: %v", err)
+	}
+
+	invRecs, err := fx.engine.List(ctx, invDef)
+	if err != nil {
+		t.Fatalf("list InventoryItem: %v", err)
+	}
+	if len(invRecs) != 1 {
+		t.Fatalf("expected exactly 1 InventoryItem row after the first receipt, got %d", len(invRecs))
+	}
+	inv := invRecs[0]
+	version := inv.Version
+	if _, err := fx.engine.Update(ctx, invDef, inv.ID, map[string]any{
+		"item_id": inv.Data["item_id"], "facility_id": inv.Data["facility_id"],
+		"qty_on_hand": inv.Data["qty_on_hand"], "qty_available_to_promise": inv.Data["qty_available_to_promise"],
+		"lot_note": "batch 42",
+	}, &version, actor); err != nil {
+		t.Fatalf("set lot_note on InventoryItem: %v", err)
+	}
+
+	// Second receipt for the SAME (item, facility) — the update branch.
+	if _, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"), map[string]any{
+		"goods_receipt_id": gr.ID, "po_line_id": fx.poLineID,
+		"item_id": fx.itemID, "qty_received": float64(6),
+	}, actor); err != nil {
+		t.Fatalf("create second GoodsReceiptLine: %v", err)
+	}
+
+	var diffJSON []byte
+	if err := fx.tenantDB.QueryRowContext(ctx,
+		`SELECT diff FROM audit_log WHERE entity_type = 'InventoryItem' AND record_id = $1 AND action = 'update' ORDER BY created_at DESC LIMIT 1`,
+		inv.ID,
+	).Scan(&diffJSON); err != nil {
+		t.Fatalf("read InventoryItem update audit diff: %v", err)
+	}
+	var diff map[string]any
+	if err := json.Unmarshal(diffJSON, &diff); err != nil {
+		t.Fatalf("unmarshal audit diff: %v", err)
+	}
+	if _, present := diff["lot_note"]; present {
+		t.Fatalf("audit diff for the credit's own update must not include lot_note (a field this credit never touches), got: %v", diff)
+	}
+	wantKeys := []string{"item_id", "facility_id", "qty_on_hand", "qty_available_to_promise"}
+	if len(diff) != len(wantKeys) {
+		t.Fatalf("audit diff = %v, want exactly the credit's own %v", diff, wantKeys)
+	}
+	for _, k := range wantKeys {
+		if _, present := diff[k]; !present {
+			t.Errorf("audit diff missing expected key %q: %v", k, diff)
+		}
 	}
 }
 
