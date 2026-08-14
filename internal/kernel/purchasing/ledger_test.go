@@ -1481,6 +1481,144 @@ func TestPostGoodsReceiptLineToLedger_SecondReceiptUpdateAuditDiffIsNarrow(t *te
 	}
 }
 
+// TestPostGoodsReceiptLineToLedger_SecondReceiptDoesNotApplyDefaults is the
+// regression test for uc-infra#227 (split from uc-infra#218's independent
+// review, blocked on uc-infra#226 landing first): creditInventoryOnReceipt's
+// update-existing branch deliberately does NOT call entity.ApplyDefaults —
+// unlike the create branch (uc-infra#218) — because UpdateTx used to be a
+// full replacement, and defaulting an omitted field there would have
+// silently resurrected it. uc-infra#226 fixed that erasure by merging onto
+// existing.Data instead of rebuilding a bare map, but that merge is NOT a
+// substitute for ApplyDefaults: a field genuinely absent from existing.Data
+// (never written by any prior path, not merely erased) stays absent after
+// the merge too, rather than being silently backfilled to its Default.
+//
+// Before uc-infra#226, "reverted to Default" and "erased" were
+// indistinguishable (both landed as absent); now that the merge preserves
+// what IS in existing.Data, this test can finally isolate the case where a
+// field was never in existing.Data to begin with — the only case
+// entity.ApplyDefaults being wrongly reachable from this branch would
+// actually change: publish InventoryItem v5 (no condition_code) and take
+// the create branch first, so the resulting row has no condition_code key
+// at all — not "good", not "", genuinely absent, the same as
+// TestPostGoodsReceiptLineToLedger_InventoryItemCreditAppliesFieldDefaults's
+// pre-fix state. THEN publish v6 (condition_code Required, Default "good")
+// and take the update branch for the same (item, facility). If
+// ApplyDefaults were ever mistakenly added to the update branch, this
+// second receipt would silently succeed with condition_code == "good"; with
+// today's correct code it must fail loudly instead — entity.ValidateRecord
+// runs against the newly-published v6 def, condition_code is Required, and
+// nothing in the update branch's own fields map (mergedRecordData's copy of
+// existing.Data plus the credit's own 4-key overrides) supplies it.
+func TestPostGoodsReceiptLineToLedger_SecondReceiptDoesNotApplyDefaults(t *testing.T) {
+	fx := setUpGoodsReceiptFixture(t, 12.50)
+	fx.engine.SetHook("GoodsReceiptLine", PostGoodsReceiptLineToLedger)
+	ctx := context.Background()
+	actor := humanActor()
+	invDef := defFor(t, fx.tenantDB, "InventoryItem")
+
+	gr, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceipt"), map[string]any{
+		"purchase_order_id": fx.poID, "received_date": "2026-01-10", "facility_id": fx.facilityID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create GoodsReceipt: %v", err)
+	}
+
+	// First receipt — take the create branch while only v5 (no
+	// condition_code) is published, so the resulting InventoryItem row
+	// has no condition_code key whatsoever, not just an empty one.
+	if _, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"), map[string]any{
+		"goods_receipt_id": gr.ID, "po_line_id": fx.poLineID,
+		"item_id": fx.itemID, "qty_received": float64(4),
+	}, actor); err != nil {
+		t.Fatalf("create first GoodsReceiptLine: %v", err)
+	}
+	invRecs, err := fx.engine.List(ctx, invDef)
+	if err != nil {
+		t.Fatalf("list InventoryItem: %v", err)
+	}
+	if len(invRecs) != 1 {
+		t.Fatalf("expected exactly 1 InventoryItem row after the first receipt, got %d", len(invRecs))
+	}
+	inv := invRecs[0]
+	if _, present := inv.Data["condition_code"]; present {
+		t.Fatalf("expected condition_code to be entirely absent after the first receipt (v5 doesn't declare it), got: %v", inv.Data["condition_code"])
+	}
+
+	// Now publish v6, adding condition_code as Required with a Default —
+	// after this InventoryItem row already exists without it.
+	withConditionCode := &entity.Definition{
+		EntityType: "InventoryItem",
+		Version:    6,
+		Module:     "purchasing",
+		Fields: []entity.Field{
+			{Name: "item_id", Type: entity.FieldReference, Required: true, Target: "Item"},
+			{Name: "facility_id", Type: entity.FieldReference, Required: true, Target: "Facility"},
+			{Name: "qty_on_hand", Type: entity.FieldNumber, Required: true, Default: float64(0), Min: entity.Float64Ptr(0)},
+			{Name: "qty_available_to_promise", Type: entity.FieldNumber, Required: true, Default: float64(0)},
+			{Name: "condition_code", Type: entity.FieldString, Required: true, Default: "good"},
+		},
+		Unique: [][]string{{"item_id", "facility_id"}},
+	}
+	raw, err := json.Marshal(withConditionCode)
+	if err != nil {
+		t.Fatalf("marshal InventoryItem v6: %v", err)
+	}
+	repo := data.NewEntityDefinitionRepo(fx.tenantDB)
+	if _, err := repo.CreateDraft(ctx, withConditionCode.EntityType, withConditionCode.Version, raw, actor); err != nil {
+		t.Fatalf("CreateDraft: %v", err)
+	}
+	if err := repo.Approve(ctx, withConditionCode.EntityType, withConditionCode.Version, actor); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	if err := repo.Publish(ctx, withConditionCode.EntityType, withConditionCode.Version, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	// Second receipt for the SAME (item, facility) — takes the update
+	// branch. existing.Data has no condition_code, the branch's own
+	// overrides don't set it either, and (this is the point of the
+	// test) nothing calls ApplyDefaults to backfill it — so validating
+	// the merged fields against the now-published v6 def must fail.
+	_, err = fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"), map[string]any{
+		"goods_receipt_id": gr.ID, "po_line_id": fx.poLineID,
+		"item_id": fx.itemID, "qty_received": float64(6),
+	}, actor)
+	if err == nil {
+		t.Fatal("expected the second GoodsReceiptLine create to fail: condition_code is Required on the now-published v6 InventoryItem and the update branch must not silently default it")
+	}
+	var verr *entity.ValidationError
+	if !errors.As(err, &verr) {
+		t.Fatalf("expected a *entity.ValidationError, got %T: %v", err, err)
+	}
+	if verr.FieldName != "condition_code" {
+		t.Fatalf("expected the validation failure to name condition_code, got %+v", verr)
+	}
+
+	// All-or-nothing: the second receipt's own GoodsReceiptLine must not
+	// exist, and the InventoryItem row must be exactly as the first
+	// receipt left it — still no condition_code, and not bumped by the
+	// second receipt's qty (proving the update branch's own write, not
+	// just the credit's validation-time view, never landed either).
+	lineRecs, err := fx.engine.List(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"))
+	if err != nil {
+		t.Fatalf("list GoodsReceiptLine: %v", err)
+	}
+	if len(lineRecs) != 1 {
+		t.Fatalf("expected exactly 1 GoodsReceiptLine (the first, successful one) after the second's rollback, got %d", len(lineRecs))
+	}
+	after, err := fx.engine.Get(ctx, invDef, inv.ID)
+	if err != nil {
+		t.Fatalf("re-read InventoryItem: %v", err)
+	}
+	if _, present := after.Data["condition_code"]; present {
+		t.Fatalf("expected condition_code to still be entirely absent after the failed second receipt, got: %v", after.Data["condition_code"])
+	}
+	if got, _ := numberFieldValue(after.Data["qty_on_hand"]); got != 4 {
+		t.Fatalf("expected InventoryItem.qty_on_hand to still be 4 (unchanged by the rolled-back second receipt), got %v", got)
+	}
+}
+
 // TestPostGoodsReceiptLineToLedger_ZeroValueLine_PostsNothing confirms a
 // zero-price/zero-qty line (this hook's own doc comment: samples, a
 // data-entry-in-progress POLine) is a legitimate no-op, not an error —
