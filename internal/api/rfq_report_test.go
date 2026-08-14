@@ -409,7 +409,7 @@ func TestBuildRFQReportView_EdgeCasePrices(t *testing.T) {
 		{ID: "l2", ItemName: "Rebate", Qty: 1, QuotesByVendor: map[string]money.Money{"v1": -200, "v2": 300}},
 		{ID: "l3", ItemName: "Unquoted", Qty: 1, QuotesByVendor: nil},
 	}
-	view := h.buildRFQReportView(context.Background(), tenantScope{}, data.Record{Data: map[string]any{}}, lines, vendors, "en", false, false)
+	view := h.buildRFQReportView(context.Background(), tenantScope{}, data.Record{Data: map[string]any{}}, lines, vendors, "en", false, false, false, false)
 
 	if len(view.Rows) != 3 {
 		t.Fatalf("expected 3 rows, got %d", len(view.Rows))
@@ -458,7 +458,7 @@ func TestBuildRFQReportView_ItemAndVendorNameRedaction(t *testing.T) {
 		{ID: "l1", ItemName: "Widget", Qty: 1, QuotesByVendor: map[string]money.Money{"v1": 500}},
 	}
 
-	view := h.buildRFQReportView(context.Background(), tenantScope{}, data.Record{Data: map[string]any{}}, lines, vendors, "en", true, true)
+	view := h.buildRFQReportView(context.Background(), tenantScope{}, data.Record{Data: map[string]any{}}, lines, vendors, "en", true, true, false, false)
 
 	if view.Rows[0].ItemAvailable || view.Rows[0].Item != "" {
 		t.Errorf("itemNameHidden=true: row = %+v, want ItemAvailable=false and Item=\"\"", view.Rows[0])
@@ -476,12 +476,126 @@ func TestBuildRFQReportView_ItemAndVendorNameRedaction(t *testing.T) {
 	}
 
 	// Unrestricted: both real values carry through.
-	openView := h.buildRFQReportView(context.Background(), tenantScope{}, data.Record{Data: map[string]any{}}, lines, vendors, "en", false, false)
+	openView := h.buildRFQReportView(context.Background(), tenantScope{}, data.Record{Data: map[string]any{}}, lines, vendors, "en", false, false, false, false)
 	if !openView.Rows[0].ItemAvailable || openView.Rows[0].Item != "Widget" {
 		t.Errorf("itemNameHidden=false: row = %+v, want ItemAvailable=true and Item=\"Widget\"", openView.Rows[0])
 	}
 	if !openView.Vendors[0].NameAvailable || openView.Vendors[0].Name != "Vendor A" {
 		t.Errorf("vendorNameHidden=false: vendor col = %+v, want NameAvailable=true and Name=\"Vendor A\"", openView.Vendors[0])
+	}
+}
+
+// TestBuildRFQReportView_QtyAndUnitPriceRedaction (uc-infra#235) is this
+// file's own version of TestBuildRFQReportView_ItemAndVendorNameRedaction
+// for the two fields #234 deliberately left open: qtyRedacted must blank
+// only Qty/QtyAvailable, and unitPriceRedacted must blank every price
+// cell AND the derived .uc-rfq-lowest mark AND the footer total — not
+// just the cell text — while leaving row/column membership and the
+// item/vendor names untouched.
+func TestBuildRFQReportView_QtyAndUnitPriceRedaction(t *testing.T) {
+	catalog, err := i18n.Load("en")
+	if err != nil {
+		t.Fatalf("load i18n catalog: %v", err)
+	}
+	h := &Handler{catalog: catalog}
+	vendors := []data.RFQComparisonVendor{{ID: "v1", Name: "Vendor A"}, {ID: "v2", Name: "Vendor B"}}
+	lines := []data.RFQComparisonLine{
+		{ID: "l1", ItemName: "Widget", Qty: 3, QuotesByVendor: map[string]money.Money{"v1": 500, "v2": 300}},
+	}
+
+	// Both redacted: no real qty, no real price, no lowest mark, no
+	// footer total — but the row/column shape (1 row x 2 vendors) is
+	// untouched, and each redacted cell is Hidden (a real quote exists),
+	// never Present, never a bare Missing.
+	view := h.buildRFQReportView(context.Background(), tenantScope{}, data.Record{Data: map[string]any{}}, lines, vendors, "en", false, false, true, true)
+	if len(view.Rows) != 1 || len(view.Rows[0].Cells) != 2 || len(view.Vendors) != 2 {
+		t.Fatalf("expected 1 row x 2 vendors regardless of redaction, got %d rows, %d vendors", len(view.Rows), len(view.Vendors))
+	}
+	if view.Rows[0].QtyAvailable || view.Rows[0].Qty != "" {
+		t.Errorf("qtyRedacted=true: row = %+v, want QtyAvailable=false and Qty=\"\"", view.Rows[0])
+	}
+	for i, c := range view.Rows[0].Cells {
+		if c.Present || !c.Hidden || c.Lowest || c.Value != "" {
+			t.Errorf("unitPriceRedacted=true: cell %d = %+v, want Hidden=true, Present=false, Lowest=false, Value=\"\"", i, c)
+		}
+	}
+	for i, c := range view.FooterCells {
+		if c.Present || !c.Hidden || c.Value != "" {
+			t.Errorf("unitPriceRedacted=true: footer cell %d = %+v, want Hidden=true, Present=false, Value=\"\"", i, c)
+		}
+	}
+	// Name fields are a different field entirely — unaffected.
+	if !view.Rows[0].ItemAvailable || view.Rows[0].Item != "Widget" {
+		t.Errorf("qty/price redaction must not touch Item: row = %+v", view.Rows[0])
+	}
+	if !view.Vendors[0].NameAvailable || view.Vendors[0].Name != "Vendor A" {
+		t.Errorf("qty/price redaction must not touch vendor Name: vendor = %+v", view.Vendors[0])
+	}
+
+	// Unrestricted: real qty, real prices, the cheaper cell (v2, 3.00)
+	// marked lowest, real footer totals.
+	openView := h.buildRFQReportView(context.Background(), tenantScope{}, data.Record{Data: map[string]any{}}, lines, vendors, "en", false, false, false, false)
+	if !openView.Rows[0].QtyAvailable || openView.Rows[0].Qty != "3" {
+		t.Errorf("qtyRedacted=false: row = %+v, want QtyAvailable=true and Qty=\"3\"", openView.Rows[0])
+	}
+	if c := openView.Rows[0].Cells[1]; !c.Present || c.Hidden || !c.Lowest || c.Value != "3.00" {
+		t.Errorf("unitPriceRedacted=false: cheaper cell = %+v, want Present=true, Hidden=false, Lowest=true, Value=\"3.00\"", c)
+	}
+	if c := openView.FooterCells[0]; !c.Present || c.Hidden || c.Value != "5.00" {
+		t.Errorf("unitPriceRedacted=false: vendor A footer = %+v, want Present=true, Value=\"5.00\"", c)
+	}
+
+	// A row nobody quoted at all stays a genuine Missing ("—"), never
+	// Hidden, even when unitPriceRedacted — Hidden means "a real quote
+	// exists but you can't see it", which is false here.
+	unquoted := []data.RFQComparisonLine{{ID: "l2", ItemName: "Never Quoted", Qty: 1, QuotesByVendor: nil}}
+	unquotedView := h.buildRFQReportView(context.Background(), tenantScope{}, data.Record{Data: map[string]any{}}, unquoted, vendors, "en", false, false, false, true)
+	for i, c := range unquotedView.Rows[0].Cells {
+		if c.Hidden || c.Present {
+			t.Errorf("nobody quoted: cell %d = %+v, want neither Hidden nor Present (a plain Missing)", i, c)
+		}
+	}
+	for i, c := range unquotedView.FooterCells {
+		if c.Hidden || c.Present {
+			t.Errorf("nobody quoted: footer cell %d = %+v, want neither Hidden nor Present", i, c)
+		}
+	}
+}
+
+// TestRFQLineQtyRedacted_TestRFQQuoteLineUnitPriceRedacted (uc-infra#235,
+// independent review) pins both predicates' full truth tables directly,
+// at the smallest possible unit — mirroring reporting.go's own
+// TestPurchaseOrderTotalRedacted_.../TestInventoryItemOnHandRedacted_...
+// tests for the equivalent predicates on other entities. This is the
+// guard against a typo in either field-name literal silently disabling
+// the whole fix: a bare inline map lookup at each call site would have
+// no unit-level test of its own, only the slower, coarser HTTP-level
+// regression test to catch a mistake here — and that HTTP test seeds its
+// FieldPermission rows against the exact same literal, so a typo shared
+// by both sides would go green there too.
+func TestRFQLineQtyRedacted_TestRFQQuoteLineUnitPriceRedacted(t *testing.T) {
+	cases := []struct {
+		name          string
+		hidden        map[string]bool
+		wantQty       bool
+		wantUnitPrice bool
+	}{
+		{"nothing hidden", map[string]bool{}, false, false},
+		{"nil map", nil, false, false},
+		{"qty hidden", map[string]bool{"qty": true}, true, false},
+		{"unit_price hidden", map[string]bool{"unit_price": true}, false, true},
+		{"both hidden", map[string]bool{"qty": true, "unit_price": true}, true, true},
+		{"unrelated field hidden", map[string]bool{"item_id": true}, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := rfqLineQtyRedacted(tc.hidden); got != tc.wantQty {
+				t.Errorf("rfqLineQtyRedacted(%v) = %v, want %v", tc.hidden, got, tc.wantQty)
+			}
+			if got := rfqQuoteLineUnitPriceRedacted(tc.hidden); got != tc.wantUnitPrice {
+				t.Errorf("rfqQuoteLineUnitPriceRedacted(%v) = %v, want %v", tc.hidden, got, tc.wantUnitPrice)
+			}
+		})
 	}
 }
 
@@ -654,6 +768,158 @@ func TestRFQComparisonReport_HiddenItemPartyFieldsRenderNotAvailable(t *testing.
 	}
 	if got := strings.Count(allBody, "Not available"); got != 4 {
 		t.Errorf("all-restricted actor: expected 4 NotAvailable cells (2 rows + 2 vendor headers), got %d:\n%s", got, allBody)
+	}
+}
+
+// TestRFQComparisonReport_HiddenQtyUnitPriceFieldsRenderNotAvailable
+// (uc-infra#235) is this report's own version of
+// TestRFQComparisonReport_HiddenItemPartyFieldsRenderNotAvailable for the
+// two fields #234 deliberately left open: RequestForQuotationLine.qty and
+// RequestForQuotationQuoteLine.unit_price. unit_price is the sharper
+// case — it also has to take the .uc-rfq-lowest mark and the footer
+// totals down with it, not just its own cell text, since both are
+// derived from the same hidden value.
+func TestRFQComparisonReport_HiddenQtyUnitPriceFieldsRenderNotAvailable(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	rfqID, lineAID, lineBID, vendorXID, vendorYID := setupRFQTenant(t, db)
+	// lineA: BOTH vendors quote (vendorX cheaper at 9.50) — the symmetric
+	// case, and where the lowest-price mark lives. lineB: only vendorX
+	// quotes (4.00) — the ASYMMETRIC case (independent review,
+	// uc-infra#235): vendorY never quoted lineB at all, so vendorY's
+	// lineB cell must render a plain Missing ("—") under every actor
+	// below, redacted or not, while vendorX's lineB cell — a real quote
+	// that exists — must render Hidden (NotAvailable) for a price-
+	// restricted actor. Without this asymmetric fixture, an
+	// implementation that hoisted the Hidden decision to per-LINE rather
+	// than per-CELL (redacting every vendor's cell on any line ANY vendor
+	// quoted) would pass every assertion here by coincidence.
+	engine := crud.NewEngine(db)
+	if _, err := engine.Create(context.Background(), purchasing.RequestForQuotationQuoteLine(),
+		map[string]any{"rfq_line_id": lineAID, "vendor_id": vendorXID, "unit_price": 950}, humanActor()); err != nil {
+		t.Fatalf("seed quote lineA/vendorX: %v", err)
+	}
+	if _, err := engine.Create(context.Background(), purchasing.RequestForQuotationQuoteLine(),
+		map[string]any{"rfq_line_id": lineAID, "vendor_id": vendorYID, "unit_price": 1200}, humanActor()); err != nil {
+		t.Fatalf("seed quote lineA/vendorY: %v", err)
+	}
+	if _, err := engine.Create(context.Background(), purchasing.RequestForQuotationQuoteLine(),
+		map[string]any{"rfq_line_id": lineBID, "vendor_id": vendorXID, "unit_price": 400}, humanActor()); err != nil {
+		t.Fatalf("seed quote lineB/vendorX: %v", err)
+	}
+
+	seedFieldRule(t, db, "qty-restricted", "user-qty-hidden", "RequestForQuotationLine", "qty")
+	seedFieldRule(t, db, "price-restricted", "user-price-hidden", "RequestForQuotationQuoteLine", "unit_price")
+	// One role with FieldPermission rows on BOTH fields, same
+	// "HiddenFields is a union of per-role agreement, not per-row" pitfall
+	// TestRFQComparisonReport_HiddenItemPartyFieldsRenderNotAvailable's own
+	// comment already documents for Item.name/Party.name.
+	allRoleID := seedFieldRule(t, db, "all-qty-price-restricted", "user-all-qty-price-hidden", "RequestForQuotationLine", "qty")
+	if _, err := engine.Create(context.Background(), foundation.FieldPermission(),
+		map[string]any{"role_id": allRoleID, "entity_type": "RequestForQuotationQuoteLine", "field_name": "unit_price", "hidden": true},
+		humanActor()); err != nil {
+		t.Fatalf("create second FieldPermission: %v", err)
+	}
+
+	get := func(actorID string) string {
+		t.Helper()
+		req := newRequest("GET", "/reports/rfq/"+rfqID, tenantID, actorID, nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("actor %s: expected 200, got %d: %s", actorID, rec.Code, rec.Body.String())
+		}
+		return rec.Body.String()
+	}
+
+	// Unrestricted actor: real qty (10/5), real prices (including lineB's
+	// sole 4.00 quote), vendorX's 9.50 AND 4.00 both marked cheapest (each
+	// is the only/lowest present quote on its own row), real footer totals
+	// — NotAvailable appears nowhere.
+	openBody := get("farshid")
+	for _, want := range []string{">10<", ">5<", "9.50", "12.00", "4.00", "13.50"} {
+		if !strings.Contains(openBody, want) {
+			t.Errorf("unrestricted actor: expected %q in body:\n%s", want, openBody)
+		}
+	}
+	if got := strings.Count(openBody, `class="uc-rfq-lowest"`); got != 2 {
+		t.Errorf("unrestricted actor: expected 2 lowest-price marks (lineA/vendorX, lineB/vendorX), got %d:\n%s", got, openBody)
+	}
+	if strings.Contains(openBody, "Not available") {
+		t.Errorf("unrestricted actor: NotAvailable must not appear:\n%s", openBody)
+	}
+
+	// qty hidden: both rows' Qty cell blanked (2 NotAvailable); prices,
+	// lowest marks, and footer totals are a different field entirely and
+	// stay real.
+	qtyBody := get("user-qty-hidden")
+	for _, leaked := range []string{">10<", ">5<"} {
+		if strings.Contains(qtyBody, leaked) {
+			t.Errorf("qty-restricted actor: %q must not appear anywhere:\n%s", leaked, qtyBody)
+		}
+	}
+	if got := strings.Count(qtyBody, "Not available"); got != 2 {
+		t.Errorf("qty-restricted actor: expected 2 NotAvailable cells (one per row), got %d:\n%s", got, qtyBody)
+	}
+	for _, want := range []string{"9.50", "12.00", "4.00"} {
+		if !strings.Contains(qtyBody, want) {
+			t.Errorf("qty-restricted actor: expected %q (a different field) to still render:\n%s", want, qtyBody)
+		}
+	}
+	if got := strings.Count(qtyBody, `class="uc-rfq-lowest"`); got != 2 {
+		t.Errorf("qty-restricted actor: expected 2 lowest-price marks (a different field), got %d:\n%s", got, qtyBody)
+	}
+
+	// unit_price hidden: lineA's 2 quoted cells blanked, lineB's ONE
+	// quoted cell (vendorX) blanked too — 3 Hidden cells — plus BOTH
+	// vendors' footer totals (each quoted at least once) — 5 NotAvailable
+	// total. lineB's vendorY cell, who genuinely never quoted THIS line
+	// (independent review, uc-infra#235 — the asymmetric case), still
+	// renders its plain Missing ("—"), proving Hidden is decided per
+	// CELL, not per line/vendor. No lowest mark anywhere. Qty is a
+	// different field and stays real.
+	priceBody := get("user-price-hidden")
+	for _, leaked := range []string{"9.50", "12.00", "4.00"} {
+		if strings.Contains(priceBody, leaked) {
+			t.Errorf("price-restricted actor: %q must not appear anywhere:\n%s", leaked, priceBody)
+		}
+	}
+	if got := strings.Count(priceBody, "Not available"); got != 5 {
+		t.Errorf("price-restricted actor: expected 5 NotAvailable cells (2 lineA + 1 lineB/vendorX + 2 footer), got %d:\n%s", got, priceBody)
+	}
+	if got := strings.Count(priceBody, "—"); got != 1 {
+		t.Errorf("price-restricted actor: expected exactly 1 plain Missing cell (lineB/vendorY, who never quoted at all), got %d:\n%s", got, priceBody)
+	}
+	if strings.Contains(priceBody, `class="uc-rfq-lowest"`) {
+		t.Errorf("price-restricted actor: no lowest-price mark must render (it's derived from the hidden price):\n%s", priceBody)
+	}
+	for _, want := range []string{">10<", ">5<"} {
+		if !strings.Contains(priceBody, want) {
+			t.Errorf("price-restricted actor: expected %q (a different field) to still render:\n%s", want, priceBody)
+		}
+	}
+
+	// Both hidden: 2 (qty) + 5 (unit_price, same breakdown as above) = 7
+	// NotAvailable, still exactly 1 plain Missing (lineB/vendorY), no
+	// lowest mark, neither qty nor price value anywhere.
+	allBody := get("user-all-qty-price-hidden")
+	for _, leaked := range []string{">10<", ">5<", "9.50", "12.00", "4.00"} {
+		if strings.Contains(allBody, leaked) {
+			t.Errorf("all-restricted actor: %q must not appear anywhere:\n%s", leaked, allBody)
+		}
+	}
+	if got := strings.Count(allBody, "Not available"); got != 7 {
+		t.Errorf("all-restricted actor: expected 7 NotAvailable cells, got %d:\n%s", got, allBody)
+	}
+	if got := strings.Count(allBody, "—"); got != 1 {
+		t.Errorf("all-restricted actor: expected exactly 1 plain Missing cell (lineB/vendorY), got %d:\n%s", got, allBody)
+	}
+	if strings.Contains(allBody, `class="uc-rfq-lowest"`) {
+		t.Errorf("all-restricted actor: no lowest-price mark must render:\n%s", allBody)
 	}
 }
 

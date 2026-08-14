@@ -112,10 +112,29 @@ func (h *Handler) renderRFQComparisonReport(w http.ResponseWriter, r *http.Reque
 		writeInternalError(w, "resolve Party field visibility", err)
 		return
 	}
+	// RequestForQuotationLine.qty/RequestForQuotationQuoteLine.unit_price
+	// (uc-infra#235) are resolved the same way: two more per-entity-type
+	// HiddenFields lookups (a third and fourth, alongside Item/Party
+	// above), since HiddenFields answers for one (actor, entity type)
+	// pair at a time and both fields reach this report through the exact
+	// same unredacted data.ReportingRepo.RFQComparison raw SQL as
+	// Item.name/Party.name.
+	hiddenLineFields, err := ts.crud.HiddenFields(ctx, "RequestForQuotationLine")
+	if err != nil {
+		writeInternalError(w, "resolve RequestForQuotationLine field visibility", err)
+		return
+	}
+	hiddenQuoteLineFields, err := ts.crud.HiddenFields(ctx, "RequestForQuotationQuoteLine")
+	if err != nil {
+		writeInternalError(w, "resolve RequestForQuotationQuoteLine field visibility", err)
+		return
+	}
 	itemNameHidden := itemNameRedacted(hiddenItemFields)
 	vendorNameHidden := partyNameRedacted(hiddenPartyFields)
+	qtyHidden := rfqLineQtyRedacted(hiddenLineFields)
+	unitPriceHidden := rfqQuoteLineUnitPriceRedacted(hiddenQuoteLineFields)
 
-	view := h.buildRFQReportView(ctx, ts, rfq, lines, vendors, locale, itemNameHidden, vendorNameHidden)
+	view := h.buildRFQReportView(ctx, ts, rfq, lines, vendors, locale, itemNameHidden, vendorNameHidden, qtyHidden, unitPriceHidden)
 
 	var buf bytes.Buffer
 	if err := rfqReportTmpl.Execute(&buf, view); err != nil {
@@ -126,6 +145,24 @@ func (h *Handler) renderRFQComparisonReport(w http.ResponseWriter, r *http.Reque
 	if err := h.renderShell(w, locale, nav, template.HTML(buf.String())); err != nil {
 		writeInternalError(w, "render rfq comparison report shell", err)
 	}
+}
+
+// rfqLineQtyRedacted/rfqQuoteLineUnitPriceRedacted (uc-infra#235) answer
+// whether THIS ACTOR's FieldPermission rows hide
+// RequestForQuotationLine.qty / RequestForQuotationQuoteLine.unit_price
+// respectively — the same one-line "look the field name up in the
+// HiddenFields map" shape as reporting.go's own
+// purchaseOrderTotalRedacted/partyNameRedacted/itemSKURedacted/
+// itemNameRedacted, which this file's itemNameRedacted/partyNameRedacted
+// calls above already reuse rather than redeclare. Declared here, not in
+// reporting.go, since neither field is read by any report outside this
+// one — unlike Item.name/Party.name, which multiple reports share.
+func rfqLineQtyRedacted(hidden map[string]bool) bool {
+	return hidden["qty"]
+}
+
+func rfqQuoteLineUnitPriceRedacted(hidden map[string]bool) bool {
+	return hidden["unit_price"]
 }
 
 // buildRFQReportView shapes the loaded RFQ header + comparison grid into
@@ -147,14 +184,23 @@ func (h *Handler) renderRFQComparisonReport(w http.ResponseWriter, r *http.Reque
 // vendorNameRedacted threading into buildLeadTimeRows/buildOnTimeRows/
 // buildQualityRows. Neither flag touches row/column membership.
 //
-// Deliberately NOT covered here, same class, not fixed (uc-infra#235):
-// the price cells, the lowest-price mark, and the footer totals are all
-// computed from RequestForQuotationQuoteLine.unit_price, which is
-// FieldPermission-hideable exactly like Item.name/Party.name but reaches
-// this page through this exact same unredacted raw-SQL path — #234's own
-// scope was Item.name/Party.name specifically; #235 tracks unit_price
-// (and RequestForQuotationLine.qty) as their own follow-up, same "flag,
-// don't chase" precedent reporting.go's own NOT-fixed-here notes use.
+// qtyRedacted/unitPriceRedacted (uc-infra#235) cover the two fields #234
+// deliberately left open: RequestForQuotationLine.qty and
+// RequestForQuotationQuoteLine.unit_price, both FieldPermission-hideable
+// exactly like Item.name/Party.name and reaching this page through the
+// identical unredacted raw-SQL path. Like the name fields, neither drives
+// row/column MEMBERSHIP (every requested line and every invited vendor
+// still gets a row/column) — but unlike a pure display field,
+// unitPriceRedacted also has to gate the DERIVED values price drives:
+// the .uc-rfq-lowest mark (which cell is cheapest is itself information
+// about the hidden prices) and the per-vendor footer total (an aggregate
+// over the same hidden field, same "can't see it summed if you can't see
+// it per-row" rule StockOnHand/StockATP already apply in reporting.go).
+// A cell whose price genuinely exists but is redacted renders
+// NotAvailable (rfqCellView.Hidden), distinct from Missing — a vendor who
+// never quoted at all — the same distinction itemNameHidden/
+// vendorNameHidden already draw between "redacted" and "never had a
+// value".
 //
 // Also NOT addressed: vendors are ordered ORDER BY p.data->>'name' (data.
 // ReportingRepo.RFQComparison) even when vendorNameHidden — so a
@@ -166,7 +212,19 @@ func (h *Handler) renderRFQComparisonReport(w http.ResponseWriter, r *http.Reque
 // real, un-redacted vendor names" comment) — not fixed here for the same
 // reason: changing the sort key is a behavior call, not a mechanical
 // redaction.
-func (h *Handler) buildRFQReportView(ctx context.Context, ts tenantScope, rfq data.Record, lines []data.RFQComparisonLine, vendors []data.RFQComparisonVendor, locale string, itemNameHidden, vendorNameHidden bool) rfqReportView {
+//
+// A related, deliberate residual channel of its own (independent review,
+// uc-infra#235): rendering Hidden distinctly from Missing tells a
+// unitPriceRedacted actor exactly WHICH (line, vendor) pairs have a real
+// quote on record and which vendors quoted anything at all — i.e.
+// RequestForQuotationQuoteLine record EXISTENCE, not the redacted
+// unit_price VALUE itself. Accepted rather than collapsed into a single
+// blank state: this is what the ticket asked for (a genuinely missing
+// quote must never be confused with a redacted one), and the actor
+// already cleared requireReportRead on RequestForQuotationQuoteLine to
+// reach this page at all, so record existence on an entity type they can
+// read is a smaller disclosure than the value FieldPermission protects.
+func (h *Handler) buildRFQReportView(ctx context.Context, ts tenantScope, rfq data.Record, lines []data.RFQComparisonLine, vendors []data.RFQComparisonVendor, locale string, itemNameHidden, vendorNameHidden, qtyRedacted, unitPriceRedacted bool) rfqReportView {
 	rfqNumber, _ := rfq.Data["rfq_number"].(string)
 	dueDate, _ := rfq.Data["due_date"].(string)
 
@@ -223,30 +281,49 @@ func (h *Handler) buildRFQReportView(ctx context.Context, ts tenantScope, rfq da
 	// money.Money already, and `totals[v.ID] += price` below is exact
 	// int64 addition — no float ever enters this accumulation.
 	totals := make(map[string]money.Money, len(vendors))
-	quoted := make(map[string]bool, len(vendors))
+	// quotedAny tracks "did this vendor quote this line at all", computed
+	// regardless of unitPriceRedacted — the footer loop below needs it
+	// even when totals is never populated, to tell a genuinely
+	// never-quoted vendor (Missing) apart from a redacted one (Hidden).
+	quotedAny := make(map[string]bool, len(vendors))
 	for _, line := range lines {
-		row := rfqLineRowView{Qty: formrender.FormatFieldValue(line.Qty)}
+		row := rfqLineRowView{}
+		if !qtyRedacted {
+			row.QtyAvailable = true
+			row.Qty = formrender.FormatFieldValue(line.Qty)
+		}
 		if !itemNameHidden {
 			row.ItemAvailable = true
 			row.Item = line.ItemName
 		}
+		// The lowest-price mark is itself derived from the hidden prices
+		// (which cell is cheapest is information about them) — skipped
+		// entirely, not just left unmarked, when unitPriceRedacted, same
+		// "gate the derived value too" rule the footer totals below
+		// follow.
 		var lowest money.Money
 		haveLowest := false
-		for _, v := range vendors {
-			price, ok := line.QuotesByVendor[v.ID]
-			if ok && (!haveLowest || price < lowest) {
-				lowest = price
-				haveLowest = true
+		if !unitPriceRedacted {
+			for _, v := range vendors {
+				price, ok := line.QuotesByVendor[v.ID]
+				if ok && (!haveLowest || price < lowest) {
+					lowest = price
+					haveLowest = true
+				}
 			}
 		}
 		for _, v := range vendors {
 			cell := rfqCellView{}
 			if price, ok := line.QuotesByVendor[v.ID]; ok {
-				cell.Value = price.String()
-				cell.Present = true
-				cell.Lowest = haveLowest && price == lowest
-				totals[v.ID] += price
-				quoted[v.ID] = true
+				quotedAny[v.ID] = true
+				if unitPriceRedacted {
+					cell.Hidden = true
+				} else {
+					cell.Value = price.String()
+					cell.Present = true
+					cell.Lowest = haveLowest && price == lowest
+					totals[v.ID] += price
+				}
 			}
 			row.Cells = append(row.Cells, cell)
 		}
@@ -255,7 +332,10 @@ func (h *Handler) buildRFQReportView(ctx context.Context, ts tenantScope, rfq da
 
 	for _, v := range vendors {
 		cell := rfqCellView{}
-		if quoted[v.ID] {
+		switch {
+		case unitPriceRedacted && quotedAny[v.ID]:
+			cell.Hidden = true
+		case !unitPriceRedacted && quotedAny[v.ID]:
 			cell.Value = totals[v.ID].String()
 			cell.Present = true
 		}
@@ -299,16 +379,22 @@ type rfqLineRowView struct {
 	Item          string
 	ItemAvailable bool
 	Qty           string
+	QtyAvailable  bool
 	Cells         []rfqCellView
 }
 
-// rfqCellView is one (line, vendor) cell — Present distinguishes a real
-// quoted price from a genuinely missing one, which the template renders
-// as Missing ("—") rather than a blank string that could be confused
-// with a real empty cell in a screenshot/DOM assertion.
+// rfqCellView is one (line, vendor) cell, or one footer (vendor) total —
+// Present/Hidden/neither are mutually exclusive: Present is a real quoted
+// price this actor may see; Hidden (uc-infra#235) is a real quoted price
+// that exists but is FieldPermission-redacted, rendered as NotAvailable —
+// distinct from neither Present nor Hidden, a genuinely missing quote,
+// which the template renders as Missing ("—") rather than a blank string
+// that could be confused with a real empty cell in a screenshot/DOM
+// assertion.
 type rfqCellView struct {
 	Value   string
 	Present bool
+	Hidden  bool
 	Lowest  bool
 }
 
@@ -333,8 +419,8 @@ var rfqReportTmpl = template.Must(template.New("rfqReport").Parse(`
 {{range .Rows}}
 <tr>
   <td>{{if .ItemAvailable}}{{.Item}}{{else}}{{$.NotAvailable}}{{end}}</td>
-  <td>{{.Qty}}</td>
-  {{range .Cells}}<td{{if .Lowest}} class="uc-rfq-lowest"{{end}}>{{if .Present}}{{.Value}}{{else}}{{$.Missing}}{{end}}</td>{{end}}
+  <td>{{if .QtyAvailable}}{{.Qty}}{{else}}{{$.NotAvailable}}{{end}}</td>
+  {{range .Cells}}<td{{if .Lowest}} class="uc-rfq-lowest"{{end}}>{{if .Present}}{{.Value}}{{else if .Hidden}}{{$.NotAvailable}}{{else}}{{$.Missing}}{{end}}</td>{{end}}
 </tr>
 {{end}}
 </tbody>
@@ -342,7 +428,7 @@ var rfqReportTmpl = template.Must(template.New("rfqReport").Parse(`
 <tr>
   <td>{{.FooterLabel}}</td>
   <td></td>
-  {{range .FooterCells}}<td>{{if .Present}}{{.Value}}{{else}}{{$.Missing}}{{end}}</td>{{end}}
+  {{range .FooterCells}}<td>{{if .Present}}{{.Value}}{{else if .Hidden}}{{$.NotAvailable}}{{else}}{{$.Missing}}{{end}}</td>{{end}}
 </tr>
 </tfoot>
 </table>
