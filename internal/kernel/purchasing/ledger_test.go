@@ -728,6 +728,87 @@ func TestPostGoodsReceiptLineToLedger_InventoryItemNotPublished_FailsWithWrapped
 	}
 }
 
+// TestPostGoodsReceiptLineToLedger_InventoryItemCreditAppliesFieldDefaults
+// is the regression test for uc-infra#218 (split from #212's independent
+// review): creditInventoryOnReceipt creates the new InventoryItem row via
+// the low-level records.CreateTx, not crud.Engine.Create, so it never got
+// Engine.Create's own entity.ApplyDefaults call. Every field this hardcoded
+// credit path sets (item_id/facility_id/qty_on_hand/qty_available_to_
+// promise) happens to always be explicit, so this was latent, not an
+// observed bug — this test proves it by publishing a v6 InventoryItem
+// Definition that adds one more Required field carrying a Default this
+// credit path does NOT set. Before uc-infra#218's fix, this would fail
+// validation ("condition_code is required"); after it, ledger.go's own
+// explicit entity.ApplyDefaults(def, fields) call (mirroring internal/
+// api/handlers.go's identical pre-Engine.Create call) fills it in, same
+// as every other write path into this Definition already does.
+func TestPostGoodsReceiptLineToLedger_InventoryItemCreditAppliesFieldDefaults(t *testing.T) {
+	fx := setUpGoodsReceiptFixture(t, 12.50)
+	fx.engine.SetHook("GoodsReceiptLine", PostGoodsReceiptLineToLedger)
+	ctx := context.Background()
+	actor := humanActor()
+
+	withConditionCode := &entity.Definition{
+		EntityType: "InventoryItem",
+		Version:    6,
+		Module:     "purchasing",
+		Fields: []entity.Field{
+			{Name: "item_id", Type: entity.FieldReference, Required: true, Target: "Item"},
+			{Name: "facility_id", Type: entity.FieldReference, Required: true, Target: "Facility"},
+			{Name: "qty_on_hand", Type: entity.FieldNumber, Required: true, Default: float64(0), Min: entity.Float64Ptr(0)},
+			{Name: "qty_available_to_promise", Type: entity.FieldNumber, Required: true, Default: float64(0)},
+			// Not set anywhere in creditInventoryOnReceipt's own fields
+			// map — only entity.ApplyDefaults can supply it.
+			{Name: "condition_code", Type: entity.FieldString, Required: true, Default: "good"},
+		},
+		// GetPublished/GetPublishedTx return the HIGHEST published
+		// version (see the sibling test above), so publishing v6 makes
+		// it authoritative without needing to roll back v5 first — and
+		// keeps v5's Unique(item_id, facility_id), which this credit's
+		// own upsert/retry design depends on.
+		Unique: [][]string{{"item_id", "facility_id"}},
+	}
+	raw, err := json.Marshal(withConditionCode)
+	if err != nil {
+		t.Fatalf("marshal InventoryItem v6: %v", err)
+	}
+	repo := data.NewEntityDefinitionRepo(fx.tenantDB)
+	if _, err := repo.CreateDraft(ctx, withConditionCode.EntityType, withConditionCode.Version, raw, actor); err != nil {
+		t.Fatalf("CreateDraft: %v", err)
+	}
+	if err := repo.Approve(ctx, withConditionCode.EntityType, withConditionCode.Version, actor); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	if err := repo.Publish(ctx, withConditionCode.EntityType, withConditionCode.Version, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	gr, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceipt"), map[string]any{
+		"purchase_order_id": fx.poID, "received_date": "2026-01-10", "facility_id": fx.facilityID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create GoodsReceipt: %v", err)
+	}
+
+	if _, err = fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"), map[string]any{
+		"goods_receipt_id": gr.ID, "po_line_id": fx.poLineID,
+		"item_id": fx.itemID, "qty_received": float64(4),
+	}, actor); err != nil {
+		t.Fatalf("create GoodsReceiptLine: expected condition_code's Default to satisfy its own Required check via entity.ApplyDefaults, got: %v", err)
+	}
+
+	invRecs, err := fx.engine.List(ctx, defFor(t, fx.tenantDB, "InventoryItem"))
+	if err != nil {
+		t.Fatalf("list InventoryItem: %v", err)
+	}
+	if len(invRecs) != 1 {
+		t.Fatalf("expected exactly 1 InventoryItem row, got %d", len(invRecs))
+	}
+	if got, _ := invRecs[0].Data["condition_code"].(string); got != "good" {
+		t.Fatalf("expected creditInventoryOnReceipt to apply condition_code's Default (\"good\") for the omitted field, got %q", got)
+	}
+}
+
 // TestPostGoodsReceiptLineToLedger_PublishedDefinitionUnmarshalFails_WrapsTheError
 // covers creditInventoryOnReceipt's entity.Unmarshal error branch —
 // independent review, uc-infra#165: EntityDefinitionRepo.CreateDraft only
