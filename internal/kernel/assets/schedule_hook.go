@@ -61,6 +61,20 @@ import (
 //     genuinely more correct, but is real design/implementation work of
 //     its own; filed as follow-up (uc-infra#213's own "real design
 //     question" note) rather than built speculatively here.
+//
+// Known limitation (uc-infra#236, filed by this change's own independent
+// review, not fixed here): this hook can only see the record's current
+// (post-write) state, not what changed, so it cannot tell "a relevant
+// field genuinely changed" apart from "someone manually corrected a
+// DepreciationSchedule row and the asset was saved again for an
+// unrelated reason" — both look identical (stored schedule != freshly
+// computed one) from here. Concretely: a manual correction to an
+// unposted row can be silently overwritten by the next FixedAsset save,
+// and once posted, an unrelated FixedAsset edit can be rejected even
+// though the asset's own terms never changed. See uc-infra#236 for why
+// the real fix (either handing this hook the pre-write record, or a
+// tracked marker distinguishing hook-written rows from corrected ones)
+// is its own follow-up rather than built speculatively here.
 func GenerateDepreciationScheduleOnWrite(ctx context.Context, tx *sql.Tx, _ *entity.Definition, rec data.Record, action audit.Action, actor audit.Actor) error {
 	records := data.NewRecordRepo(nil)
 
@@ -102,7 +116,16 @@ func GenerateDepreciationScheduleOnWrite(ctx context.Context, tx *sql.Tx, _ *ent
 	}
 	desired := scheduleFields(rec.ID, periods, minorUnit)
 
-	existing, err := records.ListByFieldTx(ctx, tx, "DepreciationSchedule", "fixed_asset_id", rec.ID)
+	// FOR UPDATE, not a plain read: this hook is about to decide, based on
+	// whether any row here is already posted, whether it's safe to delete
+	// and replace them — see ListByFieldForUpdateTx's own doc comment for
+	// the concrete race a non-locking read would leave open against
+	// internal/worker.Runner's depreciation-posting tick (PostDueDepreciation/
+	// PostDueDepreciationBatch, this same package's ledger.go). Locking
+	// here means a concurrent posting transaction either already committed
+	// (so this read sees its posted_at) or is blocked behind this hook's
+	// own transaction (so it waits, rather than racing this delete).
+	existing, err := records.ListByFieldForUpdateTx(ctx, tx, "DepreciationSchedule", "fixed_asset_id", rec.ID)
 	if err != nil {
 		return fmt.Errorf("list existing DepreciationSchedule for FixedAsset %s: %w", rec.ID, err)
 	}
@@ -125,7 +148,17 @@ func GenerateDepreciationScheduleOnWrite(ctx context.Context, tx *sql.Tx, _ *ent
 
 	for _, row := range existing {
 		if postedAt, _ := row.Data["posted_at"].(string); postedAt != "" {
-			return fmt.Errorf("%w: FixedAsset %s already has posted depreciation — cannot change cost, salvage_value, useful_life_months, depreciation_method, acquisition_date or currency_id after posting has started", crud.ErrHookRejected, rec.ID)
+			// Deliberately doesn't assert WHICH field changed, or that a
+			// depreciation-relevant field changed at all — this branch is
+			// reached on ANY mismatch between the stored schedule and what
+			// Build now computes, which can also mean a prior manual
+			// correction to a DepreciationSchedule row (see uc-infra#236,
+			// filed by this same review), not necessarily an edit to cost/
+			// salvage_value/useful_life_months/depreciation_method/
+			// acquisition_date/currency_id. An earlier draft's message
+			// claimed the specific cause; independent review caught that
+			// it can be wrong.
+			return fmt.Errorf("%w: FixedAsset %s's stored depreciation schedule no longer matches what its current terms would compute, and at least one period has already posted — this save is rejected rather than silently regenerating posted history. If the asset's cost, salvage value, useful life, method, acquisition date or currency didn't actually change, a prior manual correction to a schedule row is the more likely cause (uc-infra#236)", crud.ErrHookRejected, rec.ID)
 		}
 	}
 
@@ -152,10 +185,14 @@ func GenerateDepreciationScheduleOnWrite(ctx context.Context, tx *sql.Tx, _ *ent
 // *Tx variant, r.db is never dereferenced" convention finance.
 // SyncGLAccountOnWrite's own currency lookup already uses) — calling
 // currencyMinorUnit's plain Get here would panic on a nil r.db, exactly
-// as it did before this existed (caught by this file's own
-// TestGenerateDepreciationScheduleOnWrite_MissingCurrency_FallsBackToDefaultScale,
-// which exercises the currency_id-set-but-still-needs-a-real-read path
-// via the sibling "unset" case).
+// as it did before this function existed. Real (non-fallback) resolution
+// is exercised by this file's own
+// TestGenerateDepreciationScheduleOnWrite_CreateWithNonDefaultCurrencyScale
+// — TestGenerateDepreciationScheduleOnWrite_MissingCurrency_FallsBackToDefaultScale
+// covers the sibling no-currency_id case, which never calls this
+// function at all (an earlier version of this comment claimed otherwise
+// — independent review caught that the claim didn't match what the test
+// actually exercises).
 func currencyMinorUnitTx(ctx context.Context, tx *sql.Tx, records *data.RecordRepo, currencyID string) (int, error) {
 	currency, err := records.GetTx(ctx, tx, "Currency", currencyID)
 	if err != nil {

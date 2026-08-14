@@ -168,6 +168,69 @@ func TestGenerateDepreciationScheduleOnWrite_SalvageExceedsCost_RejectsWholeCrea
 	}
 }
 
+// TestGenerateDepreciationScheduleOnWrite_CreateWithNonDefaultCurrencyScale
+// is this file's own instance of the same regression class
+// TestCurrencyMinorUnit_ResolvesNonDefaultScale (ledger_test.go) pins:
+// every other test in this file uses USD (minor_unit=2), identical to
+// defaultCurrencyMinorUnit, so nothing distinguishes "currencyMinorUnitTx
+// resolved the real value" from "the fallback silently applied and got
+// lucky" (independent review of #213's own finding — the doc comment on
+// currencyMinorUnitTx used to claim this was already covered by the
+// missing-currency test above; it wasn't, since that test never sets
+// currency_id at all and so never calls currencyMinorUnitTx in the first
+// place). JPY-style minor_unit=0: a 1000.00 depreciation_amount must
+// convert to 1000 minor units, not 100000 (what the 2dp fallback would
+// wrongly produce).
+func TestGenerateDepreciationScheduleOnWrite_CreateWithNonDefaultCurrencyScale(t *testing.T) {
+	fx := setUpScheduleHookFixture(t)
+	ctx := context.Background()
+
+	jpy, err := fx.engine.Create(ctx, publishedDef(t, fx.tenantDB, "Currency"), map[string]any{
+		"code": "JPY", "name": "Japanese Yen", "minor_unit": float64(0),
+	}, humanActor())
+	if err != nil {
+		t.Fatalf("create JPY Currency: %v", err)
+	}
+
+	rec, err := fx.engine.Create(ctx, publishedDef(t, fx.tenantDB, "FixedAsset"), map[string]any{
+		"asset_number": "FA-HOOK-JPY", "name": map[string]any{"en": "Hook Asset (JPY)"},
+		"acquisition_date": "2026-01-15", "cost": 3000.0, "salvage_value": 0.0,
+		"useful_life_months": 3.0, "depreciation_method": "straight_line",
+		"currency_id":                         jpy.ID,
+		"asset_account_id":                    fx.assetAcct,
+		"depreciation_expense_account_id":     fx.expAcct,
+		"accumulated_depreciation_account_id": fx.accumAcct,
+		"status_id":                           fx.statusID["in_service"],
+	}, humanActor())
+	if err != nil {
+		t.Fatalf("create FixedAsset: %v", err)
+	}
+
+	rows, err := fx.engine.ListByField(ctx, publishedDef(t, fx.tenantDB, "DepreciationSchedule"), "fixed_asset_id", rec.ID)
+	if err != nil {
+		t.Fatalf("list DepreciationSchedule: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("expected 3 schedule rows, got %d", len(rows))
+	}
+	bySeq := map[int]map[string]any{}
+	for _, r := range rows {
+		seq, _ := r.Data["sequence"].(float64)
+		bySeq[int(seq)] = r.Data
+	}
+	wantAmounts := map[int]float64{1: 1000, 2: 1000, 3: 1000}
+	wantBookValues := map[int]float64{1: 2000, 2: 1000, 3: 0}
+	for seq, wantAmount := range wantAmounts {
+		got := bySeq[seq]
+		if got["depreciation_amount"] != wantAmount {
+			t.Errorf("sequence %d: depreciation_amount = %v, want %v (at JPY's 0dp scale, not the 2dp fallback's wrongly-scaled 100x value)", seq, got["depreciation_amount"], wantAmount)
+		}
+		if got["book_value"] != wantBookValues[seq] {
+			t.Errorf("sequence %d: book_value = %v, want %v", seq, got["book_value"], wantBookValues[seq])
+		}
+	}
+}
+
 func TestGenerateDepreciationScheduleOnWrite_MissingCurrency_FallsBackToDefaultScale(t *testing.T) {
 	fx := setUpScheduleHookFixture(t)
 	ctx := context.Background()
@@ -283,6 +346,10 @@ func TestGenerateDepreciationScheduleOnWrite_UpdateChangesUsefulLife_Regenerates
 	if err != nil {
 		t.Fatalf("create FixedAsset: %v", err)
 	}
+	before, err := fx.engine.ListByField(ctx, publishedDef(t, fx.tenantDB, "DepreciationSchedule"), "fixed_asset_id", rec.ID)
+	if err != nil || len(before) != 3 {
+		t.Fatalf("list DepreciationSchedule before update: err=%v n=%d", err, len(before))
+	}
 
 	extended := map[string]any{}
 	for k, v := range base {
@@ -299,6 +366,17 @@ func TestGenerateDepreciationScheduleOnWrite_UpdateChangesUsefulLife_Regenerates
 	}
 	if len(rows) != 6 {
 		t.Fatalf("expected the schedule to regenerate to 6 rows, got %d", len(rows))
+	}
+
+	// The delete half of the audit trail, not just the create half
+	// (already covered by TestGenerateDepreciationScheduleOnWrite_
+	// CreateWritesAuditRowsForEveryScheduleRow) — every one of the 3
+	// stale rows this regeneration replaced must have its own delete
+	// audit entry, per CLAUDE.md's audit-actor-identity rule.
+	for _, r := range before {
+		if n := fx.auditCount(t, "DepreciationSchedule", r.ID, "delete", "human"); n != 1 {
+			t.Errorf("expected 1 delete audit row for stale DepreciationSchedule %s, got %d", r.ID, n)
+		}
 	}
 }
 
@@ -350,7 +428,7 @@ func TestGenerateDepreciationScheduleOnWrite_UpdateAfterPosting_Rejected(t *test
 	if !errors.Is(err, crud.ErrHookRejected) {
 		t.Errorf("expected error to wrap crud.ErrHookRejected, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "already has posted depreciation") {
+	if !strings.Contains(err.Error(), "already posted") {
 		t.Errorf("expected a message explaining the rejection, got %v", err)
 	}
 

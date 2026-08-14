@@ -74,9 +74,13 @@ func FixedAssetForm() *form.Definition {
 }
 
 // DepreciationScheduleForm exists so a schedule row is independently
-// viewable and correctable — the rows are generated, but a correction
-// should go through the same audited CRUD path as any other record
-// rather than requiring a regeneration that would discard history.
+// viewable and correctable — the rows are generated
+// (GenerateDepreciationScheduleOnWrite, schedule_hook.go), but a
+// correction goes through the same audited CRUD path as any other
+// record rather than a dedicated regeneration action. That correction
+// is not currently guaranteed to survive a later, unrelated save of the
+// row's own FixedAsset, though — see DepreciationSchedule's own doc
+// comment (assets.go) and uc-infra#236.
 func DepreciationScheduleForm() *form.Definition {
 	return &form.Definition{
 		EntityType: "DepreciationSchedule",

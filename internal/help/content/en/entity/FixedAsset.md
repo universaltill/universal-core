@@ -52,8 +52,12 @@ asset is In Service.
 change Cost, Salvage Value, Useful Life, Depreciation Method,
 Acquisition Date or Currency (the save is rejected) — posted rows are
 real, already-recorded ledger entries, and changing what produced them
-would silently invalidate that history. Every other field on the asset
-(Location, Name, the posting accounts) can still be edited freely.
+would silently invalidate that history. An edit that doesn't touch the
+schedule (Location, Name, the posting accounts) normally goes through
+fine; if a save is unexpectedly rejected after posting has started even
+though you only touched one of those, a stored schedule that no longer
+matches what the asset's current terms compute is the most likely
+cause — for instance, an earlier manual correction to a schedule row.
 
 ## Rules to know
 

@@ -222,6 +222,70 @@ func TestRecordRepo_ListTx_SeesUncommittedWritesInSameTx(t *testing.T) {
 	}
 }
 
+// TestRecordRepo_ListByFieldForUpdateTx_BlocksConcurrentUpdate confirms
+// ListByFieldForUpdateTx's whole reason to exist: a real Postgres row
+// lock, not just correct data. Without FOR UPDATE, a caller deciding
+// "is it safe to delete this row?" based on a plain read can race a
+// concurrent writer — this is the exact interleaving
+// assets.GenerateDepreciationScheduleOnWrite's posted-row guard must not
+// allow against internal/worker.Runner's depreciation-posting tick.
+func TestRecordRepo_ListByFieldForUpdateTx_BlocksConcurrentUpdate(t *testing.T) {
+	tdb := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(tdb)
+
+	rec, err := repo.Create(ctx, "Widget", map[string]any{"name": "a", "group": "x"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	txA, err := tdb.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin txA: %v", err)
+	}
+	defer txA.Rollback() //nolint:errcheck
+
+	if _, err := repo.ListByFieldForUpdateTx(ctx, txA, "Widget", "group", "x"); err != nil {
+		t.Fatalf("ListByFieldForUpdateTx: %v", err)
+	}
+
+	// A concurrent transaction trying to update the SAME row must block
+	// until txA ends — proven by racing a "did it complete yet?" check
+	// against an explicit release of txA's lock, not by timing alone.
+	updated := make(chan error, 1)
+	go func() {
+		txB, err := tdb.BeginTx(ctx, nil)
+		if err != nil {
+			updated <- fmt.Errorf("begin txB: %w", err)
+			return
+		}
+		defer txB.Rollback() //nolint:errcheck
+		_, err = repo.UpdateTx(ctx, txB, "Widget", rec.ID, map[string]any{"name": "b", "group": "x"}, nil)
+		updated <- err
+	}()
+
+	select {
+	case err := <-updated:
+		t.Fatalf("expected txB's update to block behind txA's FOR UPDATE lock, but it completed (err=%v)", err)
+	case <-time.After(300 * time.Millisecond):
+		// Still blocked, as expected — release the lock and confirm txB
+		// then proceeds.
+	}
+
+	if err := txA.Rollback(); err != nil {
+		t.Fatalf("rollback txA: %v", err)
+	}
+
+	select {
+	case err := <-updated:
+		if err != nil {
+			t.Fatalf("txB's update failed after txA released the lock: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("txB's update never completed after txA released the lock")
+	}
+}
+
 // TestRecordRepo_ListByFieldTx_ParticipatesInCallerTransaction mirrors
 // TestRecordRepo_ListTx_ParticipatesInCallerTransaction for the
 // field-filtered variant — same reasoning, same fixture shape.
