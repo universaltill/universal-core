@@ -770,7 +770,30 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
             }
             stream.getTracks().forEach(function(t) { t.stop(); });
             var blob = new Blob(chunks, { type: "audio/webm" });
-            statusEl.textContent = {{.TranscribingLabel}};
+            // uc-infra#221: guarded on mediaRecorder === thisRecorder, same
+            // identity check onstop's own button-label reset above already
+            // uses — #196 legitimized a fast Stop-then-Record-again as a
+            // supported flow (isolating each take's audio bytes so they can
+            // no longer mix), but every write below this point used to be
+            // unconditional, so a still-in-flight earlier take's
+            // "Transcribing…" status, its eventual transcript/description,
+            // or its transcribe error could each land on screen *after* a
+            // newer take had already started — clobbering whatever the
+            // newer, currently-visible take had shown, or (for transcript/
+            // description) silently overwriting user edits made in the
+            // meantime with a stale take's result. This take's own request
+            // is still sent either way (aborting it would need an
+            // AbortController this take never set up, and the guard's job
+            // is only to stop a stale result from being *applied*, not to
+            // cancel the network request) — its response is just dropped on
+            // arrival, same "drop the stale take's UI update rather than
+            // apply it" choice onstop's own reset already made for the
+            // button label. Re-checked at every write below (not just
+            // once here), since a newer take can start at any point while
+            // this fetch is still in flight.
+            if (mediaRecorder === thisRecorder) {
+              statusEl.textContent = {{.TranscribingLabel}};
+            }
             var form = new FormData();
             form.append("audio", blob, "note.webm");
             fetch({{.TranscribeHref}}, { method: "POST", body: form })
@@ -779,6 +802,13 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
                 return resp.text();
               })
               .then(function(text) {
+                // uc-infra#221: see the guard comment above — a newer take
+                // may have started while this request was in flight, in
+                // which case this take no longer owns the shared status/
+                // transcript/description fields and its result is dropped.
+                if (mediaRecorder !== thisRecorder) {
+                  return;
+                }
                 // Both assignments below are clamped defensively
                 // (uc-infra#174, independent review): text is the ASR
                 // server's own response, script-assigned to .value, so
@@ -809,7 +839,12 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
                 statusEl.textContent = "";
               })
               .catch(function(err) {
-                statusEl.textContent = String(err.message || err);
+                // uc-infra#221: same guard as the success path above — a
+                // stale take's transcribe failure must not stomp a newer
+                // take's own in-progress/idle status line.
+                if (mediaRecorder === thisRecorder) {
+                  statusEl.textContent = String(err.message || err);
+                }
               });
           };
           mediaRecorder.start();
