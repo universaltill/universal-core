@@ -660,13 +660,33 @@ func TestAPI_PurchasingReport_HiddenInventoryQuantitiesRenderNotAvailable(t *tes
 
 	seedFieldRule(t, db, "onhand-restricted", "user-onhand-hidden", "InventoryItem", "qty_on_hand")
 	seedFieldRule(t, db, "atp-restricted", "user-atp-hidden", "InventoryItem", "qty_available_to_promise")
+	// A third actor with BOTH fields hidden at once (independent review,
+	// uc-infra#230) — not exercised by either single-field actor above,
+	// and proves the two predicates compose (both flags true
+	// simultaneously) rather than one silently masking the other.
+	//
+	// Deliberately ONE role with two FieldPermission rows, not two
+	// single-field roles granted to the same user: authz.Resolver.
+	// HiddenFields' own contract (authz.go) is a field is hidden only
+	// when EVERY role the actor holds has a hidden=true row for it — two
+	// single-field roles would each fail that unanimity test for the
+	// OTHER role's field, hiding NEITHER, the opposite of what this case
+	// means to test.
+	bothRoleID := seedFieldRule(t, db, "both-restricted", "user-both-hidden", "InventoryItem", "qty_on_hand")
+	mustCreate("FieldPermission", map[string]any{
+		"role_id": bothRoleID, "entity_type": "InventoryItem", "field_name": "qty_available_to_promise", "hidden": true,
+	})
 
 	mux := http.NewServeMux()
 	testHandler(t, router).Routes(mux)
 
 	// Unrestricted actor: every real number renders, on every table,
 	// including the Stockout Risk heading's own real count.
-	openBody := getAs(t, mux, "/reports/purchasing", tenantID, "farshid").Body.String()
+	recOpen := getAs(t, mux, "/reports/purchasing", tenantID, "farshid")
+	if recOpen.Code != http.StatusOK {
+		t.Fatalf("unrestricted actor: expected 200, got %d: %s", recOpen.Code, recOpen.Body.String())
+	}
+	openBody := recOpen.Body.String()
 	for _, want := range []string{
 		// Stock Summary card.
 		`<div class="uc-report-card-label">Qty On Hand</div>
@@ -691,7 +711,11 @@ func TestAPI_PurchasingReport_HiddenInventoryQuantitiesRenderNotAvailable(t *tes
 	// so the precise, anchored per-cell checks below are the real
 	// assertion — they pin exactly which cell shows what, not just
 	// whether a digit sequence occurs somewhere in the page.
-	onHandBody := getAs(t, mux, "/reports/purchasing", tenantID, "user-onhand-hidden").Body.String()
+	recOnHand := getAs(t, mux, "/reports/purchasing", tenantID, "user-onhand-hidden")
+	if recOnHand.Code != http.StatusOK {
+		t.Fatalf("qty_on_hand-restricted actor: expected 200, got %d: %s", recOnHand.Code, recOnHand.Body.String())
+	}
+	onHandBody := recOnHand.Body.String()
 	for _, want := range []string{
 		`<div class="uc-report-card-label">Qty On Hand</div>
   <div class="uc-report-card-value">Not available</div>`,
@@ -717,7 +741,11 @@ func TestAPI_PurchasingReport_HiddenInventoryQuantitiesRenderNotAvailable(t *tes
 	// purchasingReportView.StockoutAvailable's own comment). On Hand/
 	// Position stay real everywhere else — hiding ATP must not blank a
 	// field it has no relationship to.
-	atpBody := getAs(t, mux, "/reports/purchasing", tenantID, "user-atp-hidden").Body.String()
+	recATP := getAs(t, mux, "/reports/purchasing", tenantID, "user-atp-hidden")
+	if recATP.Code != http.StatusOK {
+		t.Fatalf("qty_available_to_promise-restricted actor: expected 200, got %d: %s", recATP.Code, recATP.Body.String())
+	}
+	atpBody := recATP.Body.String()
 	for _, want := range []string{
 		`<div class="uc-report-card-label">Qty On Hand</div>
   <div class="uc-report-card-value">17</div>`,
@@ -738,6 +766,32 @@ func TestAPI_PurchasingReport_HiddenInventoryQuantitiesRenderNotAvailable(t *tes
 	}
 	if strings.Contains(atpBody, "Stockout Risk (") {
 		t.Errorf("qty_available_to_promise-restricted actor: the Stockout Risk heading must not show a count derived from the hidden field:\n%s", atpBody)
+	}
+
+	// Both fields hidden at once: every site above blanks/gates
+	// simultaneously — neither predicate silently wins over the other,
+	// and OnOrder/ReorderPoint (fields neither FieldPermission touches)
+	// still render for real.
+	recBoth := getAs(t, mux, "/reports/purchasing", tenantID, "user-both-hidden")
+	if recBoth.Code != http.StatusOK {
+		t.Fatalf("both-restricted actor: expected 200, got %d: %s", recBoth.Code, recBoth.Body.String())
+	}
+	bothBody := recBoth.Body.String()
+	for _, want := range []string{
+		`<div class="uc-report-card-label">Qty On Hand</div>
+  <div class="uc-report-card-value">Not available</div>`,
+		`<div class="uc-report-card-label">Qty Available to Promise</div>
+  <div class="uc-report-card-value">Not available</div>`,
+		"<h2>Stockout Risk</h2>",
+		`<p class="uc-empty">Not available</p>`,
+		`<tr><td><a href="/forms/Item/` + itemID + `">Leaky Widget</a></td><td>Not available</td><td>0</td><td>Not available</td><td>25</td>`,
+	} {
+		if !strings.Contains(bothBody, want) {
+			t.Errorf("both-restricted actor: expected %q in body:\n%s", want, bothBody)
+		}
+	}
+	if strings.Contains(bothBody, "SKU-LEAK") {
+		t.Errorf("both-restricted actor: the Stockout Risk row must not render at all:\n%s", bothBody)
 	}
 }
 
@@ -1432,5 +1486,41 @@ func TestAPI_PurchasingReport_ModuleMenuHidesReportLinkWhenDenied(t *testing.T) 
 	}
 	if strings.Contains(denied.Body.String(), "/reports/purchasing") {
 		t.Fatalf("user-denied (Item read denied, a report dependency) still saw the report link, which leads to a guaranteed 403:\n%s", denied.Body.String())
+	}
+}
+
+// TestInventoryItemOnHandRedacted_TestInventoryItemATPRedacted (uc-infra#230,
+// independent review) pins both predicates' full truth tables directly, at
+// the smallest possible unit — mirroring project_budget_report_test.go's
+// own TestProjectBudgetLinePlannedRedacted_.../
+// TestProjectBudgetLineCategoryRedacted_... tests for the equivalent
+// predicates on a different entity. This is the guard against a typo in
+// either field-name literal silently disabling the whole fix: a bare
+// inline map lookup at each call site would have no unit-level test of
+// its own, only the slower, coarser HTTP-level regression test to catch
+// a mistake here.
+func TestInventoryItemOnHandRedacted_TestInventoryItemATPRedacted(t *testing.T) {
+	cases := []struct {
+		name       string
+		hidden     map[string]bool
+		wantOnHand bool
+		wantATP    bool
+	}{
+		{"nothing hidden", map[string]bool{}, false, false},
+		{"nil map", nil, false, false},
+		{"qty_on_hand hidden", map[string]bool{"qty_on_hand": true}, true, false},
+		{"qty_available_to_promise hidden", map[string]bool{"qty_available_to_promise": true}, false, true},
+		{"both hidden", map[string]bool{"qty_on_hand": true, "qty_available_to_promise": true}, true, true},
+		{"unrelated field hidden", map[string]bool{"item_id": true}, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := inventoryItemOnHandRedacted(tc.hidden); got != tc.wantOnHand {
+				t.Errorf("inventoryItemOnHandRedacted(%v) = %v, want %v", tc.hidden, got, tc.wantOnHand)
+			}
+			if got := inventoryItemATPRedacted(tc.hidden); got != tc.wantATP {
+				t.Errorf("inventoryItemATPRedacted(%v) = %v, want %v", tc.hidden, got, tc.wantATP)
+			}
+		})
 	}
 }
