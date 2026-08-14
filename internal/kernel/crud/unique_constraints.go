@@ -33,13 +33,30 @@ var ErrUniqueConstraintViolation = errors.New("value already used by another rec
 // ErrUniqueConstraintViolation failure named. Fields is the canonicalized
 // (sorted) field-name set, matching entity.UniqueConstraintName's own
 // ordering, so a caller resolving field labels can just range over it.
+//
+// WhenField/WhenValue are set only for a def.UniqueWhen violation
+// (uc-infra#201, ADR-0028) — both empty for an ordinary def.Unique
+// violation. independent review of #201: internal/api's error rendering
+// originally reused crud.error.unique_constraint_violation's "This
+// combination of {fields} is already used by another record." verbatim
+// for a UniqueWhen violation too, which is actively misleading (Fields is
+// often just the conditioning field itself — "This combination of Role
+// is already used" tells a user role TYPES are unique, which is false;
+// every other role_type coexists freely). Carrying the condition here
+// lets internal/api render a dedicated, accurate message instead —
+// see writeCrudErrorLocalized's own doc comment.
 type UniqueConstraintError struct {
 	EntityType     string
 	ConstraintName string
 	Fields         []string
+	WhenField      string
+	WhenValue      string
 }
 
 func (e *UniqueConstraintError) Error() string {
+	if e.WhenField != "" {
+		return fmt.Sprintf("%s.%s (when %s=%q): %s", e.EntityType, e.ConstraintName, e.WhenField, e.WhenValue, ErrUniqueConstraintViolation)
+	}
 	return fmt.Sprintf("%s.%s: %s", e.EntityType, e.ConstraintName, ErrUniqueConstraintViolation)
 }
 
@@ -136,6 +153,12 @@ func uniqueKeyValue(sortedFields []string, fields map[string]any) (value string,
 // collide. #107 already tracks id-spelling canonicalization as a
 // cross-cutting kernel gap; fixing it only here would leave every other
 // consumer of a FieldReference value inconsistent with this one.
+//
+// Also walks def.UniqueWhen (uc-infra#201, ADR-0028) — the same
+// enforcement, gated per-constraint on WhenField==WhenValue via
+// conditionalKeyValue, sharing writeConstraintKey's insert/conflict-
+// translate logic with the def.Unique loop above so the two enforcement
+// paths can never independently drift.
 func WriteUniqueConstraintKeys(ctx context.Context, tx queryable, keys *data.RecordUniqueKeyRepo, def *entity.Definition, recordID string, fields map[string]any) error {
 	for _, set := range def.Unique {
 		sorted := canonicalSort(set)
@@ -144,17 +167,96 @@ func WriteUniqueConstraintKeys(ctx context.Context, tx queryable, keys *data.Rec
 		if err != nil {
 			return err
 		}
-		if !applicable {
-			continue
+		if err := writeConstraintKey(ctx, tx, keys, def.EntityType, name, sorted, "", "", value, applicable, recordID); err != nil {
+			return err
 		}
-		if err := keys.InsertTx(ctx, tx, def.EntityType, name, value, recordID); err != nil {
+	}
+	for _, cu := range def.UniqueWhen {
+		sorted := canonicalSort(cu.Fields)
+		name := entity.ConditionalUniqueConstraintName(cu)
+		value, applicable, err := conditionalKeyValue(cu, fields)
+		if err != nil {
+			return err
+		}
+		if err := writeConstraintKey(ctx, tx, keys, def.EntityType, name, sorted, cu.WhenField, cu.WhenValue, value, applicable, recordID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// writeConstraintKey performs the Write-side (insert-only, Engine.Create
+// path) enforcement for one already-resolved (name, value, applicable)
+// triple — the common tail def.Unique's and def.UniqueWhen's loops in
+// WriteUniqueConstraintKeys both need, extracted so the two constraint
+// kinds can never independently drift on how a record_unique_keys
+// conflict gets translated into *UniqueConstraintError. whenField/
+// whenValue are passed through verbatim into the resulting error (empty
+// for a def.Unique caller, the declared condition for a def.UniqueWhen
+// caller) — independent review of uc-infra#201: internal/api needs these
+// to render a message that doesn't misrepresent a conditional violation
+// as an ordinary one (see UniqueConstraintError's own doc comment).
+func writeConstraintKey(ctx context.Context, tx queryable, keys *data.RecordUniqueKeyRepo, entityType, name string, sorted []string, whenField, whenValue string, value string, applicable bool, recordID string) error {
+	if !applicable {
+		return nil
+	}
+	if err := keys.InsertTx(ctx, tx, entityType, name, value, recordID); err != nil {
+		if errors.Is(err, data.ErrUniqueKeyConflict) {
+			return &UniqueConstraintError{EntityType: entityType, ConstraintName: name, Fields: sorted, WhenField: whenField, WhenValue: whenValue}
+		}
+		return err
+	}
+	return nil
+}
+
+// updateConstraintKey is writeConstraintKey's Engine.Update counterpart:
+// reconciles one already-resolved (name, value, applicable) triple
+// against its existing record_unique_keys row — delete when no longer
+// applicable, insert when applicable with no existing row, update
+// key_value in place otherwise. Shared the same way between def.Unique's
+// and def.UniqueWhen's loops in UpdateUniqueConstraintKeys. whenField/
+// whenValue: see writeConstraintKey's own doc comment.
+func updateConstraintKey(ctx context.Context, tx queryable, keys *data.RecordUniqueKeyRepo, entityType, name string, sorted []string, whenField, whenValue string, value string, applicable bool, recordID string) error {
+	if !applicable {
+		return keys.DeleteForConstraintTx(ctx, tx, entityType, name, recordID)
+	}
+	n, err := keys.UpdateValueTx(ctx, tx, entityType, name, value, recordID)
+	if err != nil {
+		if errors.Is(err, data.ErrUniqueKeyConflict) {
+			return &UniqueConstraintError{EntityType: entityType, ConstraintName: name, Fields: sorted, WhenField: whenField, WhenValue: whenValue}
+		}
+		return err
+	}
+	if n == 0 {
+		// No existing row — this record was created before the
+		// constraint applied to it (version bump) or its key fields
+		// were previously absent/empty (or, for UniqueWhen, the
+		// condition wasn't met). Insert now so it's covered going
+		// forward, same conflict handling as the Create path.
+		if err := keys.InsertTx(ctx, tx, entityType, name, value, recordID); err != nil {
 			if errors.Is(err, data.ErrUniqueKeyConflict) {
-				return &UniqueConstraintError{EntityType: def.EntityType, ConstraintName: name, Fields: sorted}
+				return &UniqueConstraintError{EntityType: entityType, ConstraintName: name, Fields: sorted, WhenField: whenField, WhenValue: whenValue}
 			}
 			return err
 		}
 	}
 	return nil
+}
+
+// conditionalKeyValue is uniqueKeyValue extended with an extra gate for
+// ConditionalUnique (uc-infra#201, ADR-0028): the condition
+// (WhenField==WhenValue, compared via valueMatches — the same
+// type-agnostic comparison target_constraints.go's Field.TargetFilter
+// handling already uses) must hold before the ordinary
+// Fields-present-and-non-blank check even runs. A record failing the
+// condition is inapplicable regardless of what Fields itself contains —
+// e.g. a "vendor" PartyRole is never subject to own_organization's
+// constraint no matter what role_type structurally evaluates to.
+func conditionalKeyValue(cu entity.ConditionalUnique, fields map[string]any) (value string, applicable bool, err error) {
+	if !valueMatches(fields[cu.WhenField], cu.WhenValue) {
+		return "", false, nil
+	}
+	return uniqueKeyValue(canonicalSort(cu.Fields), fields)
 }
 
 // UpdateUniqueConstraintKeys re-derives each declared constraint's key
@@ -176,6 +278,14 @@ func WriteUniqueConstraintKeys(ctx context.Context, tx queryable, keys *data.Rec
 // reasoning, a crud.Hook updating a record it looked up itself (not the
 // one Engine.Update is already writing) needs this same reconciliation,
 // not a hand-rolled duplicate of it.
+//
+// Also walks def.UniqueWhen (uc-infra#201, ADR-0028): a record
+// transitioning OUT of the condition (e.g. role_type edited away from
+// "own_organization") deletes its key row via the same "no longer
+// applicable" branch a key field going absent already uses; transitioning
+// IN inserts, same as a record newly satisfying a version-bumped Unique
+// set. Shares updateConstraintKey's reconcile logic with the def.Unique
+// loop below so the two enforcement paths can never independently drift.
 func UpdateUniqueConstraintKeys(ctx context.Context, tx queryable, keys *data.RecordUniqueKeyRepo, def *entity.Definition, recordID string, fields map[string]any) error {
 	for _, set := range def.Unique {
 		sorted := canonicalSort(set)
@@ -184,30 +294,19 @@ func UpdateUniqueConstraintKeys(ctx context.Context, tx queryable, keys *data.Re
 		if err != nil {
 			return err
 		}
-		if !applicable {
-			if err := keys.DeleteForConstraintTx(ctx, tx, def.EntityType, name, recordID); err != nil {
-				return err
-			}
-			continue
-		}
-		n, err := keys.UpdateValueTx(ctx, tx, def.EntityType, name, value, recordID)
-		if err != nil {
-			if errors.Is(err, data.ErrUniqueKeyConflict) {
-				return &UniqueConstraintError{EntityType: def.EntityType, ConstraintName: name, Fields: sorted}
-			}
+		if err := updateConstraintKey(ctx, tx, keys, def.EntityType, name, sorted, "", "", value, applicable, recordID); err != nil {
 			return err
 		}
-		if n == 0 {
-			// No existing row — this record was created before the
-			// constraint applied to it (version bump) or its key fields
-			// were previously absent/empty. Insert now so it's covered
-			// going forward, same conflict handling as the Create path.
-			if err := keys.InsertTx(ctx, tx, def.EntityType, name, value, recordID); err != nil {
-				if errors.Is(err, data.ErrUniqueKeyConflict) {
-					return &UniqueConstraintError{EntityType: def.EntityType, ConstraintName: name, Fields: sorted}
-				}
-				return err
-			}
+	}
+	for _, cu := range def.UniqueWhen {
+		sorted := canonicalSort(cu.Fields)
+		name := entity.ConditionalUniqueConstraintName(cu)
+		value, applicable, err := conditionalKeyValue(cu, fields)
+		if err != nil {
+			return err
+		}
+		if err := updateConstraintKey(ctx, tx, keys, def.EntityType, name, sorted, cu.WhenField, cu.WhenValue, value, applicable, recordID); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -336,6 +435,106 @@ func BackfillUniqueConstraintKeys(ctx context.Context, db *sql.DB, records *data
 					continue
 				}
 				return backfilled, skipped, fmt.Errorf("backfill unique constraint keys for %s: %w", entityType, err)
+			}
+			backfilled++
+		}
+		if len(page) < pageSize {
+			break
+		}
+		offset += pageSize
+	}
+	return backfilled, skipped, nil
+}
+
+// CountConditionalUniqueConstraintViolations is
+// CountUniqueConstraintViolations' UniqueWhen counterpart (uc-infra#201,
+// ADR-0028): same page-at-a-time walk and "seen more than once" count,
+// gated per-record on cu's condition via conditionalKeyValue instead of
+// uniqueKeyValue, so a record not satisfying WhenField==WhenValue never
+// enters the collision count at all — e.g. a Currency sync run counts
+// how many EXISTING is_base=true rows collide with each other, never how
+// many rows share is_base=false, which is unconstrained.
+//
+// Kept as its own page-walking loop rather than sharing
+// CountUniqueConstraintViolations' body (via, say, a value-function
+// parameter): the two already-shipped, already-tested Count/Backfill
+// pair below it do not share their own loops with each other either,
+// despite the same conceptual overlap — consistent with that precedent,
+// and lower-risk than threading a new abstraction through code this
+// change does not otherwise need to touch.
+func CountConditionalUniqueConstraintViolations(ctx context.Context, records *data.RecordRepo, entityType string, cu entity.ConditionalUnique) (int, error) {
+	const pageSize = 200
+	seen := make(map[string]int)
+	offset := 0
+	for {
+		page, err := records.ListPage(ctx, entityType, pageSize, offset)
+		if err != nil {
+			return 0, fmt.Errorf("count conditional unique constraint violations for %s: %w", entityType, err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		for _, rec := range page {
+			value, applicable, err := conditionalKeyValue(cu, rec.Data)
+			if err != nil {
+				return 0, fmt.Errorf("count conditional unique constraint violations for %s: %w", entityType, err)
+			}
+			if !applicable {
+				continue
+			}
+			seen[value]++
+		}
+		if len(page) < pageSize {
+			break
+		}
+		offset += pageSize
+	}
+	violations := 0
+	for _, count := range seen {
+		if count > 1 {
+			violations += count
+		}
+	}
+	return violations, nil
+}
+
+// BackfillConditionalUniqueConstraintKeys is BackfillUniqueConstraintKeys'
+// UniqueWhen counterpart (uc-infra#201, ADR-0028): same oldest-first,
+// page-at-a-time backfill, gated per-record on cu's condition via
+// conditionalKeyValue instead of uniqueKeyValue, so only records actually
+// satisfying WhenField==WhenValue get a record_unique_keys row — a
+// PartyRole with role_type=="vendor" is never backfilled against
+// own_organization's constraint name, the same "never touches records
+// outside the condition" scoping WriteUniqueConstraintKeys/
+// UpdateUniqueConstraintKeys enforce going forward. See
+// CountConditionalUniqueConstraintViolations' doc comment for why this
+// is its own loop rather than sharing BackfillUniqueConstraintKeys'.
+func BackfillConditionalUniqueConstraintKeys(ctx context.Context, db *sql.DB, records *data.RecordRepo, keys *data.RecordUniqueKeyRepo, entityType string, cu entity.ConditionalUnique) (backfilled, skipped int, err error) {
+	name := entity.ConditionalUniqueConstraintName(cu)
+	const pageSize = 200
+	offset := 0
+	for {
+		page, err := records.ListPage(ctx, entityType, pageSize, offset)
+		if err != nil {
+			return backfilled, skipped, fmt.Errorf("backfill conditional unique constraint keys for %s: %w", entityType, err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		for _, rec := range page {
+			value, applicable, err := conditionalKeyValue(cu, rec.Data)
+			if err != nil {
+				return backfilled, skipped, fmt.Errorf("backfill conditional unique constraint keys for %s: %w", entityType, err)
+			}
+			if !applicable {
+				continue
+			}
+			if err := keys.InsertTx(ctx, db, entityType, name, value, rec.ID); err != nil {
+				if errors.Is(err, data.ErrUniqueKeyConflict) {
+					skipped++
+					continue
+				}
+				return backfilled, skipped, fmt.Errorf("backfill conditional unique constraint keys for %s: %w", entityType, err)
 			}
 			backfilled++
 		}

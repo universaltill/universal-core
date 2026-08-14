@@ -33,11 +33,13 @@ erkenden kurar.
 - Kod ve ad zorunludur. Alt birim 0 ile 6 arasında olmalıdır.
 - Kod benzersiz olmalıdır — sistem, başka bir Para Birimi tarafından zaten
   kullanılan bir kodu yeniden kullanan ikinci bir Para Birimini reddeder.
-- Tam olarak bir Para Biriminin **Temel Para Birimi** olarak işaretlenmesi
-  gerekir. Sistem ikincisini kesin olarak engellemez, bu yüzden bunu bir
-  yönetimsel kural olarak görün — temel para birimine dayanan özellikler
-  (defter senkronizasyonu ve yasal dışa aktarım gibi), durum belirsizse
-  tahmin yürütmek yerine güvenli bir şekilde geri çekilir.
+- Tam olarak bir Para Birimi **Temel Para Birimi** olarak işaretlenebilir —
+  sistem ikinci bir işaretleme girişimini doğrudan reddeder. Temel para
+  birimine dayanan özellikler (defter senkronizasyonu ve yasal dışa
+  aktarım gibi), bu kural uygulanmadan önceki eski verilerin nadir
+  durumunda hâlâ tahmin yürütmek yerine güvenli bir şekilde geri çekilir.
+  Temel para birimini değiştirmek için önce mevcut olandaki işareti
+  kaldırıp kaydedin, ardından yeni olana işaretleyin.
 - Bir Para Birimi kaydı kendi başına döviz kurları taşımaz — bunlar ayrı,
   tarihli **Döviz Kuru** kayıtlarıdır, çünkü kurlar günlük değişirken bir
   para biriminin kodu ve adı değişmez.

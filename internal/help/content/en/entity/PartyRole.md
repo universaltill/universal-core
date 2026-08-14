@@ -32,8 +32,10 @@ record, not a second Party.
 - **Own Organization** is a special role: it marks the one Party record that
   represents your own company, consumed by statutory exports for your
   registration number and tax details (set on the Party itself). Only one
-  Party in a tenant should hold it — the system does not block a second one,
-  so treat this as an administrative convention to keep, not a hard limit.
+  Party in a tenant can hold it — the system rejects a second attempt to add
+  it outright, so there is nothing to remember to enforce by convention. To
+  move this role to a different Party, remove it from the current Party
+  first and save, then add it to the new one.
 - Roles are additive, not exclusive: a Party being a vendor does not stop it
   from also being a customer or a contact.
 - Removing a role does not delete the underlying Party or its history —

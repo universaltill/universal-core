@@ -45,6 +45,17 @@ import (
 // check stays load-bearing for real tenant data, not just a defensive
 // leftover.
 //
+// As of uc-infra#201/ADR-0028 (Currency v6), is_base=true itself is ALSO
+// schema-constrained going forward — foundation.Currency.UniqueWhen — the
+// exact same "schema-unique going forward, but a pre-existing collision
+// can still exist until backfilled, and a colliding pair is left UNBACKED
+// (not repaired) even after backfill" shape as code/uc-infra#181 above,
+// same reasoning, same crud.BackfillConditionalUniqueConstraintKeys
+// mechanism. This function's zero-or-multiple-DISTINCT-code degradation
+// therefore stays load-bearing for the same two cases: a tenant whose
+// sync hasn't reached v6 yet, and a tenant that already held two
+// is_base=true rows before this version's backfill ran.
+//
 // A candidate code that isn't a well-formed 3-letter ISO 4217 code
 // (after trimming and uppercasing, matching saft.Build's own check) is
 // treated as no code at all, not as a match — independent review found

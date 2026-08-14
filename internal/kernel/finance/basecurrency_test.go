@@ -3,6 +3,7 @@ package finance
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"testing"
 
 	"github.com/universaltill/universal-core/internal/data"
@@ -67,11 +68,64 @@ func TestResolveBaseCurrency_OneIsBaseSet_ReturnsItsCode(t *testing.T) {
 }
 
 // TestResolveBaseCurrency_MultipleIsBaseSet_FallsBackToDefault covers the
-// ambiguous case — more than one Currency claiming is_base=true (the
-// generic entity/crud layer has no unique-constraint concept, uc-infra#121)
+// ambiguous case — more than one Currency claiming is_base=true —
 // degrades to the documented fallback rather than guessing which one is
 // correct, same fail-safe posture as PartyRole.own_organization.
+//
+// As of uc-infra#201/ADR-0028 (Currency v6), a second is_base=true row
+// can no longer be produced through the ordinary crud.Engine.Create path
+// at all — foundation.Currency.UniqueWhen rejects it with
+// *crud.UniqueConstraintError, same as this test asserted was NOT the
+// case before that change (independent review: an earlier version of
+// this test went through engine.Create twice, which is exactly the
+// write path the new constraint now blocks — testing a scenario the
+// production code path can no longer reach proves nothing). The
+// remaining reachable case this function's degradation still has to
+// cover is legacy data that predates the constraint: written straight
+// via data.RecordRepo, bypassing crud.Engine entirely (same technique
+// crud.unique_constraints_test.go's own pre-existing-record tests use),
+// so no record_unique_keys row backs either currency — exactly the
+// "tenant hasn't synced to v6 yet, or already held a collision before
+// this version's backfill ran" case ResolveBaseCurrency's own doc
+// comment now documents.
 func TestResolveBaseCurrency_MultipleIsBaseSet_FallsBackToDefault(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+
+	records := data.NewRecordRepo(tenantDB)
+	if _, err := records.Create(ctx, "Currency", map[string]any{
+		"code": "GBP", "name": "British Pound", "is_base": true,
+	}); err != nil {
+		t.Fatalf("create pre-existing GBP Currency: %v", err)
+	}
+	if _, err := records.Create(ctx, "Currency", map[string]any{
+		"code": "EUR", "name": "Euro", "is_base": true,
+	}); err != nil {
+		t.Fatalf("create pre-existing EUR Currency: %v", err)
+	}
+
+	got, err := ResolveBaseCurrency(ctx, tenantDB)
+	if err != nil {
+		t.Fatalf("ResolveBaseCurrency: %v", err)
+	}
+	if got != DefaultGLCurrency {
+		t.Fatalf("expected fallback %q with two is_base=true currencies, got %q", DefaultGLCurrency, got)
+	}
+}
+
+// TestResolveBaseCurrency_SecondIsBaseCreate_RejectedByEngine is the
+// regression test for the write-time guarantee uc-infra#201/ADR-0028
+// actually adds: a second is_base=true Currency created through the
+// ordinary crud.Engine.Create path (the only path real product code
+// uses) is rejected outright, not silently accepted the way
+// TestResolveBaseCurrency_MultipleIsBaseSet_FallsBackToDefault (above)
+// used to prove was possible before this change.
+func TestResolveBaseCurrency_SecondIsBaseCreate_RejectedByEngine(t *testing.T) {
 	tenantDB := freshTenantDB(t)
 	ctx := context.Background()
 	actor := humanActor()
@@ -89,16 +143,28 @@ func TestResolveBaseCurrency_MultipleIsBaseSet_FallsBackToDefault(t *testing.T) 
 	}
 	if _, err := engine.Create(ctx, currencyDef, map[string]any{
 		"code": "EUR", "name": "Euro", "is_base": true,
-	}, actor); err != nil {
-		t.Fatalf("create EUR Currency: %v", err)
+	}, actor); err == nil {
+		t.Fatal("expected a second is_base=true Currency to be rejected, got nil error")
+	} else {
+		var uce *crud.UniqueConstraintError
+		if !errors.As(err, &uce) {
+			t.Fatalf("expected *crud.UniqueConstraintError, got %T: %v", err, err)
+		}
+		want := entity.ConditionalUniqueConstraintName(entity.ConditionalUnique{
+			Fields: []string{"is_base"}, WhenField: "is_base", WhenValue: "true",
+		})
+		if uce.ConstraintName != want {
+			t.Fatalf("unexpected constraint name %q, want %q", uce.ConstraintName, want)
+		}
 	}
 
+	// The first (only surviving) is_base=true row still resolves cleanly.
 	got, err := ResolveBaseCurrency(ctx, tenantDB)
 	if err != nil {
 		t.Fatalf("ResolveBaseCurrency: %v", err)
 	}
-	if got != DefaultGLCurrency {
-		t.Fatalf("expected fallback %q with two is_base=true currencies, got %q", DefaultGLCurrency, got)
+	if got != "GBP" {
+		t.Fatalf("expected %q, got %q", "GBP", got)
 	}
 }
 

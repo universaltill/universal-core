@@ -212,14 +212,14 @@ func checkFingerprint(t *testing.T, key, hash string) {
 // the exact line to paste.
 var wantHashes = map[string]string{
 	"entity:Party@v3":                        "ae9b08dd727881048e5958165315ab05657caa98cbd28c95e5db6bd13540a277",
-	"entity:PartyRole@v3":                    "67589ddb98a50f064830189edf6e7b29be0c22fcc7f922fda8663ba58e5355d1",
+	"entity:PartyRole@v4":                    "bea18b5b9abbaba56d57eb5c93ad38902a134242e891f99f1e11c92616d81bfe",
 	"entity:PartyRelationship@v3":            "940b2b135892b4b9b2499875527ad73cb25357f0d762f9ad30a6f9dc8ad1d931",
 	"entity:Address@v2":                      "9f9f42d98d22911e54546155c16cc4b8157e8480092239e947403b892f54b911",
 	"entity:ContactMechanism@v2":             "d826b27619304bff387ef3ac3b85554853d1ab23a862faadaeb742b1cb7ce6b1",
 	"entity:Attachment@v3":                   "349d13430e9580e209853a6517b06acaec6d75df9c49c5e1700f59ee5b8b1c6c",
 	"entity:UnitOfMeasure@v2":                "fea029ba7af041ab7119bb1dee4a1481a478739e180b08b69fc14a3a75f374df",
 	"entity:UomConversion@v3":                "a33fa5d05a1a09cd7b766f639587dd537ae16a42c80f7caf312cc167955a07d3",
-	"entity:Currency@v5":                     "681fb87310f8d61c14263a2ec222d99e1d7ddec1597be4ce9b86482c120a5cd0",
+	"entity:Currency@v6":                     "6269b740ae70f9fb6086548e366ec99fe5781225d56a48137c5cf17248c695fd",
 	"entity:ExchangeRate@v3":                 "78516fa2b76628e40b05b92ac2bf4c25b674fd68b139605a7ac0e58a774beea7",
 	"entity:StatusType@v1":                   "633c522a100ada70a2fb5aa281ba24577730a5aead9bcac43d91da4b70f1a054",
 	"entity:Status@v1":                       "53b8108a33de9c1104fbf088c8a2aa7dcd81127a4a1f0a305e095e9f3d3acdb3",

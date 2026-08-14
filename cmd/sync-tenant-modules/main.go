@@ -289,6 +289,7 @@ func syncTenant(
 		// ever added, hoist this to a local and pass the same instance to
 		// both, the same way the real-run path already has to.
 		warnings = append(warnings, uniqueConstraintWarnings(ctx, tenantDB, name, changes, defFor, oldUniqueNameLookup(ctx, entityDefs, name))...)
+		warnings = append(warnings, conditionalUniqueConstraintWarnings(ctx, tenantDB, name, changes, defFor, oldConditionalUniqueNameLookup(ctx, entityDefs, name))...)
 		return warnings, outcomeSynced
 	}
 
@@ -358,14 +359,24 @@ func syncTenant(
 	// syncTenant call, not once per caller — see oldUniqueNameLookup's own
 	// doc comment.
 	oldNamesFor := oldUniqueNameLookup(ctx, entityDefs, name)
+	// Same one-shared-instance reasoning as oldNamesFor above, for
+	// UniqueWhen (uc-infra#201, ADR-0028) — kept as its own lookup/closure
+	// rather than folded into oldNamesFor's: a corrupt/unreadable old
+	// version would otherwise warn twice (once per constraint kind) under
+	// a shared closure unless that closure's own warned-dedup grew a
+	// second key dimension, which is more invasive than a second,
+	// independently-cheap re-read for a command that isn't a hot path.
+	oldConditionalNamesFor := oldConditionalUniqueNameLookup(ctx, entityDefs, name)
 	warnings := requiredFieldWarnings(ctx, tenantDB, name, changes, defFor)
 	warnings = append(warnings, targetConstraintWarnings(ctx, tenantDB, entityDefs, name, changes, defFor)...)
 	warnings = append(warnings, numericBoundWarnings(ctx, tenantDB, entityDefs, name, changes, defFor)...)
 	warnings = append(warnings, uniqueConstraintWarnings(ctx, tenantDB, name, changes, defFor, oldNamesFor)...)
+	warnings = append(warnings, conditionalUniqueConstraintWarnings(ctx, tenantDB, name, changes, defFor, oldConditionalNamesFor)...)
 	// Real run only — a dry run must not write record_unique_keys rows,
 	// same "nothing is published" contract this whole branch's dry-run
 	// sibling above holds for entity/form definitions.
 	backfillNewUniqueConstraints(ctx, tenantDB, name, changes, defFor, oldNamesFor)
+	backfillNewConditionalUniqueConstraints(ctx, tenantDB, name, changes, defFor, oldConditionalNamesFor)
 	return warnings, result
 }
 
@@ -1079,6 +1090,169 @@ func backfillNewUniqueConstraints(
 				continue
 			}
 			log.Printf("%s: %s — backfilled unique constraint %q for %d existing record(s)%s",
+				tenantName, c.entityType, name, backfilled,
+				func() string {
+					if skipped == 0 {
+						return ""
+					}
+					return fmt.Sprintf(" (%d left unprotected due to an existing collision, see the warning above)", skipped)
+				}())
+		}
+	}
+}
+
+// conditionalUniqueConstraintWarnings is uniqueConstraintWarnings'
+// UniqueWhen counterpart (uc-infra#201, ADR-0028): a version bump that
+// adds a new ConditionalUnique can find existing records satisfying its
+// condition that already collide on it — e.g. a tenant that already
+// holds two Currency rows with is_base=true before this version's sync,
+// which crud's enforcement stage only ever sees going forward. Same
+// "added" test as uniqueConstraintWarnings (set membership on the OLD
+// published Definition vs. the new one, this time keyed by
+// entity.ConditionalUniqueConstraintName so declaration order and the
+// condition itself both have to match for a constraint to count as
+// unchanged).
+func conditionalUniqueConstraintWarnings(
+	ctx context.Context,
+	tenantDB *sql.DB,
+	tenantName string,
+	changes []change,
+	defFor func(entityType string) (*entity.Definition, bool),
+	oldNamesFor func(change) map[string]bool,
+) []string {
+	records := data.NewRecordRepo(tenantDB)
+	var out []string
+	for _, c := range changes {
+		newDef, ok := defFor(c.entityType)
+		if !ok {
+			continue
+		}
+		for _, cu := range newlyAddedConditionalUniqueSets(c, newDef, oldNamesFor) {
+			name := entity.ConditionalUniqueConstraintName(cu)
+			n, err := crud.CountConditionalUniqueConstraintViolations(ctx, records, c.entityType, cu)
+			if err != nil {
+				log.Printf("WARNING: %s: %s — could not check existing records against the new conditional unique constraint %q, this warning may be incomplete: %v",
+					tenantName, c.entityType, name, err)
+				continue
+			}
+			if n == 0 {
+				continue
+			}
+			out = append(out, fmt.Sprintf(
+				"%s: %s — %d record(s) already collide on the new conditional unique constraint %q and will fail validation on next edit",
+				tenantName, c.entityType, n, name))
+		}
+	}
+	return out
+}
+
+// oldConditionalUniqueNameLookup is oldUniqueNameLookup's UniqueWhen
+// counterpart — resolves c's OLD published version's declared UniqueWhen
+// constraint names (via entity.ConditionalUniqueConstraintName), the
+// piece newlyAddedConditionalUniqueSets needs to tell "already declared"
+// apart from "actually new". Kept as its own closure/lookup rather than
+// widening oldUniqueNameLookup's return type — see this function's call
+// site in syncTenant for why a second, independent re-read was chosen
+// over threading a second key dimension through the shared one.
+func oldConditionalUniqueNameLookup(ctx context.Context, entityDefs *data.EntityDefinitionRepo, tenantName string) func(c change) map[string]bool {
+	warned := make(map[string]bool)
+	warnOnce := func(t, msg string) {
+		if warned[t] {
+			return
+		}
+		warned[t] = true
+		log.Print(msg)
+	}
+	return func(c change) map[string]bool {
+		if c.from == 0 {
+			return nil // brand new to the registry: nothing old to compare against, not an error
+		}
+		v, err := entityDefs.GetVersion(ctx, c.entityType, c.from)
+		if err != nil {
+			warnOnce(c.entityType, fmt.Sprintf(
+				"WARNING: %s: %s v%d — could not re-read the previous published version to tell which conditional unique constraints are actually new this run, so every conditional unique constraint on this entity type is being re-checked (and re-backfilled) as if newly added; the record-migration warning(s) below may repeat one already reported for an earlier version: %v",
+				tenantName, c.entityType, c.from, err))
+			return nil
+		}
+		var d entity.Definition
+		if err := json.Unmarshal(v.Definition, &d); err != nil {
+			warnOnce(c.entityType, fmt.Sprintf(
+				"WARNING: %s: %s v%d — the previous published version could not be decoded to tell which conditional unique constraints are actually new this run, so every conditional unique constraint on this entity type is being re-checked (and re-backfilled) as if newly added; the record-migration warning(s) below may repeat one already reported for an earlier version: %v",
+				tenantName, c.entityType, c.from, err))
+			return nil
+		}
+		names := make(map[string]bool, len(d.UniqueWhen))
+		for _, cu := range d.UniqueWhen {
+			names[entity.ConditionalUniqueConstraintName(cu)] = true
+		}
+		return names
+	}
+}
+
+// newlyAddedConditionalUniqueSets is newlyAddedUniqueSets' UniqueWhen
+// counterpart — returns newDef.UniqueWhen's entries not already declared
+// on c's old published version (per oldNamesFor, see
+// oldConditionalUniqueNameLookup above). Same brand-new-type and
+// failed-lookup fail-open behavior as newlyAddedUniqueSets, same
+// reasoning.
+func newlyAddedConditionalUniqueSets(c change, newDef *entity.Definition, oldNamesFor func(change) map[string]bool) []entity.ConditionalUnique {
+	oldNames := oldNamesFor(c)
+	var out []entity.ConditionalUnique
+	for _, cu := range newDef.UniqueWhen {
+		if oldNames != nil && oldNames[entity.ConditionalUniqueConstraintName(cu)] {
+			continue
+		}
+		out = append(out, cu)
+	}
+	return out
+}
+
+// backfillNewConditionalUniqueConstraints is backfillNewUniqueConstraints'
+// UniqueWhen counterpart (uc-infra#201, ADR-0028) — populates
+// record_unique_keys for every EXISTING live record satisfying a
+// newly-declared ConditionalUnique's condition, same reasoning as
+// backfillNewUniqueConstraints' own doc comment (without this, the
+// constraint protects nothing that predates it). Called only on a real
+// (non-dry-run) sync, after publish.
+func backfillNewConditionalUniqueConstraints(
+	ctx context.Context,
+	tenantDB *sql.DB,
+	tenantName string,
+	changes []change,
+	defFor func(entityType string) (*entity.Definition, bool),
+	oldNamesFor func(change) map[string]bool,
+) {
+	records := data.NewRecordRepo(tenantDB)
+	keys := data.NewRecordUniqueKeyRepo(tenantDB)
+	for _, c := range changes {
+		newDef, ok := defFor(c.entityType)
+		if !ok {
+			continue
+		}
+		for _, cu := range newlyAddedConditionalUniqueSets(c, newDef, oldNamesFor) {
+			name := entity.ConditionalUniqueConstraintName(cu)
+			backfilled, skipped, err := crud.BackfillConditionalUniqueConstraintKeys(ctx, tenantDB, records, keys, c.entityType, cu)
+			if err != nil {
+				// "until this is retried" would overclaim: a re-run of
+				// this command only re-attempts a backfill for an entity
+				// type whose Definition version actually moved again
+				// (newlyAddedConditionalUniqueSets, via diffVersions) —
+				// there is currently no operator-facing path to force a
+				// retry against an unchanged version. Same gap
+				// backfillNewUniqueConstraints' own log line already has
+				// (independent review of uc-infra#201 found the wording
+				// copied verbatim into this new code without noticing);
+				// filed as a follow-up card rather than fixed here to
+				// avoid widening this change's scope into the pre-existing
+				// Unique backfill path too.
+				log.Printf("WARNING: %s: %s — could not backfill conditional unique constraint %q, existing records are unprotected: %v",
+					tenantName, c.entityType, name, err)
+				continue
+			}
+			if backfilled == 0 && skipped == 0 {
+				continue
+			}
+			log.Printf("%s: %s — backfilled conditional unique constraint %q for %d existing record(s)%s",
 				tenantName, c.entityType, name, backfilled,
 				func() string {
 					if skipped == 0 {
