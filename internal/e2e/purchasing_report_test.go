@@ -7,6 +7,7 @@ import (
 
 	"github.com/chromedp/chromedp"
 
+	"github.com/universaltill/universal-core/internal/kernel/audit"
 	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
 	"github.com/universaltill/universal-core/internal/kernel/purchasing"
@@ -483,5 +484,177 @@ func TestPurchasingReport_QualitySection_RealBrowser(t *testing.T) {
 		if !strings.Contains(bodyText, want) {
 			t.Errorf("report page missing %q; body text:\n%s", want, bodyText)
 		}
+	}
+}
+
+// e2eSeedPurchasingLeakFixture seeds one Item + InventoryItem + ReorderRule
+// tuned so a single fixture exercises all three uc-infra#230 leak sites at
+// once (Stock Summary card, Stockout Risk table, Reorder Signals table):
+// qty_on_hand/qty_available_to_promise are fractional (not bare integers)
+// specifically so the "does the real number leak anywhere in the raw DOM"
+// scans below can't produce a false negative by coincidentally matching a
+// hex run inside one of the seeded records' own random UUIDs — a bare
+// integer like "42" is a plausible hex substring, but "42.5" never is
+// (UUIDs are hex digits and hyphens only, no '.'), the same reason
+// TestProjectBudgetReport_PlannedRedacted_RealBrowser's own leak scan uses
+// "500.00" rather than "500". qty_available_to_promise -7.5 (<=0) puts the
+// item on the Stockout Risk table; reorder_point 100 (well above any
+// realistic position) guarantees the reorder signal fires regardless of
+// which field is hidden from the browser's own actor.
+func e2eSeedPurchasingLeakFixture(t *testing.T, ctx context.Context, engine *crud.Engine, actor audit.Actor) (itemID string) {
+	t.Helper()
+	item, err := engine.Create(ctx, purchasing.Item(), map[string]any{
+		"sku": "SKU-E2E-LEAK", "name": "E2E Leak Widget", "item_type": "stock",
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed Item: %v", err)
+	}
+	facility, err := engine.Create(ctx, purchasing.Facility(), map[string]any{
+		"code": "E2E-LEAK-MAIN", "name": "E2E Leak Warehouse", "facility_type": "warehouse", "is_active": true,
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed Facility: %v", err)
+	}
+	if _, err := engine.Create(ctx, purchasing.InventoryItem(), map[string]any{
+		"item_id": item.ID, "facility_id": facility.ID,
+		"qty_on_hand": 42.5, "qty_available_to_promise": -7.5,
+	}, actor); err != nil {
+		t.Fatalf("seed InventoryItem: %v", err)
+	}
+	if _, err := engine.Create(ctx, purchasing.ReorderRule(), map[string]any{
+		"item_id": item.ID, "reorder_point": 100, "safety_stock": 0,
+		"target_lead_time_confidence": "p90",
+	}, actor); err != nil {
+		t.Fatalf("seed ReorderRule: %v", err)
+	}
+	return item.ID
+}
+
+// TestPurchasingReport_OnHandRedacted_RealBrowser (uc-infra#230) is the
+// real-browser proof that hiding InventoryItem.qty_on_hand via a
+// FieldPermission removes the real quantity from the live DOM entirely —
+// not merely from a rendered-HTML-string assertion (internal/api's own
+// HTTP-level TestAPI_PurchasingReport_HiddenInventoryQuantitiesRenderNotAvailable) —
+// same class of proof TestProjectBudgetReport_PlannedRedacted_RealBrowser
+// already gives for a different entity/field. ReportingRepo's raw SQL
+// reads qty_on_hand entirely outside the ts.crud-redacted path, so
+// nothing short of an actual browser DOM scan proves the real number
+// never reaches the page.
+func TestPurchasingReport_OnHandRedacted_RealBrowser(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, tenantDB := testServer(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	if err := purchasing.PublishStatuses(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("PublishStatuses: %v", err)
+	}
+	// Hide InventoryItem.qty_on_hand from the browser's own actor BEFORE
+	// seeding data, same ordering the project-budget redaction e2e tests
+	// use.
+	seedFieldPermission(t, tenantDB, "e2e_onhand_redacted", "InventoryItem", "qty_on_hand")
+
+	engine := crud.NewEngine(tenantDB)
+	e2eSeedPurchasingLeakFixture(t, ctx, engine, actor)
+
+	bctx := browserCtx(t, tenantID)
+	var bodyText string
+	if err := chromedp.Run(bctx,
+		chromedp.Navigate(srv.URL+"/reports/purchasing"),
+		chromedp.WaitVisible(`.uc-report-cards`, chromedp.ByQuery),
+		chromedp.Text(`body`, &bodyText, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("open /reports/purchasing: %v", err)
+	}
+
+	if strings.Contains(bodyText, "42.5") {
+		t.Errorf("the real qty_on_hand (42.5) reached the live page for an actor with it redacted:\n%s", bodyText)
+	}
+	// qty_available_to_promise is a DIFFERENT field, not hidden by this
+	// actor's role — its real number, and the Stockout Risk row/count it
+	// drives, must still reach the page.
+	if !strings.Contains(bodyText, "-7.5") {
+		t.Errorf("qty_available_to_promise (a field this actor CAN see) should still render its real number:\n%s", bodyText)
+	}
+	if !strings.Contains(bodyText, "Not available") {
+		t.Errorf("expected at least one 'Not available' placeholder (Stock Summary On Hand card, Stockout Risk On Hand column, Reorder Signals On Hand/Position columns):\n%s", bodyText)
+	}
+	if !strings.Contains(bodyText, "E2E Leak Widget") {
+		t.Errorf("expected the reorder signal to still fire (position math is unaffected by display redaction):\n%s", bodyText)
+	}
+
+	// Belt-and-braces, same reasoning as the project-budget redaction
+	// e2e tests' own leak check: confirm the figure isn't sitting
+	// anywhere in the document outside the visible text either.
+	var leaks bool
+	if err := chromedp.Run(bctx, chromedp.EvaluateAsDevTools(
+		`document.documentElement.outerHTML.includes("42.5")`, &leaks,
+	)); err != nil {
+		t.Fatalf("scan document for the redacted on-hand quantity: %v", err)
+	}
+	if leaks {
+		t.Fatal("redacted qty_on_hand reached the browser somewhere in the document")
+	}
+}
+
+// TestPurchasingReport_AvailableToPromiseRedacted_RealBrowser
+// (uc-infra#230) is the qty_available_to_promise counterpart to
+// TestPurchasingReport_OnHandRedacted_RealBrowser above — and the one
+// that actually proves the harder fix: StockoutRiskItems' row membership
+// and StockSummary's StockoutCount are both computed server-side from the
+// real, un-redacted qty_available_to_promise, so this test also confirms
+// the Stockout Risk section renders as a whole "not available" state —
+// no rows, no count — rather than merely blanking the ATP cell of a row
+// whose very presence would otherwise still disclose "this item's real
+// ATP is <= 0" (the gap an earlier version of this fix left open, caught
+// by independent review before this test existed).
+func TestPurchasingReport_AvailableToPromiseRedacted_RealBrowser(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, tenantDB := testServer(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	if err := purchasing.PublishStatuses(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("PublishStatuses: %v", err)
+	}
+	seedFieldPermission(t, tenantDB, "e2e_atp_redacted", "InventoryItem", "qty_available_to_promise")
+
+	engine := crud.NewEngine(tenantDB)
+	e2eSeedPurchasingLeakFixture(t, ctx, engine, actor)
+
+	bctx := browserCtx(t, tenantID)
+	var bodyText string
+	if err := chromedp.Run(bctx,
+		chromedp.Navigate(srv.URL+"/reports/purchasing"),
+		chromedp.WaitVisible(`.uc-report-cards`, chromedp.ByQuery),
+		chromedp.Text(`body`, &bodyText, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("open /reports/purchasing: %v", err)
+	}
+
+	if strings.Contains(bodyText, "-7.5") {
+		t.Errorf("the real qty_available_to_promise (-7.5) reached the live page for an actor with it redacted:\n%s", bodyText)
+	}
+	if strings.Contains(bodyText, "SKU-E2E-LEAK") {
+		t.Errorf("the Stockout Risk row must not render at all when qty_available_to_promise is hidden (its membership itself is derived from the hidden field), but the SKU appears:\n%s", bodyText)
+	}
+	if strings.Contains(bodyText, "Stockout Risk (") {
+		t.Errorf("the Stockout Risk heading must not show a count derived from the hidden field:\n%s", bodyText)
+	}
+	// qty_on_hand is a DIFFERENT field, not hidden by this actor's role —
+	// its real number must still render, including in the Reorder
+	// Signals row (unaffected by ATP being hidden).
+	if !strings.Contains(bodyText, "42.5") {
+		t.Errorf("qty_on_hand (a field this actor CAN see) should still render its real number:\n%s", bodyText)
+	}
+
+	var leaks bool
+	if err := chromedp.Run(bctx, chromedp.EvaluateAsDevTools(
+		`document.documentElement.outerHTML.includes("-7.5")`, &leaks,
+	)); err != nil {
+		t.Fatalf("scan document for the redacted available-to-promise quantity: %v", err)
+	}
+	if leaks {
+		t.Fatal("redacted qty_available_to_promise reached the browser somewhere in the document")
 	}
 }
