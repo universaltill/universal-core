@@ -624,10 +624,15 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
   var statusEl = document.getElementById("uc-issue-record-status");
   var transcriptEl = document.getElementById("uc-issue-transcript");
   var descriptionEl = document.getElementById("uc-issue-description");
-  // mediaRecorder only ever needs to identify "the currently active
-  // recording" for the Stop branch below (mediaRecorder.stop()) — it is
-  // never read inside onstop/ondataavailable, so reassigning it on every
-  // Record click is safe. chunks is NOT declared here (uc-infra#196): it
+  // mediaRecorder identifies "the currently active recording" for the
+  // Stop branch below (mediaRecorder.stop()) AND, since uc-infra#223, for
+  // onstop's own thisRecorder identity check further down — reassigning
+  // it on every Record click is still safe: whenever recording === true,
+  // mediaRecorder is provably the take that owns that flag (both are set
+  // together, synchronously, in the same task), so a stale take's onstop
+  // comparing against the reassigned value is exactly how it tells it no
+  // longer owns the current recording/button state. chunks is NOT
+  // declared here (uc-infra#196): it
   // used to be a shared outer-scope array, reset in place on every Record
   // click and read by whichever take's onstop happened to fire, whenever
   // that was. Stop resets recording/the button label synchronously, but
@@ -678,7 +683,24 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
 
     recordBtn.addEventListener("click", function() {
       if (recording) {
-        mediaRecorder.stop();
+        // uc-infra#223: mediaRecorder can already be "inactive" here
+        // without this click being the cause — the underlying
+        // MediaStream can end on its own (mic permission revoked
+        // mid-recording, the input device unplugged/disabled, or any
+        // other browser-initiated track-ended event), which a real
+        // MediaRecorder reacts to by transitioning itself to "inactive"
+        // and firing onstop, exactly as an explicit .stop() call would.
+        // Before this fix nothing here checked for that: the button
+        // still read "Stop recording" (only onstop's own reset below
+        // resyncs it, and — before this fix — onstop never did), so a
+        // click on it read as a genuine Stop and called .stop() again on
+        // an already-inactive recorder, throwing InvalidStateError per
+        // the MediaStream Recording spec — uncaught, inside this click
+        // handler. Same guard shape uc-infra#220 already uses for the
+        // screen-record handler's own version of this bug.
+        if (mediaRecorder && mediaRecorder.state !== "inactive") {
+          mediaRecorder.stop();
+        }
         recording = false;
         recordBtn.textContent = {{.RecordLabel}};
         return;
@@ -720,8 +742,32 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
           // shared chunks the old code reassigned here.
           var chunks = [];
           mediaRecorder = new MediaRecorder(stream);
+          // uc-infra#223: this take's own recorder instance, captured at
+          // creation time so onstop below can tell whether it's still the
+          // current take by the time it actually fires — see onstop's own
+          // comment for why that check matters.
+          var thisRecorder = mediaRecorder;
           mediaRecorder.ondataavailable = function(e) { if (e.data.size > 0) chunks.push(e.data); };
           mediaRecorder.onstop = function() {
+            // uc-infra#223: resync recording/the button label here too,
+            // not just on an explicit Stop click, so a browser-initiated
+            // end of the stream (see the click handler's own comment
+            // above) re-syncs the button on its own instead of leaving it
+            // stuck reading Stop until another click limps it back via
+            // the guard there. Guarded on mediaRecorder === thisRecorder
+            // (uc-infra#196's own "fast Stop-then-Record-again" scenario,
+            // documented on the outer mediaRecorder var above): a stale
+            // take's onstop can fire after a newer take has already
+            // started and reassigned the shared mediaRecorder variable —
+            // resetting unconditionally here would stomp that newer
+            // take's own "Stop recording" state right out from under it.
+            // Harmless/idempotent on the ordinary explicit-Stop path,
+            // where the click handler has already reset both
+            // synchronously before this async callback even runs.
+            if (mediaRecorder === thisRecorder) {
+              recording = false;
+              recordBtn.textContent = {{.RecordLabel}};
+            }
             stream.getTracks().forEach(function(t) { t.stop(); });
             var blob = new Blob(chunks, { type: "audio/webm" });
             statusEl.textContent = {{.TranscribingLabel}};
@@ -796,10 +842,12 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
     var fileInput = document.getElementById("uc-issue-screenrecord-file");
     // screenRecorder identifies "the currently active recording" for the
     // Stop branch below AND the auto-stop timeout's own guard further
-    // down (unlike the mic handler's mediaRecorder, which only the Stop
-    // branch reads) — both are fine to read the reassigned outer value,
-    // since both only ever act on whatever recording is current right
-    // now. screenChunks/screenTimerId/screenAutoStopId/screenStartedAt
+    // down — both are fine to read the reassigned outer value, since both
+    // only ever act on whatever recording is current right now. (The mic
+    // handler's mediaRecorder is read in one more place since uc-infra#223
+    // — its onstop's own thisRecorder identity check — for the same
+    // "always fine to read the reassigned current value" reason.)
+    // screenChunks/screenTimerId/screenAutoStopId/screenStartedAt
     // are NOT declared here (uc-infra#196, same defense-in-depth fix as
     // the mic handler) — each is now declared fresh with var inside the
     // getDisplayMedia .then() callback below, so every take gets its own
