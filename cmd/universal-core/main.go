@@ -340,6 +340,12 @@ func main() {
 	// See assets.GenerateDepreciationScheduleOnWrite's own doc comment
 	// for the create/update behavior.
 	handler.RegisterHook("FixedAsset", assets.GenerateDepreciationScheduleOnWrite)
+	// uc-infra#236: a real user's DepreciationScheduleForm correction
+	// needs marking as an override the moment it's saved through this
+	// real HTTP path, so GenerateDepreciationScheduleOnWrite above can
+	// tell it apart from a hook-generated row — see
+	// MarkDepreciationScheduleOverriddenOnWrite's own doc comment.
+	handler.RegisterHook("DepreciationSchedule", assets.MarkDepreciationScheduleOverriddenOnWrite)
 	handler.Routes(mux)
 
 	// The durable workflow job queue (internal/kernel/workflow.Queue) has

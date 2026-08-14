@@ -1458,6 +1458,28 @@ func childCellValue(child map[string]any, name string, childDef *entity.Definiti
 			return catalog.TOrDefault(locale, "field."+childDef.EntityType+"."+name+"."+s, s)
 		}
 		return FormatFieldValue(v)
+	case entity.FieldBool:
+		// Same "common.value.true"/"common.value.false" catalog
+		// convention internal/api/handlers.go's uniqueConstraintMessage
+		// already uses for a FieldBool's WhenValue — not a new key,
+		// just this function's first use of it. Before this, a
+		// composition/related-list child's own boolean column (this
+		// change's own DepreciationSchedule.overridden the first
+		// production example, uc-infra#236 review finding F6) rendered
+		// the literal, untranslated Go string "true"/"false" in every
+		// locale via the fallthrough FormatFieldValue below —
+		// unreadable on an Arabic/Persian/Turkish screen where nearly
+		// every row's value is false. FormatFieldValue(v) as the
+		// fallback (not the raw Go bool) so a non-bool stored value
+		// still renders something rather than silently vanishing.
+		if b, ok := v.(bool); ok {
+			key := "common.value.false"
+			if b {
+				key = "common.value.true"
+			}
+			return catalog.TOrDefault(locale, key, FormatFieldValue(v))
+		}
+		return FormatFieldValue(v)
 	}
 	return FormatFieldValue(v)
 }

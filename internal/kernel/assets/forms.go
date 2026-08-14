@@ -78,9 +78,18 @@ func FixedAssetForm() *form.Definition {
 // (GenerateDepreciationScheduleOnWrite, schedule_hook.go), but a
 // correction goes through the same audited CRUD path as any other
 // record rather than a dedicated regeneration action. That correction
-// is not currently guaranteed to survive a later, unrelated save of the
-// row's own FixedAsset, though — see DepreciationSchedule's own doc
-// comment (assets.go) and uc-infra#236.
+// now survives a later, unrelated save of the row's own FixedAsset
+// (uc-infra#236) — deliberately not listing `overridden` as an EDITABLE
+// field here: it's a fact MarkDepreciationScheduleOverriddenOnWrite
+// (schedule_hook.go) RECOMPUTES on every write, not something a user
+// sets directly, and stays preserved via formrender's own hidden-field
+// fallback (buildHiddenFields) exactly like any other off-form field
+// whenever this form itself is what's being saved. It's still visible,
+// though — FixedAssetForm's own "Depreciation Schedule" master-detail
+// section renders every DepreciationSchedule field as a read-only
+// summary column (formrender's childColumns, not this form's own
+// Fields list), so a correction shows up there as a genuine,
+// informative "Overridden" column rather than staying invisible.
 func DepreciationScheduleForm() *form.Definition {
 	return &form.Definition{
 		EntityType: "DepreciationSchedule",

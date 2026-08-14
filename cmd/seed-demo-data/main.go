@@ -110,6 +110,16 @@ func main() {
 	// happen, the same as a real user's create/edit would, instead of a
 	// hand-built approximation of what the hook produces.
 	engine.SetHook("FixedAsset", assets.GenerateDepreciationScheduleOnWrite)
+	// uc-infra#236: same wiring as cmd/universal-core's real HTTP path —
+	// see MarkDepreciationScheduleOverriddenOnWrite's own doc comment.
+	// Inert in THIS binary today (nothing below calls engine.Update on
+	// "DepreciationSchedule" directly — seedFixedAssets only writes
+	// FixedAsset, and its generated schedule rows go through
+	// GenerateDepreciationScheduleOnWrite's own insertSchedule, which
+	// bypasses crud.Engine and this hook entirely, same as a real
+	// user's generated rows would) — kept for wiring parity with the
+	// real HTTP path rather than because this command exercises it.
+	engine.SetHook("DepreciationSchedule", assets.MarkDepreciationScheduleOverriddenOnWrite)
 
 	s := &seeder{
 		ctx:        context.Background(),

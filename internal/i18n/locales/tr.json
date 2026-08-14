@@ -500,6 +500,7 @@
   "field.DepreciationSchedule.depreciation_amount": "Amortisman",
   "field.DepreciationSchedule.book_value": "Defter Değeri",
   "field.DepreciationSchedule.posted_at": "Kaydedildi",
+  "field.DepreciationSchedule.overridden": "Elle Düzeltildi",
   "field.FixedAsset.status_id.draft": "Taslak",
   "field.FixedAsset.status_id.in_service": "Kullanımda",
   "field.FixedAsset.status_id.fully_depreciated": "Tamamen Amortismana Tabi",

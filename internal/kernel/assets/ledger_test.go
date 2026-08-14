@@ -205,6 +205,36 @@ func (fx depreciationFixture) createScheduleRow(t *testing.T, assetID string, se
 	return rec.ID
 }
 
+// markSchedulePosted sets posted_at on a DepreciationSchedule row via
+// the raw records repo (data.NewRecordRepo(fx.tenantDB).Update),
+// bypassing crud.Engine and every hook registered on it — the same
+// non-engine path production posting actually takes
+// (postAssetDepreciation, ledger.go's own records.UpdateTx calls). Using
+// fx.engine.Update here instead (as earlier versions of this file's own
+// tests did) would also run MarkDepreciationScheduleOverriddenOnWrite,
+// which recomputes `overridden` from the row's own content — a row
+// posted with no content change would come back overridden=false either
+// way, matching production behavior fine — but a test asserting "this
+// row is posted, this OTHER row is the one still overridden" needs the
+// posting write itself to introduce no side effect of its own, so tests
+// that care about that distinction use this helper rather than
+// fx.engine.Update (uc-infra#236 independent review finding F4).
+func (fx depreciationFixture) markSchedulePosted(t *testing.T, rowID, periodEnd string) {
+	t.Helper()
+	row, err := fx.engine.Get(context.Background(), publishedDef(t, fx.tenantDB, "DepreciationSchedule"), rowID)
+	if err != nil {
+		t.Fatalf("Get DepreciationSchedule %s: %v", rowID, err)
+	}
+	fields := map[string]any{}
+	for k, v := range row.Data {
+		fields[k] = v
+	}
+	fields["posted_at"] = periodEnd
+	if _, err := data.NewRecordRepo(fx.tenantDB).Update(context.Background(), "DepreciationSchedule", rowID, fields, nil); err != nil {
+		t.Fatalf("mark DepreciationSchedule %s posted: %v", rowID, err)
+	}
+}
+
 func (fx depreciationFixture) statusCode(t *testing.T, entityType, id string) string {
 	t.Helper()
 	rec, err := fx.engine.Get(context.Background(), publishedDef(t, fx.tenantDB, entityType), id)

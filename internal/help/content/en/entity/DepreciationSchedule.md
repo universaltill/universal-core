@@ -33,6 +33,17 @@ value.
 - **Posted**, once set, marks the row as already posted to the ledger. A
   posted row reflects a real accounting entry — correct it with the same
   care you'd correct any other posted record.
+- Correcting a row here is remembered as a deliberate override: it
+  survives a later, unrelated save of the row's own Fixed Asset instead
+  of being silently regenerated back to what its current terms would
+  compute, and it no longer causes such a save to be rejected on its
+  own. A change to the asset's actual depreciation terms (Cost, Salvage
+  Value, Useful Life, Depreciation Method, Acquisition Date, Currency)
+  still regenerates or rejects the schedule exactly as described on the
+  Fixed Asset topic — a correction only excuses its own row, not the
+  rest of the schedule, from that check. A corrected row shows
+  **Overridden** on the Fixed Asset's own Depreciation Schedule summary,
+  so it's visible at a glance which periods were touched by hand.
 
 ## What it connects to
 
