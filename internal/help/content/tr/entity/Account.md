@@ -65,10 +65,13 @@ eklediğinizde, pasife aldığınızda veya türünü değiştirdiğinizde otoma
 olarak güncel tutulur. Bunların hiçbiri için ayrı bir eşitleme adımına
 gerek yoktur.
 
-**Bilinmesi gereken daha dar bir kısıtlama**: mevcut bir Hesabın
-**Kod**unu değiştirmek, defterdeki iç kaydını yeniden etiketlemez — yeni
-kod altında yeni bir kayıt oluşturur ve eskisini, hâlâ aktif ve hâlâ eski
-koduyla kullanılabilir durumda, geride bırakır. Bir numaralandırma
-hatasını düzeltmeniz gerekiyorsa, kodu değiştirmek yerine doğru kodla
-yeni bir Hesap oluşturup eskisini pasife almayı tercih edin — emin
-değilseniz yöneticinize danışın.
+**Bilinmesi gereken daha dar bir özel durum**: mevcut bir Hesabın
+**Kod**unu değiştirmek artık defterdeki iç kaydını yerinde yeniden
+etiketler — aynı kayıt, hesabı yeni kod altında izlemeye devam eder ve
+eski kod artık hiçbir şeye karşılık gelmez. Bir numaralandırma hatasını
+düzeltmek için artık yeni bir Hesap oluşturma geçici çözümüne gerek
+yok; sadece kodu değiştirmeniz yeterli. Bir yeniden adlandırmanın
+reddedilebileceği tek durum: yeni kod, yeniden adlandırmanın bu şekilde
+çalışmasından önce kalan, bağlantısız eski bir iç kayıt tarafından hâlâ
+tutuluyorsa, kayıt işlemi o kaydı sessizce yeniden kullanmak yerine
+tamamen başarısız olur — bu durumda yöneticinize danışın.

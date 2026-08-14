@@ -553,3 +553,139 @@ func TestApplyTenant_RecordUniqueKeysTableAndIndexExist(t *testing.T) {
 		t.Fatalf("expected record_unique_keys_record_id_idx to exist after ApplyTenant: %v", err)
 	}
 }
+
+// TestApplyTenant_GLAccountsSourceRecordIDBackfillLinksPreExistingRows
+// confirms 0009_gl_accounts_source_record_id.sql's backfill UPDATE
+// (uc-infra#205) actually links a gl_accounts row that predates the
+// column to its still-live Account record, by code correlation — not
+// just that the column/constraint exist
+// (TestApplyTenant_CreatesEverySchemaObjectWithoutTenantID already
+// covers presence, not the backfill's own correlation logic). Simulates
+// "before this migration ran" by reverting its effect on an
+// already-fully-migrated database, inserting rows in the same
+// pre-migration shape, then letting ApplyTenant re-run the (now
+// unapplied) migration for real — the actual code path
+// cmd/migrate -target tenant takes against an existing tenant, not a
+// hand-copied duplicate of the migration's own SQL.
+func TestApplyTenant_GLAccountsSourceRecordIDBackfillLinksPreExistingRows(t *testing.T) {
+	db := freshTestDB(t, "uc_test_tenant")
+	ctx := context.Background()
+
+	if err := ApplyTenant(ctx, db); err != nil {
+		t.Fatalf("ApplyTenant (first pass): %v", err)
+	}
+
+	// Revert 0009's effect to reproduce the pre-migration shape.
+	if _, err := db.ExecContext(ctx, `ALTER TABLE gl_accounts DROP CONSTRAINT gl_accounts_source_record_id_key`); err != nil {
+		t.Fatalf("drop constraint to simulate pre-migration state: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `ALTER TABLE gl_accounts DROP COLUMN source_record_id`); err != nil {
+		t.Fatalf("drop column to simulate pre-migration state: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE filename = $1`,
+		"0009_gl_accounts_source_record_id.sql"); err != nil {
+		t.Fatalf("unrecord migration to simulate pre-migration state: %v", err)
+	}
+
+	// A pre-existing Account record and its matching, pre-migration
+	// gl_accounts row (created the old UpsertByCode-only way — no link).
+	var accountID string
+	if err := db.QueryRowContext(ctx,
+		`INSERT INTO records (entity_type, data) VALUES ('Account', $1) RETURNING id`,
+		`{"code":"1000","name":"Assets","type":"asset","is_active":true}`,
+	).Scan(&accountID); err != nil {
+		t.Fatalf("insert pre-existing Account record: %v", err)
+	}
+	var glAccountID string
+	if err := db.QueryRowContext(ctx,
+		`INSERT INTO gl_accounts (code, name, account_type, currency, is_active) VALUES ('1000', 'Assets', 'asset', 'USD', true) RETURNING id`,
+	).Scan(&glAccountID); err != nil {
+		t.Fatalf("insert pre-existing gl_accounts row: %v", err)
+	}
+
+	// A genuinely orphaned row (no live matching Account) must be left
+	// unlinked — the backfill has nothing to correlate it to.
+	var orphanID string
+	if err := db.QueryRowContext(ctx,
+		`INSERT INTO gl_accounts (code, name, account_type, currency, is_active) VALUES ('9999', 'Dead Code', 'asset', 'USD', false) RETURNING id`,
+	).Scan(&orphanID); err != nil {
+		t.Fatalf("insert orphaned gl_accounts row: %v", err)
+	}
+
+	// A SOFT-DELETED Account record must not be treated as a live match
+	// — linking to it would leave a live Account that legitimately
+	// reuses that code permanently unable to save (uc-infra#205 review
+	// finding 6). deleted_at IS NULL is load-bearing; this pins it.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO records (entity_type, data, deleted_at) VALUES ('Account', $1, now())`,
+		`{"code":"8888","name":"Deleted Account","type":"asset","is_active":false}`,
+	); err != nil {
+		t.Fatalf("insert soft-deleted Account record: %v", err)
+	}
+	var softDeletedGLID string
+	if err := db.QueryRowContext(ctx,
+		`INSERT INTO gl_accounts (code, name, account_type, currency, is_active) VALUES ('8888', 'Deleted Account', 'asset', 'USD', false) RETURNING id`,
+	).Scan(&softDeletedGLID); err != nil {
+		t.Fatalf("insert gl_accounts row matching the soft-deleted Account's code: %v", err)
+	}
+
+	// Two LIVE Account records ambiguously sharing a code (a real,
+	// pre-uc-infra#204 state this codebase already tolerates —
+	// crud/unique_constraints.go's BackfillUniqueConstraintKeys skips
+	// rather than repairs pre-existing duplicates). The backfill must
+	// leave this unlinked rather than guessing which one is right
+	// (uc-infra#205 review finding 5).
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO records (entity_type, data) VALUES ('Account', $1), ('Account', $2)`,
+		`{"code":"7777","name":"Ambiguous A","type":"asset","is_active":true}`,
+		`{"code":"7777","name":"Ambiguous B","type":"asset","is_active":true}`,
+	); err != nil {
+		t.Fatalf("insert two Account records sharing a code: %v", err)
+	}
+	var ambiguousGLID string
+	if err := db.QueryRowContext(ctx,
+		`INSERT INTO gl_accounts (code, name, account_type, currency, is_active) VALUES ('7777', 'Ambiguous', 'asset', 'USD', true) RETURNING id`,
+	).Scan(&ambiguousGLID); err != nil {
+		t.Fatalf("insert gl_accounts row matching the ambiguous code: %v", err)
+	}
+
+	if err := ApplyTenant(ctx, db); err != nil {
+		t.Fatalf("ApplyTenant (second pass, re-applying 0009): %v", err)
+	}
+
+	var linkedID sql.NullString
+	if err := db.QueryRowContext(ctx, `SELECT source_record_id FROM gl_accounts WHERE id = $1`, glAccountID).
+		Scan(&linkedID); err != nil {
+		t.Fatalf("read back backfilled source_record_id: %v", err)
+	}
+	if !linkedID.Valid || linkedID.String != accountID {
+		t.Fatalf("expected the pre-existing row to be backfilled with source_record_id=%q, got %+v", accountID, linkedID)
+	}
+
+	var orphanLinked sql.NullString
+	if err := db.QueryRowContext(ctx, `SELECT source_record_id FROM gl_accounts WHERE id = $1`, orphanID).
+		Scan(&orphanLinked); err != nil {
+		t.Fatalf("read back orphan's source_record_id: %v", err)
+	}
+	if orphanLinked.Valid {
+		t.Fatalf("expected the genuinely orphaned row (no matching live Account) to stay unlinked, got %q", orphanLinked.String)
+	}
+
+	var softDeletedLinked sql.NullString
+	if err := db.QueryRowContext(ctx, `SELECT source_record_id FROM gl_accounts WHERE id = $1`, softDeletedGLID).
+		Scan(&softDeletedLinked); err != nil {
+		t.Fatalf("read back soft-deleted-match row: %v", err)
+	}
+	if softDeletedLinked.Valid {
+		t.Fatalf("expected the row matching only a SOFT-DELETED Account to stay unlinked, got %q", softDeletedLinked.String)
+	}
+
+	var ambiguousLinked sql.NullString
+	if err := db.QueryRowContext(ctx, `SELECT source_record_id FROM gl_accounts WHERE id = $1`, ambiguousGLID).
+		Scan(&ambiguousLinked); err != nil {
+		t.Fatalf("read back ambiguous-match row: %v", err)
+	}
+	if ambiguousLinked.Valid {
+		t.Fatalf("expected the row matching TWO live Accounts (ambiguous) to stay unlinked rather than guess, got %q", ambiguousLinked.String)
+	}
+}

@@ -62,9 +62,12 @@ current automatically the moment you add, deactivate, or change the type
 of an Account. No separate synchronization step is needed for any of
 that.
 
-**A narrower limitation to know about**: renaming an existing Account's
-**Code** doesn't relabel its internal ledger entry — it creates a new one
-under the new code and leaves the old one behind, still active and still
-usable by that old code. If you need to correct a numbering mistake,
-prefer creating a new Account with the right code and deactivating the
-old one, rather than renaming — ask your administrator if you're unsure.
+**A narrower edge case to know about**: renaming an existing Account's
+**Code** now relabels its internal ledger entry in place — the same
+entry keeps tracking that account under the new code, and the old code
+stops resolving to anything. There's no create-a-new-Account workaround
+needed to correct a numbering mistake anymore; just rename it. The one
+case a rename can be rejected: if the new code is still held by an old,
+unlinked internal entry left over from before renames worked this way,
+the save fails outright instead of silently reusing that entry — ask
+your administrator if that happens.

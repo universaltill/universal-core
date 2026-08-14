@@ -260,20 +260,20 @@ func TestSyncGLAccountOnWrite_DuplicateCode_RejectedNotSilentlyOverwritten(t *te
 	}
 }
 
-// TestSyncGLAccountOnWrite_RenamingCodeOrphansThePreviousGLAccountsRow
-// pins down, deliberately, a real limitation independent review found
-// (finding 2) that this change does not close: gl_accounts is keyed by
-// Account.code (UpsertByCode), and nothing links a gl_accounts row back
-// to the Account record it was projected from. Renaming an existing
-// Account's code — legal; code is Unique but not immutable, see
-// Account()'s own doc comment — makes this hook upsert a NEW gl_accounts
-// row under the new code, while the OLD code's row is left behind,
-// active, orphaned. This test exists so that behavior can't silently
-// change (for better or worse) without this test having to change too —
-// not as an endorsement of the behavior. Closing it properly needs
-// gl_accounts to gain a source-record link (a migration) or Account.code
-// to become immutable after create; tracked as a separate backlog card.
-func TestSyncGLAccountOnWrite_RenamingCodeOrphansThePreviousGLAccountsRow(t *testing.T) {
+// TestSyncGLAccountOnWrite_RenamingCodeUpdatesTheSameRowInPlace asserts
+// the uc-infra#205 fix: gl_accounts is now keyed by source_record_id
+// (GLAccountRepo.UpsertBySourceRecord), a durable link back to the
+// Account record it was projected from — not by code alone
+// (UpsertByCode, still used by every other caller that has no Account
+// record to link to). Renaming an existing Account's code — legal; code
+// is Unique but not immutable, see Account()'s own doc comment — must
+// now update the SAME gl_accounts row in place: same id, new code, old
+// code no longer resolves to anything. Before this fix (see git
+// history for the prior version of this test, then named
+// ...OrphansThePreviousGLAccountsRow) a rename inserted a second row
+// under the new code and left the old code's row behind, active,
+// unreachable.
+func TestSyncGLAccountOnWrite_RenamingCodeUpdatesTheSameRowInPlace(t *testing.T) {
 	tenantDB := freshTenantDB(t)
 	ctx := context.Background()
 	actor := humanActor()
@@ -296,6 +296,12 @@ func TestSyncGLAccountOnWrite_RenamingCodeOrphansThePreviousGLAccountsRow(t *tes
 		t.Fatalf("create Account: %v", err)
 	}
 
+	glAccounts := data.NewGLAccountRepo(tenantDB)
+	originalID, _, err := glAccounts.IDByCode(ctx, "1000")
+	if err != nil {
+		t.Fatalf("expected a gl_accounts row for code 1000 right after create, got: %v", err)
+	}
+
 	version := rec.Version
 	if _, err := engine.Update(ctx, accountDefinition, rec.ID, map[string]any{
 		"code": "1100", "name": "Assets", "type": "asset", "is_active": true,
@@ -303,21 +309,30 @@ func TestSyncGLAccountOnWrite_RenamingCodeOrphansThePreviousGLAccountsRow(t *tes
 		t.Fatalf("update Account's code: %v", err)
 	}
 
-	glAccounts := data.NewGLAccountRepo(tenantDB)
-	if _, _, err := glAccounts.IDByCode(ctx, "1100"); err != nil {
+	newID, isActive, err := glAccounts.IDByCode(ctx, "1100")
+	if err != nil {
 		t.Fatalf("expected a gl_accounts row for the NEW code 1100, got: %v", err)
 	}
-	// Documents today's real gap: the OLD code's row is still there,
-	// unchanged, orphaned — not cleaned up, not deactivated.
-	oldID, oldActive, err := glAccounts.IDByCode(ctx, "1000")
-	if err != nil {
-		t.Fatalf("expected the OLD code 1000's gl_accounts row to still exist (orphaned, not this fix's job to clean up), got: %v", err)
+	if newID != originalID {
+		t.Fatalf("expected the rename to update the SAME gl_accounts row in place (id %q), got a different row (id %q)", originalID, newID)
 	}
-	if !oldActive {
-		t.Fatal("expected the orphaned old-code row to still read as active — this hook never touches it once the code changes")
+	if !isActive {
+		t.Fatal("expected the renamed row to still read as active")
 	}
-	if oldID == "" {
-		t.Fatal("expected a real id for the orphaned row")
+
+	// The fix's whole point: the OLD code must no longer resolve to
+	// anything — no orphaned row left reachable under it.
+	if _, _, err := glAccounts.IDByCode(ctx, "1000"); !errors.Is(err, data.ErrNotFound) {
+		t.Fatalf("expected the OLD code 1000 to no longer resolve after the rename, got: %v", err)
+	}
+
+	// Exactly one gl_accounts row total for this Account — not two.
+	var count int
+	if err := tenantDB.QueryRowContext(ctx, `SELECT count(*) FROM gl_accounts WHERE source_record_id = $1`, rec.ID).Scan(&count); err != nil {
+		t.Fatalf("count gl_accounts rows for source_record_id: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 gl_accounts row linked to this Account record, got %d", count)
 	}
 }
 

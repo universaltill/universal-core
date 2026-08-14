@@ -74,7 +74,10 @@ const DefaultGLCurrency = "USD"
 // accounts, ADR-0004) up to date with every published finance.Account
 // record — the one narrow, hand-written bridge from the generic entity
 // engine to a deterministic-core table. Idempotent by construction
-// (GLAccountRepo.UpsertByCode), safe to call any number of times.
+// (GLAccountRepo.UpsertBySourceRecord, keyed by the Account record's
+// own id since uc-infra#205 — not by code, so a renamed Account's row
+// updates in place instead of leaving an orphan under the old code),
+// safe to call any number of times.
 //
 // This is the full, all-accounts sweep — used by cmd/seed-demo-data
 // (after seeding its sample chart) and, callable ad hoc, as the backfill
@@ -90,7 +93,7 @@ const DefaultGLCurrency = "USD"
 // it's written — see that same addendum for why the fix is a per-record
 // hook and not a finance.Publish-time call to this function. Running
 // this sweep concurrently with live hook-driven edits can race (its own
-// List-then-per-account-UpsertByCode isn't transactional against a
+// List-then-per-account-UpsertBySourceRecord isn't transactional against a
 // write landing in between) — run with writes quiesced.
 func SyncGLAccounts(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 	entityDefs := data.NewEntityDefinitionRepo(db)
@@ -169,7 +172,7 @@ func SyncGLAccounts(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 			log.Printf("finance: SyncGLAccounts: Account %s has no currency_id set, defaulting gl_accounts.currency to %s", code, baseCurrency)
 		}
 
-		if _, err := glAccounts.UpsertByCode(ctx, code, name, accountType, currency, isActive); err != nil {
+		if _, err := glAccounts.UpsertBySourceRecord(ctx, acc.ID, code, name, accountType, currency, isActive); err != nil {
 			return fmt.Errorf("sync gl_account %s: %w", code, err)
 		}
 	}
@@ -230,7 +233,7 @@ func SyncGLAccountOnWrite(ctx context.Context, tx *sql.Tx, _ *entity.Definition,
 		log.Printf("finance: SyncGLAccountOnWrite: Account %s has no currency_id set, defaulting gl_accounts.currency to %s", code, currency)
 	}
 
-	if _, err := data.NewGLAccountRepo(tx).UpsertByCode(ctx, code, name, accountType, currency, isActive); err != nil {
+	if _, err := data.NewGLAccountRepo(tx).UpsertBySourceRecord(ctx, rec.ID, code, name, accountType, currency, isActive); err != nil {
 		return fmt.Errorf("sync gl_account %s on write: %w", code, err)
 	}
 	return nil
