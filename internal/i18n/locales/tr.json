@@ -68,6 +68,7 @@
   "report.purchasing.reorder_expect_days": "Şimdi sipariş verin — yaklaşık {days} gün içinde gelir",
   "report.purchasing.reorder_expect_days_overall": "Şimdi sipariş verin — yaklaşık {days} gün içinde gelir (tüm tedarikçiler)",
   "report.purchasing.reorder_insufficient": "Yetersiz tedarik süresi geçmişi",
+  "report.purchasing.not_available": "Mevcut değil",
   "report.rfq.title": "Teklif Talebi Tedarikçi Karşılaştırması",
   "report.rfq.footer_total": "Teklif Edilen Toplam",
   "report.rfq.empty": "Bu teklif talebinde henüz satır ve/veya davet edilmiş tedarikçi yok — karşılaştırılacak bir şey yok.",

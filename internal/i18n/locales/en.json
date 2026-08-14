@@ -68,6 +68,7 @@
   "report.purchasing.reorder_expect_days": "Order now — expect ~{days} days",
   "report.purchasing.reorder_expect_days_overall": "Order now — expect ~{days} days (all suppliers)",
   "report.purchasing.reorder_insufficient": "Insufficient lead-time history",
+  "report.purchasing.not_available": "Not available",
   "report.rfq.title": "RFQ Vendor Comparison",
   "report.rfq.footer_total": "Quoted Total",
   "report.rfq.empty": "This RFQ has no lines and/or no invited vendors yet — nothing to compare.",
