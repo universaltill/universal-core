@@ -647,6 +647,54 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
   // repeated invocations, so no other closure machinery is needed.
   var mediaRecorder = null;
   var recording = false;
+  // uc-infra#238: recordAttemptGeneration/recordingGeneration replace the
+  // three transcribe-write guards' old "mediaRecorder === thisRecorder"
+  // check (mediaRecorder/thisRecorder above are now used ONLY for the Stop
+  // button branch and onstop's own button-label resync — an unrelated
+  // concern this issue leaves untouched). Independent review of uc-infra
+  // #221 found recorder *identity* is the wrong proxy for "is a stale
+  // take's write safe to drop": it changes the moment a NEW MediaRecorder
+  // is merely constructed, not when a take actually starts recording or
+  // definitively fails — two narrow, reachable gaps fell out of that
+  // mismatch (this issue's own "Gap A"/"Gap B"). Two independent counters
+  // close both:
+  //   - recordAttemptGeneration bumps once per Record click, synchronously,
+  //     before getUserMedia is even called — it marks "the user's most
+  //     recent intent," the thing that should own the STATUS LINE
+  //     (statusEl) regardless of whether this attempt goes on to succeed or
+  //     fail. Gap B (a getUserMedia rejection never reassigns
+  //     mediaRecorder, so a still-in-flight older take's later success used
+  //     to silently wipe the freshly-shown "permission denied" message) is
+  //     closed because the click alone — independent of any MediaRecorder
+  //     ever existing — already claims this generation.
+  //   - recordingGeneration bumps only once a take's mediaRecorder.start()
+  //     actually succeeds — it marks "the most recent take whose data is
+  //     real," the thing that should own the TRANSCRIPT/DESCRIPTION
+  //     fields. Gap A (mediaRecorder.start() throwing after
+  //     "mediaRecorder = new MediaRecorder(stream)" already reassigned the
+  //     shared variable, which used to make an older, entirely legitimate
+  //     still-in-flight take look "superseded" and silently drop its
+  //     transcript even though nothing ever actually replaced it) is
+  //     closed because a failed start never bumps this counter — the older
+  //     take's data-generation check still passes.
+  // recordAttemptGeneration bumps synchronously at click time, strictly
+  // before recordingGeneration can bump (which needs a round trip through
+  // getUserMedia first) — so for the ordinary case where a click goes on
+  // to a successful start, there IS a real window (the whole
+  // permission-prompt wait) where the two counters disagree about which
+  // take currently owns the status line, not just on a click that fails.
+  // Independent review: that window is harmless only because the click
+  // handler clears statusEl synchronously, in the same turn as the
+  // recordAttemptGeneration bump (see that call site's own comment) — an
+  // OLDER take's status write is correctly suppressed starting at the
+  // click, and something new is visibly shown starting at the exact same
+  // moment, so the disagreement is never user-observable. Without that
+  // clear, the two counters would have left a real, user-visible gap
+  // (the status line stuck on a stale "Transcribing…", or a stale take's
+  // own error silently swallowed) for as long as the permission prompt
+  // stayed unanswered — this was caught by review, not shipped.
+  var recordAttemptGeneration = 0;
+  var recordingGeneration = 0;
 
   // Deliberately an if/else, NOT an early "return" out of the whole IIFE
   // (independent review, uc-infra#92: the earlier version DID return
@@ -721,6 +769,27 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
         // recorders after the fact.
         return;
       }
+      // uc-infra#238: claims this click's own attempt generation
+      // synchronously, before getUserMedia is even called — see the outer
+      // recordAttemptGeneration/recordingGeneration comment above for why
+      // this alone (independent of whether the attempt below goes on to
+      // succeed or fail) is what closes Gap B. The immediate clear right
+      // below is NOT cosmetic (independent review): claiming the status
+      // line here without also writing to it left a real window open —
+      // getUserMedia's own permission prompt can stay pending indefinitely
+      // (the person simply doesn't answer it yet), during which an OLDER
+      // take's still-in-flight transcribe result now fails this guard (as
+      // intended) but nothing NEW has been written yet either, so the
+      // status line was left stuck showing that older take's stale
+      // "Transcribing…" — or, worse, silently swallowing that older take's
+      // own real transcribe error — for as long as the prompt sits
+      // unanswered. Clearing synchronously here makes "claim the status
+      // line" and "show something for it" atomic, the same guarantee the
+      // old identity guard got for free by only transferring ownership at
+      // "new MediaRecorder(stream)", a point always immediately followed
+      // by a write (the success/throw branches below).
+      var myAttemptGeneration = ++recordAttemptGeneration;
+      statusEl.textContent = "";
       recordBtn.disabled = true;
       navigator.mediaDevices.getUserMedia({ audio: true }).then(function(stream) {
         recordBtn.disabled = false;
@@ -747,6 +816,15 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
           // current take by the time it actually fires — see onstop's own
           // comment for why that check matters.
           var thisRecorder = mediaRecorder;
+          // uc-infra#238: declared here (before use), assigned only once
+          // mediaRecorder.start() below actually succeeds — see the
+          // outer-scope comment for why that (as opposed to claiming it at
+          // construction, like thisRecorder above, or at click time, like
+          // recordAttemptGeneration) is what closes Gap A. Left undefined
+          // if start() throws, which is what a failed take's onstop/
+          // transcribe callbacks — which never fire in that case — would
+          // otherwise have read.
+          var myRecordingGeneration;
           mediaRecorder.ondataavailable = function(e) { if (e.data.size > 0) chunks.push(e.data); };
           mediaRecorder.onstop = function() {
             // uc-infra#223: resync recording/the button label here too,
@@ -770,12 +848,11 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
             }
             stream.getTracks().forEach(function(t) { t.stop(); });
             var blob = new Blob(chunks, { type: "audio/webm" });
-            // uc-infra#221: guarded on mediaRecorder === thisRecorder, same
-            // identity check onstop's own button-label reset above already
-            // uses — #196 legitimized a fast Stop-then-Record-again as a
-            // supported flow (isolating each take's audio bytes so they can
-            // no longer mix), but every write below this point used to be
-            // unconditional, so a still-in-flight earlier take's
+            // uc-infra#221 (guard introduced) / uc-infra#238 (guard
+            // corrected): #196 legitimized a fast Stop-then-Record-again as
+            // a supported flow (isolating each take's audio bytes so they
+            // can no longer mix), but every write below this point used to
+            // be unconditional, so a still-in-flight earlier take's
             // "Transcribing…" status, its eventual transcript/description,
             // or its transcribe error could each land on screen *after* a
             // newer take had already started — clobbering whatever the
@@ -785,13 +862,20 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
             // is still sent either way (aborting it would need an
             // AbortController this take never set up, and the guard's job
             // is only to stop a stale result from being *applied*, not to
-            // cancel the network request) — its response is just dropped on
+            // cancel the network request — see uc-infra#238's own separate,
+            // deferred finding on that) — its response is just dropped on
             // arrival, same "drop the stale take's UI update rather than
             // apply it" choice onstop's own reset already made for the
-            // button label. Re-checked at every write below (not just
-            // once here), since a newer take can start at any point while
-            // this fetch is still in flight.
-            if (mediaRecorder === thisRecorder) {
+            // button label. Re-checked at every write below (not just once
+            // here), since a newer take can start (or fail to start) at any
+            // point while this fetch is still in flight. Guarded on
+            // recordAttemptGeneration, NOT recorder identity (uc-infra#238:
+            // identity changes the instant a new MediaRecorder is merely
+            // constructed, even one whose own .start() goes on to throw —
+            // recordAttemptGeneration instead tracks the user's actual
+            // Record clicks, see the outer-scope comment for the full
+            // rationale).
+            if (myAttemptGeneration === recordAttemptGeneration) {
               statusEl.textContent = {{.TranscribingLabel}};
             }
             var form = new FormData();
@@ -802,11 +886,17 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
                 return resp.text();
               })
               .then(function(text) {
-                // uc-infra#221: see the guard comment above — a newer take
-                // may have started while this request was in flight, in
-                // which case this take no longer owns the shared status/
-                // transcript/description fields and its result is dropped.
-                if (mediaRecorder !== thisRecorder) {
+                // uc-infra#238: transcript/description are guarded on
+                // recordingGeneration specifically (not recordAttemptGeneration,
+                // which the statusEl write above and the catch below use) —
+                // this take's actual recorded data must still land even if a
+                // LATER take's own attempt went on to fail (Gap A: a failed
+                // start must not silently drop a still-legitimate earlier
+                // take's transcript, since nothing genuine ever superseded
+                // it). recordingGeneration only advances on a take that
+                // actually reached a successful mediaRecorder.start(), so a
+                // failed later attempt never invalidates this check.
+                if (myRecordingGeneration !== recordingGeneration) {
                   return;
                 }
                 // Both assignments below are clamped defensively
@@ -836,19 +926,35 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
                   combined = combined.slice(0, {{.DescriptionMaxLength}});
                 }
                 descriptionEl.value = combined;
-                statusEl.textContent = "";
+                // uc-infra#238: this clear is a STATUS-LINE write (unlike
+                // the transcript/description writes just above), so it uses
+                // recordAttemptGeneration, same as the "Transcribing…" write
+                // that opened this onstop handler — a later take's own
+                // failure (Gap B: e.g. a getUserMedia rejection, which never
+                // even reaches this file's mediaRecorder var) must keep
+                // owning the status line, not have this take's own
+                // late-arriving success silently erase it.
+                if (myAttemptGeneration === recordAttemptGeneration) {
+                  statusEl.textContent = "";
+                }
               })
               .catch(function(err) {
-                // uc-infra#221: same guard as the success path above — a
-                // stale take's transcribe failure must not stomp a newer
-                // take's own in-progress/idle status line.
-                if (mediaRecorder === thisRecorder) {
+                // uc-infra#238: same recordAttemptGeneration guard as the
+                // success path's statusEl clear above — a stale take's
+                // transcribe failure must not stomp a newer attempt's own
+                // in-progress/idle/error status line.
+                if (myAttemptGeneration === recordAttemptGeneration) {
                   statusEl.textContent = String(err.message || err);
                 }
               });
           };
           mediaRecorder.start();
           recording = true;
+          // uc-infra#238: assigned only now that mediaRecorder.start() has
+          // actually succeeded (declared earlier, next to thisRecorder —
+          // see that declaration's own comment for why this timing is what
+          // closes Gap A).
+          myRecordingGeneration = ++recordingGeneration;
           recordBtn.textContent = {{.StopLabel}};
           statusEl.textContent = "";
         } catch (e) {
