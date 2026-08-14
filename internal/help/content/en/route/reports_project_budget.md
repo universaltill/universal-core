@@ -46,6 +46,15 @@ there is anything to compare.
   case, on every row, even one whose Actual is otherwise shown: Variance
   is Planned compared against Actual, so it cannot be a real number
   when Planned is not visible to you.
+- If your role does not have visibility into Budget Lines' category,
+  the **Category** column itself shows **Not available** on every row
+  instead of the category name — and, since Category also decides which
+  Budget Line rows a category's Planned figure is summed from, **Planned**
+  and **Variance** show **Not available** too in that case, the same as
+  when your role lacks visibility into the planned amounts directly. The
+  unpriced-hours note above still appears on its row when this applies —
+  it says something about hours, not about which category they belong
+  to.
 
 ## Rules to know
 

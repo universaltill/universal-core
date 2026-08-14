@@ -309,28 +309,49 @@ func TestProjectBudgetReport_RBACDenied(t *testing.T) {
 }
 
 // TestProjectBudgetReport_PlannedRedactedRendersNotAvailable (uc-infra
-// #216) is the HTTP-level proof that a FieldPermission hiding a
-// ProjectBudgetLine field projectBudgetPlannedMinor reads makes the
-// whole page's Planned (and, since it's derived from Planned, Variance)
-// column render "Not available" instead of a fabricated figure a naive
-// read of an already-redacted budgetLines row would otherwise produce —
-// while Actual, a genuinely separate source, keeps rendering normally.
-// Table-driven over BOTH fields projectBudgetPlannedMinor reads out of
-// budgetLines' Data (independent review finding, uc-infra#216): not just
-// "planned_amount" (the field that holds the number) but "category" too
-// (the field the summing loop matches rows by) — hiding category alone
-// makes every budgetLines row's `cat` compare empty against the actuals'
-// real category, so no row is ever summed, and an earlier version of
-// this fix only gated on "planned_amount" being hidden, letting a
-// category-only redaction sail straight through as a fabricated 0.00
-// Planned and, worse, a confidently wrong non-zero Variance (Planned 0
-// minus a real Actual). Uses seedFieldPermission (handlers_test.go)
-// rather than seedRBAC, matching every other FieldPermission-specific
-// HTTP test in this package (e.g. TestAPI_Export_RedactsHiddenFieldColumn's
-// own convention).
+// #216, extended by uc-infra#222) is the HTTP-level proof that a
+// FieldPermission hiding a ProjectBudgetLine field this report reads
+// makes the affected column(s) render "Not available" instead of a
+// fabricated or leaked real value — while Actual, a genuinely separate
+// source, keeps rendering normally. Table-driven over BOTH fields
+// projectBudgetPlannedMinor reads out of budgetLines' Data (independent
+// review finding, uc-infra#216): not just "planned_amount" (the field
+// that holds the number) but "category" too (the field the summing loop
+// matches rows by) — hiding category alone makes every budgetLines row's
+// `cat` compare empty against the actuals' real category, so no row is
+// ever summed, and an earlier version of this fix only gated on
+// "planned_amount" being hidden, letting a category-only redaction sail
+// straight through as a fabricated 0.00 Planned and, worse, a
+// confidently wrong non-zero Variance (Planned 0 minus a real Actual).
+//
+// uc-infra#222 (independent review of #216 itself) found a second,
+// separate leak the #216 fix never touched: even with Planned/Variance
+// correctly blanked, the Category column's own text came from
+// data.ReportingRepo.ProjectBudgetActuals' raw SQL — read straight out
+// of `records`, entirely outside the FieldPermission-redacted
+// budgetLines slice — so an actor with "category" hidden still saw the
+// real category names ("Labour"/"Materials") as every row's own label.
+// wantCategoryTextShown/wantNotAvailableCount below distinguish the two
+// hiddenField cases precisely: redacting "planned_amount" alone must
+// NOT touch Category (still real text, still 5 "Not available" cells,
+// matching #216's original count); redacting "category" must ALSO blank
+// Category on every row (2 more "Not available" cells, one per row, on
+// top of #216's existing 5 — 7 total), and the real category names must
+// not appear anywhere in the body. Uses seedFieldPermission
+// (handlers_test.go) rather than seedRBAC, matching every other
+// FieldPermission-specific HTTP test in this package (e.g.
+// TestAPI_Export_RedactsHiddenFieldColumn's own convention).
 func TestProjectBudgetReport_PlannedRedactedRendersNotAvailable(t *testing.T) {
-	for _, hiddenField := range []string{"planned_amount", "category"} {
-		t.Run(hiddenField, func(t *testing.T) {
+	cases := []struct {
+		hiddenField           string
+		wantCategoryTextShown bool
+		wantNotAvailableCount int
+	}{
+		{"planned_amount", true, 5},
+		{"category", false, 7},
+	}
+	for _, tc := range cases {
+		t.Run(tc.hiddenField, func(t *testing.T) {
 			router := newTestRouter(t)
 			withDevAuthEnabled(t)
 			tenantID, db := newTestTenant(t, router)
@@ -338,7 +359,7 @@ func TestProjectBudgetReport_PlannedRedactedRendersNotAvailable(t *testing.T) {
 			testHandler(t, router).Routes(mux)
 
 			projectID := setupProjectBudgetTenant(t, db)
-			seedFieldPermission(t, db, "budget_redacted", "user-redacted", "ProjectBudgetLine", hiddenField)
+			seedFieldPermission(t, db, "budget_redacted", "user-redacted", "ProjectBudgetLine", tc.hiddenField)
 
 			req := newRequest("GET", "/reports/project-budget/"+projectID, tenantID, "user-redacted", nil)
 			rec := httptest.NewRecorder()
@@ -349,21 +370,29 @@ func TestProjectBudgetReport_PlannedRedactedRendersNotAvailable(t *testing.T) {
 			body := rec.Body.String()
 
 			if strings.Contains(body, "500.00") || strings.Contains(body, "200.00") {
-				t.Errorf("report body still shows a planned amount for an actor whose role has %s redacted:\n%s", hiddenField, body)
+				t.Errorf("report body still shows a planned amount for an actor whose role has %s redacted:\n%s", tc.hiddenField, body)
 			}
 			// A category-only redaction must not silently turn into a
 			// wrong, confidently-rendered NEGATIVE variance (Planned
 			// fabricated as 0 minus a real 50.00 Actual) — the exact
 			// failure mode independent review reproduced.
 			if strings.Contains(body, "-50.00") {
-				t.Errorf("report body shows a fabricated negative variance for an actor with %s redacted:\n%s", hiddenField, body)
+				t.Errorf("report body shows a fabricated negative variance for an actor with %s redacted:\n%s", tc.hiddenField, body)
 			}
 			// Labour's real Actual ($50.00, from TimeEntry — a source
 			// entirely separate from ProjectBudgetLine) must still
 			// render: redaction of one ProjectBudgetLine field must not
 			// black out an unrelated column.
 			if !strings.Contains(body, "50.00") {
-				t.Errorf("report body missing labour's Actual (50.00) — redacting %s must not also hide Actual:\n%s", hiddenField, body)
+				t.Errorf("report body missing labour's Actual (50.00) — redacting %s must not also hide Actual:\n%s", tc.hiddenField, body)
+			}
+			// uc-infra#222: the real category names must appear when
+			// only planned_amount is redacted (category itself is
+			// untouched), and must NOT appear anywhere in the body when
+			// category is the redacted field — the leak this card fixes.
+			categoryTextShown := strings.Contains(body, "Labour") && strings.Contains(body, "Materials")
+			if categoryTextShown != tc.wantCategoryTextShown {
+				t.Errorf("report body category-name visibility = %v, want %v, for an actor with %s redacted:\n%s", categoryTextShown, tc.wantCategoryTextShown, tc.hiddenField, body)
 			}
 			// Labour's Variance cell specifically must read "Not
 			// available", not merely be absent from a loose substring
@@ -375,38 +404,105 @@ func TestProjectBudgetReport_PlannedRedactedRendersNotAvailable(t *testing.T) {
 			// ("<td></td>") instead of "Not available", since
 			// buildProjectBudgetReportView never sets Variance when
 			// Planned is redacted. Pinned here as the literal three-cell
-			// sequence the template emits for the labour row: Planned
-			// "Not available", Actual "50.00" (real), Variance "Not
-			// available" — proving the Variance guard is doing its own,
-			// distinct job, not riding along on Planned's.
+			// sequence the template emits for the labour row's own
+			// trailing Planned/Actual/Variance cells: "Not available" /
+			// "50.00" (real) / "Not available" — proving the Variance
+			// guard is doing its own, distinct job, not riding along on
+			// Planned's. Unaffected by whether Category (the cell
+			// immediately BEFORE this sequence) is itself redacted.
 			const labourPlannedActualVarianceCells = "  <td>Not available</td>\n  <td>50.00</td>\n  <td>Not available</td>"
 			if !strings.Contains(body, labourPlannedActualVarianceCells) {
 				t.Errorf("expected the labour row's Planned/Actual/Variance cells to read Not available / 50.00 / Not available in sequence, got:\n%s", body)
 			}
+			if !tc.wantCategoryTextShown {
+				// category redacted: the labour row's full 4-cell
+				// sequence (Category/Planned/Actual/Variance) must read
+				// Not available / Not available / 50.00 / Not available
+				// — pinning Category's own cell right alongside Planned's,
+				// not just trusting the "Labour" substring's absence. The
+				// Category cell also still carries the unpriced-note span
+				// right after "Not available" (uc-infra#222 independent
+				// review: the note must survive category's redaction,
+				// it's a fact about hours, not the category name) — pinned
+				// here too, not just by the separate "note text present
+				// somewhere in body" check below.
+				const labourAllFourCells = `  <td>Not available <span class="uc-project-budget-unpriced">(some logged hours could not be priced)</span></td>` + "\n" +
+					`  <td>Not available</td>` + "\n" +
+					`  <td>50.00</td>` + "\n" +
+					`  <td>Not available</td>`
+				if !strings.Contains(body, labourAllFourCells) {
+					t.Errorf("expected the labour row's Category/Planned/Actual/Variance cells to read (Not available + unpriced note) / Not available / 50.00 / Not available in sequence, got:\n%s", body)
+				}
+			}
 			// Exact count, not a loose lower bound (independent review
 			// finding: a "< 3" bound stayed green through the Variance-
 			// guard regression above, since it only dropped the count by
-			// one). Both rows lose Planned; labour also loses Variance
-			// (2 cells); materials has no Actual source at all regardless
-			// of this redaction, so it loses Actual and Variance too (3
-			// cells) — 5 total.
-			if got := strings.Count(body, "Not available"); got != 5 {
-				t.Errorf(`expected exactly 5 "Not available" cells (labour: Planned+Variance; materials: Planned+Actual+Variance), got %d:\n%s`, got, body)
+			// one).
+			if got := strings.Count(body, "Not available"); got != tc.wantNotAvailableCount {
+				t.Errorf(`expected exactly %d "Not available" cells for %s redacted, got %d:\n%s`, tc.wantNotAvailableCount, tc.hiddenField, got, body)
 			}
 
 			// An actor with no such redaction still sees the real
-			// planned amounts — the fix must be actor-specific, not a
-			// global change.
+			// planned amounts and real category names — the fix must be
+			// actor-specific, not a global change.
 			req = newRequest("GET", "/reports/project-budget/"+projectID, tenantID, "farshid", nil)
 			rec = httptest.NewRecorder()
 			mux.ServeHTTP(rec, req)
 			if rec.Code != http.StatusOK {
 				t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 			}
-			if !strings.Contains(rec.Body.String(), "500.00") {
-				t.Errorf("an actor without the redaction should still see the real planned amount:\n%s", rec.Body.String())
+			unredactedBody := rec.Body.String()
+			if !strings.Contains(unredactedBody, "500.00") {
+				t.Errorf("an actor without the redaction should still see the real planned amount:\n%s", unredactedBody)
+			}
+			if !strings.Contains(unredactedBody, "Labour") || !strings.Contains(unredactedBody, "Materials") {
+				t.Errorf("an actor without the redaction should still see the real category names:\n%s", unredactedBody)
 			}
 		})
+	}
+}
+
+// TestProjectBudgetReport_CategoryRedactedRendersNotAvailable (uc-infra
+// #222, independent review of this same fix) is the HTTP-level, real-
+// template proof that the unpriced-hours note keeps rendering for an
+// actor with ProjectBudgetLine.category redacted — the exact regression
+// an earlier draft of this fix shipped (nesting the note's template
+// guard inside CategoryAvailable's, so the note silently vanished
+// alongside the real category name it has nothing to do with). Separate
+// from TestBuildProjectBudgetReportView_CategoryRedactedRendersNotAvailable
+// (Go view-model level, doesn't exercise projectBudgetReportTmpl at all)
+// and from TestProjectBudgetReport_PlannedRedactedRendersNotAvailable's
+// own "category" subtest (asserts the leak is closed, never asserted the
+// note either way).
+func TestProjectBudgetReport_CategoryRedactedRendersNotAvailable(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	// setupProjectBudgetTenant seeds Bob's unpriced TimeEntry alongside
+	// Alice's priced one, which is exactly what makes the labour row's
+	// UnpricedNote non-empty.
+	projectID := setupProjectBudgetTenant(t, db)
+	seedFieldPermission(t, db, "budget_category_redacted", "user-redacted", "ProjectBudgetLine", "category")
+
+	req := newRequest("GET", "/reports/project-budget/"+projectID, tenantID, "user-redacted", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+
+	if strings.Contains(body, "Labour") || strings.Contains(body, "Materials") {
+		t.Errorf("report body still shows real category names for an actor with category redacted:\n%s", body)
+	}
+	if !strings.Contains(body, "some logged hours could not be priced") {
+		t.Errorf("report body missing the unpriced-hours note for an actor with category redacted — the note is unrelated to the category name and must not be suppressed by its redaction:\n%s", body)
+	}
+	if !strings.Contains(body, `<span class="uc-project-budget-unpriced">`) {
+		t.Errorf("report body missing the unpriced-note span markup for an actor with category redacted:\n%s", body)
 	}
 }
 
@@ -546,12 +642,15 @@ func TestBuildProjectBudgetReportView_NilVsZeroAndScaling(t *testing.T) {
 		{Category: "travel", Actual: &zero},                                        // confirmed zero activity, zero unpriced: no note
 	}
 
-	view := h.buildProjectBudgetReportView(project, budgetLines, actuals, "en", false)
+	view := h.buildProjectBudgetReportView(project, budgetLines, actuals, "en", false, false)
 	if len(view.Rows) != 3 {
 		t.Fatalf("expected 3 rows, got %d", len(view.Rows))
 	}
 
 	labour := view.Rows[0]
+	if !labour.CategoryAvailable || labour.Category != "Labour" {
+		t.Errorf("labour row = %+v, want CategoryAvailable=true Category=Labour", labour)
+	}
 	if !labour.PlannedAvailable || !labour.Available || labour.Planned != "10.00" || labour.Actual != "2.50" || labour.Variance != "7.50" {
 		t.Errorf("labour row = %+v, want PlannedAvailable=true Planned=10.00 Actual=2.50 Variance=7.50", labour)
 	}
@@ -603,7 +702,7 @@ func TestBuildProjectBudgetReportView_PlannedRedactedRendersNotAvailable(t *test
 		{Category: "labour", Actual: &priced},
 	}
 
-	view := h.buildProjectBudgetReportView(project, budgetLines, actuals, "en", true)
+	view := h.buildProjectBudgetReportView(project, budgetLines, actuals, "en", true, false)
 	if len(view.Rows) != 1 {
 		t.Fatalf("expected 1 row, got %d", len(view.Rows))
 	}
@@ -620,6 +719,76 @@ func TestBuildProjectBudgetReportView_PlannedRedactedRendersNotAvailable(t *test
 	}
 	if labour.Variance != "" {
 		t.Errorf("labour row = %+v, want Variance=\"\" — it depends on the redacted Planned, so it can't be a real number either", labour)
+	}
+	// categoryRedacted=false here — redacting planned_amount alone must
+	// not also blank the Category column (uc-infra#222 keeps these two
+	// independent at the view-model level, even though the real handler
+	// always sets both true together when "category" itself is hidden).
+	if !labour.CategoryAvailable || labour.Category != "Labour" {
+		t.Errorf("labour row = %+v, want CategoryAvailable=true Category=Labour — only planned_amount is redacted here, not category", labour)
+	}
+}
+
+// TestBuildProjectBudgetReportView_CategoryRedactedRendersNotAvailable
+// (uc-infra#222) pins the fix for the leak independent review found in
+// uc-infra#216's own redaction fix: ProjectBudgetActuals' raw-SQL
+// category values are read straight from a.Category — a field the
+// SQL query in internal/data/reporting.go reads directly out of
+// `records`, entirely outside the already-redacted budgetLines slice
+// ts.crud.ListByField produces. Hiding ProjectBudgetLine.category via a
+// FieldPermission must therefore also stop this view from putting the
+// real category name in the Category column, not just blank
+// Planned/Variance (which projectBudgetLinePlannedRedacted already did
+// before this fix, since it ORs in hidden["category"] for exactly this
+// reason — but that only ever protected Planned/Variance, never the
+// Category label itself). categoryRedacted=true here arrives alongside
+// plannedRedacted=true, matching what renderProjectBudgetReport actually
+// passes (projectBudgetLinePlannedRedacted treats a hidden "category" as
+// redacting Planned too).
+//
+// Also pins a second, independent-review-only finding (uc-infra#222,
+// review of this same fix): UnpricedNote must still be set even when
+// categoryRedacted is true. UnpricedHours/UnpricedEntries are non-zero
+// here specifically so a regression that (re-)nests the note's template
+// guard inside CategoryAvailable — the actual bug an earlier draft of
+// this fix shipped, silently dropping the note for a category-redacted
+// actor — would leave UnpricedNote computed-but-unrendered, invisible to
+// a test that only checks the Go view model's Category/CategoryAvailable
+// fields. See TestProjectBudgetReport_CategoryRedactedRendersNotAvailable
+// (HTTP-level) for the template-rendering half of this same pin.
+func TestBuildProjectBudgetReportView_CategoryRedactedRendersNotAvailable(t *testing.T) {
+	catalog, err := i18n.Load("en")
+	if err != nil {
+		t.Fatalf("load i18n catalog: %v", err)
+	}
+	h := &Handler{catalog: catalog}
+
+	project := data.Record{Data: map[string]any{"project_code": "PRJ-1"}}
+	budgetLines := []data.Record{
+		{Data: map[string]any{"category": "labour", "planned_amount": 10.0}},
+	}
+	priced := money.Money(250) // $2.50
+	actuals := []data.ProjectCategoryActual{
+		{Category: "labour", Actual: &priced, UnpricedHours: 1.5, UnpricedEntries: 1},
+	}
+
+	view := h.buildProjectBudgetReportView(project, budgetLines, actuals, "en", true, true)
+	if len(view.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(view.Rows))
+	}
+
+	labour := view.Rows[0]
+	if labour.CategoryAvailable {
+		t.Errorf("labour row = %+v, want CategoryAvailable=false — category is redacted for this actor", labour)
+	}
+	if labour.Category != "" {
+		t.Errorf("labour row = %+v, want Category=\"\" (real category name never assigned) when redacted, got %q", labour, labour.Category)
+	}
+	if !labour.Available || labour.Actual != "2.50" {
+		t.Errorf("labour row = %+v, want Available=true Actual=2.50 — Actual is a separate source, unaffected by category's redaction", labour)
+	}
+	if labour.UnpricedNote == "" {
+		t.Errorf("labour row = %+v, want a non-empty UnpricedNote — it's a boolean-shaped fact (some hours were unpriced), not the category name, and must not be suppressed by category's redaction", labour)
 	}
 }
 
@@ -656,6 +825,37 @@ func TestProjectBudgetLinePlannedRedacted_CoversBothFieldsProjectBudgetPlannedMi
 	}
 }
 
+// TestProjectBudgetLineCategoryRedacted_OnlyCategoryGates (uc-infra#222)
+// pins projectBudgetLineCategoryRedacted's full truth table directly, at
+// the smallest possible unit — mirroring
+// TestProjectBudgetLinePlannedRedacted_CoversBothFieldsProjectBudgetPlannedMinorReads
+// just above. The one case that matters most here: "planned_amount
+// hidden" alone must NOT redact Category — this predicate is
+// deliberately narrower than projectBudgetLinePlannedRedacted, which
+// treats a hidden planned_amount as reason enough to blank Planned/
+// Variance but must never blank the Category column on its own.
+func TestProjectBudgetLineCategoryRedacted_OnlyCategoryGates(t *testing.T) {
+	cases := []struct {
+		name   string
+		hidden map[string]bool
+		want   bool
+	}{
+		{"nothing hidden", map[string]bool{}, false},
+		{"nil map", nil, false},
+		{"planned_amount hidden", map[string]bool{"planned_amount": true}, false},
+		{"category hidden", map[string]bool{"category": true}, true},
+		{"both hidden", map[string]bool{"planned_amount": true, "category": true}, true},
+		{"unrelated field hidden", map[string]bool{"notes": true}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := projectBudgetLineCategoryRedacted(tc.hidden); got != tc.want {
+				t.Errorf("projectBudgetLineCategoryRedacted(%v) = %v, want %v", tc.hidden, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestBuildProjectBudgetReportView_NoRowsForNoActuals confirms an empty
 // actuals slice (no ProjectBudgetLine rows on the project at all, per
 // ProjectBudgetActuals' own "empty slice, not an error" contract)
@@ -667,7 +867,7 @@ func TestBuildProjectBudgetReportView_NoRowsForNoActuals(t *testing.T) {
 	}
 	h := &Handler{catalog: catalog}
 
-	view := h.buildProjectBudgetReportView(data.Record{Data: map[string]any{}}, nil, nil, "en", false)
+	view := h.buildProjectBudgetReportView(data.Record{Data: map[string]any{}}, nil, nil, "en", false, false)
 	if len(view.Rows) != 0 {
 		t.Fatalf("expected 0 rows, got %d", len(view.Rows))
 	}
