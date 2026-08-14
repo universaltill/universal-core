@@ -463,6 +463,42 @@ func creditInventoryOnReceipt(ctx context.Context, tx *sql.Tx, records *data.Rec
 			"qty_on_hand":              qty,
 			"qty_available_to_promise": qty,
 		}
+		// This creates via the low-level records.CreateTx below, not
+		// crud.Engine.Create — the SAVEPOINT-based retry-on-unique-
+		// conflict dance a few lines down needs to run inside the
+		// caller's own *sql.Tx (handed to this hook by crud.Hook's
+		// signature), and Engine.Create always opens its own transaction.
+		// That means this call site never gets Engine.Create's internal
+		// entity.ApplyDefaults call, so it must apply the tenant's
+		// published InventoryItem Definition's Field.Default itself,
+		// explicitly (uc-infra#218, split from #212's independent
+		// review) — before validation, so a Default can satisfy its own
+		// field's Required check. internal/api/handlers.go calls
+		// ApplyDefaults explicitly ahead of crud.Engine.Create too, for
+		// a different reason (so its own pre-check agrees with what
+		// Create will do internally) — cited here only because the
+		// ordering-before-validation rationale is the same, not because
+		// the two callers share a motive. Currently a no-op in practice
+		// (item_id/facility_id/qty_on_hand/qty_available_to_promise are
+		// always set explicitly above), but a future field added to
+		// InventoryItem with a Default would otherwise silently diverge
+		// from every other write path into this Definition the moment
+		// this call omitted it.
+		//
+		// Deliberately NOT added to the update-existing branch above
+		// (the `if found {` block) — entity.ApplyDefaults's own doc
+		// comment explains why: data.RecordRepo.UpdateTx is a full
+		// replacement (`SET data = $1`), so defaulting an omitted field
+		// there would silently resurrect it instead of leaving it
+		// erased, same as crud.Engine.Update's own exclusion. Filed as
+		// uc-infra#226/#227 (independent review): that erasure was
+		// already latent for any tenant-added defaulted field, but this
+		// fix makes it newly *reachable* (a first receipt can now store
+		// such a field via this branch; a second receipt for the same
+		// (item, facility) hits the update branch and erases or
+		// hard-fails on it), and today nothing pins this exclusion with
+		// a test — not fixed here, out of scope for #218 itself.
+		entity.ApplyDefaults(def, fields)
 		if err := entity.ValidateRecord(def, fields); err != nil {
 			return fmt.Errorf("build InventoryItem credit for GoodsReceiptLine %s: %w", goodsReceiptLineID, err)
 		}
