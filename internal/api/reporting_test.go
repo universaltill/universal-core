@@ -664,7 +664,8 @@ func TestAPI_PurchasingReport_HiddenInventoryQuantitiesRenderNotAvailable(t *tes
 	mux := http.NewServeMux()
 	testHandler(t, router).Routes(mux)
 
-	// Unrestricted actor: every real number renders, on every table.
+	// Unrestricted actor: every real number renders, on every table,
+	// including the Stockout Risk heading's own real count.
 	openBody := getAs(t, mux, "/reports/purchasing", tenantID, "farshid").Body.String()
 	for _, want := range []string{
 		// Stock Summary card.
@@ -672,7 +673,8 @@ func TestAPI_PurchasingReport_HiddenInventoryQuantitiesRenderNotAvailable(t *tes
   <div class="uc-report-card-value">17</div>`,
 		`<div class="uc-report-card-label">Qty Available to Promise</div>
   <div class="uc-report-card-value">-4</div>`,
-		// Stockout Risk row.
+		// Stockout Risk heading count + row.
+		"<h2>Stockout Risk (1)</h2>",
 		`<td><a href="/forms/Item/` + itemID + `">SKU-LEAK</a></td><td>Leaky Widget</td><td>17</td><td>-4</td>`,
 		// Reorder Signals row: OnHand=17, OnOrder=0, Position=17, ReorderPoint=25.
 		`<tr><td><a href="/forms/Item/` + itemID + `">Leaky Widget</a></td><td>17</td><td>0</td><td>17</td><td>25</td>`,
@@ -703,22 +705,39 @@ func TestAPI_PurchasingReport_HiddenInventoryQuantitiesRenderNotAvailable(t *tes
 		}
 	}
 
-	// qty_available_to_promise hidden: ATP blank on the two tables that
-	// show it (Stock Summary card has no per-item ATP row beyond the
-	// aggregate, checked below); On Hand/Position stay real everywhere —
-	// hiding ATP must not blank a field it has no relationship to.
+	// qty_available_to_promise hidden: the Stock Summary card's ATP total
+	// blanks (a straightforward per-cell redaction, like OnHand's own
+	// above). The Stockout Risk section, though, is NOT a per-cell case:
+	// StockoutRiskItems' row membership and stock.StockoutCount are both
+	// filtered/computed server-side from the real, un-redacted
+	// qty_available_to_promise (WHERE atp <= 0), so blanking only the ATP
+	// cell would still leak "this item's real ATP is <= 0" via bare
+	// presence in the list and the heading's own count — the WHOLE
+	// section (heading count AND table) must gate together instead (see
+	// purchasingReportView.StockoutAvailable's own comment). On Hand/
+	// Position stay real everywhere else — hiding ATP must not blank a
+	// field it has no relationship to.
 	atpBody := getAs(t, mux, "/reports/purchasing", tenantID, "user-atp-hidden").Body.String()
 	for _, want := range []string{
 		`<div class="uc-report-card-label">Qty On Hand</div>
   <div class="uc-report-card-value">17</div>`,
 		`<div class="uc-report-card-label">Qty Available to Promise</div>
   <div class="uc-report-card-value">Not available</div>`,
-		`<td><a href="/forms/Item/` + itemID + `">SKU-LEAK</a></td><td>Leaky Widget</td><td>17</td><td>Not available</td>`,
+		// No "(N)" count suffix on the heading, and no table — just the
+		// section-level not-available notice.
+		"<h2>Stockout Risk</h2>",
+		`<p class="uc-empty">Not available</p>`,
 		`<tr><td><a href="/forms/Item/` + itemID + `">Leaky Widget</a></td><td>17</td><td>0</td><td>17</td><td>25</td>`,
 	} {
 		if !strings.Contains(atpBody, want) {
 			t.Errorf("qty_available_to_promise-restricted actor: expected %q in body:\n%s", want, atpBody)
 		}
+	}
+	if strings.Contains(atpBody, "SKU-LEAK") {
+		t.Errorf("qty_available_to_promise-restricted actor: the Stockout Risk row must not render at all (its membership itself is derived from the hidden field), but SKU-LEAK appears:\n%s", atpBody)
+	}
+	if strings.Contains(atpBody, "Stockout Risk (") {
+		t.Errorf("qty_available_to_promise-restricted actor: the Stockout Risk heading must not show a count derived from the hidden field:\n%s", atpBody)
 	}
 }
 

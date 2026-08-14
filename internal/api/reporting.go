@@ -228,7 +228,6 @@ func (h *Handler) renderPurchasingReport(w http.ResponseWriter, r *http.Request)
 		StockoutOnHandCol: h.catalog.TOrDefault(locale, "field.InventoryItem.qty_on_hand", "Qty On Hand"),
 		StockoutATPCol:    h.catalog.TOrDefault(locale, "field.InventoryItem.qty_available_to_promise", "Qty Available to Promise"),
 		StockItemCount:    strconv.Itoa(stock.ItemCount),
-		StockoutCount:     strconv.Itoa(stock.StockoutCount),
 
 		LeadTimeHeading:    h.catalog.T(locale, "report.purchasing.leadtime_heading"),
 		LeadTimeEmpty:      h.catalog.T(locale, "report.purchasing.leadtime_empty"),
@@ -274,6 +273,31 @@ func (h *Handler) renderPurchasingReport(w http.ResponseWriter, r *http.Request)
 		view.StockATPAvailable = true
 		view.StockATP = formrender.FormatFieldValue(stock.TotalATP)
 	}
+	// StockoutAvailable (uc-infra#230) gates
+	// the WHOLE Stockout Risk section, not just its OnHand/ATP cell text,
+	// when qty_available_to_promise is hidden — StockoutRiskItems'
+	// membership (which items appear at all) AND stock.StockoutCount (the
+	// heading's own "(N)") are BOTH computed server-side from the real,
+	// un-redacted qty_available_to_promise (WHERE atp <= 0), so blanking
+	// only the per-row ATP cell would still leave a restricted actor able
+	// to read off "this item's real ATP is <= 0" from bare list
+	// membership, and the real count of such items from the heading —
+	// exactly the value the FieldPermission exists to hide, just
+	// expressed as a threshold fact instead of the number itself. Unlike
+	// buildReorderSignals' own OnHand/Position redaction (which leaves
+	// the fire/no-fire decision itself untouched — a deliberate,
+	// documented deferral to the same business-behavior question
+	// uc-infra#231 raises for safety_stock), there is no equivalent
+	// "should this alert still fire regardless" argument for a plain
+	// report list: it exists only to be read, so the safe default is not
+	// computing it for display at all when its filter criterion is
+	// hidden from the viewer, the same way an actor can't derive "how
+	// many ProjectBudgetLine rows exist in a hidden category" from
+	// project_budget_report.go's redaction either.
+	view.StockoutAvailable = !atpRedacted
+	if !atpRedacted {
+		view.StockoutCount = strconv.Itoa(stock.StockoutCount)
+	}
 	view.LeadTimeRows = h.buildLeadTimeRows(stats, leadTimes, locale)
 	view.OnTimeRows = h.buildOnTimeRows(onTimeStats, leadTimes, locale)
 	view.QualityRows = h.buildQualityRows(qualityStats, qualityLines, locale)
@@ -300,27 +324,31 @@ func (h *Handler) renderPurchasingReport(w http.ResponseWriter, r *http.Request)
 			Spend:  v.Total.String(),
 		})
 	}
-	for _, item := range stockouts {
-		row := stockoutRowView{
-			SKU:  item.SKU,
-			Name: item.Name,
-			Href: "/forms/Item/" + item.ItemID,
-		}
-		// Same per-field redaction as the stock summary card above
-		// (uc-infra#230): StockoutRiskItems is a raw-SQL data.ReportingRepo
-		// aggregate, entirely outside the ts.crud-redacted path, so
-		// OnHand/ATP must be checked against InventoryItem's
-		// FieldPermission individually rather than assumed safe just
-		// because the item itself is readable.
-		if !onHandRedacted {
-			row.OnHandAvailable = true
-			row.OnHand = formrender.FormatFieldValue(item.QtyOnHand)
-		}
-		if !atpRedacted {
-			row.ATPAvailable = true
+	// The whole loop is skipped, not just the ATP cell, when atpRedacted
+	// — see view.StockoutAvailable's own comment above for why row
+	// MEMBERSHIP here is itself derived from the real, hidden
+	// qty_available_to_promise (StockoutRiskItems' WHERE atp <= 0), not
+	// just the displayed number.
+	if !atpRedacted {
+		for _, item := range stockouts {
+			row := stockoutRowView{
+				SKU:  item.SKU,
+				Name: item.Name,
+				Href: "/forms/Item/" + item.ItemID,
+			}
+			// OnHand is still checked against its OWN FieldPermission
+			// independently (uc-infra#230): qty_on_hand and
+			// qty_available_to_promise are separate fields, and a role
+			// that hides only qty_on_hand must still see this
+			// (atp-driven) section normally, with just its OnHand
+			// column blanked.
+			if !onHandRedacted {
+				row.OnHandAvailable = true
+				row.OnHand = formrender.FormatFieldValue(item.QtyOnHand)
+			}
 			row.ATP = formrender.FormatFieldValue(item.QtyATP)
+			view.Stockouts = append(view.Stockouts, row)
 		}
-		view.Stockouts = append(view.Stockouts, row)
 	}
 
 	var buf bytes.Buffer
@@ -793,8 +821,17 @@ type purchasingReportView struct {
 	StockATPAvailable    bool
 	StockATP             string
 
-	StockoutHeading   string
-	StockoutEmpty     string
+	StockoutHeading string
+	StockoutEmpty   string
+	// StockoutAvailable (uc-infra#230) is false when
+	// qty_available_to_promise is hidden from this actor: the whole
+	// section (heading count AND table rows) is gated together, not
+	// per-cell, because StockoutRiskItems' row membership and
+	// stock.StockoutCount are both filtered/computed server-side from the
+	// real, un-redacted value (WHERE atp <= 0) — see the handler's own
+	// comment on why a per-cell blank alone would still leak "this item's
+	// real ATP is <= 0" via bare presence in the list.
+	StockoutAvailable bool
 	StockoutSKUCol    string
 	StockoutNameCol   string
 	StockoutOnHandCol string
@@ -887,14 +924,17 @@ type vendorRowView struct {
 type stockoutRowView struct {
 	SKU  string
 	Name string
-	// OnHandAvailable/ATPAvailable (uc-infra#230) are independent, unlike
-	// reorderRowView's OnHandAvailable/PositionAvailable pair: this table
-	// has no visible OnOrder column to combine with OnHand and recover a
-	// hidden figure, so qty_on_hand and qty_available_to_promise are
-	// gated on their own FieldPermission independently.
+	// OnHandAvailable (uc-infra#230) gates only this row's OnHand cell,
+	// independently of ATP: unlike reorderRowView's OnHandAvailable/
+	// PositionAvailable pair, this table has no visible OnOrder column to
+	// combine with OnHand and recover a hidden figure, so qty_on_hand is
+	// gated on its own FieldPermission alone. ATP has no equivalent
+	// per-row flag: a stockoutRowView only ever exists when ATP itself is
+	// available (see purchasingReportView.StockoutAvailable) — row
+	// membership itself is derived from the real ATP value, so there is
+	// no "row present, ATP cell blank" state to represent.
 	OnHandAvailable bool
 	OnHand          string
-	ATPAvailable    bool
 	ATP             string
 	Href            string
 }
@@ -943,13 +983,15 @@ var purchasingReportTmpl = template.Must(template.New("purchasingReport").Parse(
 </div>
 </div>
 
-<h2>{{.StockoutHeading}} ({{.StockoutCount}})</h2>
-{{if .Stockouts}}
+<h2>{{.StockoutHeading}}{{if .StockoutAvailable}} ({{.StockoutCount}}){{end}}</h2>
+{{if not .StockoutAvailable}}
+<p class="uc-empty">{{.NotAvailable}}</p>
+{{else if .Stockouts}}
 <table class="uc-table">
 <thead><tr><th>{{.StockoutSKUCol}}</th><th>{{.StockoutNameCol}}</th><th>{{.StockoutOnHandCol}}</th><th>{{.StockoutATPCol}}</th></tr></thead>
 <tbody>
 {{range .Stockouts}}
-<tr><td><a href="{{.Href}}">{{.SKU}}</a></td><td>{{.Name}}</td><td>{{if .OnHandAvailable}}{{.OnHand}}{{else}}{{$.NotAvailable}}{{end}}</td><td>{{if .ATPAvailable}}{{.ATP}}{{else}}{{$.NotAvailable}}{{end}}</td></tr>
+<tr><td><a href="{{.Href}}">{{.SKU}}</a></td><td>{{.Name}}</td><td>{{if .OnHandAvailable}}{{.OnHand}}{{else}}{{$.NotAvailable}}{{end}}</td><td>{{.ATP}}</td></tr>
 {{end}}
 </tbody>
 </table>
