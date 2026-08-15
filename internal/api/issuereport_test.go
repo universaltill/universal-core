@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"log"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -406,6 +407,120 @@ func TestIssueReport_Transcribe_ForwardsCurrentUILocaleAsLanguageHint(t *testing
 	}
 	if gotLanguage != "ar" {
 		t.Fatalf("expected the current UI locale (ar) forwarded as the language hint, got %q", gotLanguage)
+	}
+}
+
+// TestIssueReport_Transcribe_ServerErrorLogsAndReturns500 is the control
+// case for TestIssueReport_Transcribe_ClientAbortDoesNotLogOrWriteResponse
+// below: a genuine speechassist.Transcribe failure (not a client abort)
+// must still log (via writeInternalError) and still return a real 500 —
+// proving uc-infra#239's r.Context().Err() carve-out is a targeted
+// exception for cancellation specifically, not a blanket "stop logging
+// transcribe errors" regression. No test in this file exercised a real
+// Transcribe failure at the Go-handler level before this (only the
+// browser-side StaleTranscribeError e2e test, which fakes fetch/Response
+// entirely and never reaches this handler at all).
+func TestIssueReport_Transcribe_ServerErrorLogsAndReturns500(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, _ := newTestTenant(t, router)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "asr backend on fire", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	speech := speechassist.NewClient(srv.URL)
+
+	mux := http.NewServeMux()
+	testHandlerWithSpeech(t, router, speech).Routes(mux)
+
+	var logBuf bytes.Buffer
+	origOutput := log.Writer()
+	origFlags := log.Flags()
+	log.SetOutput(&logBuf)
+	log.SetFlags(0)
+	t.Cleanup(func() { log.SetOutput(origOutput); log.SetFlags(origFlags) })
+
+	req := newAudioUploadRequest(t, "/issue-report/transcribe", tenantID, "farshid", []byte("fake audio bytes"))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 on a genuine ASR backend failure, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(logBuf.String(), "transcribe voice note") {
+		t.Fatalf("expected a genuine ASR failure to still be logged via writeInternalError, got log output: %q", logBuf.String())
+	}
+}
+
+// TestIssueReport_Transcribe_ClientAbortDoesNotLogOrWriteResponse is the
+// regression test for uc-infra#239's independent-review finding #1: once
+// #239's client-side AbortController fix made a superseded take's mic
+// capture actually cancel its own /issue-report/transcribe request, a
+// client abort became a ROUTINE outcome of any ordinary fast re-take —
+// not a rare edge case — but issueReportTranscribe still funneled it
+// through writeInternalError exactly like a genuine ASR/network fault,
+// spraying an error-level "transcribe voice note: ... context canceled"
+// log line indistinguishable from a real outage on every such re-take.
+//
+// Simulates the abort by cancelling the request's own context before
+// issueReportTranscribe ever runs — http.Client.Do (inside
+// speechassist.Transcribe) returns immediately with a context-cancellation
+// error without ever reaching the network, the same effective shape a real
+// browser closing the connection produces server-side. Calls
+// issueReportTranscribe directly (bypassing DevAuth's own r.WithContext,
+// which would produce a request the test can no longer control the
+// context of afterward — same reasoning
+// TestIssueReport_Transcribe_LargeRecordingSpillsToDiskNotHeap's own doc
+// comment already gives for this pattern).
+func TestIssueReport_Transcribe_ClientAbortDoesNotLogOrWriteResponse(t *testing.T) {
+	router := newTestRouter(t)
+	tenantID, _ := newTestTenant(t, router)
+
+	// A REAL, reachable server (independent review, uc-infra#239: the
+	// quiet early-return must be reached because the request's own
+	// context was already cancelled BEFORE Do() ever runs — not because
+	// some unrelated early return, or an unreachable baseURL, happened to
+	// produce the same observable log/body-emptiness by coincidence). If
+	// speechassist.Client.Transcribe were ever reached, this server would
+	// answer with a real 200 and a real transcript — which the assertions
+	// below would then contradict, proving the request actually never
+	// went out.
+	var serverWasDialed bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		serverWasDialed = true
+		w.Write([]byte("should never be seen"))
+	}))
+	defer srv.Close()
+	speech := speechassist.NewClient(srv.URL)
+	h := testHandlerWithSpeech(t, router, speech)
+
+	var logBuf bytes.Buffer
+	origOutput := log.Writer()
+	origFlags := log.Flags()
+	log.SetOutput(&logBuf)
+	log.SetFlags(0)
+	t.Cleanup(func() { log.SetOutput(origOutput); log.SetFlags(origFlags) })
+
+	req := newAudioUploadRequest(t, "/issue-report/transcribe", "", "", []byte("fake audio bytes"))
+	ctx, cancel := context.WithCancel(req.Context())
+	cancel() // superseded take's AbortController firing, from the server's point of view
+	req = req.WithContext(httpx.WithRequestContext(ctx, httpx.RequestContext{TenantID: tenantID, Actor: humanActor()}))
+
+	rec := httptest.NewRecorder()
+	h.issueReportTranscribe(rec, req)
+
+	if rec.Body.Len() != 0 {
+		t.Fatalf("expected no response body written for an aborted request, got %q", rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "" {
+		t.Fatalf("expected no Content-Type header written for an aborted request (implies a body was written), got %q", ct)
+	}
+	if logBuf.Len() != 0 {
+		t.Fatalf("expected a client-aborted (context-cancelled) transcribe request to log nothing — an ordinary fast re-take must not spray an error-level log line indistinguishable from a real ASR outage; got log output: %q", logBuf.String())
+	}
+	if serverWasDialed {
+		t.Fatal("expected the speech server to never be dialed at all for an already-cancelled request context — a request that reached the network (even one whose response was then discarded) is not what this test claims to prove")
 	}
 }
 

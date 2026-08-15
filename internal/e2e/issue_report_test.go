@@ -2380,6 +2380,384 @@ func TestIssueReportPage_MicRecord_FailedMiddleTakeDoesNotSkewGenerationsAcrossT
 	}
 }
 
+// TestIssueReportPage_MicRecord_NewTakeAbortsPreviousTakesTranscribeFetch is
+// the regression test for uc-infra#239 (the AbortController design pass
+// uc-infra#238's own commit deferred here): the StaleTranscribe*/
+// generation-counter tests above prove a superseded take's UI write is
+// dropped once its result eventually arrives, but pre-fix nothing ever
+// cancelled the underlying network request itself — a fast re-take
+// sequence still sent one real /issue-report/transcribe POST (and
+// therefore one real, possibly-metered self-hosted-Whisper ASR call) per
+// take, silently discarding every response but the last.
+//
+// Uses the same deferred-onstop fake (window.__recorders/__fireOnstop/
+// __fireData) TestIssueReportPage_MicRecord_StopThenRecordAgainDoesNotMixTakes
+// already establishes, rather than a synchronous-onstop MediaRecorder fake:
+// a synchronous fake always issues take #1's fetch() before take #2 can
+// click Record, so its signal would never be observably pre-aborted at
+// fetch-call time — leaving the real-world "Stop then Record again before
+// onstop has fired" interleaving (the same class of race #196/#221/#238
+// all guard elsewhere in this file) completely uncovered here. Deferring
+// onstop lets this test hold take #1's onstop back until AFTER take #2's
+// Record click has already fired (per this fix's own design: the abort
+// happens synchronously inside the click handler, before getUserMedia is
+// even called — see issuereport.go's transcribeAbortController comment),
+// so take #1's eventual fetch() call actually exercises the "signal is
+// already aborted before this take's own fetch ever runs" branch, not
+// just "signal aborts while fetch is in flight."
+func TestIssueReportPage_MicRecord_NewTakeAbortsPreviousTakesTranscribeFetch(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, _ := testServer(t)
+	ctx := browserCtx(t, tenantID)
+
+	const fakeScript = `
+(function() {
+  navigator.mediaDevices = navigator.mediaDevices || {};
+  navigator.mediaDevices.getUserMedia = function() {
+    return Promise.resolve({ getTracks: function() { return []; } });
+  };
+  window.__recorders = [];
+  window.MediaRecorder = function() {
+    var self = this;
+    this.start = function() {};
+    this.stop = function() { window.__recorders.push(self); };
+  };
+  window.__fireData = function(index, chunkText) {
+    var self = window.__recorders[index];
+    if (self.ondataavailable) { self.ondataavailable({ data: new Blob([chunkText]) }); }
+  };
+  window.__fireOnstop = function(index) {
+    var self = window.__recorders[index];
+    if (self.onstop) { self.onstop(); }
+  };
+  window.__fireStop = function(index, chunkText) {
+    window.__fireData(index, chunkText);
+    window.__fireOnstop(index);
+  };
+  // __transcribeAborted/__transcribeResolvers are indexed by FETCH CALL
+  // order, not by take/recorder index — a take whose onstop never fires
+  // (not this test's concern) would never reach fetch() at all, so the
+  // two index spaces are only guaranteed to line up for takes that do.
+  window.__transcribeAborted = [];
+  window.__transcribeResolvers = [];
+  var realFetch = window.fetch;
+  window.fetch = function(url, opts) {
+    if (String(url).indexOf("/issue-report/transcribe") !== -1) {
+      var idx = window.__transcribeAborted.length;
+      window.__transcribeAborted.push(false);
+      return new Promise(function(resolve, reject) {
+        // Mirrors a real fetch(): a signal that is ALREADY aborted at
+        // call time rejects synchronously, rather than only reacting to
+        // a future "abort" event — the exact case a take superseded
+        // before its own onstop ever fires produces under this fix's
+        // click-time-abort design.
+        if (opts && opts.signal && opts.signal.aborted) {
+          window.__transcribeAborted[idx] = true;
+          reject(new DOMException("The user aborted a request.", "AbortError"));
+          return;
+        }
+        window.__transcribeResolvers.push(resolve);
+        if (opts && opts.signal) {
+          opts.signal.addEventListener("abort", function() {
+            window.__transcribeAborted[idx] = true;
+            reject(new DOMException("The user aborted a request.", "AbortError"));
+          });
+        }
+      });
+    }
+    return realFetch.apply(window, arguments);
+  };
+})();
+`
+	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		_, err := page.AddScriptToEvaluateOnNewDocument(fakeScript).Do(ctx)
+		return err
+	})); err != nil {
+		t.Fatalf("inject fake deferred-stop media/abortable-fetch script: %v", err)
+	}
+
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/issue-report/new"),
+		chromedp.WaitVisible(`#uc-issue-record-btn`, chromedp.ByQuery),
+		chromedp.Click(`#uc-issue-record-btn`, chromedp.ByQuery), // take #1: start
+	); err != nil {
+		t.Fatalf("start take #1: %v", err)
+	}
+	var recordBtnText string
+	if err := chromedp.Run(ctx, chromedp.PollFunction(
+		`function() { var t = document.getElementById("uc-issue-record-btn").textContent; return t === "Stop recording" ? t : null; }`,
+		&recordBtnText,
+	)); err != nil {
+		t.Fatalf("wait for take #1 to start: %v", err)
+	}
+
+	// Take #1: Stop click. The button resets synchronously (as it always
+	// does), but this fake's onstop is deferred — take #1's recorder is
+	// only pushed onto window.__recorders; no fetch() has happened yet.
+	if err := chromedp.Run(ctx, chromedp.Click(`#uc-issue-record-btn`, chromedp.ByQuery)); err != nil {
+		t.Fatalf("stop take #1: %v", err)
+	}
+	if err := chromedp.Run(ctx, chromedp.PollFunction(
+		`function() { var t = document.getElementById("uc-issue-record-btn").textContent; return t === "Record voice note" ? t : null; }`,
+		&recordBtnText,
+	)); err != nil {
+		t.Fatalf("wait for the button to reset after stopping take #1: %v", err)
+	}
+
+	// Take #2 starts — Record clicked again while take #1's onstop is
+	// still unfired (no fetch call exists for take #1 at all yet). Per
+	// this fix's own design, the previous attempt's controller is aborted
+	// synchronously inside THIS click handler, before getUserMedia is even
+	// called — not deferred until take #1's own fetch is somehow already
+	// in flight.
+	if err := chromedp.Run(ctx, chromedp.Click(`#uc-issue-record-btn`, chromedp.ByQuery)); err != nil {
+		t.Fatalf("start take #2: %v", err)
+	}
+	if err := chromedp.Run(ctx, chromedp.PollFunction(
+		`function() { var t = document.getElementById("uc-issue-record-btn").textContent; return t === "Stop recording" ? t : null; }`,
+		&recordBtnText,
+	)); err != nil {
+		t.Fatalf("wait for take #2 to start: %v", err)
+	}
+
+	// NOW fire take #1's deferred onstop — its fetch() call happens for
+	// the first time here, strictly after take #2's click already
+	// superseded it, so its own AbortController's signal must already
+	// read aborted the instant fetch() is called, before any "abort"
+	// event could even fire.
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`window.__fireStop(0, "take-one-audio"); void 0;`, nil)); err != nil {
+		t.Fatalf("fire take #1's deferred onstop: %v", err)
+	}
+	var take1Aborted bool
+	if err := chromedp.Run(ctx, chromedp.PollFunction(
+		`function() { return window.__transcribeAborted.length >= 1 && window.__transcribeAborted[0] === true ? true : null; }`,
+		&take1Aborted,
+	)); err != nil {
+		t.Fatalf("wait for take #1's transcribe fetch to be pre-aborted: %v — a take superseded before its own onstop ever fires must still have its fetch() call rejected immediately, not merely have its eventual result dropped", err)
+	}
+
+	// The abort's own rejection must not surface as a raw "AbortError: The
+	// user aborted a request." on the status line — same
+	// recordAttemptGeneration guard every other stale-take status write
+	// site already uses (uc-infra#238) must cover this path too, with no
+	// special-casing needed.
+	if err := chromedp.Run(ctx, chromedp.Evaluate(
+		`new Promise(function(resolve) { setTimeout(resolve, 50); })`, nil,
+		func(p *cdpruntime.EvaluateParams) *cdpruntime.EvaluateParams {
+			return p.WithAwaitPromise(true)
+		},
+	)); err != nil {
+		t.Fatalf("flush the abort rejection's promise chain: %v", err)
+	}
+	var statusAfterAbort string
+	if err := chromedp.Run(ctx, chromedp.Text(`#uc-issue-record-status`, &statusAfterAbort, chromedp.ByQuery)); err != nil {
+		t.Fatalf("read status line after take #1's fetch was pre-aborted: %v", err)
+	}
+	if strings.Contains(statusAfterAbort, "AbortError") || strings.Contains(statusAfterAbort, "aborted") {
+		t.Fatalf("status line = %q after take #1's superseded transcribe fetch was aborted — the abort must be silently dropped (guarded), not surfaced as a raw browser error string", statusAfterAbort)
+	}
+
+	// Stop take #2 and fire its own onstop — its fetch() must NOT be
+	// aborted (only a take superseded by a NEWER one may ever be), and
+	// its own result must still apply normally once resolved.
+	if err := chromedp.Run(ctx, chromedp.Click(`#uc-issue-record-btn`, chromedp.ByQuery)); err != nil {
+		t.Fatalf("stop take #2: %v", err)
+	}
+	if err := chromedp.Run(ctx, chromedp.PollFunction(
+		`function() { var t = document.getElementById("uc-issue-record-btn").textContent; return t === "Record voice note" ? t : null; }`,
+		&recordBtnText,
+	)); err != nil {
+		t.Fatalf("wait for the button to reset after stopping take #2: %v", err)
+	}
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`window.__fireStop(1, "take-two-audio"); void 0;`, nil)); err != nil {
+		t.Fatalf("fire take #2's onstop: %v", err)
+	}
+	var finalAbortedCount int
+	if err := chromedp.Run(ctx, chromedp.PollFunction(
+		`function() { return window.__transcribeAborted.length === 2 ? 2 : null; }`,
+		&finalAbortedCount,
+	)); err != nil {
+		t.Fatalf("wait for exactly two transcribe fetch calls total: %v — a regression that issued a duplicate fetch per take would leave this at more than 2", err)
+	}
+	var take2Aborted bool
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`window.__transcribeAborted[1]`, &take2Aborted)); err != nil {
+		t.Fatalf("read take #2's abort flag: %v", err)
+	}
+	if take2Aborted {
+		t.Fatalf("take #2's own transcribe fetch was aborted — only a take SUPERSEDED by a newer one may ever be aborted, and no third take was ever started")
+	}
+
+	// Take #2's own call resolves normally — the guard/abort machinery
+	// must not disable transcription for every take from then on.
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`window.__transcribeResolvers[0](new Response("CURRENT-TAKE-TWO-TRANSCRIPT", { status: 200 })); void 0;`, nil)); err != nil {
+		t.Fatalf("resolve take #2's (current, non-aborted) transcribe call: %v", err)
+	}
+	var transcriptAfterCurrent string
+	if err := chromedp.Run(ctx, chromedp.PollFunction(
+		`function() {
+			var v = document.getElementById("uc-issue-transcript").value;
+			return v === "CURRENT-TAKE-TWO-TRANSCRIPT" ? v : null;
+		}`,
+		&transcriptAfterCurrent,
+	)); err != nil {
+		t.Fatalf("wait for take #2's own (current) transcript to apply: %v", err)
+	}
+}
+
+// TestIssueReportPage_MicRecord_FailedRestartDoesNotAbortPriorTakesTranscribeFetch
+// is the regression test for a real bug independent review caught in this
+// fix's own first draft, before it ever merged: an earlier version aborted
+// the PREVIOUS attempt's transcribeAbortController synchronously at Record-
+// click time, tied to recordAttemptGeneration — the same moment
+// TestIssueReportPage_MicRecord_NewTakeAbortsPreviousTakesTranscribeFetch
+// above correctly wants cancellation to happen for an ORDINARY successful
+// re-take. But for the uc-infra#238 Gap A scenario specifically (a later
+// take's own mediaRecorder.start() throws), that timing is wrong: it
+// cancelled — and thereby destroyed — a still-legitimate EARLIER take's
+// real, in-flight transcribe request purely because the user clicked
+// Record again, even though that click never actually produced a new
+// recording. TestIssueReportPage_MicRecord_FailedRestartDoesNotDropPriorTakesTranscript
+// above already pins "the transcript still lands" for this exact scenario
+// — but its own fetch fake never reads opts.signal at all, so it stayed
+// green even under the buggy click-time-abort design (the abort fired, but
+// nothing was listening for it). This test reuses that same Gap A fake
+// verbatim, with one addition: a signal-aware fetch fake (the same shape
+// TestIssueReportPage_MicRecord_NewTakeAbortsPreviousTakesTranscribeFetch
+// already uses) that can actually detect whether take #1's request was
+// ever aborted — closing the exact hole that let the buggy draft pass
+// review's own automated gate.
+func TestIssueReportPage_MicRecord_FailedRestartDoesNotAbortPriorTakesTranscribeFetch(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, _ := testServer(t)
+	ctx := browserCtx(t, tenantID)
+
+	const fakeScript = `
+(function() {
+  navigator.mediaDevices = navigator.mediaDevices || {};
+  navigator.mediaDevices.getUserMedia = function() {
+    return Promise.resolve({ getTracks: function() { return []; } });
+  };
+  // Same shape as TestIssueReportPage_MicRecord_FailedRestartDoesNotDropPriorTakesTranscript's
+  // own fake: take #1's MediaRecorder works normally; take #2's
+  // construction succeeds (reassigning issuereport.go's shared
+  // mediaRecorder variable) but its own .start() throws — the exact Gap A
+  // trigger — so recordingGeneration must never advance for take #2.
+  window.__recorderCount = 0;
+  window.MediaRecorder = function() {
+    var self = this;
+    window.__recorderCount++;
+    if (window.__recorderCount === 1) {
+      this.start = function() {};
+      this.stop = function() {
+        if (self.ondataavailable) { self.ondataavailable({ data: new Blob(["fake"]) }); }
+        if (self.onstop) { self.onstop(); }
+      };
+    } else {
+      this.start = function() { throw new Error("second-take-start-failure"); };
+      this.stop = function() {};
+    }
+  };
+  // Signal-aware fetch fake (same shape as
+  // TestIssueReportPage_MicRecord_NewTakeAbortsPreviousTakesTranscribeFetch's
+  // own) — deliberately NOT the signal-blind fake this file's other
+  // FailedRestart/RejectedPermission tests use, since that shape is
+  // exactly what let the buggy click-time-abort draft pass unnoticed.
+  window.__transcribeAborted = [];
+  window.__transcribeResolvers = [];
+  var realFetch = window.fetch;
+  window.fetch = function(url, opts) {
+    if (String(url).indexOf("/issue-report/transcribe") !== -1) {
+      var idx = window.__transcribeAborted.length;
+      window.__transcribeAborted.push(false);
+      return new Promise(function(resolve, reject) {
+        if (opts && opts.signal && opts.signal.aborted) {
+          window.__transcribeAborted[idx] = true;
+          reject(new DOMException("The user aborted a request.", "AbortError"));
+          return;
+        }
+        window.__transcribeResolvers.push(resolve);
+        if (opts && opts.signal) {
+          opts.signal.addEventListener("abort", function() {
+            window.__transcribeAborted[idx] = true;
+            reject(new DOMException("The user aborted a request.", "AbortError"));
+          });
+        }
+      });
+    }
+    return realFetch.apply(window, arguments);
+  };
+})();
+`
+	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		_, err := page.AddScriptToEvaluateOnNewDocument(fakeScript).Do(ctx)
+		return err
+	})); err != nil {
+		t.Fatalf("inject fake media/signal-aware-fetch script: %v", err)
+	}
+
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/issue-report/new"),
+		chromedp.WaitVisible(`#uc-issue-record-btn`, chromedp.ByQuery),
+		chromedp.Click(`#uc-issue-record-btn`, chromedp.ByQuery), // take #1: start
+		chromedp.Click(`#uc-issue-record-btn`, chromedp.ByQuery), // take #1: stop -> transcribe call #0, left pending
+	); err != nil {
+		t.Fatalf("start then stop take #1: %v", err)
+	}
+	var pendingCount int
+	if err := chromedp.Run(ctx, chromedp.PollFunction(
+		`function() { return window.__transcribeAborted.length >= 1 ? window.__transcribeAborted.length : null; }`,
+		&pendingCount,
+	)); err != nil {
+		t.Fatalf("wait for take #1's transcribe call to be pending: %v", err)
+	}
+
+	// Take #2's Record click: getUserMedia resolves, MediaRecorder is
+	// constructed, but its own .start() throws synchronously — take #2
+	// never reaches a successful start, so recordingGeneration never
+	// advances and transcribeAbortController must never be touched.
+	if err := chromedp.Run(ctx, chromedp.Click(`#uc-issue-record-btn`, chromedp.ByQuery)); err != nil {
+		t.Fatalf("attempt (and fail) take #2: %v", err)
+	}
+	var statusAfterFailedRestart string
+	if err := chromedp.Run(ctx, chromedp.PollFunction(
+		`function() {
+			var t = document.getElementById("uc-issue-record-status").textContent;
+			return t && t.indexOf("second-take-start-failure") !== -1 ? t : null;
+		}`,
+		&statusAfterFailedRestart,
+	)); err != nil {
+		t.Fatalf("wait for take #2's start-failure status message: %v", err)
+	}
+
+	// The actual regression check: take #1's transcribe fetch must NOT
+	// have been aborted by take #2's failed restart attempt.
+	var take1Aborted bool
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`window.__transcribeAborted[0]`, &take1Aborted)); err != nil {
+		t.Fatalf("read take #1's abort flag: %v", err)
+	}
+	if take1Aborted {
+		t.Fatalf("take #1's transcribe fetch was aborted after take #2's Record click, even though take #2 never actually started recording (its own .start() threw) — a click alone must not cancel a still-legitimate earlier take's request; only a take that itself reaches a successful mediaRecorder.start() (i.e. actually advances recordingGeneration) may supersede and cancel a previous one (regression: independent review of uc-infra#239's first draft, which tied cancellation to recordAttemptGeneration/click-time instead of recordingGeneration/successful-start-time)")
+	}
+
+	// And, as the pre-existing FailedRestartDoesNotDropPriorTakesTranscript
+	// test also pins (via a signal-blind fake that couldn't have caught the
+	// abort-timing bug this test targets): take #1's transcript must still
+	// actually land once its call resolves.
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`window.__transcribeResolvers[0](new Response("TAKE-ONE-TRANSCRIPT", { status: 200 })); void 0;`, nil)); err != nil {
+		t.Fatalf("resolve take #1's transcribe call: %v", err)
+	}
+	var transcriptAfterResolve string
+	if err := chromedp.Run(ctx, chromedp.PollFunction(
+		`function() {
+			var v = document.getElementById("uc-issue-transcript").value;
+			return v === "TAKE-ONE-TRANSCRIPT" ? v : null;
+		}`,
+		&transcriptAfterResolve,
+	)); err != nil {
+		t.Fatalf("wait for take #1's transcript to apply after its transcribe call resolved: %v — take #1 never got superseded by an ACTUAL new recording, so its real, legitimate result must not be dropped", err)
+	}
+}
+
 // TestIssueReportPage_ConsoleLogCapturedFromEarlierPageAndPrefilled is the
 // real-browser proof for universaltill/uc-infra#46's log-capture slice:
 // internal/api/layout.go's shellTmpl installs a console/error listener on
