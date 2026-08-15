@@ -331,3 +331,317 @@ func TestAPI_I18nText_SearchDegradesSortFilter(t *testing.T) {
 		t.Fatalf("expected both units back (filter degraded to none), got %d: %+v", len(opts), opts)
 	}
 }
+
+// widgetRefTargetFirstEntityDef/FormDef is widgetRefEntityDef's target
+// field reordered to be FIRST (matching the real production shape:
+// Task.project_id, TimeEntry.task_id, ProjectBudgetLine.project_id and
+// DepreciationSchedule.fixed_asset_id are all their own entity's first
+// field, all targeting an i18n_text-labelled entity) — needed to exercise
+// renderRecordList's IMPLICIT default-filter-column path (no explicit
+// ?filter=), not just the explicit one widgetRefEntityDef's "sku first"
+// shape reaches.
+func widgetRefTargetFirstEntityDef() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "Widget3",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "unit_id", Type: entity.FieldReference, Target: "MultiUnit"},
+			{Name: "sku", Type: entity.FieldString, Required: true},
+		},
+	}
+}
+
+func widgetRefTargetFirstFormDef() *form.Definition {
+	return &form.Definition{
+		EntityType: "Widget3",
+		Version:    1,
+		Sections: []form.Section{{
+			Title: "Details", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "unit_id", Label: "Unit"}, {Name: "sku", Label: "SKU"}},
+		}},
+	}
+}
+
+// TestListPage_ReferenceFilter_I18nTextTargetLabelMatchesRealPerLocaleLabel
+// is the regression test for uc-infra#245's correctness bug: unlike
+// reference_search.go's own canSortFilter guard (exercised above by
+// TestAPI_I18nText_SearchDegradesSortFilter), listview.go's
+// referenceIDsMatching had NO equivalent guard — filtering a list page by
+// a FieldReference column whose TARGET's label field is i18n_text (ADR-
+// 0009) built `data->>labelField ILIKE '%text%'` straight against the
+// target's raw JSON blob, not the viewer's actual displayed label.
+//
+// The sharpest proof of the OLD bug: every i18n_text-labelled record's raw
+// JSON contains the literal locale key "en" — so filtering by q=en used to
+// match EVERY row regardless of what its real (English-locale) label
+// actually says.
+//
+// The fix does NOT simply disable this filter (an earlier draft did,
+// independent review caught that this silently regresses board #49's
+// shipped label-filter feature on every entity whose first/only reachable
+// filter column is a reference to an i18n_text-labelled target — a real,
+// common shape, not a hypothetical one: see widgetRefTargetFirstEntityDef's
+// own doc comment for the production examples). Instead it resolves the
+// match application-side, against each candidate's REAL per-viewer-locale
+// label — the same resolution the list cell itself renders, so what
+// matches here is exactly what's on screen.
+func TestListPage_ReferenceFilter_I18nTextTargetLabelMatchesRealPerLocaleLabel(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, unitI18nEntityDef(), unitI18nFormDef())
+	publishEntityAndForm(t, db, widgetRefEntityDef(), widgetRefFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	eachUnit := postForm(t, mux, "/api/records/MultiUnit", tenantID, "farshid", "name.en=Each&name.tr=Adet")
+	boxUnit := postForm(t, mux, "/api/records/MultiUnit", tenantID, "farshid", "name.en=Box&name.tr=Kutu")
+	var each, box struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	json.Unmarshal(eachUnit.Body.Bytes(), &each)
+	json.Unmarshal(boxUnit.Body.Bytes(), &box)
+
+	w1 := postForm(t, mux, "/api/records/Widget2", tenantID, "farshid", "sku=W-1&unit_id="+each.Data.ID)
+	w2 := postForm(t, mux, "/api/records/Widget2", tenantID, "farshid", "sku=W-2&unit_id="+box.Data.ID)
+	if w1.Code != http.StatusCreated || w2.Code != http.StatusCreated {
+		t.Fatalf("seed widgets: W-1 %d, W-2 %d", w1.Code, w2.Code)
+	}
+
+	// The literal-locale-key false positive: q=en is nobody's real label
+	// ("Each"/"Box" contain no "en" substring), but every MultiUnit's raw
+	// JSON contains the key "en" — before the fix this matched BOTH
+	// widgets. Also rules out a regressed nil-vs-empty FilterIn (a nil
+	// return here would degrade to an ILIKE against the raw stored
+	// unit_id UUID, which "en" could in principle match by chance — the
+	// positive per-locale assertions below are what actually pin that
+	// distinction deterministically, since a nil-degrade could never
+	// match "Each"/"Box"/"Kutu" against a hex UUID).
+	byKey := getAs(t, mux, "/records/Widget2?filter=unit_id&q=en", tenantID, "farshid")
+	if byKey.Code != http.StatusOK {
+		t.Fatalf("filter by i18n_text target label should return 200, got %d: %s", byKey.Code, byKey.Body.String())
+	}
+	if strings.Contains(byKey.Body.String(), "W-1") || strings.Contains(byKey.Body.String(), "W-2") {
+		t.Fatalf("q=en (a locale key, not anyone's real label) must match no widget:\n%s", byKey.Body.String())
+	}
+
+	// A real label value must find exactly the ONE widget whose target
+	// actually carries it — not both (proving this isn't a raw-JSON
+	// substring match, which would also incidentally work here) and not
+	// neither (proving the filter isn't just disabled). Only a genuine
+	// per-record label comparison produces this exact result: a nil/
+	// degraded FilterIn could never match "Each" against a hex UUID
+	// either, so this also fails loudly if that regresses.
+	byRealLabel := getAs(t, mux, "/records/Widget2?filter=unit_id&q=Each", tenantID, "farshid")
+	if byRealLabel.Code != http.StatusOK {
+		t.Fatalf("filter by i18n_text target label should return 200, got %d: %s", byRealLabel.Code, byRealLabel.Body.String())
+	}
+	if !strings.Contains(byRealLabel.Body.String(), "W-1") {
+		t.Fatalf("q=Each should find W-1 (its unit's real English label):\n%s", byRealLabel.Body.String())
+	}
+	if strings.Contains(byRealLabel.Body.String(), "W-2") {
+		t.Fatalf("q=Each should NOT find W-2 (Box/Kutu, unrelated label):\n%s", byRealLabel.Body.String())
+	}
+
+	// The match is against the VIEWER'S locale, not always English: under
+	// lang=tr, Box's displayed label is "Kutu" — q=Box (the English value)
+	// must NOT match under tr, and q=Kutu (the Turkish value) must.
+	byEnUnderTr := getAs(t, mux, "/records/Widget2?filter=unit_id&q=Box&lang=tr", tenantID, "farshid")
+	if strings.Contains(byEnUnderTr.Body.String(), "W-2") {
+		t.Fatalf("q=Box under lang=tr should not match — the tr viewer sees \"Kutu\", not \"Box\":\n%s", byEnUnderTr.Body.String())
+	}
+	byTrLabel := getAs(t, mux, "/records/Widget2?filter=unit_id&q=Kutu&lang=tr", tenantID, "farshid")
+	if !strings.Contains(byTrLabel.Body.String(), "W-2") {
+		t.Fatalf("q=Kutu under lang=tr should match W-2 (Box unit's real Turkish label):\n%s", byTrLabel.Body.String())
+	}
+	if strings.Contains(byTrLabel.Body.String(), "W-1") {
+		t.Fatalf("q=Kutu under lang=tr should not also match W-1 (Each/Adet, unrelated label):\n%s", byTrLabel.Body.String())
+	}
+
+	// Sanity control: the SAME filter mechanism still narrows correctly
+	// for a plain-string (non-i18n) reference target, proving the above
+	// isn't just a broken query — see
+	// TestListPage_DefaultFilterOnReferenceColumn_ResolvesByLabel for the
+	// full version of this control.
+	sku := getAs(t, mux, "/records/Widget2?filter=sku&q=W-1", tenantID, "farshid")
+	if !strings.Contains(sku.Body.String(), "W-1") || strings.Contains(sku.Body.String(), "W-2") {
+		t.Fatalf("plain-string filter (sku) should still narrow correctly:\n%s", sku.Body.String())
+	}
+}
+
+// TestListPage_DefaultFilterOnReferenceColumn_I18nTextTargetLabel is the
+// companion regression test for the IMPLICIT default-filter-column path
+// (no explicit ?filter= in the URL): widgetRefEntityDef puts the plain-
+// string "sku" first, so the test above never actually exercises the
+// production shape where the reference-to-i18n_text-target column is
+// itself the default (Task/TimeEntry/ProjectBudgetLine/
+// DepreciationSchedule all have this shape for real — independent review).
+// widgetRefTargetFirstEntityDef puts "unit_id" first specifically to close
+// that gap.
+func TestListPage_DefaultFilterOnReferenceColumn_I18nTextTargetLabel(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, unitI18nEntityDef(), unitI18nFormDef())
+	publishEntityAndForm(t, db, widgetRefTargetFirstEntityDef(), widgetRefTargetFirstFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	eachUnit := postForm(t, mux, "/api/records/MultiUnit", tenantID, "farshid", "name.en=Each&name.tr=Adet")
+	boxUnit := postForm(t, mux, "/api/records/MultiUnit", tenantID, "farshid", "name.en=Box&name.tr=Kutu")
+	var each, box struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	json.Unmarshal(eachUnit.Body.Bytes(), &each)
+	json.Unmarshal(boxUnit.Body.Bytes(), &box)
+
+	w1 := postForm(t, mux, "/api/records/Widget3", tenantID, "farshid", "sku=W-1&unit_id="+each.Data.ID)
+	w2 := postForm(t, mux, "/api/records/Widget3", tenantID, "farshid", "sku=W-2&unit_id="+box.Data.ID)
+	if w1.Code != http.StatusCreated || w2.Code != http.StatusCreated {
+		t.Fatalf("seed widgets: W-1 %d, W-2 %d", w1.Code, w2.Code)
+	}
+
+	// No ?filter= at all: the box defaults to "unit_id" (the first
+	// column), a Reference whose target's label is i18n_text.
+	body := getAs(t, mux, "/records/Widget3?q=Each", tenantID, "farshid").Body.String()
+	if !strings.Contains(body, `name="filter" value="unit_id"`) {
+		t.Fatalf("expected the default filter field to resolve to the reference column \"unit_id\":\n%s", body)
+	}
+	if !strings.Contains(body, "W-1") {
+		t.Fatalf("default filter q=Each on an i18n_text-labelled reference target should find W-1:\n%s", body)
+	}
+	if strings.Contains(body, "W-2") {
+		t.Fatalf("default filter q=Each should not also match W-2 (Box/Kutu, unrelated label):\n%s", body)
+	}
+
+	// Same discriminating check as the explicit-?filter= test: q=en (a
+	// locale key baked into every i18n_text record's raw JSON, not
+	// anyone's real label) must match NEITHER widget. Under the old
+	// unguarded raw-JSON ILIKE this matched everything; it's included here
+	// too because the positive q=Each check above (unlike this one) would
+	// have passed by ACCIDENT even against the old, unfixed code — Each's
+	// own raw JSON blob also happens to literally contain the substring
+	// "Each" — so that assertion alone doesn't actually prove this test
+	// exercises the fix rather than the pre-existing bug.
+	byKey := getAs(t, mux, "/records/Widget3?q=en", tenantID, "farshid").Body.String()
+	if strings.Contains(byKey, "W-1") || strings.Contains(byKey, "W-2") {
+		t.Fatalf("default filter q=en (a locale key) must match no widget:\n%s", byKey)
+	}
+}
+
+// TestAPI_RecordLabel_I18nTextLegacyPlainStringFallsThroughNotRawID is the
+// regression test for the second, narrower finding in uc-infra#245:
+// Handler.recordLabel returned the raw record UUID whenever an i18n_text
+// field's ResolveLocalized failed to find a usable translation — including
+// when the stored value isn't a locale->string object at all (a legacy row
+// from before this field's own string->i18n_text migration, still holding
+// a plain string). The fix falls through to the plain-string branch
+// instead of returning the id outright, so a legacy value still renders as
+// itself.
+func TestAPI_RecordLabel_I18nTextLegacyPlainStringFallsThroughNotRawID(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, unitI18nEntityDef(), unitI18nFormDef())
+	publishEntityAndForm(t, db, widgetRefEntityDef(), widgetRefFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	unitRec := postForm(t, mux, "/api/records/MultiUnit", tenantID, "farshid", "name.en=Each&name.tr=Adet")
+	if unitRec.Code != http.StatusCreated {
+		t.Fatalf("create unit: %d: %s", unitRec.Code, unitRec.Body.String())
+	}
+	var unit struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	json.Unmarshal(unitRec.Body.Bytes(), &unit)
+
+	// Simulate a legacy row that predates this field's string->i18n_text
+	// migration: overwrite the stored value with a bare JSON string
+	// instead of a locale->string object — exactly the shape
+	// ResolveLocalized cannot resolve, the same class of gap uc-infra#174/
+	// #199 already document for a different field type change.
+	if _, err := db.Exec(`UPDATE records SET data = jsonb_set(data, '{name}', '"LegacyEach"') WHERE id = $1`, unit.Data.ID); err != nil {
+		t.Fatalf("simulate legacy plain-string value: %v", err)
+	}
+
+	wRec := postForm(t, mux, "/api/records/Widget2", tenantID, "farshid", "sku=W-1&unit_id="+unit.Data.ID)
+	if wRec.Code != http.StatusCreated {
+		t.Fatalf("create widget: %d: %s", wRec.Code, wRec.Body.String())
+	}
+
+	list := getAs(t, mux, "/records/Widget2", tenantID, "farshid")
+	if list.Code != http.StatusOK {
+		t.Fatalf("list: %d: %s", list.Code, list.Body.String())
+	}
+	body := list.Body.String()
+	if !strings.Contains(body, "LegacyEach") {
+		t.Fatalf("expected the legacy plain-string label \"LegacyEach\" to render, got:\n%s", body)
+	}
+	if strings.Contains(body, unit.Data.ID) {
+		t.Fatalf("legacy plain-string i18n_text value must not fall back to the raw record id:\n%s", body)
+	}
+}
+
+// TestAPI_RecordLabel_I18nTextAllBlankObjectStillFallsBackToRawID pins
+// PRESERVED (not new) behaviour, per independent review: a well-formed
+// i18n_text object with no usable translation in ANY locale — as opposed
+// to the legacy-plain-string case above, which is not a map at all —
+// still falls back to the raw record id, not to the legacy-plain-string
+// fallthrough this change added. ResolveLocalized returns ("", true) for
+// an all-blank object (ok=true, unlike the plain-string case's (_, false)),
+// so recordLabel's own `ok && s != ""` guard must keep rejecting it, and
+// the subsequent rec.Data[labelField].(string) type assertion must keep
+// failing (the stored value is a map, not a string) — the fix must not
+// have accidentally widened either check.
+func TestAPI_RecordLabel_I18nTextAllBlankObjectStillFallsBackToRawID(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, unitI18nEntityDef(), unitI18nFormDef())
+	publishEntityAndForm(t, db, widgetRefEntityDef(), widgetRefFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	unitRec := postForm(t, mux, "/api/records/MultiUnit", tenantID, "farshid", "name.en=Each&name.tr=Adet")
+	if unitRec.Code != http.StatusCreated {
+		t.Fatalf("create unit: %d: %s", unitRec.Code, unitRec.Body.String())
+	}
+	var unit struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	json.Unmarshal(unitRec.Body.Bytes(), &unit)
+
+	// A well-formed i18n object where every locale is blank — legal shape
+	// (ResolveLocalized's own contract, internal/i18n/i18n.go), just
+	// nothing to show.
+	if _, err := db.Exec(`UPDATE records SET data = jsonb_set(data, '{name}', '{"en": "", "tr": ""}'::jsonb) WHERE id = $1`, unit.Data.ID); err != nil {
+		t.Fatalf("simulate all-blank i18n object: %v", err)
+	}
+
+	wRec := postForm(t, mux, "/api/records/Widget2", tenantID, "farshid", "sku=W-1&unit_id="+unit.Data.ID)
+	if wRec.Code != http.StatusCreated {
+		t.Fatalf("create widget: %d: %s", wRec.Code, wRec.Body.String())
+	}
+
+	list := getAs(t, mux, "/records/Widget2", tenantID, "farshid")
+	if list.Code != http.StatusOK {
+		t.Fatalf("list: %d: %s", list.Code, list.Body.String())
+	}
+	body := list.Body.String()
+	if !strings.Contains(body, unit.Data.ID) {
+		t.Fatalf("an all-blank i18n_text object should still fall back to the raw record id, got:\n%s", body)
+	}
+}

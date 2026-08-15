@@ -1361,9 +1361,19 @@ func childCellValue(child map[string]any, name string, childDef *entity.Definiti
 		if s, ok := catalog.ResolveLocalized(v, locale); ok {
 			return s
 		}
-		// An unresolvable i18n value renders blank rather than as a raw
-		// map — a missing translation is not something to show as Go
-		// syntax.
+		// ResolveLocalized failed: either a well-formed object with no
+		// usable translation in any fallback locale, or the stored value
+		// isn't a locale->string object at all — a legacy row that
+		// predates this field's own string->i18n_text migration, still
+		// holding a plain string (the same class of gap
+		// internal/api/handlers.go's recordLabel now falls through for,
+		// uc-infra#245). A legacy plain string renders as itself, not
+		// blank; a genuinely unresolvable object (or anything else that
+		// isn't a plain string either) still renders blank rather than as
+		// raw Go syntax.
+		if s, ok := v.(string); ok && s != "" {
+			return s
+		}
 		return nil
 	case entity.FieldDate:
 		// Same regional formatting cellText's FieldDate case applies to

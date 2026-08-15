@@ -1812,7 +1812,14 @@ func (h *Handler) recordLabel(def *entity.Definition, rec data.Record, locale st
 		if s, ok := h.catalog.ResolveLocalized(rec.Data[labelField], locale); ok && s != "" {
 			return s
 		}
-		return rec.ID
+		// ResolveLocalized found no usable translation — either the
+		// object has no entry any fallback locale reaches, or the stored
+		// value isn't a locale->string object at all (e.g. a row from
+		// before this field's own string->i18n_text migration, still
+		// holding a plain string). Fall through to the plain-string
+		// handling below instead of returning the raw id outright, so a
+		// legacy plain-string value still renders as itself rather than
+		// as a UUID.
 	}
 	if s, ok := rec.Data[labelField].(string); ok && s != "" {
 		return s
