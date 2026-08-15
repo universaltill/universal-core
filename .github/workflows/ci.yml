@@ -187,6 +187,27 @@ jobs:
             exit 1
           }
 
+      # Same self-test-before-trusting-it discipline as the "Coverage
+      # floor script self-test" / "Help allowlist script self-test" steps
+      # near the top of this job, for scripts/run-full-gate.sh
+      # (uc-infra#215's one-shot local/pipeline-session gate runner) —
+      # "a script nothing runs is only ever read, not verified" applies
+      # here too. Placed HERE, not alongside those two — unlike them,
+      # this harness spawns real subprocess invocations of
+      # run-full-gate.sh itself, whose own preflight now checks for
+      # xmllint and a browser (uc-infra#215's independent review found
+      # both were silently unchecked in the first draft); running it
+      # any earlier than this would trip those checks against a runner
+      # image that hasn't installed xmllint yet, which is a real ordering
+      # bug this exact placement fixes (found the hard way: an earlier
+      # version of this step sat with the other two self-tests, before
+      # Go/xmllint setup, and failed CI on its own PR for exactly this
+      # reason). Still needs no Go toolchain and no live-Postgres schema
+      # itself — DB reachability is the one precondition this harness
+      # can't fake, and it doesn't attempt to.
+      - name: Full-gate script self-test
+        run: scripts/run-full-gate_test.sh
+
       - name: Test
         env:
           GOMODCACHE: ${{ runner.temp }}/gomodcache

@@ -77,7 +77,11 @@ every layer it touches is not done, regardless of how confident manual
 verification felt. This applies to existing code too: under-tested code
 you touch is debt to close, not a precedent to match. Gate every commit
 on the full suite passing (`go build`, `go vet`, `go test ./... -p 1`
-against a real local Postgres).
+against a real local Postgres) — `scripts/run-full-gate.sh` runs all of
+this, plus the coverage-floor check below, in one shot against
+`$TEST_DATABASE_URL`; prefer it over reconstructing the command
+sequence by hand, especially across separate tool invocations that
+might not share shell state.
 
 **Test-first, and a regression test the moment a bug is found.** Write
 the test before (or alongside) the code it exercises, not after — this
