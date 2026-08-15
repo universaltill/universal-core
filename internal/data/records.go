@@ -596,6 +596,28 @@ type ListPageOptions struct {
 	// filter". Collapsing the two would turn a search with no hits into
 	// a search with no filter, which is the more dangerous default.
 	FilterIn []string
+	// FilterI18nText, when true (with FilterField/FilterValue also set),
+	// matches an entity.FieldI18nText field (ADR-0009) by checking EVERY
+	// locale's translation for a substring match, not just the field's raw
+	// JSON text — a plain `data->>field ILIKE` on an i18n object matches
+	// its literal serialized JSON (locale keys included), which is
+	// meaningless. Ignored when FilterField == "" or FilterIn != nil.
+	FilterI18nText bool
+	// SortI18nLocales, when non-empty (with SortField also set), sorts an
+	// entity.FieldI18nText field by the VIEWER's own resolved label
+	// instead of the field's raw JSON text — the priority-ordered locale
+	// codes to try, same precedence i18n.Catalog.FallbackChain returns
+	// (exact locale, base language, catalog fallback, fallback's base
+	// language). A record whose i18n object has no entry in ANY of these
+	// locales sorts NULL (NULLS LAST) — the "any translation at all, in
+	// sorted-key order" deepest fallback ResolveLocalized itself falls back
+	// to is NOT replicated here (no simple all-locales "first non-null key"
+	// SQL without unnesting+ranking); documented, accepted gap, no worse
+	// than today's fully-degraded (no sort at all) behavior. Mutually
+	// exclusive with SortNumeric — a caller should never set both; if both
+	// are set, SortI18nLocales takes precedence in ListPageFiltered's own
+	// implementation (i18n text is never numeric).
+	SortI18nLocales []string
 	// EqualsFilters are additional exact-match (data->>field = value)
 	// conditions ANDed onto the query, independent of FilterField's own
 	// substring search — the mechanism a FieldReference's declared
@@ -705,6 +727,49 @@ func filterWhereClause(entityType string, opts ListPageOptions) (string, []any) 
 		if opts.FilterIn != nil {
 			args = append(args, opts.FilterField, opts.FilterIn)
 			where += fmt.Sprintf(` AND data->>$%d = ANY($%d)`, len(args)-1, len(args))
+		} else if opts.FilterI18nText {
+			// An entity.FieldI18nText field (ADR-0009) stores a
+			// locale->string JSONB object, so a plain `data->>field ILIKE`
+			// would match against the object's whole serialized JSON text
+			// (locale keys included) — meaningless. Instead, check EVERY
+			// locale's own translation for a substring match via
+			// jsonb_each_text.
+			//
+			// The CASE/jsonb_typeof guard is REQUIRED: jsonb_each_text
+			// raises a real Postgres error on scalar/non-object jsonb
+			// input (e.g. a legacy pre-migration row whose field still
+			// holds a plain string), and Postgres does not guarantee AND
+			// short-circuits subquery evaluation order, so a bare
+			// `jsonb_typeof(...) = 'object' AND EXISTS(...)` would not be
+			// a safe guard on its own — the CASE expression is what
+			// actually prevents jsonb_each_text from ever seeing a
+			// non-object value. data->$N (not data->>$N) is required too:
+			// it must yield jsonb, not text, for the CASE/jsonb_typeof/
+			// jsonb_each_text chain to typecheck.
+			//
+			// The trailing OR is a deliberate second case, not defensive
+			// padding: recordLabel (internal/api/handlers.go) falls
+			// through to render a legacy pre-migration row's plain-string
+			// value as itself rather than a raw UUID, specifically so that
+			// row stays visible in a picker. Without this OR, such a row
+			// would still render (recordLabel's fallback is untouched by
+			// this change) but could never be FOUND by typing its own
+			// visible label — a real regression from the pre-fix
+			// behaviour (independent review), since before this feature
+			// every row was listed, filtered or not. jsonb_typeof(...) =
+			// 'string' scopes this to exactly the legacy scalar case, not
+			// any other stored shape.
+			args = append(args, opts.FilterField, "%"+escapeLike(opts.FilterValue)+"%")
+			fieldIdx, valIdx := len(args)-1, len(args)
+			where += fmt.Sprintf(` AND (
+				EXISTS (
+					SELECT 1 FROM jsonb_each_text(
+						CASE WHEN jsonb_typeof(data->$%d) = 'object' THEN data->$%d ELSE '{}'::jsonb END
+					) AS kv(locale, value)
+					WHERE kv.value ILIKE $%d ESCAPE '\'
+				)
+				OR (jsonb_typeof(data->$%d) = 'string' AND data->>$%d ILIKE $%d ESCAPE '\')
+			)`, fieldIdx, fieldIdx, valIdx, fieldIdx, fieldIdx, valIdx)
 		} else {
 			args = append(args, opts.FilterField, "%"+escapeLike(opts.FilterValue)+"%")
 			where += fmt.Sprintf(` AND data->>$%d ILIKE $%d ESCAPE '\'`, len(args)-1, len(args))
@@ -769,7 +834,48 @@ func (r *RecordRepo) ListPageFiltered(ctx context.Context, entityType string, op
 	// value. NULLS LAST keeps records missing the sort field from
 	// dominating the first page of a descending sort.
 	orderBy := "created_at"
-	if opts.SortField != "" {
+	switch {
+	case opts.SortField != "" && len(opts.SortI18nLocales) > 0:
+		// An entity.FieldI18nText field (ADR-0009) sorted by the VIEWER'S
+		// own resolved label, not the field's raw JSON text — a COALESCE
+		// across each candidate locale, in the same priority order
+		// i18n.Catalog.FallbackChain returns. Both the field name and
+		// every locale code are bound parameters, never concatenated,
+		// the same discipline every other branch here follows. Takes
+		// precedence over SortNumeric (i18n text is never numeric) — a
+		// caller should never set both, but this order makes the choice
+		// deterministic if one ever does. Gated on SortField != "" too:
+		// SortI18nLocales alone (SortField empty) would otherwise bind
+		// data->''->>loc, always NULL, silently collapsing the sort to
+		// the `, id` tiebreaker with no signal anything was misconfigured.
+		//
+		// NULLIF(..., '') matters, not just NULL-safety: ResolveLocalized
+		// (internal/i18n) treats an empty-string translation as "no
+		// translation for this locale" and keeps walking its fallback
+		// chain, but SQL COALESCE only skips actual NULL — without the
+		// NULLIF, a record with an explicit "" for its highest-priority
+		// locale would sort under '' (first, ahead of everything) while
+		// still DISPLAYING its next fallback locale's real value, a
+		// visible mismatch between what's shown and where it sorts
+		// (independent review).
+		var parts []string
+		for _, loc := range opts.SortI18nLocales {
+			args = append(args, opts.SortField, loc)
+			parts = append(parts, fmt.Sprintf("NULLIF(data->$%d->>$%d, '')", len(args)-1, len(args)))
+		}
+		// Trailing fallback for a legacy pre-migration row whose field
+		// still holds a plain string, not an i18n object — the same class
+		// of row the filter side's own OR clause (above) restores
+		// findability for. jsonb_typeof(...) = 'string' scopes this
+		// strictly to that case: an object with none of the requested
+		// locales (e.g. only a locale outside this chain) must still sort
+		// NULL/last, unchanged from before — this term does not fire for
+		// that case, only for a genuine scalar string.
+		args = append(args, opts.SortField)
+		legacyIdx := len(args)
+		parts = append(parts, fmt.Sprintf("CASE WHEN jsonb_typeof(data->$%d) = 'string' THEN data->>$%d END", legacyIdx, legacyIdx))
+		orderBy = fmt.Sprintf("COALESCE(%s)", strings.Join(parts, ", "))
+	case opts.SortField != "":
 		args = append(args, opts.SortField)
 		// A numeric field cast to numeric, so "10" sorts after "9" rather
 		// than before it (text order) — wrong for money/qty is not a

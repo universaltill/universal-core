@@ -302,12 +302,15 @@ func TestAPI_I18nText_OwnListPageLocalizesAndDegrades(t *testing.T) {
 	}
 }
 
-// TestAPI_I18nText_SearchDegradesSortFilter confirms the search endpoint
-// does not 500 or error when the label field is i18n_text — it can't
-// sort/filter by a JSON object (ADR-0009 deferral), so it returns a capped
-// unsorted list rather than failing. A ?q= is accepted but simply doesn't
-// filter this slice.
-func TestAPI_I18nText_SearchDegradesSortFilter(t *testing.T) {
+// TestAPI_I18nText_SearchFiltersAndSortsByViewerLocale is uc-infra#249
+// item 1: the reference-picker search endpoint used to hard-degrade to an
+// unsorted, unfiltered capped listing whenever the target's label field
+// was i18n_text (ADR-0009) — this is the regression test proving that gap
+// is closed. It both filters (a query matching only a non-default-locale
+// translation returns that record, and nothing else) and sorts (by the
+// viewer's own resolved label, not creation order) using
+// ListPageOptions.FilterI18nText/SortI18nLocales.
+func TestAPI_I18nText_SearchFiltersAndSortsByViewerLocale(t *testing.T) {
 	router := newTestRouter(t)
 	withDevAuthEnabled(t)
 	tenantID, db := newTestTenant(t, router)
@@ -316,19 +319,34 @@ func TestAPI_I18nText_SearchDegradesSortFilter(t *testing.T) {
 	mux := http.NewServeMux()
 	testHandler(t, router).Routes(mux)
 
-	postForm(t, mux, "/api/records/MultiUnit", tenantID, "farshid", "name.en=Each&name.tr=Adet")
-	postForm(t, mux, "/api/records/MultiUnit", tenantID, "farshid", "name.en=Box&name.tr=Kutu")
+	// Created out of alphabetical order, so a passing sort assertion can't
+	// be explained away by creation order happening to already match.
+	postForm(t, mux, "/api/records/MultiUnit", tenantID, "farshid", "name.en=Zulu&name.tr=Onaylandı")
+	postForm(t, mux, "/api/records/MultiUnit", tenantID, "farshid", "name.en=Alpha&name.tr=Beta")
 
-	// A query that would filter a plain-string label: here it must still
-	// return 200 with results (unfiltered), never a 500 from sorting/
-	// filtering by a JSON object.
-	rec := getAs(t, mux, "/api/references/MultiUnit?q=Each&lang=en", tenantID, "farshid")
+	// Filtering: "onay" is a substring only of the Turkish translation
+	// "Onaylandı" (the record whose English label is "Zulu") — a query
+	// matching a non-default-locale translation must return that record,
+	// and only that record.
+	rec := getAs(t, mux, "/api/references/MultiUnit?q=onay&lang=en", tenantID, "farshid")
 	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200 (degraded, not errored), got %d: %s", rec.Code, rec.Body.String())
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
 	opts := decodeRefOptions(t, rec.Body.Bytes())
-	if len(opts) != 2 {
-		t.Fatalf("expected both units back (filter degraded to none), got %d: %+v", len(opts), opts)
+	if len(opts) != 1 || opts[0].Label != "Zulu" {
+		t.Fatalf("expected exactly the Zulu/Onaylandı unit (matched via its Turkish translation), got %+v", opts)
+	}
+
+	// Sorting: under lang=tr, the two units' Turkish labels are "Beta" and
+	// "Onaylandı" — alphabetically Beta first — which is NOT creation
+	// order (Onaylandı/Zulu was created first above).
+	sortRec := getAs(t, mux, "/api/references/MultiUnit?lang=tr", tenantID, "farshid")
+	if sortRec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", sortRec.Code, sortRec.Body.String())
+	}
+	sorted := decodeRefOptions(t, sortRec.Body.Bytes())
+	if len(sorted) != 2 || sorted[0].Label != "Beta" || sorted[1].Label != "Onaylandı" {
+		t.Fatalf("expected [Beta, Onaylandı] sorted by the tr label (not creation order), got %+v", sorted)
 	}
 }
 

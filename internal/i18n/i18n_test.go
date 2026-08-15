@@ -165,6 +165,29 @@ func TestResolveLocalized(t *testing.T) {
 	}
 }
 
+// TestFallbackChain_ReturnsSamePrecedenceResolveLocalizedUses pins the
+// exact ordered candidate list ResolveLocalized's own (formerly inline)
+// fallback chain walks — exact locale, base language, catalog fallback,
+// fallback's base language — so a caller building its own locale-aware
+// query (internal/data's SortI18nLocales) can mirror ResolveLocalized's
+// precedence exactly, without duplicating the logic.
+func TestFallbackChain_ReturnsSamePrecedenceResolveLocalizedUses(t *testing.T) {
+	c, err := Load("en")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got := c.FallbackChain("tr-TR")
+	want := []string{"tr-TR", "tr", "en", "en"}
+	if len(got) != len(want) {
+		t.Fatalf("FallbackChain(tr-TR): got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("FallbackChain(tr-TR): got %v, want %v", got, want)
+		}
+	}
+}
+
 func TestFallback_ReturnsConfiguredLocale(t *testing.T) {
 	c, err := Load("en")
 	if err != nil {

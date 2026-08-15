@@ -119,9 +119,14 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 		// filtered — conventionally name. An i18n_text column is skipped
 		// because it stores a JSON object, not a searchable string
 		// (ADR-0009): `data->>'name'` on an object matches its raw JSON
-		// text, which is meaningless — the same reason the reference-search
-		// endpoint degrades. Localized filtering needs a per-locale JSONB
-		// expression index and is deferred (ties into #64).
+		// text, which is meaningless. This LIST-PAGE column filter still
+		// degrades this way (unchanged, out of scope here) — the
+		// reference-PICKER endpoint (reference_search.go) no longer does,
+		// since uc-infra#249 gave it its own viewer-locale-aware
+		// ListPageOptions.SortI18nLocales/FilterI18nText mechanism; this
+		// list-column path could adopt the same mechanism in a future
+		// follow-up but hasn't yet — don't assume the two still behave
+		// the same way.
 		for _, c := range columns {
 			if sortFilterableField(def, c.Name) {
 				filterField = c.Name
@@ -439,12 +444,16 @@ func isVisibleColumn(cols []entity.Field, name string) bool {
 	return false
 }
 
-// sortFilterableField reports whether a field can back a SQL sort/filter.
-// An i18n_text field (ADR-0009) can't: its value is a JSON object, so
-// `data->>'name'` would order/match by the object's raw JSON text, which is
-// meaningless — the same reason the reference-search endpoint degrades for
-// such a label. Localized sort/filter needs a per-locale JSONB expression
-// index and is deferred (#64). A field the Definition doesn't declare is
+// sortFilterableField reports whether a field can back a SQL sort/filter on
+// the LIST PAGE's own column sort/filter (a different endpoint from the
+// reference-picker search this function has no relationship to beyond
+// sharing ADR-0009's field type). An i18n_text field (ADR-0009) can't back
+// this one: its value is a JSON object, so `data->>'name'` would order/
+// match by the object's raw JSON text, which is meaningless. Unlike the
+// reference-picker endpoint (reference_search.go, fixed by uc-infra#249),
+// this list-column path still degrades this way — it could adopt the same
+// ListPageOptions.SortI18nLocales/FilterI18nText mechanism in a future
+// follow-up, but hasn't yet. A field the Definition doesn't declare is
 // not sort/filterable either (defensive; callers already gate on
 // isVisibleColumn).
 func sortFilterableField(def *entity.Definition, name string) bool {
