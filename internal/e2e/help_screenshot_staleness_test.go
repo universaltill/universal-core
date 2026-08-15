@@ -38,6 +38,24 @@
 // that the relative comparison alone wouldn't if every one of the 8
 // checked-in files were somehow equally wrong.
 //
+// Margin update (uc-infra#192, independent review): the "help" family's
+// real-content recapture is now the tightest of the 8 combos — help/en's
+// own-vs-closest-other margin measured ~0.0163, help/ar ~0.0153, both
+// noticeably thinner than the 0.0060/0.0056 pair the design note above
+// was originally tuned against. Why: unlike list/form/wizard (which
+// render one fixed record and don't move when help content changes),
+// "help"'s screenshot is essentially a picture of the topic sidebar —
+// almost all of its ink lives there — and CLAUDE.md requires every
+// user-visible feature to ship a help topic, so that sidebar grows over
+// time. A single new topic in an alphabetically-early module (assets/
+// crm/export/finance, all sorted ahead of foundation's own topics) can
+// shift enough of the sidebar to approach this margin. That is a real,
+// expected reason for this test to go red — re-run
+// `CAPTURE_HELP_SCREENSHOTS=1 go test ./internal/e2e -run
+// TestCaptureHelpScreenshots -v` and commit the updated JPEGs, the same
+// as any other intended UI change below — not evidence the check itself
+// is broken.
+//
 // Honesty note (do not remove, per this card's own acceptance
 // criteria): this design is spot-checked against one real run in this
 // sandbox, covering all 8 combos. It has NOT been validated across
@@ -101,7 +119,14 @@ func loadCheckedInHelpScreenshots(t *testing.T) map[string]image.Image {
 // ceiling.
 func TestHelpScreenshot_StalenessCheck_RealBrowser(t *testing.T) {
 	withDevAuthEnabled(t)
-	srv, tenantID, _ := demoOrgHelpServer(t)
+	// demoOrgTestServer, not a fixture-overridden help.Index (uc-infra#192):
+	// this must use the exact same server setup TestCaptureHelpScreenshots
+	// used to produce the checked-in files it's comparing against, or the
+	// "help" family combos would spuriously read as stale (a fresh
+	// fixture-rendered capture diffed against the real-content file
+	// that's actually checked in — not a real regression, just the two
+	// legs disagreeing about which content they're supposed to show).
+	srv, tenantID, _ := demoOrgTestServer(t)
 	// browserCtxWithTimeout, not the package's plain 30-second browserCtx
 	// (independent review, uc-infra#145 — found by actually reproducing
 	// CI's `-race` run locally, not just reading the diff): this test
@@ -133,7 +158,7 @@ func TestHelpScreenshot_StalenessCheck_RealBrowser(t *testing.T) {
 				ownScore := help.ImageDiffScore(freshImg, checkedIn[key])
 				t.Logf("%s: fresh vs own checked-in = %.4f (sanity ceiling %.4f)", key, ownScore, help.HelpScreenshotStaleThreshold)
 				if ownScore >= help.HelpScreenshotStaleThreshold {
-					t.Errorf("%s: fresh re-capture (unchanged page) scored %.4f against its own checked-in file — over the %.4f sanity ceiling, either a real UI regression or a wholesale mismatch", key, ownScore, help.HelpScreenshotStaleThreshold)
+					t.Errorf("%s: fresh re-capture (unchanged page) scored %.4f against its own checked-in file — over the %.4f sanity ceiling, either a real UI regression or a wholesale mismatch. If this is an intended UI or help-content change, re-run `CAPTURE_HELP_SCREENSHOTS=1 go test ./internal/e2e -run TestCaptureHelpScreenshots -v` and commit the updated JPEGs.", key, ownScore, help.HelpScreenshotStaleThreshold)
 				}
 
 				var minOtherScore float64 = -1
@@ -150,7 +175,7 @@ func TestHelpScreenshot_StalenessCheck_RealBrowser(t *testing.T) {
 				}
 				t.Logf("%s: closest OTHER checked-in combo = %s at %.4f", key, minOtherKey, minOtherScore)
 				if ownScore >= minOtherScore {
-					t.Errorf("%s: fresh re-capture scored closer to (or tied with) a DIFFERENT page (%s, %.4f) than to its own checked-in file (%.4f) — this is the real staleness signal, and it just failed: either %s genuinely changed to resemble %s, or the checked-in file for %s is wrong", key, minOtherKey, minOtherScore, ownScore, key, minOtherKey, key)
+					t.Errorf("%s: fresh re-capture scored closer to (or tied with) a DIFFERENT page (%s, %.4f) than to its own checked-in file (%.4f) — this is the real staleness signal, and it just failed: either %s genuinely changed to resemble %s, or the checked-in file for %s is wrong. If %s is an intended change (e.g. new help content shifting the topic sidebar), re-run `CAPTURE_HELP_SCREENSHOTS=1 go test ./internal/e2e -run TestCaptureHelpScreenshots -v` and commit the updated JPEGs.", key, minOtherKey, minOtherScore, ownScore, key, minOtherKey, key, key)
 				}
 			})
 		}

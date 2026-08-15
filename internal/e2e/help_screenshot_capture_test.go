@@ -28,7 +28,6 @@ import (
 	"github.com/chromedp/chromedp"
 
 	"github.com/universaltill/universal-core/internal/api"
-	"github.com/universaltill/universal-core/internal/help"
 	"github.com/universaltill/universal-core/internal/i18n"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
 	"github.com/universaltill/universal-core/internal/kernel/purchasing"
@@ -204,25 +203,17 @@ func demoOrgTestServer(t *testing.T) (srv *httptest.Server, tenantID string, ten
 	return srv, id, tenantDB
 }
 
-// demoOrgHelpServer is demoOrgTestServer plus this package's fixture
-// help.Index (help_test.go's helpE2EFixtureIndex/helpE2EFixtureIndex,
-// shared rather than duplicated) wired in via help.SetIndexForTesting —
-// purely so the "help" family's own screenshot shows a populated,
-// meaningful two-pane manual instead of the real production "no content
-// yet" empty state (internal/help/content/ ships no real topics until
-// uc-infra#147-152).
-func demoOrgHelpServer(t *testing.T) (srv *httptest.Server, tenantID string, tenantDB *sql.DB) {
-	t.Helper()
-	restore := help.SetIndexForTesting(helpE2EFixtureIndex(t))
-	t.Cleanup(restore)
-	return demoOrgTestServer(t)
-}
-
 // TestCaptureHelpScreenshots is the one command that (re)generates every
 // screenshot this card ships under internal/help/content/assets/ —
-// deterministic given a fixed 1280x800 viewport, a real "Demo
-// Organization" tenant, and this package's fixture help.Index (wired in
-// purely so the "help" family's own screenshot shows populated content).
+// deterministic given a fixed 1280x800 viewport and a real "Demo
+// Organization" tenant. Every family, including "help", is captured
+// against the real production help.GetIndex() content (internal/help/
+// content/ ships real topics as of uc-infra#147-152) — no fixture
+// override (uc-infra#192: an earlier revision wired help.SetIndexForTesting
+// in here purely so the "help" family's own screenshot showed a
+// populated manual instead of the pre-#147-152 empty state; now that real
+// content ships, the checked-in help/{en,ar}.jpg show genuine product
+// topics like the other three families already did).
 //
 // Run it explicitly with:
 //
@@ -243,7 +234,7 @@ func TestCaptureHelpScreenshots(t *testing.T) {
 		t.Skip("set CAPTURE_HELP_SCREENSHOTS=1 to (re)generate internal/help/content/assets/ — see this test's own doc comment for the exact command")
 	}
 	withDevAuthEnabled(t)
-	srv, tenantID, _ := demoOrgHelpServer(t)
+	srv, tenantID, _ := demoOrgTestServer(t)
 	// browserCtxWithTimeout, not the package's plain 30-second browserCtx
 	// (independent review, uc-infra#145): this loop does 8 real
 	// navigate+capture round trips through ONE shared browser context,

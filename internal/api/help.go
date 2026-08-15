@@ -10,12 +10,13 @@
 // kernel/deterministic-core boundary rule every other generic surface
 // in this package already follows (CLAUDE.md).
 //
-// This slice ships the viewer only, not content: internal/help/content/
-// still holds nothing but its own README.md (uc-infra#147-152 is real
-// topic content), so in production every page here renders a topic-free
-// "no results"/"select a topic" state today — the honest, content-free
-// counterpart to ADR-0023's own "this slice's own change is invisible
-// beyond the inert '?' icon" framing, one level up.
+// This slice originally shipped the viewer only, not content:
+// internal/help/content/ held nothing but its own README.md, so every
+// page here rendered a topic-free "no results"/"select a topic" state.
+// Real topic content has since shipped (uc-infra#147-152 — 69 topics per
+// locale under internal/help/content/{locale}/{entity,route}/*.md), so
+// production now renders a populated two-pane manual; only the "select a
+// topic" right-pane state (no topic chosen yet) still shows that message.
 package api
 
 import (
