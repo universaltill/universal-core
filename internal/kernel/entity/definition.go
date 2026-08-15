@@ -347,7 +347,7 @@ type Definition struct {
 	// migrated by this field's introduction, see foundation.go's doc
 	// comment on StatusType for why). Empty means this entity has no
 	// managed lifecycle; crud.Engine.ValidateStatusTransition is a no-op
-	// for it. When set, Validate below requires a matching "status_id"
+	// for it. When set, Validate below requires a matching StatusIDFieldName
 	// FieldReference — the field crud.Engine.ValidateStatusTransition
 	// actually reads/writes.
 	StatusTypeCode string         `json:"status_type_code,omitempty"`
@@ -391,6 +391,25 @@ type Definition struct {
 	// comment (uc-infra#201, ADR-0028).
 	UniqueWhen []ConditionalUnique `json:"unique_when,omitempty"`
 }
+
+// StatusIDFieldName and StatusTypeIDFieldName name the two field-name
+// literals the Definition.StatusTypeCode convention is built on
+// (independent review, ADR-0032/uc-infra#250): every Definition that
+// sets StatusTypeCode is required by Validate below to declare a
+// FieldReference literally named StatusIDFieldName targeting "Status"
+// (crud.Engine.ValidateStatusTransition reads/writes it by this same
+// literal name), and foundation.Status itself stores
+// StatusTypeIDFieldName as the FieldReference back to its own
+// StatusType. Exported so the three-plus packages that already read
+// these literals by convention (this package's own Validate,
+// crud/status.go, crud/target_constraints.go, authz.go) name them
+// once, compile-time-checkably, instead of each re-typing the string —
+// a typo in any of the duplicated literals used to be a silent runtime
+// mismatch, not a build failure.
+const (
+	StatusIDFieldName     = "status_id"
+	StatusTypeIDFieldName = "status_type_id"
+)
 
 // Float64Ptr returns a pointer to v — a small helper so every Definition
 // declaring a Field.Min/Max literal doesn't need its own local variable to
@@ -703,7 +722,7 @@ func (d *Definition) Validate() error {
 		}
 	}
 	if d.StatusTypeCode != "" {
-		sf, ok := d.FieldByName("status_id")
+		sf, ok := d.FieldByName(StatusIDFieldName)
 		if !ok {
 			return fmt.Errorf("%s declares status_type_code %q but has no status_id field", d.EntityType, d.StatusTypeCode)
 		}

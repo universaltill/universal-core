@@ -49,6 +49,10 @@ döngüsü tanımlarken kendiniz eklersiniz.
   Edildi'ye geçebilir. Bir satın alma siparişini Gönderildi ve Onaylandı'yı
   atlayarak doğrudan Taslak'tan Alındı'ya taşımaya çalışmak, ikisini
   doğrudan bağlayan bir Durum Geçişi olmadığından reddedilir.
+- Bir kaydın Durum seçicisi yalnızca o kayıt türünün kendi Durum Türüne
+  ait durumları sunar — başka bir kayıt türü için tohumlanmış bir durum
+  (farklı bir Durum Türü) hiçbir zaman sunulmaz, kiracıdaki her Durum
+  Türünü okuyabilseniz bile.
 
 ## Neyle bağlantılıdır
 

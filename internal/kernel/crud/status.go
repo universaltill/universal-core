@@ -55,7 +55,7 @@ func (e *Engine) ValidateStatusTransition(ctx context.Context, def *entity.Defin
 	if def.StatusTypeCode == "" {
 		return nil
 	}
-	newStatusID, touched := fields["status_id"].(string)
+	newStatusID, touched := fields[entity.StatusIDFieldName].(string)
 	if !touched || newStatusID == "" {
 		if isCreate {
 			return fmt.Errorf("%s requires status_id to create (status_type_code %q)", def.EntityType, def.StatusTypeCode)
@@ -74,7 +74,7 @@ func (e *Engine) ValidateStatusTransition(ctx context.Context, def *entity.Defin
 		}
 		return fmt.Errorf("look up status %s: %w", newStatusID, err)
 	}
-	if got, _ := newStatus.Data["status_type_id"].(string); got != statusTypeID {
+	if got, _ := newStatus.Data[entity.StatusTypeIDFieldName].(string); got != statusTypeID {
 		return fmt.Errorf("%w: status_id %q does not belong to status type %q", ErrInvalidTransition, newStatusID, def.StatusTypeCode)
 	}
 
@@ -89,7 +89,7 @@ func (e *Engine) ValidateStatusTransition(ctx context.Context, def *entity.Defin
 			// have said had this check not run first.
 			return fmt.Errorf("look up current %s %s: %w", def.EntityType, id, err)
 		}
-		currentStatusID, _ = rec.Data["status_id"].(string)
+		currentStatusID, _ = rec.Data[entity.StatusIDFieldName].(string)
 	}
 
 	if currentStatusID == "" {
@@ -118,7 +118,7 @@ func (e *Engine) ValidateStatusTransition(ctx context.Context, def *entity.Defin
 		return nil // setting to the same status is always a no-op, not a transition
 	}
 
-	transitions, err := e.records.ListByField(ctx, "StatusTransition", "status_type_id", statusTypeID)
+	transitions, err := e.records.ListByField(ctx, "StatusTransition", entity.StatusTypeIDFieldName, statusTypeID)
 	if err != nil {
 		return fmt.Errorf("list transitions for status type %s: %w", def.StatusTypeCode, err)
 	}

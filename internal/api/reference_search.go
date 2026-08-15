@@ -11,11 +11,13 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 
 	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/httpx"
+	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/formrender"
 )
@@ -173,12 +175,33 @@ func (h *Handler) searchReferenceOptions(w http.ResponseWriter, r *http.Request)
 	// actually a FieldReference targeting entityType, is ignored rather
 	// than failing the whole search — the same graceful-degradation
 	// posture the label/sort logic above already takes.
+	//
+	// sourceDef is also what lets ResolveReferenceFilter auto-scope a
+	// status_id picker to sourceDef's own StatusTypeCode (ADR-0032) —
+	// no separate wiring needed here beyond passing sourceDef through,
+	// since that scoping isn't a declared TargetFilter at all.
 	if sourceEntityType := r.URL.Query().Get("source_entity_type"); sourceEntityType != "" {
 		if sourceField := r.URL.Query().Get("source_field"); sourceField != "" {
 			if sourceDef, err := ts.entityDef(r.Context(), sourceEntityType); err == nil {
 				if f, ok := sourceDef.FieldByName(sourceField); ok && f.Type == entity.FieldReference && f.Target == entityType {
-					constraintOpts, err := ts.crud.ResolveReferenceFilter(r.Context(), f, r.URL.Query().Get("sibling_value"))
+					constraintOpts, err := ts.crud.ResolveReferenceFilter(r.Context(), sourceDef, f, r.URL.Query().Get("sibling_value"))
 					if err != nil {
+						// ADR-0032: an unresolvable StatusTypeCode
+						// (crud.ErrInvalidTransition, the status_id
+						// auto-scoping's own error path) is the caller's
+						// tenant-provisioning state, not a server fault —
+						// same 400 classification every other
+						// ErrInvalidTransition call site already uses
+						// (handlers.go's create/updateRecord). Reachable
+						// from caller-supplied source_entity_type/
+						// source_field, so a 500 here would both mislabel
+						// an ordinary state and light up server error
+						// logs for routine, caller-triggerable input
+						// (independent review).
+						if errors.Is(err, crud.ErrInvalidTransition) {
+							httpx.WriteError(w, http.StatusBadRequest, err.Error())
+							return
+						}
 						writeInternalError(w, "resolve reference filter for "+sourceEntityType+"."+sourceField, err)
 						return
 					}
