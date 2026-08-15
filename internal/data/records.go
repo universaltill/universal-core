@@ -1284,3 +1284,43 @@ func (r *RecordRepo) CountOutOfRangeField(ctx context.Context, entityType, field
 	}
 	return n, nil
 }
+
+// CountFieldTypeMismatch counts live records of entityType whose stored
+// JSONB value for fieldName no longer matches expectedJSONType's shape
+// (a Postgres jsonb_typeof result: "string", "number", "boolean", or
+// "object" — see entity.FieldType.FieldTypeJSONShape, which is what
+// every caller should derive it from rather than a hand-typed literal).
+//
+// Used by cmd/sync-tenant-modules to report the data migration a publish
+// just made necessary when a field's TYPE changes on an existing field
+// name (uc-infra#214/ADR-0031's Status.name string->i18n_text bump is the
+// first of this class — see that command's typeChangeWarnings), the same
+// "silent state, loud report" contract CountMissingField already gives a
+// newly-Required field and CountOutOfRangeField gives a newly-bounded one.
+//
+// A record with NO value at all for fieldName is deliberately not
+// counted here: `data->$2` on a missing key returns SQL NULL, and
+// `jsonb_typeof(NULL)` is itself NULL, so the `<>` comparison below is
+// UNKNOWN rather than true and the row is excluded — "field absent" is
+// requiredFieldWarnings' concern (if the field is Required), not this
+// function's. A JSON `null` value is excluded the same way, explicitly:
+// entity.ValidateRecord's Required check already treats JSON null as
+// "no value" (see CountMissingField's own doc comment), so counting it
+// here too would double-report the same row under two different
+// warnings for what is really one underlying gap.
+func (r *RecordRepo) CountFieldTypeMismatch(ctx context.Context, entityType, fieldName, expectedJSONType string) (int, error) {
+	var n int
+	err := r.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM records
+		 WHERE entity_type = $1
+		   AND deleted_at IS NULL
+		   AND jsonb_typeof(data->$2) IS NOT NULL
+		   AND jsonb_typeof(data->$2) <> 'null'
+		   AND jsonb_typeof(data->$2) <> $3`,
+		entityType, fieldName, expectedJSONType,
+	).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count %s records with %s not shaped like %s: %w", entityType, fieldName, expectedJSONType, err)
+	}
+	return n, nil
+}

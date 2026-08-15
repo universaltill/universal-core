@@ -715,6 +715,144 @@ func TestSync_WarnsAboutTargetConstraintViolations(t *testing.T) {
 	}
 }
 
+// staleTenantOldStatus is staleTenantOldPurchaseOrder's sibling for the
+// typeChangeWarnings data-migration warning test below (uc-infra#214/
+// ADR-0031): everything else is CURRENT, but Status is pinned at v1
+// (plain FieldString "name"), the version before the string->i18n_text
+// bump (v2) existed at all. Unlike staleTenantOldPurchaseOrder's target
+// module (an optional one, published on its own), Status lives in
+// foundation, which every tenant always has and which modules.
+// PublishFoundation only ever publishes as a whole — so this hand-builds
+// the same moduleseed.Item list foundation.Publish would, substituting
+// just Status, the same technique staleTenantOldPurchaseOrder and
+// staleTenantOldAttendanceRecord already use for their own module.
+func staleTenantOldStatus(t *testing.T, control *sql.DB, router *tenantdb.Router, name string) (id string, tenantDB *sql.DB) {
+	t.Helper()
+	id, tenantDB = newTenant(t, control, router, name)
+	ctx := context.Background()
+	var items []moduleseed.Item
+	for _, def := range foundation.All() {
+		if def.EntityType == "Status" {
+			def = statusV1()
+		}
+		raw, err := json.Marshal(def)
+		if err != nil {
+			t.Fatalf("marshal %s definition: %v", def.EntityType, err)
+		}
+		items = append(items, moduleseed.Item{Key: def.EntityType, Version: def.Version, Raw: raw})
+	}
+	if err := moduleseed.PublishAll(ctx, data.NewEntityDefinitionRepo(tenantDB), items, setupActor); err != nil {
+		t.Fatalf("publish foundation with old Status: %v", err)
+	}
+	return id, tenantDB
+}
+
+// statusV1 is foundation.Status as it stood before uc-infra#214/ADR-0031
+// changed "name"'s TYPE from FieldString to FieldI18nText (v2) — derived
+// from the CURRENT Definition, same reasoning purchaseOrderV6's and
+// attendanceRecordV1's own doc comments give: the only difference v1 had
+// was "name"'s type, so copying and reverting just that field can't
+// drift from the real v1 shape as unrelated fields change around it.
+func statusV1() *entity.Definition {
+	def := *foundation.Status()
+	def.Version = 1
+	fields := make([]entity.Field, len(def.Fields))
+	copy(fields, def.Fields)
+	for i, f := range fields {
+		if f.Name == "name" {
+			f.Type = entity.FieldString
+			fields[i] = f
+		}
+	}
+	def.Fields = fields
+	return &def
+}
+
+// insertLegacyStatus writes a v1-shaped Status row (plain string "name",
+// not yet the {"en": ...} object v2 requires) straight into records,
+// bypassing crud.Engine — same reasoning insertLegacyPurchaseOrder gives:
+// v2 would reject the very row whose existence the sync has to warn
+// about.
+func insertLegacyStatus(t *testing.T, tenantDB *sql.DB, statusTypeID, code, name string) {
+	t.Helper()
+	raw, err := json.Marshal(map[string]any{
+		"status_type_id": statusTypeID,
+		"code":           code,
+		"name":           name,
+	})
+	if err != nil {
+		t.Fatalf("marshal legacy Status: %v", err)
+	}
+	if _, err := tenantDB.ExecContext(context.Background(),
+		`INSERT INTO records (entity_type, data) VALUES ('Status', $1)`, raw,
+	); err != nil {
+		t.Fatalf("insert legacy Status: %v", err)
+	}
+}
+
+// TestSync_WarnsAboutFieldTypeChangeViolations is
+// TestSync_WarnsAboutTargetConstraintViolations' counterpart for a
+// field's declared TYPE changing on an existing field name
+// (uc-infra#214/ADR-0031's typeChangeWarnings): a tenant with a
+// pre-existing, not-yet-backfilled Status row, synced past the version
+// that changes "name" from a plain string to i18n_text, must be warned —
+// not silently told "0 data migrations needed" only for the very next
+// hand-edit of that row (or, per this same bump's own review findings,
+// every OTHER status-managed entity's status picker) to break.
+func TestSync_WarnsAboutFieldTypeChangeViolations(t *testing.T) {
+	dsn, control, router := controlPlane(t)
+	_, tenantDB := staleTenantOldStatus(t, control, router, "Sync Smoke Test TypeChange")
+
+	insertLegacyStatus(t, tenantDB, "00000000-0000-0000-0000-000000000000", "draft", "Draft")
+
+	stdout, stderr, code := run(t, []string{"DATABASE_URL=" + dsn}, "-actor-id=smoke-test")
+	if code != 0 {
+		t.Fatalf("sync: exit %d, stderr: %s", code, stderr)
+	}
+	want := `Sync Smoke Test TypeChange: Status — 1 record(s) still hold "name" in its old shape and will fail validation on next edit; run the matching backfill command for this entity type`
+	if !strings.Contains(stdout, want) {
+		t.Fatalf("expected warning %q, got stdout: %q", want, stdout)
+	}
+	// The sync reports; it must not have repaired or rejected anything.
+	var n int
+	if err := tenantDB.QueryRowContext(context.Background(),
+		`SELECT count(*) FROM records WHERE entity_type = 'Status' AND deleted_at IS NULL AND jsonb_typeof(data->'name') = 'string'`,
+	).Scan(&n); err != nil {
+		t.Fatalf("count legacy-shaped Status records: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("sync must not touch the offending record, got %d Status record(s) still string-shaped", n)
+	}
+}
+
+// TestSync_TypeUnchangedIsNotAWarning confirms fieldTypeChanged's
+// asymmetry actually reaches the warning path: a field whose type is
+// identical across versions must never warn, even on a version bump that
+// changes something else about the entity — otherwise every sync of
+// every entity would re-report every field it has ever declared, forever.
+func TestSync_TypeUnchangedIsNotAWarning(t *testing.T) {
+	old := &entity.Definition{EntityType: "Widget", Version: 1, Fields: []entity.Field{
+		{Name: "name", Type: entity.FieldString},
+		{Name: "qty", Type: entity.FieldNumber},
+	}}
+	unchanged := entity.Field{Name: "name", Type: entity.FieldString}
+	changed := entity.Field{Name: "name", Type: entity.FieldI18nText}
+	newField := entity.Field{Name: "other", Type: entity.FieldI18nText}
+
+	if fieldTypeChanged(old, unchanged) {
+		t.Error("an unchanged field type must not be reported as changed")
+	}
+	if !fieldTypeChanged(old, changed) {
+		t.Error("a field whose type differs from the old Definition must be reported as changed")
+	}
+	if fieldTypeChanged(old, newField) {
+		t.Error("a field with no same-named predecessor is new, not a type CHANGE, and must not be reported as changed")
+	}
+	if !fieldTypeChanged(nil, changed) {
+		t.Error("a nil oldDef (nothing to compare against) must fail open to \"changed\", not \"unchanged\"")
+	}
+}
+
 // staleTenantOldAttendanceRecord is staleTenantOldPurchaseOrder's sibling
 // for the Unique data-migration warning test below: HR published with
 // AttendanceRecord pinned at v1, the version before uc-infra#81's

@@ -383,6 +383,7 @@ func syncTenant(
 		warnings := requiredFieldWarnings(ctx, tenantDB, name, changes, defFor)
 		warnings = append(warnings, targetConstraintWarnings(ctx, tenantDB, entityDefs, name, changes, defFor)...)
 		warnings = append(warnings, numericBoundWarnings(ctx, tenantDB, entityDefs, name, changes, defFor)...)
+		warnings = append(warnings, typeChangeWarnings(ctx, tenantDB, entityDefs, name, changes, defFor)...)
 		// Built inline, unlike the real-run path below: a dry run has only
 		// this one consumer of the lookup (no backfill step), so there is
 		// nothing to share it with yet. If a second dry-run consumer is
@@ -470,6 +471,7 @@ func syncTenant(
 	warnings := requiredFieldWarnings(ctx, tenantDB, name, changes, defFor)
 	warnings = append(warnings, targetConstraintWarnings(ctx, tenantDB, entityDefs, name, changes, defFor)...)
 	warnings = append(warnings, numericBoundWarnings(ctx, tenantDB, entityDefs, name, changes, defFor)...)
+	warnings = append(warnings, typeChangeWarnings(ctx, tenantDB, entityDefs, name, changes, defFor)...)
 	warnings = append(warnings, uniqueConstraintWarnings(ctx, tenantDB, name, changes, defFor, oldNamesFor)...)
 	warnings = append(warnings, conditionalUniqueConstraintWarnings(ctx, tenantDB, name, changes, defFor, oldConditionalNamesFor)...)
 	// Real run only — a dry run must not write record_unique_keys rows,
@@ -956,6 +958,106 @@ func targetConstraintChanged(oldDef *entity.Definition, newField entity.Field) b
 		return true
 	}
 	return !reflect.DeepEqual(oldField.TargetFilter, newField.TargetFilter)
+}
+
+// typeChangeWarnings is requiredFieldWarnings/targetConstraintWarnings/
+// numericBoundWarnings' counterpart for a field's declared TYPE changing
+// on an existing field NAME (uc-infra#214/ADR-0031's Status.name
+// string->i18n_text bump is the first of this class this command has
+// ever had to report on). requiredFieldWarnings' own CountMissingField
+// cannot catch this: a legacy Status row's "name" is a non-empty plain
+// string, so it reads as present under the old-or-new type either way —
+// zero warnings, and the operator learns about the now-invalid shape
+// only when an edit-and-save 400s, exactly the silent state every other
+// warning in this file exists to make loud (ADR-0017 §5). This is why
+// this diff's own doc comments elsewhere calling Status v1->v2 "the same
+// class of bump as PurchaseOrder v3->v4 / InventoryItem v2->v3" only
+// held on the "a Version bump can invalidate existing rows" dimension —
+// those two bumps both ADDED a new required field, which
+// requiredFieldWarnings already catches; this is the first bump in the
+// "same field name, new type" class, and needed its own check.
+//
+// Same "compare against c.from's old Definition, skip if unchanged,
+// treat a from==0 (new to the registry) field as changed" shape as
+// targetConstraintWarnings above — see that function's own doc comment
+// for why a brand-new-to-the-registry type is deliberately not skipped.
+func typeChangeWarnings(
+	ctx context.Context,
+	tenantDB *sql.DB,
+	entityDefs *data.EntityDefinitionRepo,
+	tenantName string,
+	changes []change,
+	defFor func(entityType string) (*entity.Definition, bool),
+) []string {
+	records := data.NewRecordRepo(tenantDB)
+	var out []string
+	for _, c := range changes {
+		newDef, ok := defFor(c.entityType)
+		if !ok {
+			continue
+		}
+		var oldDef *entity.Definition
+		if c.from > 0 {
+			v, err := entityDefs.GetVersion(ctx, c.entityType, c.from)
+			if err != nil {
+				log.Printf("WARNING: %s: %s v%d — could not re-read the previous published version to tell which field types actually changed this run, so every field's type is being re-checked as if newly added; the record-migration warning(s) below may repeat one already reported for an earlier version: %v",
+					tenantName, c.entityType, c.from, err)
+			} else {
+				var d entity.Definition
+				if err := json.Unmarshal(v.Definition, &d); err != nil {
+					log.Printf("WARNING: %s: %s v%d — the previous published version could not be decoded to tell which field types actually changed this run, so every field's type is being re-checked as if newly added; the record-migration warning(s) below may repeat one already reported for an earlier version: %v",
+						tenantName, c.entityType, c.from, err)
+				} else {
+					oldDef = &d
+				}
+			}
+		}
+		for _, f := range newDef.Fields {
+			shape, known := f.Type.FieldTypeJSONShape()
+			if !known {
+				continue
+			}
+			if !fieldTypeChanged(oldDef, f) {
+				continue
+			}
+			n, err := records.CountFieldTypeMismatch(ctx, c.entityType, f.Name, shape)
+			if err != nil {
+				log.Printf("WARNING: %s: %s — could not check existing records against the new type of %q, this warning may be incomplete: %v",
+					tenantName, c.entityType, f.Name, err)
+				continue
+			}
+			if n == 0 {
+				continue
+			}
+			out = append(out, fmt.Sprintf(
+				"%s: %s — %d record(s) still hold %q in its old shape and will fail validation on next edit; run the matching backfill command for this entity type",
+				tenantName, c.entityType, n, f.Name))
+		}
+	}
+	return out
+}
+
+// fieldTypeChanged reports whether newField's declared Type is new, or
+// differs from, the same-named field on oldDef — targetConstraintChanged's
+// counterpart for a field's TYPE rather than its reference constraints.
+// oldDef == nil (nothing to compare against — either genuinely new to the
+// registry, or its old version couldn't be read/decoded) is treated as
+// changed, the same "fail open to checking everything" choice
+// targetConstraintChanged and numericBoundChanged both make. A field
+// that's new to oldDef (no prior field of that name at all) is
+// deliberately NOT reported as a type change — a field appearing for the
+// first time isn't a change to its OWN type, it has no prior type to
+// have changed from; requiredFieldWarnings already covers "invalid
+// because this field didn't exist on those rows" if it's Required.
+func fieldTypeChanged(oldDef *entity.Definition, newField entity.Field) bool {
+	if oldDef == nil {
+		return true
+	}
+	oldField, existed := oldDef.FieldByName(newField.Name)
+	if !existed {
+		return false
+	}
+	return oldField.Type != newField.Type
 }
 
 // numericBoundWarnings is requiredFieldWarnings/targetConstraintWarnings'
