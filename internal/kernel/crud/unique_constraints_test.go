@@ -1020,6 +1020,100 @@ func TestBackfillUniqueConstraintKeys_OldestRecordWinsAmongCollisions(t *testing
 	}
 }
 
+// TestBackfillUniqueConstraintKeys_RerunOverAlreadyBackedRecordsNoLongerMisreportsThemAsUnprotected
+// is the regression test for uc-infra#237 gap 3, at the level
+// cmd/sync-tenant-modules actually calls: re-running
+// BackfillUniqueConstraintKeys a second time over an entity type that's
+// already fully backed (the fail-open re-check path, or a forced
+// -backfill-only retry) used to have every already-keyed record's own
+// re-insert collide with ITSELF — reported as "skipped" / "unprotected"
+// even though it was already protected. Proves the fix: the second run
+// reports the same records as backfilled again (not skipped), and the
+// key rows themselves are untouched (same count, same owners).
+func TestBackfillUniqueConstraintKeys_RerunOverAlreadyBackedRecordsNoLongerMisreportsThemAsUnprotected(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	records := data.NewRecordRepo(db)
+	keys := data.NewRecordUniqueKeyRepo(db)
+	def := attendanceLikeDef()
+
+	rec1, err := records.Create(ctx, def.EntityType, map[string]any{
+		"employee_id": "emp-1", "entry_date": "2026-08-01", "hours_worked": float64(8),
+	})
+	if err != nil {
+		t.Fatalf("create record 1: %v", err)
+	}
+	rec2, err := records.Create(ctx, def.EntityType, map[string]any{
+		"employee_id": "emp-2", "entry_date": "2026-08-01", "hours_worked": float64(6),
+	})
+	if err != nil {
+		t.Fatalf("create record 2: %v", err)
+	}
+
+	first, firstSkipped, err := BackfillUniqueConstraintKeys(ctx, db, records, keys, def.EntityType, []string{"employee_id", "entry_date"})
+	if err != nil {
+		t.Fatalf("first BackfillUniqueConstraintKeys: %v", err)
+	}
+	if first != 2 || firstSkipped != 0 {
+		t.Fatalf("expected first run backfilled=2 skipped=0, got backfilled=%d skipped=%d", first, firstSkipped)
+	}
+
+	// The re-run: same entity type, same field set, nothing new — exactly
+	// what a re-backfill against an unchanged Definition version does.
+	second, secondSkipped, err := BackfillUniqueConstraintKeys(ctx, db, records, keys, def.EntityType, []string{"employee_id", "entry_date"})
+	if err != nil {
+		t.Fatalf("second BackfillUniqueConstraintKeys: %v", err)
+	}
+	if second != 2 {
+		t.Fatalf("expected the re-run to report both already-backed records as backfilled=2 (not skipped as unprotected), got backfilled=%d skipped=%d", second, secondSkipped)
+	}
+	if secondSkipped != 0 {
+		t.Fatalf("expected skipped=0 on the re-run — neither record is genuinely unprotected, got skipped=%d", secondSkipped)
+	}
+
+	var totalRows int
+	if err := db.QueryRowContext(ctx,
+		`SELECT count(*) FROM record_unique_keys WHERE entity_type = $1`, def.EntityType,
+	).Scan(&totalRows); err != nil {
+		t.Fatalf("count total rows: %v", err)
+	}
+	if totalRows != 2 {
+		t.Fatalf("expected exactly 2 key rows total (one per record, untouched by the re-run), got %d", totalRows)
+	}
+
+	var owner1, owner2 string
+	if err := db.QueryRowContext(ctx,
+		`SELECT record_id FROM record_unique_keys WHERE entity_type = $1 AND key_value = $2`,
+		def.EntityType, keyValueFor(t, "emp-1", "2026-08-01"),
+	).Scan(&owner1); err != nil {
+		t.Fatalf("read owner 1: %v", err)
+	}
+	if err := db.QueryRowContext(ctx,
+		`SELECT record_id FROM record_unique_keys WHERE entity_type = $1 AND key_value = $2`,
+		def.EntityType, keyValueFor(t, "emp-2", "2026-08-01"),
+	).Scan(&owner2); err != nil {
+		t.Fatalf("read owner 2: %v", err)
+	}
+	if owner1 != rec1.ID || owner2 != rec2.ID {
+		t.Fatalf("expected the re-run to leave ownership unchanged (rec1=%s rec2=%s), got owner1=%s owner2=%s", rec1.ID, rec2.ID, owner1, owner2)
+	}
+}
+
+// keyValueFor computes uniqueKeyValue's hash for a two-field
+// (employee_id, entry_date) key the same way BackfillUniqueConstraintKeys
+// itself does, so this test can look up a specific record's row by its
+// real key_value instead of assuming row order.
+func keyValueFor(t *testing.T, employeeID, entryDate string) string {
+	t.Helper()
+	value, applicable, err := uniqueKeyValue([]string{"employee_id", "entry_date"}, map[string]any{
+		"employee_id": employeeID, "entry_date": entryDate,
+	})
+	if err != nil || !applicable {
+		t.Fatalf("compute key value: applicable=%v err=%v", applicable, err)
+	}
+	return value
+}
+
 // --- ConditionalUnique / UniqueWhen (uc-infra#201, ADR-0028) ---
 
 // roleLikeDef is a throwaway Definition shaped like
@@ -1523,6 +1617,58 @@ func TestBackfillConditionalUniqueConstraintKeys_OldestRecordWinsAmongCollisions
 	}
 	if olderCount != 1 || newerCount != 0 {
 		t.Fatalf("expected the OLDER record to win the key (created_at order), got older=%d newer=%d", olderCount, newerCount)
+	}
+}
+
+// TestBackfillConditionalUniqueConstraintKeys_RerunOverAlreadyBackedRecordsNoLongerMisreportsThemAsUnprotected
+// is TestBackfillUniqueConstraintKeys_RerunOverAlreadyBackedRecordsNoLongerMisreportsThemAsUnprotected's
+// UniqueWhen counterpart (uc-infra#237 gap 3): re-running the conditional
+// backfill over an already-backed own_organization role must report it
+// as backfilled again, not skipped as unprotected.
+func TestBackfillConditionalUniqueConstraintKeys_RerunOverAlreadyBackedRecordsNoLongerMisreportsThemAsUnprotected(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	records := data.NewRecordRepo(db)
+	keys := data.NewRecordUniqueKeyRepo(db)
+	def := roleLikeDef()
+
+	rec, err := records.Create(ctx, def.EntityType, map[string]any{
+		"party_id": "party-1", "role_type": "own_organization",
+	})
+	if err != nil {
+		t.Fatalf("create record: %v", err)
+	}
+
+	cu := entity.ConditionalUnique{Fields: []string{"role_type"}, WhenField: "role_type", WhenValue: "own_organization"}
+	first, firstSkipped, err := BackfillConditionalUniqueConstraintKeys(ctx, db, records, keys, def.EntityType, cu)
+	if err != nil {
+		t.Fatalf("first BackfillConditionalUniqueConstraintKeys: %v", err)
+	}
+	if first != 1 || firstSkipped != 0 {
+		t.Fatalf("expected first run backfilled=1 skipped=0, got backfilled=%d skipped=%d", first, firstSkipped)
+	}
+
+	second, secondSkipped, err := BackfillConditionalUniqueConstraintKeys(ctx, db, records, keys, def.EntityType, cu)
+	if err != nil {
+		t.Fatalf("second BackfillConditionalUniqueConstraintKeys: %v", err)
+	}
+	if second != 1 || secondSkipped != 0 {
+		t.Fatalf("expected the re-run to report the already-backed record as backfilled=1 skipped=0 (not skipped as unprotected), got backfilled=%d skipped=%d", second, secondSkipped)
+	}
+
+	var totalRows int
+	var owner string
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM record_unique_keys WHERE record_id = $1`, rec.ID).Scan(&totalRows); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if totalRows != 1 {
+		t.Fatalf("expected exactly 1 key row (untouched by the re-run), got %d", totalRows)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT record_id FROM record_unique_keys WHERE entity_type = $1`, def.EntityType).Scan(&owner); err != nil {
+		t.Fatalf("read owner: %v", err)
+	}
+	if owner != rec.ID {
+		t.Fatalf("expected the re-run to leave ownership unchanged (%s), got %s", rec.ID, owner)
 	}
 }
 

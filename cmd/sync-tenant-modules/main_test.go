@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -907,6 +908,264 @@ func TestSync_DryRun_DoesNotBackfillUniqueConstraintKeys(t *testing.T) {
 	}
 	if keyCount != 0 {
 		t.Fatalf("expected -dry-run to write no record_unique_keys rows, got %d", keyCount)
+	}
+}
+
+// --- -backfill-only (uc-infra#237 gap 2: a retry path that didn't exist) ---
+
+func TestSync_BackfillOnly_RequiresTenantID(t *testing.T) {
+	dsn, _, _ := controlPlane(t)
+	_, stderr, code := run(t, []string{"DATABASE_URL=" + dsn}, "-actor-id=smoke-test", "-backfill-only=AttendanceRecord")
+	if code == 0 {
+		t.Fatal("expected non-zero exit with -backfill-only set but -tenant-id unset")
+	}
+	if !strings.Contains(stderr, "-backfill-only requires -tenant-id") {
+		t.Fatalf("expected the -tenant-id requirement error, got stderr: %q", stderr)
+	}
+}
+
+func TestSync_BackfillOnly_RejectsDryRun(t *testing.T) {
+	dsn, control, router := controlPlane(t)
+	id, _ := staleTenantOldAttendanceRecord(t, control, router, "Sync Smoke Test BackfillOnly DryRun Rejection")
+	_, stderr, code := run(t, []string{"DATABASE_URL=" + dsn}, "-actor-id=smoke-test", "-tenant-id="+id, "-backfill-only=AttendanceRecord", "-dry-run")
+	if code == 0 {
+		t.Fatal("expected non-zero exit with -backfill-only combined with -dry-run")
+	}
+	if !strings.Contains(stderr, "does not support -dry-run") {
+		t.Fatalf("expected the -dry-run rejection error, got stderr: %q", stderr)
+	}
+}
+
+// TestSync_BackfillOnly_ForcesRetryAgainstAnUnchangedVersionAndDoesNotMisreportAlreadyBackedRecords
+// is the end-to-end regression test for both halves of uc-infra#237: a
+// normal sync only ever re-attempts a backfill for an entity type whose
+// Definition version moved THIS run (gap 2 — no operator-facing retry
+// otherwise), and a re-backfill over a record that's already protected
+// used to be misreported as "skipped due to collision" (gap 3).
+//
+// Sequence:
+//  1. A stale tenant's AttendanceRecord gets synced past the version that
+//     first declares Unique(employee_id, entry_date) — the real sync
+//     backfills its one pre-existing record, exactly like
+//     TestSync_BackfillsUniqueConstraintKeysForExistingRecords.
+//  2. A SECOND legacy record is inserted directly (bypassing crud.Engine,
+//     the same fixture shape insertLegacyDuplicateAttendanceRecords uses)
+//     for a DIFFERENT (employee_id, entry_date) — simulating data that
+//     arrived after the sync already consumed its one-time version-diff
+//     window. A second ordinary sync run would not see it (no `changes`
+//     left to iterate — this is gap 2, demonstrated directly below).
+//  3. -backfill-only=AttendanceRecord is run standalone. It must: back
+//     the SECOND (never-yet-protected) record for real, AND report the
+//     FIRST (already-protected) record as backfilled again, not skipped
+//     as unprotected (gap 3) — and it must not touch the first record's
+//     existing key row while doing so.
+func TestSync_BackfillOnly_ForcesRetryAgainstAnUnchangedVersionAndDoesNotMisreportAlreadyBackedRecords(t *testing.T) {
+	dsn, control, router := controlPlane(t)
+	id, tenantDB := staleTenantOldAttendanceRecord(t, control, router, "Sync Smoke Test BackfillOnly")
+
+	insertLegacyDuplicateAttendanceRecords(t, tenantDB, "00000000-0000-0000-0000-0000000000f1", "2026-08-01")
+	if _, err := tenantDB.ExecContext(context.Background(),
+		`DELETE FROM records WHERE entity_type = 'AttendanceRecord' AND id = (
+			SELECT id FROM records WHERE entity_type = 'AttendanceRecord' ORDER BY created_at, id LIMIT 1
+		)`); err != nil {
+		t.Fatalf("trim fixture to a single pre-existing record: %v", err)
+	}
+
+	// Step 1: the real sync backfills the one pre-existing record and
+	// bumps AttendanceRecord to the version declaring Unique.
+	stdout, stderr, code := run(t, []string{"DATABASE_URL=" + dsn}, "-actor-id=smoke-test", "-tenant-id="+id)
+	if code != 0 {
+		t.Fatalf("initial sync: exit %d, stderr: %s", code, stderr)
+	}
+	if !strings.Contains(stderr, `backfilled unique constraint "employee_id+entry_date" for 1 existing record(s)`) {
+		t.Fatalf("expected the initial sync to backfill the pre-existing record, got stdout: %q stderr: %q", stdout, stderr)
+	}
+	var rec1Key string
+	if err := tenantDB.QueryRowContext(context.Background(),
+		`SELECT key_value FROM record_unique_keys WHERE entity_type = 'AttendanceRecord'`).Scan(&rec1Key); err != nil {
+		t.Fatalf("read the first record's key_value: %v", err)
+	}
+
+	// Step 2: a second legacy record, unrelated to the first, arrives
+	// after the sync already consumed its one-time version-diff window.
+	if _, err := tenantDB.ExecContext(context.Background(),
+		`INSERT INTO records (entity_type, data) VALUES ('AttendanceRecord', $1)`,
+		[]byte(`{"employee_id":"00000000-0000-0000-0000-0000000000f2","entry_date":"2026-08-02","hours_worked":8,"source":"manual"}`),
+	); err != nil {
+		t.Fatalf("insert second legacy record: %v", err)
+	}
+
+	// Gap 2, demonstrated directly: an ordinary re-sync has nothing left
+	// to iterate for AttendanceRecord (its version didn't move again), so
+	// it does NOT pick up the second record.
+	stdout2, stderr2, code2 := run(t, []string{"DATABASE_URL=" + dsn}, "-actor-id=smoke-test", "-tenant-id="+id)
+	if code2 != 0 {
+		t.Fatalf("ordinary re-sync: exit %d, stderr: %s", code2, stderr2)
+	}
+	if strings.Contains(stderr2, "AttendanceRecord") {
+		t.Fatalf("expected an ordinary re-sync to have nothing to say about AttendanceRecord (no version diff to act on), got stdout: %q stderr: %q", stdout2, stderr2)
+	}
+	var keyCountAfterOrdinaryResync int
+	if err := tenantDB.QueryRowContext(context.Background(),
+		`SELECT count(*) FROM record_unique_keys WHERE entity_type = 'AttendanceRecord'`).Scan(&keyCountAfterOrdinaryResync); err != nil {
+		t.Fatalf("count keys after ordinary re-sync: %v", err)
+	}
+	if keyCountAfterOrdinaryResync != 1 {
+		t.Fatalf("expected the ordinary re-sync to leave the second record unprotected (1 key row, not 2), got %d", keyCountAfterOrdinaryResync)
+	}
+
+	// Step 3: -backfill-only forces the retry gap 2 has no other path
+	// for, over the CURRENTLY PUBLISHED Definition.
+	stdout3, stderr3, code3 := run(t, []string{"DATABASE_URL=" + dsn}, "-actor-id=smoke-test", "-tenant-id="+id, "-backfill-only=AttendanceRecord")
+	if code3 != 0 {
+		t.Fatalf("-backfill-only run: exit %d, stderr: %s", code3, stderr3)
+	}
+	if !strings.Contains(stdout3, `backfilled unique constraint "employee_id+entry_date" for 2 existing record(s)`) {
+		t.Fatalf(`expected -backfill-only to report backfilled=2 (both records, neither "skipped due to collision"), got stdout: %q`, stdout3)
+	}
+	if strings.Contains(stdout3, "unprotected") || strings.Contains(stdout3, "collision") {
+		t.Fatalf("gap 3 regression: -backfill-only misreported an already-backed record as unprotected/collision, got stdout: %q", stdout3)
+	}
+
+	// Real proof, not just the printed count: exactly 2 key rows now
+	// exist, the first record's own key_value is untouched, and a fresh
+	// duplicate against the SECOND record (only just backfilled) is
+	// rejected through the real engine — the second record is now
+	// genuinely protected, not just reported as such.
+	var totalKeys int
+	if err := tenantDB.QueryRowContext(context.Background(),
+		`SELECT count(*) FROM record_unique_keys WHERE entity_type = 'AttendanceRecord'`).Scan(&totalKeys); err != nil {
+		t.Fatalf("count total keys: %v", err)
+	}
+	if totalKeys != 2 {
+		t.Fatalf("expected exactly 2 key rows after -backfill-only, got %d", totalKeys)
+	}
+	var rec1KeyAfter string
+	if err := tenantDB.QueryRowContext(context.Background(),
+		`SELECT key_value FROM record_unique_keys WHERE entity_type = 'AttendanceRecord' AND key_value = $1`, rec1Key,
+	).Scan(&rec1KeyAfter); err != nil {
+		t.Fatalf("expected the first record's original key row to still be present untouched: %v", err)
+	}
+
+	engine := crud.NewEngine(tenantDB)
+	_, err := engine.Create(context.Background(), hr.AttendanceRecord(), map[string]any{
+		"employee_id": "00000000-0000-0000-0000-0000000000f2", "entry_date": "2026-08-02",
+		"hours_worked": float64(1), "source": "manual",
+	}, setupActor)
+	if !errors.Is(err, crud.ErrUniqueConstraintViolation) {
+		t.Fatalf("expected a fresh duplicate against the -backfill-only-protected second record to be rejected, got %v", err)
+	}
+}
+
+// TestSync_BackfillOnly_ExitsNonZeroAndWarnsOnStderrForAnUnknownEntityType
+// is the regression test for independent review's findings 2 and 5: a
+// -backfill-only run naming an entity type with no published Definition
+// (a typo, most plausibly) used to exit 0 and print its WARNING to
+// stdout — indistinguishable from success to any script or CI step
+// checking either the exit code or stderr alone.
+func TestSync_BackfillOnly_ExitsNonZeroAndWarnsOnStderrForAnUnknownEntityType(t *testing.T) {
+	dsn, control, router := controlPlane(t)
+	id, _ := staleTenant(t, control, router, "Sync Smoke Test BackfillOnly Unknown Type")
+
+	stdout, stderr, code := run(t, []string{"DATABASE_URL=" + dsn}, "-actor-id=smoke-test", "-tenant-id="+id, "-backfill-only=NotARealEntityType")
+	if code == 0 {
+		t.Fatalf("expected a non-zero exit when every named entity type fails, got 0 (stdout: %q, stderr: %q)", stdout, stderr)
+	}
+	if !strings.Contains(stderr, "WARNING:") || !strings.Contains(stderr, "NotARealEntityType") {
+		t.Fatalf("expected the WARNING to be on stderr, got stderr: %q (stdout: %q)", stderr, stdout)
+	}
+	if strings.Contains(stdout, "WARNING:") {
+		t.Fatalf("expected stdout to carry no WARNING lines, got stdout: %q", stdout)
+	}
+}
+
+// TestSync_BackfillOnly_ReportsNoConstraintsDeclaredExplicitly is the
+// regression test for independent review's finding 3: an entity type
+// with no Unique/UniqueWhen declared on its currently published
+// Definition (nothing was ever attempted) must not be reported the same
+// way as "every record is already protected" — the two are different
+// claims, and folding them into one generic message hides a typo or an
+// unexpectedly-bare Definition behind apparent success.
+func TestSync_BackfillOnly_ReportsNoConstraintsDeclaredExplicitly(t *testing.T) {
+	dsn, control, router := controlPlane(t)
+	id, _ := staleTenant(t, control, router, "Sync Smoke Test BackfillOnly No Constraints")
+
+	// Department (foundation) has no Unique/UniqueWhen declared.
+	stdout, stderr, code := run(t, []string{"DATABASE_URL=" + dsn}, "-actor-id=smoke-test", "-tenant-id="+id, "-backfill-only=Department")
+	if code != 0 {
+		t.Fatalf("expected exit 0 (nothing declared is not a failure), got %d, stderr: %s", code, stderr)
+	}
+	want := "Department — no unique/conditional-unique constraint declared on the currently published Definition, nothing to backfill."
+	if !strings.Contains(stdout, want) {
+		t.Fatalf("expected the explicit no-constraints-declared message %q, got stdout: %q", want, stdout)
+	}
+}
+
+// TestSync_BackfillOnly_RejectsPositionalArguments is the regression
+// test for independent review's nit 11: -backfill-only takes entity
+// types as its OWN comma-separated flag value, not as further positional
+// arguments — "-backfill-only Foo Department" silently processed only
+// "Foo" and dropped "Department" without a word before this fix.
+func TestSync_BackfillOnly_RejectsPositionalArguments(t *testing.T) {
+	dsn, control, router := controlPlane(t)
+	id, _ := staleTenant(t, control, router, "Sync Smoke Test BackfillOnly Positional Args")
+
+	_, stderr, code := run(t, []string{"DATABASE_URL=" + dsn}, "-actor-id=smoke-test", "-tenant-id="+id, "-backfill-only=AttendanceRecord", "Department")
+	if code == 0 {
+		t.Fatal("expected a non-zero exit for a stray positional argument")
+	}
+	if !strings.Contains(stderr, "positional arguments") {
+		t.Fatalf("expected the positional-argument rejection error, got stderr: %q", stderr)
+	}
+}
+
+// TestSplitCommaList and TestDedupe are plain unit tests (no database) for
+// -backfill-only's own list-parsing helpers — independent review of
+// uc-infra#237 flagged both as undertested despite the whitespace/empty-
+// entry/repeat semantics this file's own comments document for them.
+func TestSplitCommaList(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want []string
+	}{
+		{"empty", "", nil},
+		{"single", "Foo", []string{"Foo"}},
+		{"plain list", "Foo,Bar", []string{"Foo", "Bar"}},
+		{"whitespace around entries", "Foo, Bar , Baz", []string{"Foo", "Bar", "Baz"}},
+		{"empty entries dropped", "Foo,,Bar", []string{"Foo", "Bar"}},
+		{"trailing comma dropped", "Foo,Bar,", []string{"Foo", "Bar"}},
+		{"whitespace-only entries dropped", "Foo, ,Bar", []string{"Foo", "Bar"}},
+		{"all empty", ", ,", nil},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := splitCommaList(c.in)
+			if !reflect.DeepEqual(got, c.want) {
+				t.Fatalf("splitCommaList(%q) = %#v, want %#v", c.in, got, c.want)
+			}
+		})
+	}
+}
+
+func TestDedupe(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{"empty", nil, []string{}},
+		{"no duplicates preserves order", []string{"Foo", "Bar"}, []string{"Foo", "Bar"}},
+		{"consecutive duplicate dropped", []string{"Foo", "Foo"}, []string{"Foo"}},
+		{"non-consecutive duplicate dropped, first occurrence order kept", []string{"Foo", "Bar", "Foo"}, []string{"Foo", "Bar"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := dedupe(c.in)
+			if !reflect.DeepEqual(got, c.want) {
+				t.Fatalf("dedupe(%#v) = %#v, want %#v", c.in, got, c.want)
+			}
+		})
 	}
 }
 
