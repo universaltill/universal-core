@@ -112,6 +112,17 @@ jobs:
           git fetch origin ${{ github.event.pull_request.base.sha }} --depth=1
           git show ${{ github.event.pull_request.base.sha }}:internal/help/coverage_test.go > "${RUNNER_TEMP}/base-coverage_test.go" 2>/dev/null || true
           .github/scripts/check-help-allowlist.sh internal/help/coverage_test.go "${RUNNER_TEMP}/base-coverage_test.go"
+      # Same self-test-before-trusting-it discipline as the two self-tests
+      # above, for scripts/run-full-gate.sh (uc-infra#215's one-shot
+      # local/pipeline-session gate runner) — "a script nothing runs is
+      # only ever read, not verified" applies here too. Needs no Go
+      # toolchain and no database (its own design: preflight checks are
+      # ordered cheapest/local-only first, network last, specifically so
+      # this harness can exercise everything except live DB reachability
+      # without one), so it runs before Go is even set up, same as the
+      # two self-tests above.
+      - name: Full-gate script self-test
+        run: scripts/run-full-gate_test.sh
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
