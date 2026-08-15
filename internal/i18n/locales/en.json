@@ -3,6 +3,7 @@
   "form.related_list.empty": "No related records.",
   "form.master_detail.empty": "No lines yet.",
   "form.master_detail.add": "+ Add",
+  "import.title": "Import records",
   "import.choose_file": "Choose a CSV or XLSX file",
   "import.preview_button": "Preview",
   "import.commit_button": "Commit",

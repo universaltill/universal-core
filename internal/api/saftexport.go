@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/universaltill/universal-core/internal/data"
+	"github.com/universaltill/universal-core/internal/help"
 	"github.com/universaltill/universal-core/internal/httpx"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
 	"github.com/universaltill/universal-core/internal/kernel/finance"
@@ -545,6 +546,11 @@ func (h *Handler) saftExportPage(w http.ResponseWriter, r *http.Request) {
 		DefaultFrom: time.Date(now.Year(), 1, 1, 0, 0, 0, 0, time.UTC).Format("2006-01-02"),
 		DefaultTo:   now.Format("2006-01-02"),
 	}
+	// ADR-0023's "?" help affordance (uc-infra#152) — same pattern
+	// project_budget_report.go established.
+	saftTopicID := help.RouteTopicID("export/saft")
+	view.Help = h.buildHelpView(locale, saftTopicID, help.HasContent(locale, saftTopicID))
+
 	var buf bytes.Buffer
 	if err := saftPageTmpl.Execute(&buf, view); err != nil {
 		writeInternalError(w, "render SAF-T export page", err)
@@ -564,10 +570,13 @@ type saftPageView struct {
 	ButtonLabel string
 	DefaultFrom string
 	DefaultTo   string
+	// Help is the page-level "?" affordance (ADR-0023, uc-infra#143/#152)
+	// — see buildHelpView.
+	Help helpView
 }
 
 var saftPageTmpl = template.Must(template.New("saftExport").Parse(`
-<h1>{{.Heading}}</h1>
+<h1>{{.Heading}} <a class="uc-help-affordance" role="link" data-help-topic="{{.Help.TopicID}}"{{if .Help.Href}} href="{{.Help.Href}}"{{end}}{{if .Help.Disabled}} aria-disabled="true"{{end}} tabindex="0" aria-label="{{.Help.Label}}">?</a></h1>
 <p>{{.Intro}}</p>
 <form class="uc-form uc-saft-form" method="get" action="/export/saft">
   <label>{{.FromLabel}} <input type="date" name="from" value="{{.DefaultFrom}}" required></label>

@@ -9,6 +9,7 @@ import (
 	"net/http"
 
 	"github.com/universaltill/universal-core/internal/data"
+	"github.com/universaltill/universal-core/internal/help"
 	"github.com/universaltill/universal-core/internal/httpx"
 	"github.com/universaltill/universal-core/internal/kernel/formrender"
 	"github.com/universaltill/universal-core/internal/kernel/money"
@@ -86,6 +87,10 @@ func (h *Handler) renderRFQComparisonReport(w http.ResponseWriter, r *http.Reque
 	}
 
 	view := h.buildRFQReportView(ctx, ts, rfq, lines, vendors, locale)
+	// ADR-0023's "?" help affordance (uc-infra#152) — same pattern
+	// project_budget_report.go established.
+	rfqReportTopicID := help.RouteTopicID("reports/rfq")
+	view.Help = h.buildHelpView(locale, rfqReportTopicID, help.HasContent(locale, rfqReportTopicID))
 
 	var buf bytes.Buffer
 	if err := rfqReportTmpl.Execute(&buf, view); err != nil {
@@ -220,6 +225,10 @@ type rfqReportView struct {
 
 	Empty   string
 	Missing string
+
+	// Help is the page-level "?" affordance (ADR-0023, uc-infra#143/#152)
+	// — see buildHelpView.
+	Help helpView
 }
 
 type rfqVendorColView struct {
@@ -244,7 +253,7 @@ type rfqCellView struct {
 }
 
 var rfqReportTmpl = template.Must(template.New("rfqReport").Parse(`
-<h1>{{.Title}}</h1>
+<h1>{{.Title}} <a class="uc-help-affordance" role="link" data-help-topic="{{.Help.TopicID}}"{{if .Help.Href}} href="{{.Help.Href}}"{{end}}{{if .Help.Disabled}} aria-disabled="true"{{end}} tabindex="0" aria-label="{{.Help.Label}}">?</a></h1>
 <p>
   <strong>{{.RFQNumberLabel}}:</strong> {{.RFQNumber}}
   &nbsp;&nbsp;<strong>{{.DueDateLabel}}:</strong> {{.DueDate}}

@@ -3,6 +3,7 @@
   "form.related_list.empty": "رکورد مرتبطی وجود ندارد.",
   "form.master_detail.empty": "هنوز ردیفی وجود ندارد.",
   "form.master_detail.add": "+ افزودن",
+  "import.title": "ورود رکوردها",
   "import.choose_file": "یک فایل CSV یا XLSX انتخاب کنید",
   "import.preview_button": "پیش‌نمایش",
   "import.commit_button": "اجرا",
