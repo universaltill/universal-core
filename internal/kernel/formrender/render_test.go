@@ -2828,6 +2828,49 @@ func TestRender_ChildRowsResolveI18nAndAlignColumns(t *testing.T) {
 	}
 }
 
+// TestRender_ChildRowI18nText_LegacyPlainStringFallsThroughNotBlank is the
+// regression test for uc-infra#245's independent review finding 2:
+// childCellValue's FieldI18nText case rendered a legacy pre-migration
+// value (a bare string, from before this field's own string->i18n_text
+// type change) as a BLANK cell — ResolveLocalized returns (_, false) for
+// anything that isn't a locale->string object, and the old code returned
+// nil outright on that failure. That's the identical class of gap
+// internal/api/handlers.go's recordLabel was fixed to fall through for
+// (same issue) — this is the master-detail/related-list child-grid
+// rendering path, a different surface hitting the same stored-data shape.
+// A legacy plain string must render as itself, not disappear.
+func TestRender_ChildRowI18nText_LegacyPlainStringFallsThroughNotBlank(t *testing.T) {
+	r := testRenderer(t)
+	childDef := &entity.Definition{
+		EntityType: "Sub", Version: 1,
+		Fields: []entity.Field{
+			{Name: "title", Type: entity.FieldI18nText, Required: true},
+			{Name: "hours", Type: entity.FieldNumber},
+		},
+	}
+	data := Data{
+		Record: map[string]any{"payment_method": "Wire"},
+		Children: map[string][]map[string]any{
+			// title is a bare string, not a {locale: text} object — the
+			// shape a row predating this field's i18n_text migration
+			// would still carry (ResolveLocalized returns ok=false here).
+			"POLine": {
+				{"title": "LegacyDesign", "hours": 8.0},
+			},
+		},
+		ChildDefs: map[string]*entity.Definition{"POLine": childDef},
+	}
+
+	var buf strings.Builder
+	if err := r.Render(&buf, purchaseOrderForm(), purchaseOrderEntity(), data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, `<td data-field="title">LegacyDesign</td>`) {
+		t.Errorf("legacy plain-string i18n_text child value should render as itself, not blank:\n%s", out)
+	}
+}
+
 // TestRender_SectionTitleResolvesThroughCatalog (#53): a section whose
 // EntityType+Title has a real form.{EntityType}.section.{slug} catalog
 // entry renders the translation, not the Go Definition's literal Title —

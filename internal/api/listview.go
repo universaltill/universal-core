@@ -156,7 +156,7 @@ func (h *Handler) renderRecordList(w http.ResponseWriter, r *http.Request) {
 				// ids it matches. Generic — it reads the Definition,
 				// never a specific entity type — so every reference-first
 				// list gets it, not just this one.
-				ids, err := h.referenceIDsMatching(r.Context(), ts, f.Target, filterValue)
+				ids, err := h.referenceIDsMatching(r.Context(), ts, f.Target, filterValue, locale)
 				if err != nil {
 					h.writeCrudPageError(w, r, &rc, locale, fmt.Sprintf("resolve %s filter", filterField), err)
 					return
@@ -477,7 +477,10 @@ func visibleFields(def *entity.Definition, redacted map[string]bool) []entity.Fi
 // A target with no label field at all resolves to no matches rather
 // than to everything: silently widening a filter to the whole table is
 // worse than an empty result a user can see and correct.
-func (h *Handler) referenceIDsMatching(ctx context.Context, ts tenantScope, targetType, text string) ([]string, error) {
+//
+// locale is the VIEWER's locale — needed only for an i18n_text label
+// field (see below); a plain-string label field ignores it.
+func (h *Handler) referenceIDsMatching(ctx context.Context, ts tenantScope, targetType, text, locale string) ([]string, error) {
 	targetDef, err := ts.entityDef(ctx, targetType)
 	if errors.Is(err, data.ErrNotFound) {
 		// The target's module is not licensed in this tenant — a real,
@@ -496,6 +499,52 @@ func (h *Handler) referenceIDsMatching(ctx context.Context, ts tenantScope, targ
 	labelField := referenceLabelFieldFor(targetDef)
 	if labelField == "" {
 		return []string{}, nil
+	}
+	if f, ok := targetDef.FieldByName(labelField); ok && f.Type == entity.FieldI18nText {
+		// The label field stores a JSON object (ADR-0009): data->>labelField
+		// (the plain-string path below) casts the WHOLE object to text, so
+		// an ILIKE against it matches raw JSON — locale keys and every
+		// other locale's translation included, not just the viewer's own
+		// displayed label. Typing "en" would then match virtually every
+		// row (uc-infra#245), and a substring of some OTHER locale's
+		// translation would match a row whose visible (this-locale) label
+		// doesn't contain it at all.
+		//
+		// This target type is NOT rare: Project/Task/FixedAsset all carry
+		// an i18n_text label and are unbounded transactional entities that
+		// several other entities reference as their own FIRST (therefore
+		// DEFAULT-filter) column — Task.project_id, TimeEntry.task_id,
+		// ProjectBudgetLine.project_id, DepreciationSchedule.fixed_asset_id
+		// — so degrading straight to "matches nothing" (an earlier version
+		// of this fix, independent review) would silently disable board
+		// #49's own filter-by-label feature on those pages, not just fix a
+		// false-positive. Resolve the label APPLICATION-side instead: list
+		// candidates (same referenceFilterMatchLimit bound the plain-string
+		// path already accepts) and match against each one's real,
+		// viewer-locale label — the same resolution recordLabel/the list
+		// cell itself renders, so what matches here is exactly what the
+		// viewer can see on screen. No per-locale JSONB index needed
+		// (that's uc-infra#249's separate, larger deferred item).
+		cands, err := ts.crud.ListPageFiltered(ctx, targetDef, data.ListPageOptions{
+			Limit: referenceFilterMatchLimit,
+		})
+		if errors.Is(err, authz.ErrDenied) {
+			// Same two RBAC refusals the plain-string path's ErrDenied
+			// branch below documents — degrade to "matches nothing", not a
+			// page-wide 403 or an unfiltered widen (uc-infra#89).
+			return []string{}, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("list %s for localized label filter: %w", targetType, err)
+		}
+		needle := strings.ToLower(text)
+		ids := make([]string, 0, len(cands))
+		for _, m := range cands {
+			if strings.Contains(strings.ToLower(h.recordLabel(targetDef, m, locale)), needle) {
+				ids = append(ids, m.ID)
+			}
+		}
+		return ids, nil
 	}
 	matches, err := ts.crud.ListPageFiltered(ctx, targetDef, data.ListPageOptions{
 		FilterField: labelField,
