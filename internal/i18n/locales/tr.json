@@ -3,6 +3,7 @@
   "form.related_list.empty": "İlişkili kayıt yok.",
   "form.master_detail.empty": "Henüz satır yok.",
   "form.master_detail.add": "+ Ekle",
+  "import.title": "Kayıtları içe aktar",
   "import.choose_file": "Bir CSV veya XLSX dosyası seçin",
   "import.preview_button": "Önizle",
   "import.commit_button": "Uygula",

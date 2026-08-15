@@ -3,6 +3,7 @@
   "form.related_list.empty": "لا توجد سجلات مرتبطة.",
   "form.master_detail.empty": "لا توجد بنود بعد.",
   "form.master_detail.add": "+ إضافة",
+  "import.title": "استيراد السجلات",
   "import.choose_file": "اختر ملف CSV أو XLSX",
   "import.preview_button": "معاينة",
   "import.commit_button": "تنفيذ",

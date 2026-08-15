@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/universaltill/universal-core/internal/data"
+	"github.com/universaltill/universal-core/internal/help"
 	"github.com/universaltill/universal-core/internal/httpx"
 	"github.com/universaltill/universal-core/internal/kernel/forecast"
 	"github.com/universaltill/universal-core/internal/kernel/formrender"
@@ -343,6 +344,10 @@ func (h *Handler) renderPurchasingReport(w http.ResponseWriter, r *http.Request)
 		ReorderExpectedCol: h.catalog.T(locale, "report.purchasing.reorder_expected_col"),
 		ReorderRows:        signals,
 	}
+	// ADR-0023's "?" help affordance (uc-infra#152) — same pattern
+	// project_budget_report.go established.
+	purchasingReportTopicID := help.RouteTopicID("reports/purchasing")
+	view.Help = h.buildHelpView(locale, purchasingReportTopicID, help.HasContent(locale, purchasingReportTopicID))
 	// StockOnHand/StockATP are aggregates over the same
 	// FieldPermission-hidden InventoryItem fields as every per-row
 	// quantity on this report (uc-infra#230) — a role that can't see
@@ -1044,6 +1049,10 @@ type purchasingReportView struct {
 	ReorderPointCol    string
 	ReorderExpectedCol string
 	ReorderRows        []reorderRowView
+
+	// Help is the page-level "?" affordance (ADR-0023, uc-infra#143/#152)
+	// — see buildHelpView.
+	Help helpView
 }
 
 type leadTimeRowView struct {
@@ -1143,7 +1152,7 @@ type stockoutRowView struct {
 }
 
 var purchasingReportTmpl = template.Must(template.New("purchasingReport").Parse(`
-<h1>{{.Title}}</h1>
+<h1>{{.Title}} <a class="uc-help-affordance" role="link" data-help-topic="{{.Help.TopicID}}"{{if .Help.Href}} href="{{.Help.Href}}"{{end}}{{if .Help.Disabled}} aria-disabled="true"{{end}} tabindex="0" aria-label="{{.Help.Label}}">?</a></h1>
 
 <h2>{{.StatusHeading}}</h2>
 <div class="uc-report-cards">

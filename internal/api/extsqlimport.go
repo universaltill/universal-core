@@ -38,6 +38,7 @@ import (
 	"time"
 
 	"github.com/universaltill/universal-core/internal/data"
+	"github.com/universaltill/universal-core/internal/help"
 	"github.com/universaltill/universal-core/internal/httpx"
 	"github.com/universaltill/universal-core/internal/kernel/authz"
 	"github.com/universaltill/universal-core/internal/kernel/crud"
@@ -99,6 +100,11 @@ func (h *Handler) extSQLImportPage(w http.ResponseWriter, r *http.Request) {
 		name, _ := rec.Data["name"].(string)
 		view.Sources = append(view.Sources, extSQLImportSourceOption{ID: rec.ID, Name: name})
 	}
+	// ADR-0023's "?" help affordance (uc-infra#152) — a route topic, not
+	// entity-scoped, same reasoning as importUploadPage's own wiring: the
+	// flow works the same for every entityType.
+	extSQLImportTopicID := help.RouteTopicID("import/external-sql")
+	view.Help = h.buildHelpView(locale, extSQLImportTopicID, help.HasContent(locale, extSQLImportTopicID))
 
 	var buf strings.Builder
 	if err := extSQLImportTmpl.ExecuteTemplate(&buf, "page", view); err != nil {
@@ -755,6 +761,9 @@ type extSQLImportPageView struct {
 	NoSources     string
 	ConfigureLink string
 	Sources       []extSQLImportSourceOption
+	// Help is the page-level "?" affordance (ADR-0023, uc-infra#143/#152)
+	// — see buildHelpView.
+	Help helpView
 }
 
 type extSQLImportSourceOption struct {
@@ -832,7 +841,7 @@ type extSQLImportResultView struct {
 var extSQLImportTmpl = template.Must(template.New("ext-sql-import").Parse(`
 {{define "page"}}
 <div class="uc-extsql-import" data-entity-type="{{.EntityType}}">
-<h1>{{.Heading}}</h1>
+<h1>{{.Heading}} <a class="uc-help-affordance" role="link" data-help-topic="{{.Help.TopicID}}"{{if .Help.Href}} href="{{.Help.Href}}"{{end}}{{if .Help.Disabled}} aria-disabled="true"{{end}} tabindex="0" aria-label="{{.Help.Label}}">?</a></h1>
 <p>{{.Intro}}</p>
 {{if .Sources}}
 <form id="uc-extsql-import-form">

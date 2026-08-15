@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/universaltill/universal-core/internal/help"
 	"github.com/universaltill/universal-core/internal/httpx"
 	"github.com/universaltill/universal-core/internal/kernel/aiassist"
 	"github.com/universaltill/universal-core/internal/kernel/aiprovider"
@@ -75,8 +76,8 @@ func (h *Handler) importUploadPage(w http.ResponseWriter, r *http.Request) {
 	// browser has nothing to execute it. The preview/commit fragments
 	// this page's own htmx swaps into #uc-import-result stay bare —
 	// only the very first page load gets the shell.
-	var buf bytes.Buffer
-	err = importTmpl.ExecuteTemplate(&buf, "page", importPageView{
+	view := importPageView{
+		Title:        h.catalog.T(locale, "import.title"),
 		EntityType:   entityType,
 		PreviewHref:  "/import/" + entityType + "/preview",
 		ChooseFile:   h.catalog.T(locale, "import.choose_file"),
@@ -86,7 +87,17 @@ func (h *Handler) importUploadPage(w http.ResponseWriter, r *http.Request) {
 		// yet, and links onward to /settings/sql-sources.
 		SQLImportHref:  "/import/" + entityType + "/sql",
 		SQLImportLabel: h.catalog.T(locale, "import.sql_source_link"),
-	})
+	}
+	// ADR-0023's "?" help affordance (uc-infra#152) — this page is a
+	// route topic (import isn't entity-scoped for help purposes even
+	// though the URL carries an entityType: the wizard itself works the
+	// same way for every entity, so one topic documents it, not one per
+	// entity type), same pattern project_budget_report.go established.
+	importTopicID := help.RouteTopicID("import")
+	view.Help = h.buildHelpView(locale, importTopicID, help.HasContent(locale, importTopicID))
+
+	var buf bytes.Buffer
+	err = importTmpl.ExecuteTemplate(&buf, "page", view)
 	if err != nil {
 		writeInternalError(w, "render import upload page", err)
 		return
@@ -536,12 +547,16 @@ func mappingFromForm(r *http.Request) csvimport.ColumnMapping {
 // --- view models ---
 
 type importPageView struct {
+	Title          string
 	EntityType     string
 	PreviewHref    string
 	ChooseFile     string
 	PreviewLabel   string
 	SQLImportHref  string
 	SQLImportLabel string
+	// Help is the page-level "?" affordance (ADR-0023, uc-infra#143/#152)
+	// — see buildHelpView.
+	Help helpView
 }
 
 type importPreviewView struct {
@@ -691,6 +706,7 @@ func redactsHiddenField(err error, hidden map[string]bool) bool {
 var importTmpl = template.Must(template.New("import").Parse(`
 {{define "page"}}
 <div class="uc-import" data-entity-type="{{.EntityType}}">
+<h1>{{.Title}} <a class="uc-help-affordance" role="link" data-help-topic="{{.Help.TopicID}}"{{if .Help.Href}} href="{{.Help.Href}}"{{end}}{{if .Help.Disabled}} aria-disabled="true"{{end}} tabindex="0" aria-label="{{.Help.Label}}">?</a></h1>
 <form id="uc-import-form" enctype="multipart/form-data">
 <label for="uc-import-file">{{.ChooseFile}}</label>
 <input type="file" id="uc-import-file" name="file" accept=".csv,.xlsx" required>

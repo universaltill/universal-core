@@ -19,6 +19,7 @@ import (
 	"strings"
 
 	"github.com/universaltill/universal-core/internal/data"
+	"github.com/universaltill/universal-core/internal/help"
 	"github.com/universaltill/universal-core/internal/httpx"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
@@ -737,6 +738,10 @@ func (h *Handler) renderWorkflowInbox(w http.ResponseWriter, r *http.Request) {
 		ColumnAction:   h.catalog.T(locale, "workflow_inbox.column_action"),
 		ApproveLabel:   h.catalog.T(locale, "workflow_inbox.approve_button"),
 	}
+	// ADR-0023's "?" help affordance (uc-infra#152) — same pattern
+	// project_budget_report.go established.
+	workflowInboxTopicID := help.RouteTopicID("workflow-jobs")
+	view.Help = h.buildHelpView(locale, workflowInboxTopicID, help.HasContent(locale, workflowInboxTopicID))
 
 	// Department-scoped approval (R17) resolves per-job against the record's
 	// own department, so the viewer's roles can no longer be reduced to one
@@ -810,6 +815,9 @@ type workflowInboxView struct {
 	ColumnAction   string
 	ApproveLabel   string
 	Rows           []workflowInboxRowView
+	// Help is the page-level "?" affordance (ADR-0023, uc-infra#143/#152)
+	// — see buildHelpView.
+	Help helpView
 }
 
 type workflowInboxRowView struct {
@@ -831,7 +839,7 @@ type workflowInboxRowView struct {
 
 var workflowInboxTmpl = template.Must(template.New("workflowInbox").Parse(`
 <div class="uc-list-toolbar">
-<h1>{{.Title}}</h1>
+<h1>{{.Title}} <a class="uc-help-affordance" role="link" data-help-topic="{{.Help.TopicID}}"{{if .Help.Href}} href="{{.Help.Href}}"{{end}}{{if .Help.Disabled}} aria-disabled="true"{{end}} tabindex="0" aria-label="{{.Help.Label}}">?</a></h1>
 </div>
 {{if not .Rows}}
 <p class="uc-empty">{{.Empty}}</p>
