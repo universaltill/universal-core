@@ -17,6 +17,13 @@
 // locale under internal/help/content/{locale}/{entity,route}/*.md), so
 // production now renders a populated two-pane manual; only the "select a
 // topic" right-pane state (no topic chosen yet) still shows that message.
+//
+// This page now documents itself, too (uc-infra#243): renderHelpPage
+// wires its own "?" affordance the same way every other page's does,
+// pointing at help.RouteTopicID("help") — see content/{locale}/route/
+// help.md, which also finally gives the "help" family's own screenshot
+// (previously captured/budgeted/staleness-gated but embedded nowhere) a
+// real topic to live in.
 package api
 
 import (
@@ -78,12 +85,20 @@ func (h *Handler) renderHelpPage(w http.ResponseWriter, r *http.Request, selecte
 		return
 	}
 
+	// ADR-0023's "?" help affordance (uc-infra#243) — the manual documents
+	// itself the same way every other page documents itself: a route
+	// topic, wired the same way import.go's own importTopicID is (route/
+	// isn't authz-filtered — see visibleHelpTopics above — so this is
+	// never gated, matching every other page's own topic never being
+	// gated on read access to *itself*).
+	helpTopicID := help.RouteTopicID("help")
 	view := helpPageView{
 		Title:             h.catalog.T(locale, "help.viewer.title"),
 		SearchPlaceholder: h.catalog.T(locale, "help.viewer.search_placeholder"),
 		SearchHref:        "/help/search",
 		SelectedTopicID:   selectedTopicID,
 		TopicList:         buildHelpTopicListData(h.catalog, locale, visible, selectedTopicID),
+		Help:              h.buildHelpView(locale, helpTopicID, help.HasContent(locale, helpTopicID)),
 	}
 
 	if selectedTopicID == "" {
@@ -317,6 +332,10 @@ type helpPageView struct {
 	DetailTitle    string
 	DetailHTML     template.HTML
 	DetailEmpty    string
+	// Help is the page's own "?" affordance (uc-infra#243) — the manual
+	// documenting itself, same shape every other page's Help field
+	// already has (listview.go's helpView, buildHelpView).
+	Help helpView
 }
 
 type helpNotFoundView struct {
@@ -363,7 +382,7 @@ var helpTopicListTmpl = template.Must(template.New("helpTopicList").Parse(`
 // keystroke would drop its focus/cursor position mid-type.
 var helpPageTmpl = template.Must(helpTopicListTmpl.New("helpPage").Parse(`
 <div class="uc-help">
-<h1>{{.Title}}</h1>
+<h1>{{.Title}} <a class="uc-help-affordance" role="link" data-help-topic="{{.Help.TopicID}}"{{if .Help.Href}} href="{{.Help.Href}}"{{end}}{{if .Help.Disabled}} aria-disabled="true"{{end}} tabindex="0" aria-label="{{.Help.Label}}">?</a></h1>
 <div class="uc-help-layout">
 <aside id="uc-help-topics" class="uc-help-topics">
 <input type="search" id="uc-help-search" class="uc-help-search" name="q" placeholder="{{.SearchPlaceholder}}" aria-label="{{.SearchPlaceholder}}" autocomplete="off"

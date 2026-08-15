@@ -360,6 +360,42 @@ func TestGetIndex_RealEmbeddedContent(t *testing.T) {
 	}
 }
 
+// TestGetIndex_RealEmbeddedContent_RouteHelp (uc-infra#243): the manual
+// now documents itself — a real route/help topic in every shipped
+// locale, embedding the "help" family's own screenshot (previously
+// captured/budgeted/staleness-gated but referenced from no real topic,
+// per this card's own title). en/fa/tr all reference the "en" capture
+// (only en/ar are actually captured per helpScreenshotLocales — fa/tr
+// were never expected to get their own); ar references the "ar"
+// capture, same real-vs-fallback split TestHelp_RealFoundationContent_
+// RendersInViewer_RealBrowser already proves for entity/Role.
+func TestGetIndex_RealEmbeddedContent_RouteHelp(t *testing.T) {
+	idx, err := GetIndex()
+	if err != nil {
+		t.Fatalf("GetIndex: %v", err)
+	}
+	cases := []struct {
+		locale   string
+		imageSrc string
+	}{
+		{"en", "/help/assets/help/en.jpg"},
+		{"ar", "/help/assets/help/ar.jpg"},
+		{"fa", "/help/assets/help/en.jpg"},
+		{"tr", "/help/assets/help/en.jpg"},
+	}
+	for _, c := range cases {
+		t.Run(c.locale, func(t *testing.T) {
+			rendered, ok := idx.Get("route/help", c.locale)
+			if !ok || strings.TrimSpace(rendered.PlainText) == "" {
+				t.Fatalf("GetIndex().Get(route/help, %s) = (%+v, %v), want real, non-blank content", c.locale, rendered, ok)
+			}
+			if !strings.Contains(string(rendered.HTML), `src="`+c.imageSrc+`"`) {
+				t.Errorf("expected route/help (%s) to embed %s, got HTML:\n%s", c.locale, c.imageSrc, rendered.HTML)
+			}
+		})
+	}
+}
+
 func TestSetIndexForTesting_OverridesAndRestores(t *testing.T) {
 	fixture, err := BuildIndexFrom(fstest.MapFS{"content/en/entity/Item.md": mdFile(itemTopicEN())})
 	if err != nil {

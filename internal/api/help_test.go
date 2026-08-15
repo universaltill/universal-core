@@ -75,6 +75,44 @@ func TestAPI_HelpIndex_ListsVisibleTopics(t *testing.T) {
 	}
 }
 
+// TestAPI_HelpIndex_OwnAffordanceEnabledWithRealContent (uc-infra#243):
+// the manual's own "?" affordance (next to its own <h1>, wired to
+// help.RouteTopicID("help")) is a real, enabled link now that
+// internal/help/content/{locale}/route/help.md ships for real.
+//
+// Deliberately uses withHelpFixtureIndex, not the real embedded index —
+// this test only needs GET /help to succeed and list some topics; it is
+// NOT what makes the affordance enabled. help.HasContent (help.go) reads
+// the real go:embed'd content tree directly, independent of whatever
+// help.SetIndexForTesting has swapped GetIndex() to return (that seam
+// only affects topic *listing*/authz, not this per-topic existence
+// check) — so the affordance reflects real shipped content even under a
+// fixture index, the same way every other route page's affordance
+// already does in production once its own topic ships.
+func TestAPI_HelpIndex_OwnAffordanceEnabledWithRealContent(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	withHelpFixtureIndex(t)
+	tenantID, _ := newTestTenant(t, router)
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	req := newRequest("GET", "/help", tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /help = %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `uc-help-affordance" role="link" data-help-topic="route/help" href="/help/route/help"`) {
+		t.Errorf("expected an enabled affordance linking to /help/route/help, got:\n%s", body)
+	}
+	if strings.Contains(body, `data-help-topic="route/help" aria-disabled="true"`) {
+		t.Errorf("expected the affordance NOT disabled, since route/help content really ships now, got:\n%s", body)
+	}
+}
+
 func TestAPI_HelpIndex_NoTopicSelectedShowsEmptyState(t *testing.T) {
 	router := newTestRouter(t)
 	withDevAuthEnabled(t)
