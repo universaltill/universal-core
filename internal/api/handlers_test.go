@@ -147,6 +147,36 @@ func quickCreatableVendorEntityDef() *entity.Definition {
 	return def
 }
 
+// requiredWithDefaultEntityDef mirrors the shape of a real Definition
+// affected by uc-infra#212's finding 2 (purchasing.StockLevel.
+// qty_on_hand, projects.Task.planned_amount): a field that is both
+// Required and carries a Default. Standalone (no FieldReference
+// dependency) so the HTTP-level test below doesn't need fixture
+// records for anything else.
+func requiredWithDefaultEntityDef() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "StockyThing",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "name", Type: entity.FieldString, Required: true},
+			{Name: "qty_on_hand", Type: entity.FieldNumber, Required: true, Default: float64(0), Min: entity.Float64Ptr(0)},
+		},
+	}
+}
+
+func requiredWithDefaultFormDef() *form.Definition {
+	return &form.Definition{
+		EntityType: "StockyThing",
+		Version:    1,
+		Sections: []form.Section{
+			{Title: "Details", Component: form.ComponentFields, Fields: []form.FormField{
+				{Name: "name", Label: "Name"},
+				{Name: "qty_on_hand", Label: "Qty On Hand"},
+			}},
+		},
+	}
+}
+
 func vendorFormDef() *form.Definition {
 	return &form.Definition{
 		EntityType: "Vendor",
@@ -437,6 +467,48 @@ func TestAPI_CreateRecord_ValidationFailureIs400(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for a validation failure, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestAPI_CreateRecord_RequiredFieldWithDefaultOmittedSucceeds is the
+// real-HTTP pin for uc-infra#212's finding 2 (independent review): a
+// field that is both Required and carries a Default — e.g. real
+// Definitions purchasing.StockLevel.qty_on_hand or projects.Task.
+// planned_amount — was rejected as 400 "missing" by this handler's own
+// pre-check (entity.ValidateRecord, called before crud.Create) even
+// after crud.Engine.Create itself started applying the Default and
+// would have accepted the identical payload. The two checks disagreeing
+// about the same payload is exactly the "one Definition, two callers"
+// drift this repo has already been burned by (crud/unique_constraints.go's
+// own comment on uc-infra#81/#105) — this pins that they now agree.
+func TestAPI_CreateRecord_RequiredFieldWithDefaultOmittedSucceeds(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	publishEntityAndForm(t, db, requiredWithDefaultEntityDef(), requiredWithDefaultFormDef())
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	// qty_on_hand is Required, Default: float64(0) — omitted entirely,
+	// not submitted as 0.
+	req := newRequest("POST", "/api/records/StockyThing", tenantID, "farshid", []byte(`{"name":"Widget"}`))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 (Default satisfies Required when omitted), got %d: %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		Data struct {
+			Data map[string]any `json:"data"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal create response: %v", err)
+	}
+	if created.Data.Data["qty_on_hand"] != float64(0) {
+		t.Fatalf(`expected qty_on_hand's Default (0) to be applied and echoed back, got %+v`, created.Data.Data)
 	}
 }
 
@@ -1548,6 +1620,124 @@ func TestAPI_CreateRecord_UniqueConstraintViolationIs400Localized(t *testing.T) 
 	}
 	if count != 1 {
 		t.Fatalf("expected the rejected duplicate create to roll back entirely, found %d CheckIn records", count)
+	}
+}
+
+// createRecordViaAPI POSTs a record through the real JSON API and returns
+// its id — a small shared helper for tests that need a real Party (or
+// other record) to reference by id, rather than each test file
+// re-declaring its own local `post` closure (saftexport_test.go/
+// ublexport_test.go's own convention, duplicated here as a package-level
+// func since two tests in this file share it).
+func createRecordViaAPI(t *testing.T, mux *http.ServeMux, tenantID, entityType, body string) string {
+	t.Helper()
+	req := newRequest("POST", "/api/records/"+entityType, tenantID, "farshid", []byte(body))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST /api/records/%s: expected 201, got %d: %s", entityType, rec.Code, rec.Body.String())
+	}
+	var envelope struct {
+		Data map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode /api/records/%s response: %v", entityType, err)
+	}
+	id, _ := envelope.Data["id"].(string)
+	if id == "" {
+		t.Fatalf("expected a non-empty id in /api/records/%s response, got: %s", entityType, rec.Body.String())
+	}
+	return id
+}
+
+// TestAPI_CreateRecord_ConditionalUniqueConstraintViolationIs400LocalizedEnum
+// is TestAPI_CreateRecord_UniqueConstraintViolationIs400Localized's
+// UniqueWhen counterpart (uc-infra#201, ADR-0028), for the WhenField
+// FieldEnum shape (foundation.PartyRole.role_type=="own_organization").
+// Independent review found the ORIGINAL fix reused
+// crud.error.unique_constraint_violation verbatim for this case, which
+// is actively misleading at the HTTP layer specifically — nothing
+// exercised the actual response body before this test — so this pins
+// the corrected crud.error.conditional_unique_constraint_violation
+// message end to end, including the enum-value label resolving to its
+// human name ("Own Organization"), not the raw "own_organization".
+func TestAPI_CreateRecord_ConditionalUniqueConstraintViolationIs400LocalizedEnum(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := foundation.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	orgA := createRecordViaAPI(t, mux, tenantID, "Party", `{"party_type":"organization","name":"Org One"}`)
+	orgB := createRecordViaAPI(t, mux, tenantID, "Party", `{"party_type":"organization","name":"Org Two"}`)
+
+	first := newRequest("POST", "/api/records/PartyRole", tenantID, "farshid",
+		[]byte(`{"party_id":"`+orgA+`","role_type":"own_organization"}`))
+	firstRec := httptest.NewRecorder()
+	mux.ServeHTTP(firstRec, first)
+	if firstRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 for the first own_organization PartyRole, got %d: %s", firstRec.Code, firstRec.Body.String())
+	}
+
+	second := newRequest("POST", "/api/records/PartyRole", tenantID, "farshid",
+		[]byte(`{"party_id":"`+orgB+`","role_type":"own_organization"}`))
+	secondRec := httptest.NewRecorder()
+	mux.ServeHTTP(secondRec, second)
+	if secondRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a second own_organization PartyRole, got %d: %s", secondRec.Code, secondRec.Body.String())
+	}
+	want := `Only one record can have Role set to Own Organization.`
+	if !strings.Contains(secondRec.Body.String(), want) {
+		t.Fatalf("expected the translated conditional message %q, got: %s", want, secondRec.Body.String())
+	}
+	if strings.Contains(secondRec.Body.String(), "own_organization") || strings.Contains(secondRec.Body.String(), "This combination of") {
+		t.Fatalf("expected no raw enum value or the ordinary Unique message to reach the client, got: %s", secondRec.Body.String())
+	}
+}
+
+// TestAPI_CreateRecord_ConditionalUniqueConstraintViolationIs400LocalizedBool
+// is the FieldBool counterpart (foundation.Currency.is_base==true) —
+// covers uniqueConstraintMessage's fallback path (no enum-value catalog
+// key exists for a bool field, so "true" resolves via common.value.true
+// instead of leaking the raw string).
+func TestAPI_CreateRecord_ConditionalUniqueConstraintViolationIs400LocalizedBool(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := foundation.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	first := newRequest("POST", "/api/records/Currency", tenantID, "farshid",
+		[]byte(`{"code":"USD","name":"US Dollar","is_base":true}`))
+	firstRec := httptest.NewRecorder()
+	mux.ServeHTTP(firstRec, first)
+	if firstRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 for the first is_base=true Currency, got %d: %s", firstRec.Code, firstRec.Body.String())
+	}
+
+	second := newRequest("POST", "/api/records/Currency", tenantID, "farshid",
+		[]byte(`{"code":"EUR","name":"Euro","is_base":true}`))
+	secondRec := httptest.NewRecorder()
+	mux.ServeHTTP(secondRec, second)
+	if secondRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a second is_base=true Currency, got %d: %s", secondRec.Code, secondRec.Body.String())
+	}
+	want := `Only one record can have Base Currency set to Yes.`
+	if !strings.Contains(secondRec.Body.String(), want) {
+		t.Fatalf("expected the translated conditional message %q, got: %s", want, secondRec.Body.String())
+	}
+	if strings.Contains(secondRec.Body.String(), `"true"`) || strings.Contains(secondRec.Body.String(), "set to true") {
+		t.Fatalf("expected no raw \"true\" literal to reach the client, got: %s", secondRec.Body.String())
 	}
 }
 

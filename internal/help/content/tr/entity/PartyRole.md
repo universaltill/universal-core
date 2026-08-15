@@ -34,9 +34,11 @@ aynı Taraf kaydına ikinci bir Taraf Rolü eklenir.
 - **Kendi Kuruluşum** özel bir roldür: kendi şirketinizi temsil eden tek
   Taraf kaydını işaretler ve yasal dışa aktarımlarda sicil numarası ve
   vergi bilgileri için (bunlar Tarafın kendisinde tutulur) kullanılır. Bir
-  kiracıda yalnızca bir Tarafın bu role sahip olması gerekir — sistem
-  ikinciyi kesin olarak engellemez, bu yüzden bunu bir sınır değil,
-  korunması gereken bir yönetimsel kural olarak görün.
+  kiracıda yalnızca bir Taraf bu role sahip olabilir — sistem ikinci bir
+  ekleme girişimini doğrudan reddeder, bu yüzden bunu bir yönetimsel kural
+  olarak ayrıca hatırlamanıza gerek yoktur. Bu rolü başka bir Tarafa
+  taşımak için önce mevcut Taraftan kaldırıp kaydedin, ardından yeni
+  Tarafa ekleyin.
 - Roller birikimlidir, birbirini dışlamaz: bir Tarafın tedarikçi olması,
   aynı zamanda müşteri veya irtibat kişisi olmasını engellemez.
 - Bir rolü kaldırmak, altındaki Tarafı veya geçmişini silmez — adresler,

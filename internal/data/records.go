@@ -339,6 +339,40 @@ type LifeCompleteGroupOptions struct {
 	ChildPostedField string // child field; non-empty means "counts toward the quota"
 	ChildDueField    string // child field, an ISO date string
 	Cutoff           string // ISO date; a child is "due" when ChildDueField <= Cutoff
+	// ParentCounterField (uc-infra#202), optional: a parent field,
+	// numeric, that the CALLER maintains as an approximate running count
+	// of children satisfying ChildPostedField. When set,
+	// LifeCompleteGroupIDs compares this stored value to LifeField
+	// directly instead of re-deriving the count from a correlated
+	// count(*) over ChildType — O(1) per candidate parent instead of
+	// O(that parent's own child-row count) for the quota half of the
+	// check specifically (the NOT EXISTS due-row half is identical
+	// either way — see this method's own doc comment on why that half
+	// isn't actually index-served, so this option speeds up the common
+	// case, not every case). When empty (the default, and every caller
+	// before this one), behavior is unchanged: the count(*) subquery
+	// re-derives the true count from the child rows themselves every
+	// call.
+	//
+	// TREAT THIS AS A FAST, SOMETIMES-WRONG FILTER, NOT AN AUTHORITY —
+	// a caller-maintained counter can drift (low OR high) from whatever
+	// out-of-band writes touch the child rows outside the caller's own
+	// bookkeeping path (assets.FixedAsset.posted_period_count's own doc
+	// comment has the concrete example: independent review found
+	// DepreciationScheduleForm can change a child's ChildPostedField
+	// value without the parent counter following). A result this option
+	// includes must be re-verified against the real child rows before
+	// anything irreversible happens to it — see
+	// assets.verifyLifeComplete/healStuckFullyDepreciatedAssets for the
+	// pattern this repo's own caller uses. A missing or non-numeric
+	// ParentCounterField value on a given parent (e.g. a row written
+	// before the caller's own Version bump added the field, ahead of a
+	// backfill) makes that parent's quota comparison evaluate to
+	// NULL/false, the same "not complete" fail-safe LifeField's own
+	// `> 0` regex guard already gives a missing/malformed LifeField —
+	// never a false "complete" from THIS half of the check (the
+	// caller-side verification step is still what closes the loop).
+	ParentCounterField string
 }
 
 // LifeCompleteGroupIDs returns up to limit ParentType record ids
@@ -366,47 +400,96 @@ type LifeCompleteGroupOptions struct {
 //
 // Computed as one SQL query — a self-join on the same generic `records`
 // table (parent and child rows both live there) using a correlated
-// NOT EXISTS and a correlated count — rather than a Go-side loop
-// reading and decoding every child row for every candidate parent: cost
-// is proportional to how many parents are ACTUALLY stuck (the ordinary
-// case is zero), not to total child-row volume, which is exactly what
-// made the previous shape of this whole area (reading every
-// DepreciationSchedule row in the tenant on every call) the problem
-// uc-infra#182 tracks.
+// NOT EXISTS and (unless ParentCounterField is set — see below) a
+// correlated count — rather than a Go-side loop reading and decoding
+// every child row for every candidate parent. In the ordinary healthy
+// steady state (nothing stuck), this is fast: don't assume that
+// generalizes to "proportional to how many parents are ACTUALLY
+// stuck" without checking ADR-0026/ADR-0029 first — independent review
+// measured the NOT EXISTS anti-join itself is NOT index-served (no
+// index on `records.data` can serve a bind-parameterized `->>` key),
+// so a call where most candidates genuinely ARE stuck still costs
+// close to the tenant's total child-row volume, `LIMIT` notwithstanding
+// (`ORDER BY parent.id LIMIT $n` bounds the RESULT size, not the work —
+// the sort has to consume every qualifying candidate before
+// truncating). This is a real, currently-unfixed limitation of the
+// underlying anti-join both before and after uc-infra#202's
+// ParentCounterField addition — not something that option regresses.
 //
 // Every field name is bound as a parameter to the ->> operator, never
 // concatenated into the query text, the same discipline every other
 // generic field-name-driven query in this file follows.
 func (r *RecordRepo) LifeCompleteGroupIDs(ctx context.Context, opts LifeCompleteGroupOptions, limit int) ([]string, error) {
-	rows, err := r.db.QueryContext(ctx, `
-		SELECT parent.id
-		FROM records parent
-		WHERE parent.entity_type = $1
-		  AND parent.deleted_at IS NULL
-		  AND parent.data->>$2 = $3
-		  AND parent.data->>$4 ~ '^-?[0-9]+(\.[0-9]+)?$'
-		  AND (parent.data->>$4)::numeric > 0
-		  AND NOT EXISTS (
-			SELECT 1 FROM records child
-			WHERE child.entity_type = $5
-			  AND child.deleted_at IS NULL
-			  AND child.data->>$6 = parent.id::text
-			  AND coalesce(child.data->>$7, '') = ''
-			  AND child.data->>$8 <> '' AND child.data->>$8 <= $9
-		  )
-		  AND (
-			SELECT count(*) FROM records child2
-			WHERE child2.entity_type = $5
-			  AND child2.deleted_at IS NULL
-			  AND child2.data->>$6 = parent.id::text
-			  AND coalesce(child2.data->>$7, '') <> ''
-		  ) >= (parent.data->>$4)::numeric
-		ORDER BY parent.id
-		LIMIT $10`,
-		opts.ParentType, opts.ParentMatchField, opts.ParentMatchValue, opts.LifeField,
-		opts.ChildType, opts.ChildJoinField, opts.ChildPostedField, opts.ChildDueField, opts.Cutoff,
-		limit,
-	)
+	var rows *sql.Rows
+	var err error
+	if opts.ParentCounterField != "" {
+		// Counter fast path (uc-infra#202): the quota check is a direct
+		// comparison against a value the caller already maintains,
+		// instead of a correlated count(*) over every candidate
+		// parent's own child rows — see LifeCompleteGroupOptions.
+		// ParentCounterField's own doc comment for why this result is a
+		// filter for the caller to re-verify, not an authority. The NOT
+		// EXISTS due-row check is IDENTICAL to the slow path's own below
+		// — same query shape, same cost characteristics (this method's
+		// own doc comment covers why that's NOT actually index-served
+		// once the field name is a bind parameter rather than a literal;
+		// don't call it "cheap" here without re-checking that first).
+		rows, err = r.db.QueryContext(ctx, `
+			SELECT parent.id
+			FROM records parent
+			WHERE parent.entity_type = $1
+			  AND parent.deleted_at IS NULL
+			  AND parent.data->>$2 = $3
+			  AND parent.data->>$4 ~ '^-?[0-9]+(\.[0-9]+)?$'
+			  AND (parent.data->>$4)::numeric > 0
+			  AND parent.data->>$5 ~ '^-?[0-9]+(\.[0-9]+)?$'
+			  AND (parent.data->>$5)::numeric >= (parent.data->>$4)::numeric
+			  AND NOT EXISTS (
+				SELECT 1 FROM records child
+				WHERE child.entity_type = $6
+				  AND child.deleted_at IS NULL
+				  AND child.data->>$7 = parent.id::text
+				  AND coalesce(child.data->>$8, '') = ''
+				  AND child.data->>$9 <> '' AND child.data->>$9 <= $10
+			  )
+			ORDER BY parent.id
+			LIMIT $11`,
+			opts.ParentType, opts.ParentMatchField, opts.ParentMatchValue, opts.LifeField,
+			opts.ParentCounterField,
+			opts.ChildType, opts.ChildJoinField, opts.ChildPostedField, opts.ChildDueField, opts.Cutoff,
+			limit,
+		)
+	} else {
+		rows, err = r.db.QueryContext(ctx, `
+			SELECT parent.id
+			FROM records parent
+			WHERE parent.entity_type = $1
+			  AND parent.deleted_at IS NULL
+			  AND parent.data->>$2 = $3
+			  AND parent.data->>$4 ~ '^-?[0-9]+(\.[0-9]+)?$'
+			  AND (parent.data->>$4)::numeric > 0
+			  AND NOT EXISTS (
+				SELECT 1 FROM records child
+				WHERE child.entity_type = $5
+				  AND child.deleted_at IS NULL
+				  AND child.data->>$6 = parent.id::text
+				  AND coalesce(child.data->>$7, '') = ''
+				  AND child.data->>$8 <> '' AND child.data->>$8 <= $9
+			  )
+			  AND (
+				SELECT count(*) FROM records child2
+				WHERE child2.entity_type = $5
+				  AND child2.deleted_at IS NULL
+				  AND child2.data->>$6 = parent.id::text
+				  AND coalesce(child2.data->>$7, '') <> ''
+			  ) >= (parent.data->>$4)::numeric
+			ORDER BY parent.id
+			LIMIT $10`,
+			opts.ParentType, opts.ParentMatchField, opts.ParentMatchValue, opts.LifeField,
+			opts.ChildType, opts.ChildJoinField, opts.ChildPostedField, opts.ChildDueField, opts.Cutoff,
+			limit,
+		)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("find life-complete groups: %w", err)
 	}
@@ -742,12 +825,50 @@ func (r *RecordRepo) ListPageFiltered(ctx context.Context, entityType string, op
 // parameter to the ->> operator, never concatenated into the query text,
 // so a caller-controlled field name can't alter the query's structure.
 func (r *RecordRepo) ListByField(ctx context.Context, entityType, fieldName, value string) ([]Record, error) {
-	rows, err := r.db.QueryContext(ctx,
-		`SELECT id, data, version FROM records
+	return r.listByField(ctx, r.db, entityType, fieldName, value, false)
+}
+
+// ListByFieldTx is ListByField against a caller-supplied querier/tx
+// instead of r.db — same "same shape as the Tx write methods, now needed
+// for a read too" reasoning GetTx/ListTx's own doc comments give. First
+// real caller: assets.GenerateDepreciationScheduleOnWrite, which needs to
+// read a FixedAsset's existing DepreciationSchedule rows from within the
+// same transaction as the FixedAsset write that triggered it, to decide
+// whether the schedule needs regenerating.
+func (r *RecordRepo) ListByFieldTx(ctx context.Context, q querier, entityType, fieldName, value string) ([]Record, error) {
+	return r.listByField(ctx, q, entityType, fieldName, value, false)
+}
+
+// ListByFieldForUpdateTx is ListByFieldTx with `SELECT ... FOR UPDATE` —
+// for a caller that is about to decide whether to delete/replace the
+// rows it reads based on their current state (e.g. "has anything here
+// been posted yet?") and cannot let that decision race a concurrent
+// writer. Without the row lock, a plain read here can observe a row as
+// not-yet-posted, decide it's safe to delete, and then block on (and
+// ultimately still delete) a row a concurrent transaction is in the
+// middle of marking posted — the two-step "check, then act" any
+// non-locking read+write pair is prone to under READ COMMITTED. First
+// real caller: assets.GenerateDepreciationScheduleOnWrite's posted-row
+// guard, which must not let a FixedAsset edit race
+// internal/worker.Runner's depreciation-posting tick — see that hook's
+// own doc comment for the concrete interleaving this closes.
+func (r *RecordRepo) ListByFieldForUpdateTx(ctx context.Context, tx *sql.Tx, entityType, fieldName, value string) ([]Record, error) {
+	return r.listByField(ctx, tx, entityType, fieldName, value, true)
+}
+
+func (r *RecordRepo) listByField(ctx context.Context, q querier, entityType, fieldName, value string, forUpdate bool) ([]Record, error) {
+	query := `SELECT id, data, version FROM records
 		 WHERE entity_type = $1 AND data->>$2 = $3 AND deleted_at IS NULL
-		 ORDER BY created_at, id`,
-		entityType, fieldName, value,
-	)
+		 ORDER BY created_at, id`
+	if forUpdate {
+		// FOR UPDATE requires a real transaction, not a bare *sql.DB
+		// connection (which could span more than one physical connection
+		// across calls) — enforced by taking *sql.Tx explicitly in
+		// ListByFieldForUpdateTx's own signature rather than the generic
+		// querier interface every other Tx method here accepts.
+		query += " FOR UPDATE"
+	}
+	rows, err := q.QueryContext(ctx, query, entityType, fieldName, value)
 	if err != nil {
 		return nil, fmt.Errorf("list records by field: %w", err)
 	}

@@ -222,6 +222,138 @@ func TestRecordRepo_ListTx_SeesUncommittedWritesInSameTx(t *testing.T) {
 	}
 }
 
+// TestRecordRepo_ListByFieldForUpdateTx_BlocksConcurrentUpdate confirms
+// ListByFieldForUpdateTx's whole reason to exist: a real Postgres row
+// lock, not just correct data. Without FOR UPDATE, a caller deciding
+// "is it safe to delete this row?" based on a plain read can race a
+// concurrent writer — this is the exact interleaving
+// assets.GenerateDepreciationScheduleOnWrite's posted-row guard must not
+// allow against internal/worker.Runner's depreciation-posting tick.
+func TestRecordRepo_ListByFieldForUpdateTx_BlocksConcurrentUpdate(t *testing.T) {
+	tdb := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(tdb)
+
+	rec, err := repo.Create(ctx, "Widget", map[string]any{"name": "a", "group": "x"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	txA, err := tdb.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin txA: %v", err)
+	}
+	defer txA.Rollback() //nolint:errcheck
+
+	if _, err := repo.ListByFieldForUpdateTx(ctx, txA, "Widget", "group", "x"); err != nil {
+		t.Fatalf("ListByFieldForUpdateTx: %v", err)
+	}
+
+	// A concurrent transaction trying to update the SAME row must block
+	// until txA ends — proven by racing a "did it complete yet?" check
+	// against an explicit release of txA's lock, not by timing alone.
+	updated := make(chan error, 1)
+	go func() {
+		txB, err := tdb.BeginTx(ctx, nil)
+		if err != nil {
+			updated <- fmt.Errorf("begin txB: %w", err)
+			return
+		}
+		defer txB.Rollback() //nolint:errcheck
+		_, err = repo.UpdateTx(ctx, txB, "Widget", rec.ID, map[string]any{"name": "b", "group": "x"}, nil)
+		updated <- err
+	}()
+
+	select {
+	case err := <-updated:
+		t.Fatalf("expected txB's update to block behind txA's FOR UPDATE lock, but it completed (err=%v)", err)
+	case <-time.After(300 * time.Millisecond):
+		// Still blocked, as expected — release the lock and confirm txB
+		// then proceeds.
+	}
+
+	if err := txA.Rollback(); err != nil {
+		t.Fatalf("rollback txA: %v", err)
+	}
+
+	select {
+	case err := <-updated:
+		if err != nil {
+			t.Fatalf("txB's update failed after txA released the lock: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("txB's update never completed after txA released the lock")
+	}
+}
+
+// TestRecordRepo_ListByFieldTx_ParticipatesInCallerTransaction mirrors
+// TestRecordRepo_ListTx_ParticipatesInCallerTransaction for the
+// field-filtered variant — same reasoning, same fixture shape.
+func TestRecordRepo_ListByFieldTx_ParticipatesInCallerTransaction(t *testing.T) {
+	tdb := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(tdb)
+
+	if _, err := repo.Create(ctx, "Widget", map[string]any{"name": "a", "group": "x"}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := repo.Create(ctx, "Widget", map[string]any{"name": "b", "group": "y"}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	tx, err := tdb.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	got, err := repo.ListByFieldTx(ctx, tx, "Widget", "group", "x")
+	if err != nil {
+		t.Fatalf("ListByFieldTx: %v", err)
+	}
+	if len(got) != 1 || got[0].Data["name"] != "a" {
+		t.Fatalf("expected exactly the 1 Widget in group x, got %+v", got)
+	}
+}
+
+// TestRecordRepo_ListByFieldTx_SeesUncommittedWritesInSameTx mirrors
+// TestRecordRepo_ListTx_SeesUncommittedWritesInSameTx — the property
+// assets.GenerateDepreciationScheduleOnWrite's Update path actually
+// depends on: it must see any DepreciationSchedule rows already written
+// earlier in the SAME FixedAsset write's transaction, not just rows
+// already committed before this transaction began.
+func TestRecordRepo_ListByFieldTx_SeesUncommittedWritesInSameTx(t *testing.T) {
+	tdb := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(tdb)
+
+	tx, err := tdb.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	if _, err := repo.CreateTx(ctx, tx, "Widget", map[string]any{"name": "uncommitted", "group": "x"}); err != nil {
+		t.Fatalf("CreateTx: %v", err)
+	}
+
+	got, err := repo.ListByFieldTx(ctx, tx, "Widget", "group", "x")
+	if err != nil {
+		t.Fatalf("ListByFieldTx: %v", err)
+	}
+	if len(got) != 1 || got[0].Data["name"] != "uncommitted" {
+		t.Fatalf("expected ListByFieldTx to see the uncommitted write within the same tx, got %+v", got)
+	}
+
+	outside, err := repo.ListByField(ctx, "Widget", "group", "x")
+	if err != nil {
+		t.Fatalf("ListByField: %v", err)
+	}
+	if len(outside) != 0 {
+		t.Fatalf("expected the uncommitted write to be invisible outside the tx, got %+v", outside)
+	}
+}
+
 // ListPageFiltered/CountFiltered: sorting, substring filtering, and — the
 // property that matters most for a JSONB query built from user input — no
 // injection through the field name.
@@ -1279,5 +1411,248 @@ func TestRecordRepo_LifeCompleteGroupIDs_RespectsLimit(t *testing.T) {
 	}
 	if len(got) != 2 {
 		t.Fatalf("expected exactly 2 rows (limit), got %d: %v", len(got), got)
+	}
+}
+
+// TestRecordRepo_LifeCompleteGroupIDs_ParentCounterFieldTrustsStoredValueNotChildCount
+// is the direct regression test for uc-infra#202's fast path
+// (LifeCompleteGroupOptions.ParentCounterField): when set, the quota
+// check must compare the STORED counter value to LifeField, not
+// re-derive it from ChildPostedField rows — proven here by deliberately
+// making the two disagree (a real child count of 1, a stored counter of
+// 5) and confirming the counter, not the true child count, is what
+// decides the outcome in both directions. This is what actually
+// distinguishes the fast path from the slow (count(*)) one this test's
+// sibling above already covers — a test that kept the two in agreement
+// wouldn't prove which one the query is really using.
+func TestRecordRepo_LifeCompleteGroupIDs_ParentCounterFieldTrustsStoredValueNotChildCount(t *testing.T) {
+	tdb := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(tdb)
+
+	opts := LifeCompleteGroupOptions{
+		ParentType: "Parent", ParentMatchField: "status", ParentMatchValue: "active",
+		LifeField: "quota", ChildType: "Child", ChildJoinField: "parent_id",
+		ChildPostedField: "done_at", ChildDueField: "due_date", Cutoff: "2020-06-01",
+		ParentCounterField: "posted_count",
+	}
+
+	// counterAheadOfChildren: only 1 real posted child, but the stored
+	// counter claims 5 (>= quota 3) — the fast path must trust the
+	// counter and report this parent complete, even though the slow
+	// (count(*)) path would not.
+	counterAhead, err := repo.Create(ctx, "Parent", map[string]any{
+		"status": "active", "quota": float64(3), "posted_count": float64(5),
+	})
+	if err != nil {
+		t.Fatalf("create counterAhead parent: %v", err)
+	}
+	if _, err := repo.Create(ctx, "Child", map[string]any{"parent_id": counterAhead.ID, "done_at": "2020-01-01"}); err != nil {
+		t.Fatalf("create counterAhead child: %v", err)
+	}
+
+	// counterBehindChildren: 3 real posted children (would satisfy quota
+	// 3 under the slow path), but the stored counter is still 0 — the
+	// fast path must trust the counter and report this parent NOT
+	// complete.
+	counterBehind, err := repo.Create(ctx, "Parent", map[string]any{
+		"status": "active", "quota": float64(3), "posted_count": float64(0),
+	})
+	if err != nil {
+		t.Fatalf("create counterBehind parent: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := repo.Create(ctx, "Child", map[string]any{"parent_id": counterBehind.ID, "done_at": "2020-01-01"}); err != nil {
+			t.Fatalf("create counterBehind child %d: %v", i, err)
+		}
+	}
+
+	got, err := repo.LifeCompleteGroupIDs(ctx, opts, 100)
+	if err != nil {
+		t.Fatalf("LifeCompleteGroupIDs: %v", err)
+	}
+	gotIDs := map[string]bool{}
+	for _, id := range got {
+		gotIDs[id] = true
+	}
+	if !gotIDs[counterAhead.ID] {
+		t.Errorf("expected counterAhead (%s) reported complete — its stored counter meets quota", counterAhead.ID)
+	}
+	if gotIDs[counterBehind.ID] {
+		t.Errorf("counterBehind (%s) should NOT be reported complete — its stored counter hasn't caught up, even though its real children have", counterBehind.ID)
+	}
+}
+
+// TestRecordRepo_LifeCompleteGroupIDs_ParentCounterFieldMissingOrMalformedIsNotComplete
+// is the direct regression test for the fail-safe default
+// ParentCounterField's own doc comment promises: a parent with no
+// ParentCounterField value at all (the pre-backfill shape a real row
+// predating a Version bump that added the field would have), or one
+// whose stored value isn't numeric, must read as "not complete" — never
+// as a false positive from a NULL/malformed comparison silently
+// evaluating truthy.
+func TestRecordRepo_LifeCompleteGroupIDs_ParentCounterFieldMissingOrMalformedIsNotComplete(t *testing.T) {
+	tdb := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(tdb)
+
+	opts := LifeCompleteGroupOptions{
+		ParentType: "Parent", ParentMatchField: "status", ParentMatchValue: "active",
+		LifeField: "quota", ChildType: "Child", ChildJoinField: "parent_id",
+		ChildPostedField: "done_at", ChildDueField: "due_date", Cutoff: "2020-06-01",
+		ParentCounterField: "posted_count",
+	}
+
+	// missingCounter: quota 1, one real posted child, but no
+	// posted_count key at all.
+	missingCounter, err := repo.Create(ctx, "Parent", map[string]any{"status": "active", "quota": float64(1)})
+	if err != nil {
+		t.Fatalf("create missingCounter parent: %v", err)
+	}
+	if _, err := repo.Create(ctx, "Child", map[string]any{"parent_id": missingCounter.ID, "done_at": "2020-01-01"}); err != nil {
+		t.Fatalf("create missingCounter child: %v", err)
+	}
+
+	// malformedCounter: a non-numeric stored value.
+	malformedCounter, err := repo.Create(ctx, "Parent", map[string]any{
+		"status": "active", "quota": float64(1), "posted_count": "many",
+	})
+	if err != nil {
+		t.Fatalf("create malformedCounter parent: %v", err)
+	}
+	if _, err := repo.Create(ctx, "Child", map[string]any{"parent_id": malformedCounter.ID, "done_at": "2020-01-01"}); err != nil {
+		t.Fatalf("create malformedCounter child: %v", err)
+	}
+
+	got, err := repo.LifeCompleteGroupIDs(ctx, opts, 100)
+	if err != nil {
+		t.Fatalf("LifeCompleteGroupIDs: %v", err)
+	}
+	for _, excluded := range []struct {
+		name string
+		id   string
+	}{{"missingCounter", missingCounter.ID}, {"malformedCounter", malformedCounter.ID}} {
+		for _, id := range got {
+			if id == excluded.id {
+				t.Errorf("%s (%s) should NOT be reported complete — a missing/malformed counter must fail safe, not read as quota met", excluded.name, excluded.id)
+			}
+		}
+	}
+}
+
+// TestRecordRepo_LifeCompleteGroupIDs_ParentCounterFieldStillRequiresNoDueChildren
+// confirms the fast path keeps the SAME due-child safety check the slow
+// path has always had (this method's own doc comment,
+// uc-infra#137/ADR-0026): meeting quota via the stored counter must not
+// override a genuinely outstanding due-and-unposted child — only
+// ParentCounterField's own count(*)-replacement changed, not the
+// NOT EXISTS clause it's paired with.
+func TestRecordRepo_LifeCompleteGroupIDs_ParentCounterFieldStillRequiresNoDueChildren(t *testing.T) {
+	tdb := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(tdb)
+
+	parent, err := repo.Create(ctx, "Parent", map[string]any{
+		"status": "active", "quota": float64(1), "posted_count": float64(5), // quota met via counter
+	})
+	if err != nil {
+		t.Fatalf("create parent: %v", err)
+	}
+	if _, err := repo.Create(ctx, "Child", map[string]any{"parent_id": parent.ID, "due_date": "2020-01-02", "done_at": ""}); err != nil {
+		t.Fatalf("create outstanding due child: %v", err)
+	}
+
+	got, err := repo.LifeCompleteGroupIDs(ctx, LifeCompleteGroupOptions{
+		ParentType: "Parent", ParentMatchField: "status", ParentMatchValue: "active",
+		LifeField: "quota", ChildType: "Child", ChildJoinField: "parent_id",
+		ChildPostedField: "done_at", ChildDueField: "due_date", Cutoff: "2020-06-01",
+		ParentCounterField: "posted_count",
+	}, 100)
+	if err != nil {
+		t.Fatalf("LifeCompleteGroupIDs: %v", err)
+	}
+	for _, id := range got {
+		if id == parent.ID {
+			t.Fatalf("parent %s should NOT be reported complete — a due-and-unposted child remains, regardless of the counter meeting quota", parent.ID)
+		}
+	}
+}
+
+// TestRecordRepo_LifeCompleteGroupIDs_CounterPathAgreesWithSlowPathOnHonestData
+// guards against the two query bodies (with and without ParentCounterField
+// — independent review's nit: they duplicate the same NOT EXISTS
+// predicate as two separate string literals rather than one shared
+// fragment) drifting apart from each other. On a fixture where the
+// counter is kept honest (matches the real child count), both paths
+// must agree on every parent, not just the ones each test elsewhere
+// happens to check individually.
+func TestRecordRepo_LifeCompleteGroupIDs_CounterPathAgreesWithSlowPathOnHonestData(t *testing.T) {
+	tdb := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(tdb)
+
+	cases := []struct {
+		name        string
+		quota       float64
+		doneCount   int
+		outstanding bool // an extra due-and-unposted child
+	}{
+		{"exactly at quota, nothing outstanding", 2, 2, false},
+		{"below quota", 3, 2, false},
+		{"above quota", 2, 4, false},
+		{"at quota but something outstanding", 1, 1, true},
+		{"zero children", 1, 0, false},
+	}
+
+	ids := map[string]string{}
+	for _, c := range cases {
+		parent, err := repo.Create(ctx, "Parent", map[string]any{
+			"status": "active", "quota": c.quota, "posted_count": float64(c.doneCount),
+		})
+		if err != nil {
+			t.Fatalf("create parent %q: %v", c.name, err)
+		}
+		ids[c.name] = parent.ID
+		for i := 0; i < c.doneCount; i++ {
+			if _, err := repo.Create(ctx, "Child", map[string]any{"parent_id": parent.ID, "done_at": "2020-01-01"}); err != nil {
+				t.Fatalf("create done child for %q: %v", c.name, err)
+			}
+		}
+		if c.outstanding {
+			if _, err := repo.Create(ctx, "Child", map[string]any{"parent_id": parent.ID, "due_date": "2020-01-02", "done_at": ""}); err != nil {
+				t.Fatalf("create outstanding child for %q: %v", c.name, err)
+			}
+		}
+	}
+
+	baseOpts := LifeCompleteGroupOptions{
+		ParentType: "Parent", ParentMatchField: "status", ParentMatchValue: "active",
+		LifeField: "quota", ChildType: "Child", ChildJoinField: "parent_id",
+		ChildPostedField: "done_at", ChildDueField: "due_date", Cutoff: "2020-06-01",
+	}
+
+	slow, err := repo.LifeCompleteGroupIDs(ctx, baseOpts, 100)
+	if err != nil {
+		t.Fatalf("LifeCompleteGroupIDs (slow path): %v", err)
+	}
+	fastOpts := baseOpts
+	fastOpts.ParentCounterField = "posted_count"
+	fast, err := repo.LifeCompleteGroupIDs(ctx, fastOpts, 100)
+	if err != nil {
+		t.Fatalf("LifeCompleteGroupIDs (fast path): %v", err)
+	}
+
+	slowSet := map[string]bool{}
+	for _, id := range slow {
+		slowSet[id] = true
+	}
+	fastSet := map[string]bool{}
+	for _, id := range fast {
+		fastSet[id] = true
+	}
+	for name, id := range ids {
+		if slowSet[id] != fastSet[id] {
+			t.Errorf("case %q: slow path complete=%v, fast path complete=%v — must agree when the counter is honest", name, slowSet[id], fastSet[id])
+		}
 	}
 }

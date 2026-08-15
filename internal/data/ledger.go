@@ -5,12 +5,42 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
+
+// glAccountsCodeConstraintName is the Postgres constraint name
+// 0001_init.sql's inline `UNIQUE (code)` gives gl_accounts (Postgres'
+// default <table>_<column>_key naming) — named explicitly so
+// UpsertBySourceRecord can classify a conflict on it the same way
+// record_unique_keys.go's classifyUniqueKeyErr classifies its own
+// SQLSTATE 23505 (never by substring-matching the driver error's TEXT,
+// same reasoning ErrUniqueKeyConflict's own doc comment already gives).
+const glAccountsCodeConstraintName = "gl_accounts_code_key"
+
+// ErrGLAccountCodeConflict is returned by UpsertBySourceRecord when the
+// code it's trying to write is already held by a DIFFERENT gl_accounts
+// row than the one source_record_id identifies (uc-infra#205 review
+// finding 4). ON CONFLICT (source_record_id) only arbitrates a
+// collision on that column; it does nothing to prevent the UPDATE it
+// performs from itself violating the pre-existing UNIQUE(code)
+// constraint against an unrelated row. Reachable today in one real way:
+// renaming an Account onto a code still held by a gl_accounts row that
+// predates uc-infra#205 and was left unlinked because the backfill
+// migration found no unambiguous live Account to correlate it to (see
+// 0009_gl_accounts_source_record_id.sql's own doc comment) — most
+// plausibly a rename back to a code that was itself renamed away from
+// before this fix shipped. Failing the write outright here is
+// deliberate: silently reusing that unrelated row would misattribute
+// its (possibly already-posted-against) identity to the wrong Account.
+var ErrGLAccountCodeConflict = errors.New("data: gl_account code already used by a different, unlinked gl_accounts row")
 
 // GLAccountRepo is the repository for gl_accounts — the ledger core's own
 // typed chart of accounts (ADR-0004), a projection of
-// internal/kernel/finance.Account kept in sync by finance.SyncGLAccounts,
-// never written to directly by the generic entity engine.
+// internal/kernel/finance.Account kept in sync by
+// finance.SyncGLAccountOnWrite (the per-write hook, ordinary path) and
+// finance.SyncGLAccounts (the full sweep, backfill path), never written
+// to directly by the generic entity engine.
 type GLAccountRepo struct {
 	db querier
 }
@@ -19,13 +49,21 @@ func NewGLAccountRepo(db querier) *GLAccountRepo {
 	return &GLAccountRepo{db: db}
 }
 
-// UpsertByCode inserts or updates a gl_accounts row keyed by code (the
-// same natural key finance.Account already uses) — the one write path
-// ADR-0004 allows into this table, called only from
-// finance.SyncGLAccounts, never from the generic crud.Engine. Each call
-// is its own auto-committed statement — a sync run needs no atomicity
-// across different accounts' rows, the same reasoning
-// moduleseed.PublishAll's own per-item idempotent upserts already rely on.
+// UpsertByCode inserts or updates a gl_accounts row keyed by code alone
+// (no source_record_id link). No production caller uses this anymore
+// (uc-infra#205): finance.SyncGLAccountOnWrite/SyncGLAccounts both moved
+// to UpsertBySourceRecord below, the one write path a real
+// finance.Account projection must use — a caller that projects an
+// Account record through UpsertByCode instead would reintroduce
+// uc-infra#205's original code-rename-orphans-a-row bug, since a row it
+// writes carries no source_record_id for a later rename to find by.
+// What's left calling this today is test-seeding only: ledger-posting
+// tests across internal/{data,api,e2e} and
+// internal/kernel/{ledger,sales,purchasing} that need a gl_accounts row
+// to post against and have no Account record to link it to. Each call
+// is its own auto-committed statement — fine for that use, the same
+// reasoning moduleseed.PublishAll's own per-item idempotent upserts
+// already rely on.
 func (r *GLAccountRepo) UpsertByCode(ctx context.Context, code, name, accountType, currency string, isActive bool) (id string, err error) {
 	err = r.db.QueryRowContext(ctx, `
 		INSERT INTO gl_accounts (code, name, account_type, currency, is_active)
@@ -40,6 +78,42 @@ func (r *GLAccountRepo) UpsertByCode(ctx context.Context, code, name, accountTyp
 	).Scan(&id)
 	if err != nil {
 		return "", fmt.Errorf("upsert gl_account %s: %w", code, err)
+	}
+	return id, nil
+}
+
+// UpsertBySourceRecord inserts or updates a gl_accounts row keyed by
+// source_record_id — the finance.Account record it was projected from
+// (uc-infra#205 / ADR-0004 addendum) — rather than by code the way
+// UpsertByCode does. This is what lets a legal Account.code rename
+// (code is Unique but not immutable) update the SAME gl_accounts row in
+// place instead of inserting a second row under the new code and
+// leaving the old code's row behind, orphaned. Used only by
+// finance.SyncGLAccountOnWrite and finance.SyncGLAccounts — the two
+// real sync paths from a finance.Account record; UpsertByCode stays
+// unchanged for every other caller (direct gl_accounts seeding in
+// ledger-posting tests that have no Account record to link to). Returns
+// ErrGLAccountCodeConflict (see its own doc comment) if code is already
+// held by a different, unrelated gl_accounts row.
+func (r *GLAccountRepo) UpsertBySourceRecord(ctx context.Context, sourceRecordID, code, name, accountType, currency string, isActive bool) (id string, err error) {
+	err = r.db.QueryRowContext(ctx, `
+		INSERT INTO gl_accounts (source_record_id, code, name, account_type, currency, is_active)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (source_record_id) DO UPDATE SET
+			code = EXCLUDED.code,
+			name = EXCLUDED.name,
+			account_type = EXCLUDED.account_type,
+			currency = EXCLUDED.currency,
+			is_active = EXCLUDED.is_active
+		RETURNING id`,
+		sourceRecordID, code, name, accountType, currency, isActive,
+	).Scan(&id)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == glAccountsCodeConstraintName {
+			return "", fmt.Errorf("upsert gl_account by source record %s (code %s): %w", sourceRecordID, code, ErrGLAccountCodeConflict)
+		}
+		return "", fmt.Errorf("upsert gl_account by source record %s (code %s): %w", sourceRecordID, code, err)
 	}
 	return id, nil
 }

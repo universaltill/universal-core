@@ -190,3 +190,262 @@ func TestRFQComparisonReport_RealBrowser(t *testing.T) {
 		t.Errorf("report page missing the RFQ number; body text:\n%s", bodyText)
 	}
 }
+
+// TestRFQComparisonReport_HiddenItemPartyFields_RealBrowser (uc-infra#234)
+// is the real-browser proof that hiding Item.name/Party.name via a
+// FieldPermission removes each real value from the live DOM entirely —
+// not merely from a rendered-HTML-string assertion (internal/api's own
+// TestRFQComparisonReport_HiddenItemPartyFieldsRenderNotAvailable, which
+// already pins per-field independence one field at a time). Same class
+// of proof purchasing_report_test.go's
+// TestPurchasingReport_HiddenPurchaseOrderPartyItemFields_RealBrowser
+// gives for the equivalent purchasing-report fix — data.ReportingRepo.
+// RFQComparison's raw SQL reads both fields entirely outside the
+// ts.crud-redacted path, so nothing short of an actual browser DOM scan
+// proves the real values never reach the page.
+//
+// Both fields are hidden from the SAME browser actor at once here
+// (browserCtx always authenticates as the one fixed e2eActorID): this
+// test's job is to prove the real DOM never leaks either, together, not
+// to re-litigate their independence (already covered at the HTTP level).
+func TestRFQComparisonReport_HiddenItemPartyFields_RealBrowser(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, tenantDB := testServer(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	if err := purchasing.PublishStatuses(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("PublishStatuses: %v", err)
+	}
+	// ONE role holding both FieldPermission rows, not two single-field
+	// roles granted to the same actor — authz.Resolver.HiddenFields' own
+	// contract (a field is hidden only when EVERY role the actor holds
+	// has a hidden=true row for it) would hide NEITHER field with two
+	// single-field roles, the exact gotcha
+	// TestPurchasingReport_HiddenPurchaseOrderPartyItemFields_RealBrowser's
+	// own comment documents hitting on its first run.
+	roleID := grantE2ERole(t, tenantDB, "e2e_234_all_redacted")
+	engine := crud.NewEngine(tenantDB)
+	for _, fp := range []struct{ entityType, field string }{
+		{"Item", "name"}, {"Party", "name"},
+	} {
+		if _, err := engine.Create(ctx, foundation.FieldPermission(), map[string]any{
+			"role_id": roleID, "entity_type": fp.entityType, "field_name": fp.field, "hidden": true,
+		}, actor); err != nil {
+			t.Fatalf("create FieldPermission %s.%s: %v", fp.entityType, fp.field, err)
+		}
+	}
+
+	draftID := publishedStatusID(t, tenantDB, "rfq_status", "draft")
+	rfq, err := engine.Create(ctx, purchasing.RequestForQuotation(), map[string]any{
+		"rfq_number": "RFQ-E2E-LEAK234", "due_date": "2026-08-20", "status_id": draftID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed RequestForQuotation: %v", err)
+	}
+	item, err := engine.Create(ctx, purchasing.Item(), map[string]any{
+		"sku": "SKU-E2E-LEAK234", "name": "E2E Leak Widget 234", "item_type": "stock",
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed Item: %v", err)
+	}
+	line, err := engine.Create(ctx, purchasing.RequestForQuotationLine(), map[string]any{
+		"request_for_quotation_id": rfq.ID, "item_id": item.ID, "qty": 10.0,
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed line: %v", err)
+	}
+	vendor, err := engine.Create(ctx, foundation.Party(), map[string]any{
+		"name": "E2E Leak Vendor Co 234", "party_type": "organization", "status": "active",
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed vendor: %v", err)
+	}
+	if _, err := engine.Create(ctx, purchasing.RequestForQuotationVendor(), map[string]any{
+		"request_for_quotation_id": rfq.ID, "vendor_id": vendor.ID,
+	}, actor); err != nil {
+		t.Fatalf("invite vendor: %v", err)
+	}
+	if _, err := engine.Create(ctx, purchasing.RequestForQuotationQuoteLine(), map[string]any{
+		"rfq_line_id": line.ID, "vendor_id": vendor.ID, "unit_price": 950,
+	}, actor); err != nil {
+		t.Fatalf("seed quote line: %v", err)
+	}
+
+	bctx := browserCtx(t, tenantID)
+	var bodyText string
+	if err := chromedp.Run(bctx,
+		chromedp.Navigate(srv.URL+"/reports/rfq/"+rfq.ID),
+		chromedp.WaitVisible(`table.uc-table`, chromedp.ByQuery),
+		chromedp.Text(`body`, &bodyText, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("open /reports/rfq/%s: %v", rfq.ID, err)
+	}
+
+	for _, leaked := range []string{"E2E Leak Widget 234", "E2E Leak Vendor Co 234"} {
+		if strings.Contains(bodyText, leaked) {
+			t.Errorf("redacted value %q reached the live page for an actor with it hidden:\n%s", leaked, bodyText)
+		}
+	}
+	if !strings.Contains(bodyText, "Not available") {
+		t.Errorf("expected at least one 'Not available' placeholder (row label, vendor column header):\n%s", bodyText)
+	}
+	// The real quoted price (a different field, not hidden by this
+	// actor's role) must still render — redacting the labels must not
+	// also blank the price grid itself.
+	if !strings.Contains(bodyText, "9.50") {
+		t.Errorf("expected the real quoted price (9.50) — a field this actor CAN see — to still render:\n%s", bodyText)
+	}
+
+	// Belt-and-braces, same reasoning
+	// TestPurchasingReport_HiddenPurchaseOrderPartyItemFields_RealBrowser's
+	// own leak check already uses — confirm neither value is sitting
+	// anywhere in the document outside the visible text either.
+	for _, leaked := range []string{"E2E Leak Widget 234", "E2E Leak Vendor Co 234"} {
+		var leaks bool
+		if err := chromedp.Run(bctx, chromedp.EvaluateAsDevTools(
+			`document.documentElement.outerHTML.includes("`+leaked+`")`, &leaks,
+		)); err != nil {
+			t.Fatalf("scan document for %q: %v", leaked, err)
+		}
+		if leaks {
+			t.Errorf("redacted value %q reached the browser somewhere in the document", leaked)
+		}
+	}
+}
+
+// TestRFQComparisonReport_HiddenUnitPrice_RealBrowser (uc-infra#235) is
+// the real-browser proof for the field #234's own review found and left
+// open: RequestForQuotationQuoteLine.unit_price. Unlike Item.name/
+// Party.name, unit_price also drives a real computed style
+// (.uc-rfq-lowest) — proving the redaction removes the VALUE from the
+// live DOM is not enough; this also has to prove the lowest-price mark
+// itself never renders, since that mark is derived information about the
+// hidden price (which cell is cheapest), the same class of proof
+// TestRFQComparisonReport_RealBrowser already gives for the mark existing
+// and resolving a real background color when unit_price is NOT hidden.
+func TestRFQComparisonReport_HiddenUnitPrice_RealBrowser(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, tenantDB := testServer(t)
+	ctx := context.Background()
+	actor := humanActor()
+
+	if err := purchasing.PublishStatuses(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("PublishStatuses: %v", err)
+	}
+	roleID := grantE2ERole(t, tenantDB, "e2e_235_price_redacted")
+	engine := crud.NewEngine(tenantDB)
+	if _, err := engine.Create(ctx, foundation.FieldPermission(), map[string]any{
+		"role_id": roleID, "entity_type": "RequestForQuotationQuoteLine", "field_name": "unit_price", "hidden": true,
+	}, actor); err != nil {
+		t.Fatalf("create FieldPermission RequestForQuotationQuoteLine.unit_price: %v", err)
+	}
+
+	draftID := publishedStatusID(t, tenantDB, "rfq_status", "draft")
+	rfq, err := engine.Create(ctx, purchasing.RequestForQuotation(), map[string]any{
+		"rfq_number": "RFQ-E2E-LEAK235", "due_date": "2026-08-20", "status_id": draftID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed RequestForQuotation: %v", err)
+	}
+	item, err := engine.Create(ctx, purchasing.Item(), map[string]any{
+		"sku": "SKU-E2E-LEAK235", "name": "E2E Leak Widget 235", "item_type": "stock",
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed Item: %v", err)
+	}
+	line, err := engine.Create(ctx, purchasing.RequestForQuotationLine(), map[string]any{
+		"request_for_quotation_id": rfq.ID, "item_id": item.ID, "qty": 10.0,
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed line: %v", err)
+	}
+	vendorX, err := engine.Create(ctx, foundation.Party(), map[string]any{
+		"name": "E2E Leak Vendor X 235", "party_type": "organization", "status": "active",
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed vendor X: %v", err)
+	}
+	vendorY, err := engine.Create(ctx, foundation.Party(), map[string]any{
+		"name": "E2E Leak Vendor Y 235", "party_type": "organization", "status": "active",
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed vendor Y: %v", err)
+	}
+	for _, v := range []string{vendorX.ID, vendorY.ID} {
+		if _, err := engine.Create(ctx, purchasing.RequestForQuotationVendor(), map[string]any{
+			"request_for_quotation_id": rfq.ID, "vendor_id": v,
+		}, actor); err != nil {
+			t.Fatalf("invite vendor %s: %v", v, err)
+		}
+	}
+	// Both vendors quote — vendor X cheaper, so an UNredacted actor would
+	// see it marked lowest. This actor must see neither price nor mark.
+	if _, err := engine.Create(ctx, purchasing.RequestForQuotationQuoteLine(), map[string]any{
+		"rfq_line_id": line.ID, "vendor_id": vendorX.ID, "unit_price": 950,
+	}, actor); err != nil {
+		t.Fatalf("seed quote line X: %v", err)
+	}
+	if _, err := engine.Create(ctx, purchasing.RequestForQuotationQuoteLine(), map[string]any{
+		"rfq_line_id": line.ID, "vendor_id": vendorY.ID, "unit_price": 1200,
+	}, actor); err != nil {
+		t.Fatalf("seed quote line Y: %v", err)
+	}
+
+	bctx := browserCtx(t, tenantID)
+	var bodyText string
+	if err := chromedp.Run(bctx,
+		chromedp.Navigate(srv.URL+"/reports/rfq/"+rfq.ID),
+		chromedp.WaitVisible(`table.uc-table`, chromedp.ByQuery),
+		chromedp.Text(`body`, &bodyText, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("open /reports/rfq/%s: %v", rfq.ID, err)
+	}
+
+	for _, leaked := range []string{"9.50", "12.00"} {
+		if strings.Contains(bodyText, leaked) {
+			t.Errorf("redacted unit_price %q reached the live page for an actor with it hidden:\n%s", leaked, bodyText)
+		}
+	}
+	if !strings.Contains(bodyText, "Not available") {
+		t.Errorf("expected at least one 'Not available' placeholder for the hidden quoted prices:\n%s", bodyText)
+	}
+	// A different field (Item.name/Party.name) this actor CAN see — the
+	// redaction must not blank fields unrelated to unit_price.
+	for _, want := range []string{"E2E Leak Widget 235", "E2E Leak Vendor X 235", "E2E Leak Vendor Y 235"} {
+		if !strings.Contains(bodyText, want) {
+			t.Errorf("expected %q (a different field) to still render:\n%s", want, bodyText)
+		}
+	}
+
+	// The real DOM/CSS proof: the lowest-price mark is derived from the
+	// hidden price, so it must not render AT ALL for this actor — not
+	// just have its cell text blanked. querySelectorAll returning 0 is
+	// the only way to prove the mark itself never made it into the DOM,
+	// the same "class name in the markup" gap the unredacted browser test
+	// closes for the positive case.
+	var lowestCellCount int
+	if err := chromedp.Run(bctx,
+		chromedp.Evaluate(`document.querySelectorAll('.uc-rfq-lowest').length`, &lowestCellCount),
+	); err != nil {
+		t.Fatalf("inspect lowest-price cell count: %v", err)
+	}
+	if lowestCellCount != 0 {
+		t.Errorf("expected 0 .uc-rfq-lowest cells when unit_price is redacted, got %d", lowestCellCount)
+	}
+
+	// Belt-and-braces outerHTML scan, same reasoning
+	// TestRFQComparisonReport_HiddenItemPartyFields_RealBrowser's own leak
+	// check already uses.
+	for _, leaked := range []string{"9.50", "12.00"} {
+		var leaks bool
+		if err := chromedp.Run(bctx, chromedp.EvaluateAsDevTools(
+			`document.documentElement.outerHTML.includes("`+leaked+`")`, &leaks,
+		)); err != nil {
+			t.Fatalf("scan document for %q: %v", leaked, err)
+		}
+		if leaks {
+			t.Errorf("redacted unit_price %q reached the browser somewhere in the document", leaked)
+		}
+	}
+}

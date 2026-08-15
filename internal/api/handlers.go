@@ -582,19 +582,15 @@ func (h *Handler) writeCrudErrorLocalized(w http.ResponseWriter, r *http.Request
 	// envelope treatment as TargetConstraintError above, for the same
 	// reason: a duplicate (employee_id, entry_date) is a routine
 	// data-entry mistake a real end user hits, not a rare admin action.
-	// Every named field's label resolves through the same field-label
-	// catalog key (field.{EntityType}.{FieldName}) TargetConstraintError
-	// already uses, joined for the composite-field case.
+	// uniqueConstraintMessage (below) picks between an ordinary and a
+	// conditional (UniqueWhen, uc-infra#201) message — the same
+	// *UniqueConstraintError type carries both, distinguished by
+	// WhenField being set.
 	var uce *crud.UniqueConstraintError
 	if errors.As(err, &uce) {
 		log.Printf("api: %s: %v", logContext, err)
 		locale := localeFromRequest(w, r)
-		labels := make([]string, len(uce.Fields))
-		for i, f := range uce.Fields {
-			labels[i] = h.catalog.TOrDefault(locale, "field."+uce.EntityType+"."+f, f)
-		}
-		msg := strings.ReplaceAll(h.catalog.T(locale, "crud.error.unique_constraint_violation"), "{fields}", strings.Join(labels, ", "))
-		httpx.WriteError(w, http.StatusBadRequest, msg)
+		httpx.WriteError(w, http.StatusBadRequest, h.uniqueConstraintMessage(locale, uce))
 		return
 	}
 	// entity.ValidationError (uc-infra#96): every current create/update
@@ -700,6 +696,59 @@ func (h *Handler) writeValidationErrorLocalized(w http.ResponseWriter, r *http.R
 // binary-search the stored value of) a field they cannot see, the exact
 // class of leak this fix exists to close, just reachable through the
 // second field instead of the first (independent review, uc-infra#178).
+// uniqueConstraintMessage renders a *crud.UniqueConstraintError into a
+// translated, user-facing message — shared by writeCrudErrorLocalized
+// (the single-record save path) and validationErrorMessage (the bulk
+// SQL/CSV import path) so the two can never render this differently.
+//
+// Two shapes, distinguished by uce.WhenField (independent review of
+// uc-infra#201/ADR-0028: reusing the plain "This combination of {fields}
+// is already used by another record." message for a UniqueWhen violation
+// is actively misleading — Fields is often just the conditioning field
+// itself, e.g. "This combination of Role is already used by another
+// record" reads as if role TYPES were unique, when every role_type other
+// than the conditioned one coexists freely):
+//
+//   - Ordinary (def.Unique, WhenField == ""): the existing per-field
+//     message, unchanged.
+//   - Conditional (def.UniqueWhen): "Only one record can have {field} set
+//     to {value}." — {field} resolves uce.WhenField through the same
+//     field.{EntityType}.{FieldName} catalog key every field label
+//     already uses; {value} tries the enum-value label catalog key
+//     (field.{EntityType}.{WhenField}.{WhenValue}, e.g.
+//     field.PartyRole.role_type.own_organization) FIRST, since that's
+//     the more specific/accurate label when WhenField is a FieldEnum,
+//     and only falls back to a literal "true"/"false" → Yes/No mapping
+//     when no such enum-value label exists (a FieldBool WhenField, e.g.
+//     Currency.is_base) — never the raw "true" string, which would read
+//     as a stray implementation detail to a real user.
+func (h *Handler) uniqueConstraintMessage(locale string, uce *crud.UniqueConstraintError) string {
+	if uce.WhenField == "" {
+		labels := make([]string, len(uce.Fields))
+		for i, f := range uce.Fields {
+			labels[i] = h.catalog.TOrDefault(locale, "field."+uce.EntityType+"."+f, f)
+		}
+		return strings.ReplaceAll(h.catalog.T(locale, "crud.error.unique_constraint_violation"), "{fields}", strings.Join(labels, ", "))
+	}
+	fieldLabel := h.catalog.TOrDefault(locale, "field."+uce.EntityType+"."+uce.WhenField, uce.WhenField)
+	enumKey := "field." + uce.EntityType + "." + uce.WhenField + "." + uce.WhenValue
+	valueLabel := h.catalog.TOrDefault(locale, enumKey, "")
+	if valueLabel == "" {
+		switch uce.WhenValue {
+		case "true":
+			valueLabel = h.catalog.TOrDefault(locale, "common.value.true", uce.WhenValue)
+		case "false":
+			valueLabel = h.catalog.TOrDefault(locale, "common.value.false", uce.WhenValue)
+		default:
+			valueLabel = uce.WhenValue
+		}
+	}
+	msg := h.catalog.T(locale, "crud.error.conditional_unique_constraint_violation")
+	msg = strings.ReplaceAll(msg, "{field}", fieldLabel)
+	msg = strings.ReplaceAll(msg, "{value}", valueLabel)
+	return msg
+}
+
 func (h *Handler) validationErrorMessage(locale string, err error, hidden map[string]bool) string {
 	if err == nil {
 		return ""
@@ -715,20 +764,12 @@ func (h *Handler) validationErrorMessage(locale string, err error, hidden map[st
 	// fallback below: an untranslated message naming the raw snake_case
 	// field ("Item.sku: value already used by another record") instead of
 	// the same translated-envelope treatment the single-record save path
-	// already gets (this file's own writeCrudError, "crud.error.
-	// unique_constraint_violation") — CLAUDE.md's "no hardcoded
-	// user-facing strings" rule applies here exactly as much as it does to
-	// entity.ValidationError below. Every named field's label resolves
-	// through the same field.{EntityType}.{FieldName} catalog key,
-	// joined for the composite-field case, same as writeCrudError's own
-	// branch.
+	// already gets. uniqueConstraintMessage (below, shared with
+	// writeCrudErrorLocalized) resolves this the same way for both an
+	// ordinary and a conditional (UniqueWhen, uc-infra#201) violation.
 	var uce *crud.UniqueConstraintError
 	if errors.As(err, &uce) {
-		labels := make([]string, len(uce.Fields))
-		for i, f := range uce.Fields {
-			labels[i] = h.catalog.TOrDefault(locale, "field."+uce.EntityType+"."+f, f)
-		}
-		return strings.ReplaceAll(h.catalog.T(locale, "crud.error.unique_constraint_violation"), "{fields}", strings.Join(labels, ", "))
+		return h.uniqueConstraintMessage(locale, uce)
 	}
 	var verr *entity.ValidationError
 	if !errors.As(err, &verr) {
@@ -888,6 +929,28 @@ func (h *Handler) createRecord(w http.ResponseWriter, r *http.Request) {
 		writeCrudError(w, fmt.Sprintf("apply field permissions for new %s", entityType), err)
 		return
 	}
+
+	// Applied before this handler's own pre-check below, for the same
+	// reason crud.Engine.Create applies it before its internal one
+	// (uc-infra#212): without this, a Required field that also declares
+	// a Default (e.g. purchasing.StockLevel.qty_on_hand,
+	// projects.Task.planned_amount) would 400 here as "missing" on an
+	// omitting payload that Create itself would go on to accept — the
+	// two checks disagreeing about the identical payload is exactly the
+	// "one Definition, two callers drift apart" failure this repo has
+	// already been burned by (see crud/unique_constraints.go's own
+	// comment on uc-infra#81/#105). Placed after EffectiveWriteFields,
+	// not before: a field this actor can't see was just stripped, and
+	// applying its Default here mirrors what happens next regardless —
+	// crud.Create's own internal ApplyDefaults call sees that same
+	// stripped map and would reintroduce the Default anyway (the
+	// Default is Definition-declared config, not attacker/actor-
+	// controlled data, and the guarded engine redacts the echoed record
+	// on the way back out — not a disclosure). Calling ApplyDefaults
+	// twice (once here, once inside Create) is intentional and cheap: a
+	// field already present after this call is left untouched the
+	// second time.
+	entity.ApplyDefaults(entDef, fields)
 
 	// Validated explicitly here, ahead of crud.Create (which validates
 	// again internally — cheap, no DB round trip, and Create doesn't

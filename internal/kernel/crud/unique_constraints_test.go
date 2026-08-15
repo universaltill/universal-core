@@ -1019,3 +1019,907 @@ func TestBackfillUniqueConstraintKeys_OldestRecordWinsAmongCollisions(t *testing
 		t.Fatalf("expected the OLDER record to win the key (created_at order), got older=%d newer=%d", olderCount, newerCount)
 	}
 }
+
+// TestBackfillUniqueConstraintKeys_RerunOverAlreadyBackedRecordsNoLongerMisreportsThemAsUnprotected
+// is the regression test for uc-infra#237 gap 3, at the level
+// cmd/sync-tenant-modules actually calls: re-running
+// BackfillUniqueConstraintKeys a second time over an entity type that's
+// already fully backed (the fail-open re-check path, or a forced
+// -backfill-only retry) used to have every already-keyed record's own
+// re-insert collide with ITSELF — reported as "skipped" / "unprotected"
+// even though it was already protected. Proves the fix: the second run
+// reports the same records as backfilled again (not skipped), and the
+// key rows themselves are untouched (same count, same owners).
+func TestBackfillUniqueConstraintKeys_RerunOverAlreadyBackedRecordsNoLongerMisreportsThemAsUnprotected(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	records := data.NewRecordRepo(db)
+	keys := data.NewRecordUniqueKeyRepo(db)
+	def := attendanceLikeDef()
+
+	rec1, err := records.Create(ctx, def.EntityType, map[string]any{
+		"employee_id": "emp-1", "entry_date": "2026-08-01", "hours_worked": float64(8),
+	})
+	if err != nil {
+		t.Fatalf("create record 1: %v", err)
+	}
+	rec2, err := records.Create(ctx, def.EntityType, map[string]any{
+		"employee_id": "emp-2", "entry_date": "2026-08-01", "hours_worked": float64(6),
+	})
+	if err != nil {
+		t.Fatalf("create record 2: %v", err)
+	}
+
+	first, firstSkipped, err := BackfillUniqueConstraintKeys(ctx, db, records, keys, def.EntityType, []string{"employee_id", "entry_date"})
+	if err != nil {
+		t.Fatalf("first BackfillUniqueConstraintKeys: %v", err)
+	}
+	if first != 2 || firstSkipped != 0 {
+		t.Fatalf("expected first run backfilled=2 skipped=0, got backfilled=%d skipped=%d", first, firstSkipped)
+	}
+
+	// The re-run: same entity type, same field set, nothing new — exactly
+	// what a re-backfill against an unchanged Definition version does.
+	second, secondSkipped, err := BackfillUniqueConstraintKeys(ctx, db, records, keys, def.EntityType, []string{"employee_id", "entry_date"})
+	if err != nil {
+		t.Fatalf("second BackfillUniqueConstraintKeys: %v", err)
+	}
+	if second != 2 {
+		t.Fatalf("expected the re-run to report both already-backed records as backfilled=2 (not skipped as unprotected), got backfilled=%d skipped=%d", second, secondSkipped)
+	}
+	if secondSkipped != 0 {
+		t.Fatalf("expected skipped=0 on the re-run — neither record is genuinely unprotected, got skipped=%d", secondSkipped)
+	}
+
+	var totalRows int
+	if err := db.QueryRowContext(ctx,
+		`SELECT count(*) FROM record_unique_keys WHERE entity_type = $1`, def.EntityType,
+	).Scan(&totalRows); err != nil {
+		t.Fatalf("count total rows: %v", err)
+	}
+	if totalRows != 2 {
+		t.Fatalf("expected exactly 2 key rows total (one per record, untouched by the re-run), got %d", totalRows)
+	}
+
+	var owner1, owner2 string
+	if err := db.QueryRowContext(ctx,
+		`SELECT record_id FROM record_unique_keys WHERE entity_type = $1 AND key_value = $2`,
+		def.EntityType, keyValueFor(t, "emp-1", "2026-08-01"),
+	).Scan(&owner1); err != nil {
+		t.Fatalf("read owner 1: %v", err)
+	}
+	if err := db.QueryRowContext(ctx,
+		`SELECT record_id FROM record_unique_keys WHERE entity_type = $1 AND key_value = $2`,
+		def.EntityType, keyValueFor(t, "emp-2", "2026-08-01"),
+	).Scan(&owner2); err != nil {
+		t.Fatalf("read owner 2: %v", err)
+	}
+	if owner1 != rec1.ID || owner2 != rec2.ID {
+		t.Fatalf("expected the re-run to leave ownership unchanged (rec1=%s rec2=%s), got owner1=%s owner2=%s", rec1.ID, rec2.ID, owner1, owner2)
+	}
+}
+
+// keyValueFor computes uniqueKeyValue's hash for a two-field
+// (employee_id, entry_date) key the same way BackfillUniqueConstraintKeys
+// itself does, so this test can look up a specific record's row by its
+// real key_value instead of assuming row order.
+func keyValueFor(t *testing.T, employeeID, entryDate string) string {
+	t.Helper()
+	value, applicable, err := uniqueKeyValue([]string{"employee_id", "entry_date"}, map[string]any{
+		"employee_id": employeeID, "entry_date": entryDate,
+	})
+	if err != nil || !applicable {
+		t.Fatalf("compute key value: applicable=%v err=%v", applicable, err)
+	}
+	return value
+}
+
+// --- ConditionalUnique / UniqueWhen (uc-infra#201, ADR-0028) ---
+
+// roleLikeDef is a throwaway Definition shaped like
+// foundation.PartyRole's driving case (role_type, conditional on
+// "own_organization") — modeled generically here rather than importing
+// internal/kernel/foundation, same reasoning attendanceLikeDef's own doc
+// comment gives for Unique.
+func roleLikeDef() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "Role",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "party_id", Type: entity.FieldString, Required: true},
+			{Name: "role_type", Type: entity.FieldEnum, Required: true,
+				EnumValues: []string{"customer", "vendor", "own_organization"}},
+		},
+		UniqueWhen: []entity.ConditionalUnique{
+			{Fields: []string{"role_type"}, WhenField: "role_type", WhenValue: "own_organization"},
+		},
+	}
+}
+
+// flagLikeDef is a throwaway Definition shaped like foundation.Currency's
+// is_base case — a FieldBool conditioning field, exercising
+// conditionalKeyValue's valueMatches comparison against a non-string Go
+// value (bool, not enum/string).
+func flagLikeDef() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "Flag",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "code", Type: entity.FieldString, Required: true},
+			{Name: "is_base", Type: entity.FieldBool},
+		},
+		UniqueWhen: []entity.ConditionalUnique{
+			{Fields: []string{"is_base"}, WhenField: "is_base", WhenValue: "true"},
+		},
+	}
+}
+
+func roleConstraintName() string {
+	return entity.ConditionalUniqueConstraintName(entity.ConditionalUnique{
+		Fields: []string{"role_type"}, WhenField: "role_type", WhenValue: "own_organization",
+	})
+}
+
+func TestConditionalKeyValue(t *testing.T) {
+	cu := entity.ConditionalUnique{Fields: []string{"role_type"}, WhenField: "role_type", WhenValue: "own_organization"}
+	cases := []struct {
+		name        string
+		data        map[string]any
+		wantApplies bool
+	}{
+		{"condition met", map[string]any{"role_type": "own_organization"}, true},
+		{"condition not met (different enum value)", map[string]any{"role_type": "vendor"}, false},
+		{"when_field absent", map[string]any{}, false},
+		{"when_field nil", map[string]any{"role_type": nil}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			value, applicable, err := conditionalKeyValue(cu, tc.data)
+			if err != nil {
+				t.Fatalf("conditionalKeyValue: %v", err)
+			}
+			if applicable != tc.wantApplies {
+				t.Fatalf("applicable = %v, want %v", applicable, tc.wantApplies)
+			}
+			if applicable && !hexPattern.MatchString(value) {
+				t.Fatalf("value %q is not a 64-char lowercase hex sha256 digest", value)
+			}
+		})
+	}
+
+	// A bool WhenField, compared via the same generic fmt.Sprint-based
+	// valueMatches target_constraints.go already uses — WhenValue is
+	// always the literal string "true"/"false", never a typed bool.
+	boolCU := entity.ConditionalUnique{Fields: []string{"is_base"}, WhenField: "is_base", WhenValue: "true"}
+	if _, applicable, err := conditionalKeyValue(boolCU, map[string]any{"is_base": true}); err != nil || !applicable {
+		t.Fatalf("expected is_base=true (Go bool) to satisfy WhenValue %q: applicable=%v err=%v", "true", applicable, err)
+	}
+	if _, applicable, err := conditionalKeyValue(boolCU, map[string]any{"is_base": false}); err != nil || applicable {
+		t.Fatalf("expected is_base=false to NOT satisfy WhenValue %q: applicable=%v err=%v", "true", applicable, err)
+	}
+}
+
+func TestEngine_Create_ConditionalUniqueConstraint_RejectsSecondMatchingRecord(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	def := roleLikeDef()
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	if _, err := engine.Create(ctx, def, map[string]any{
+		"party_id": "party-1", "role_type": "own_organization",
+	}, actor); err != nil {
+		t.Fatalf("create first own_organization role: %v", err)
+	}
+
+	// A DIFFERENT party claiming the same conditioned role is rejected —
+	// the constraint is on role_type alone, not (party_id, role_type).
+	_, err := engine.Create(ctx, def, map[string]any{
+		"party_id": "party-2", "role_type": "own_organization",
+	}, actor)
+	if !errors.Is(err, ErrUniqueConstraintViolation) {
+		t.Fatalf("expected ErrUniqueConstraintViolation for a second own_organization role, got %v", err)
+	}
+	var uce *UniqueConstraintError
+	if !errors.As(err, &uce) {
+		t.Fatalf("expected a *UniqueConstraintError, got %T: %v", err, err)
+	}
+	if uce.ConstraintName != roleConstraintName() {
+		t.Fatalf("ConstraintName = %q, want %q", uce.ConstraintName, roleConstraintName())
+	}
+
+	// The SAME party claiming it twice is rejected the same way.
+	_, err = engine.Create(ctx, def, map[string]any{
+		"party_id": "party-1", "role_type": "own_organization",
+	}, actor)
+	if !errors.Is(err, ErrUniqueConstraintViolation) {
+		t.Fatalf("expected ErrUniqueConstraintViolation for the same party claiming the role twice, got %v", err)
+	}
+}
+
+func TestEngine_Create_ConditionalUniqueConstraint_AllowsMultipleNonMatchingRecords(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	def := roleLikeDef()
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	// Any number of non-"own_organization" roles must coexist freely —
+	// the whole point of a CONDITIONAL constraint over a plain Unique.
+	for i, roleType := range []string{"vendor", "vendor", "customer", "customer"} {
+		if _, err := engine.Create(ctx, def, map[string]any{
+			"party_id": fmt.Sprintf("party-%d", i), "role_type": roleType,
+		}, actor); err != nil {
+			t.Fatalf("create role %d (%s): %v", i, roleType, err)
+		}
+	}
+
+	// And exactly one own_organization role alongside them is still fine.
+	if _, err := engine.Create(ctx, def, map[string]any{
+		"party_id": "party-org", "role_type": "own_organization",
+	}, actor); err != nil {
+		t.Fatalf("create the one own_organization role: %v", err)
+	}
+}
+
+func TestEngine_Create_ConditionalUniqueConstraint_BoolField_RejectsSecondTrue(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	def := flagLikeDef()
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	if _, err := engine.Create(ctx, def, map[string]any{
+		"code": "GBP", "is_base": true,
+	}, actor); err != nil {
+		t.Fatalf("create first is_base=true: %v", err)
+	}
+	// Any number of is_base=false rows must coexist freely.
+	for _, code := range []string{"USD", "EUR", "JPY"} {
+		if _, err := engine.Create(ctx, def, map[string]any{
+			"code": code, "is_base": false,
+		}, actor); err != nil {
+			t.Fatalf("create is_base=false %s: %v", code, err)
+		}
+	}
+	// A second is_base=true is rejected.
+	_, err := engine.Create(ctx, def, map[string]any{
+		"code": "EUR2", "is_base": true,
+	}, actor)
+	if !errors.Is(err, ErrUniqueConstraintViolation) {
+		t.Fatalf("expected ErrUniqueConstraintViolation for a second is_base=true, got %v", err)
+	}
+}
+
+func TestEngine_Update_ConditionalUniqueConstraint_TransitionIntoCondition_RejectsIfTaken(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	def := roleLikeDef()
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	if _, err := engine.Create(ctx, def, map[string]any{
+		"party_id": "party-1", "role_type": "own_organization",
+	}, actor); err != nil {
+		t.Fatalf("create own_organization role: %v", err)
+	}
+	vendor, err := engine.Create(ctx, def, map[string]any{
+		"party_id": "party-2", "role_type": "vendor",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create vendor role: %v", err)
+	}
+
+	// Editing the vendor role INTO the condition while it's already taken
+	// must fail, the same as a Create would.
+	_, err = engine.Update(ctx, def, vendor.ID, map[string]any{
+		"party_id": "party-2", "role_type": "own_organization",
+	}, nil, actor)
+	if !errors.Is(err, ErrUniqueConstraintViolation) {
+		t.Fatalf("expected ErrUniqueConstraintViolation transitioning into a taken condition, got %v", err)
+	}
+}
+
+func TestEngine_Update_ConditionalUniqueConstraint_TransitionOutOfCondition_FreesValue(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	def := roleLikeDef()
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	org, err := engine.Create(ctx, def, map[string]any{
+		"party_id": "party-1", "role_type": "own_organization",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create own_organization role: %v", err)
+	}
+
+	// Edit it AWAY from the condition.
+	if _, err := engine.Update(ctx, def, org.ID, map[string]any{
+		"party_id": "party-1", "role_type": "vendor",
+	}, nil, actor); err != nil {
+		t.Fatalf("update away from the condition: %v", err)
+	}
+
+	var keyCount int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM record_unique_keys WHERE record_id = $1 AND constraint_name = $2`,
+		org.ID, roleConstraintName()).Scan(&keyCount); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if keyCount != 0 {
+		t.Fatalf("expected the key row to be deleted once role_type left the condition, got %d", keyCount)
+	}
+
+	// The vacated own_organization slot must now be usable by ANOTHER record.
+	if _, err := engine.Create(ctx, def, map[string]any{
+		"party_id": "party-2", "role_type": "own_organization",
+	}, actor); err != nil {
+		t.Fatalf("expected the vacated condition to be reusable, got %v", err)
+	}
+}
+
+func TestEngine_Update_ConditionalUniqueConstraint_PreExistingRecordWithNoKeyRowGetsOneOnUpdate(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	def := roleLikeDef()
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	rec, err := engine.Create(ctx, def, map[string]any{
+		"party_id": "party-1", "role_type": "own_organization",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `DELETE FROM record_unique_keys WHERE record_id = $1`, rec.ID); err != nil {
+		t.Fatalf("simulate a pre-existing record with no key row: %v", err)
+	}
+
+	if _, err := engine.Update(ctx, def, rec.ID, map[string]any{
+		"party_id": "party-1", "role_type": "own_organization",
+	}, nil, actor); err != nil {
+		t.Fatalf("expected the backfilling update to succeed, got %v", err)
+	}
+
+	var keyCount int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM record_unique_keys WHERE record_id = $1`, rec.ID).Scan(&keyCount); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if keyCount != 1 {
+		t.Fatalf("expected the update to backfill exactly 1 key row, got %d", keyCount)
+	}
+
+	// And the backfilled key is real: a genuine collision is still caught.
+	_, err = engine.Create(ctx, def, map[string]any{
+		"party_id": "party-2", "role_type": "own_organization",
+	}, actor)
+	if !errors.Is(err, ErrUniqueConstraintViolation) {
+		t.Fatalf("expected the backfilled key to be enforced, got %v", err)
+	}
+}
+
+func TestEngine_Delete_ConditionalUniqueConstraint_FreesTheKeyForReuse(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	def := roleLikeDef()
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	rec, err := engine.Create(ctx, def, map[string]any{
+		"party_id": "party-1", "role_type": "own_organization",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := engine.Delete(ctx, def, rec.ID, actor); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	if _, err := engine.Create(ctx, def, map[string]any{
+		"party_id": "party-2", "role_type": "own_organization",
+	}, actor); err != nil {
+		t.Fatalf("expected the freed condition to be reusable after delete, got %v", err)
+	}
+}
+
+func TestCountConditionalUniqueConstraintViolations_NoExistingRecords(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	records := data.NewRecordRepo(db)
+	cu := entity.ConditionalUnique{Fields: []string{"role_type"}, WhenField: "role_type", WhenValue: "own_organization"}
+
+	n, err := CountConditionalUniqueConstraintViolations(ctx, records, "Role", cu)
+	if err != nil {
+		t.Fatalf("CountConditionalUniqueConstraintViolations: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("expected 0 violations with no records, got %d", n)
+	}
+}
+
+// TestCountConditionalUniqueConstraintViolations_CountsExistingCollisions
+// deliberately bypasses Engine.Create (records.CreateTx directly) so the
+// records collide WITHOUT the enforcement stage ever running — simulating
+// data that predates the constraint, same reasoning
+// TestCountUniqueConstraintViolations_CountsExistingCollisions gives.
+func TestCountConditionalUniqueConstraintViolations_CountsExistingCollisions(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	records := data.NewRecordRepo(db)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	for i := 0; i < 3; i++ {
+		if _, err := records.CreateTx(ctx, tx, "Role", map[string]any{
+			"party_id": fmt.Sprintf("party-%d", i), "role_type": "own_organization",
+		}); err != nil {
+			t.Fatalf("create colliding record %d: %v", i, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	cu := entity.ConditionalUnique{Fields: []string{"role_type"}, WhenField: "role_type", WhenValue: "own_organization"}
+	n, err := CountConditionalUniqueConstraintViolations(ctx, records, "Role", cu)
+	if err != nil {
+		t.Fatalf("CountConditionalUniqueConstraintViolations: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("expected all 3 colliding records to be counted, got %d", n)
+	}
+}
+
+func TestCountConditionalUniqueConstraintViolations_IgnoresNonMatchingRecords(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	records := data.NewRecordRepo(db)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	// Many rows sharing role_type="vendor" must never count as a
+	// collision — the condition never applies to them.
+	for i := 0; i < 5; i++ {
+		if _, err := records.CreateTx(ctx, tx, "Role", map[string]any{
+			"party_id": fmt.Sprintf("party-%d", i), "role_type": "vendor",
+		}); err != nil {
+			t.Fatalf("create vendor record %d: %v", i, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	cu := entity.ConditionalUnique{Fields: []string{"role_type"}, WhenField: "role_type", WhenValue: "own_organization"}
+	n, err := CountConditionalUniqueConstraintViolations(ctx, records, "Role", cu)
+	if err != nil {
+		t.Fatalf("CountConditionalUniqueConstraintViolations: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("expected 0 violations — none of the records satisfy the condition, got %d", n)
+	}
+}
+
+func TestBackfillConditionalUniqueConstraintKeys_NoExistingRecords(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	records := data.NewRecordRepo(db)
+	keys := data.NewRecordUniqueKeyRepo(db)
+	cu := entity.ConditionalUnique{Fields: []string{"role_type"}, WhenField: "role_type", WhenValue: "own_organization"}
+
+	backfilled, skipped, err := BackfillConditionalUniqueConstraintKeys(ctx, db, records, keys, "Role", cu)
+	if err != nil {
+		t.Fatalf("BackfillConditionalUniqueConstraintKeys: %v", err)
+	}
+	if backfilled != 0 || skipped != 0 {
+		t.Fatalf("expected 0/0 with no records, got backfilled=%d skipped=%d", backfilled, skipped)
+	}
+}
+
+// TestBackfillConditionalUniqueConstraintKeys_ProtectsExistingDataGoingForward
+// is the regression test for the same gap
+// TestBackfillUniqueConstraintKeys_ProtectsExistingDataGoingForward
+// closes for Unique: without a backfill, a pre-existing own_organization
+// role has no key row, so a BRAND-NEW own_organization role could
+// silently duplicate it even though the old row's own data was perfectly
+// valid.
+func TestBackfillConditionalUniqueConstraintKeys_ProtectsExistingDataGoingForward(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	records := data.NewRecordRepo(db)
+	keys := data.NewRecordUniqueKeyRepo(db)
+	def := roleLikeDef()
+
+	pre, err := records.Create(ctx, def.EntityType, map[string]any{
+		"party_id": "party-1", "role_type": "own_organization",
+	})
+	if err != nil {
+		t.Fatalf("create pre-existing record: %v", err)
+	}
+
+	var before int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM record_unique_keys WHERE record_id = $1`, pre.ID).Scan(&before); err != nil {
+		t.Fatalf("count before backfill: %v", err)
+	}
+	if before != 0 {
+		t.Fatalf("expected no key row before backfill, got %d", before)
+	}
+
+	cu := entity.ConditionalUnique{Fields: []string{"role_type"}, WhenField: "role_type", WhenValue: "own_organization"}
+	backfilled, skipped, err := BackfillConditionalUniqueConstraintKeys(ctx, db, records, keys, def.EntityType, cu)
+	if err != nil {
+		t.Fatalf("BackfillConditionalUniqueConstraintKeys: %v", err)
+	}
+	if backfilled != 1 || skipped != 0 {
+		t.Fatalf("expected backfilled=1 skipped=0, got backfilled=%d skipped=%d", backfilled, skipped)
+	}
+
+	var after int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM record_unique_keys WHERE record_id = $1`, pre.ID).Scan(&after); err != nil {
+		t.Fatalf("count after backfill: %v", err)
+	}
+	if after != 1 {
+		t.Fatalf("expected 1 key row after backfill, got %d", after)
+	}
+
+	// The backfilled key is real: engine.Create now rejects a duplicate.
+	engine := NewEngine(db)
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+	_, err = engine.Create(ctx, def, map[string]any{
+		"party_id": "party-2", "role_type": "own_organization",
+	}, actor)
+	if !errors.Is(err, ErrUniqueConstraintViolation) {
+		t.Fatalf("expected the backfilled key to be enforced, got %v", err)
+	}
+}
+
+func TestBackfillConditionalUniqueConstraintKeys_OldestRecordWinsAmongCollisions(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	records := data.NewRecordRepo(db)
+	keys := data.NewRecordUniqueKeyRepo(db)
+	def := roleLikeDef()
+
+	older, err := records.Create(ctx, def.EntityType, map[string]any{
+		"party_id": "party-1", "role_type": "own_organization",
+	})
+	if err != nil {
+		t.Fatalf("create older record: %v", err)
+	}
+	newer, err := records.Create(ctx, def.EntityType, map[string]any{
+		"party_id": "party-2", "role_type": "own_organization",
+	})
+	if err != nil {
+		t.Fatalf("create newer record: %v", err)
+	}
+
+	cu := entity.ConditionalUnique{Fields: []string{"role_type"}, WhenField: "role_type", WhenValue: "own_organization"}
+	backfilled, skipped, err := BackfillConditionalUniqueConstraintKeys(ctx, db, records, keys, def.EntityType, cu)
+	if err != nil {
+		t.Fatalf("BackfillConditionalUniqueConstraintKeys: %v", err)
+	}
+	if backfilled != 1 || skipped != 1 {
+		t.Fatalf("expected backfilled=1 skipped=1 for a colliding pair, got backfilled=%d skipped=%d", backfilled, skipped)
+	}
+
+	var olderCount, newerCount int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM record_unique_keys WHERE record_id = $1`, older.ID).Scan(&olderCount); err != nil {
+		t.Fatalf("count older: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM record_unique_keys WHERE record_id = $1`, newer.ID).Scan(&newerCount); err != nil {
+		t.Fatalf("count newer: %v", err)
+	}
+	if olderCount != 1 || newerCount != 0 {
+		t.Fatalf("expected the OLDER record to win the key (created_at order), got older=%d newer=%d", olderCount, newerCount)
+	}
+}
+
+// TestBackfillConditionalUniqueConstraintKeys_RerunOverAlreadyBackedRecordsNoLongerMisreportsThemAsUnprotected
+// is TestBackfillUniqueConstraintKeys_RerunOverAlreadyBackedRecordsNoLongerMisreportsThemAsUnprotected's
+// UniqueWhen counterpart (uc-infra#237 gap 3): re-running the conditional
+// backfill over an already-backed own_organization role must report it
+// as backfilled again, not skipped as unprotected.
+func TestBackfillConditionalUniqueConstraintKeys_RerunOverAlreadyBackedRecordsNoLongerMisreportsThemAsUnprotected(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	records := data.NewRecordRepo(db)
+	keys := data.NewRecordUniqueKeyRepo(db)
+	def := roleLikeDef()
+
+	rec, err := records.Create(ctx, def.EntityType, map[string]any{
+		"party_id": "party-1", "role_type": "own_organization",
+	})
+	if err != nil {
+		t.Fatalf("create record: %v", err)
+	}
+
+	cu := entity.ConditionalUnique{Fields: []string{"role_type"}, WhenField: "role_type", WhenValue: "own_organization"}
+	first, firstSkipped, err := BackfillConditionalUniqueConstraintKeys(ctx, db, records, keys, def.EntityType, cu)
+	if err != nil {
+		t.Fatalf("first BackfillConditionalUniqueConstraintKeys: %v", err)
+	}
+	if first != 1 || firstSkipped != 0 {
+		t.Fatalf("expected first run backfilled=1 skipped=0, got backfilled=%d skipped=%d", first, firstSkipped)
+	}
+
+	second, secondSkipped, err := BackfillConditionalUniqueConstraintKeys(ctx, db, records, keys, def.EntityType, cu)
+	if err != nil {
+		t.Fatalf("second BackfillConditionalUniqueConstraintKeys: %v", err)
+	}
+	if second != 1 || secondSkipped != 0 {
+		t.Fatalf("expected the re-run to report the already-backed record as backfilled=1 skipped=0 (not skipped as unprotected), got backfilled=%d skipped=%d", second, secondSkipped)
+	}
+
+	var totalRows int
+	var owner string
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM record_unique_keys WHERE record_id = $1`, rec.ID).Scan(&totalRows); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if totalRows != 1 {
+		t.Fatalf("expected exactly 1 key row (untouched by the re-run), got %d", totalRows)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT record_id FROM record_unique_keys WHERE entity_type = $1`, def.EntityType).Scan(&owner); err != nil {
+		t.Fatalf("read owner: %v", err)
+	}
+	if owner != rec.ID {
+		t.Fatalf("expected the re-run to leave ownership unchanged (%s), got %s", rec.ID, owner)
+	}
+}
+
+// taskLikeDef exercises the GENERAL ConditionalUnique shape ADR-0028's
+// Consequences section advertises but neither shipped Definition
+// (PartyRole/Currency) actually uses: Fields naming a DIFFERENT field
+// than WhenField — "at most one active Task per assignee_id" (assignee_id
+// unconstrained among inactive Tasks, and independently keyed per
+// assignee_id among active ones — NOT "at most one active Task, full
+// stop," the degenerate shape roleLikeDef/flagLikeDef both happen to
+// share). Independent review of uc-infra#201: this general shape was
+// entirely untested before this fixture — every existing conditional
+// test used Fields == [WhenField].
+func taskLikeDef() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "Task",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "assignee_id", Type: entity.FieldString},
+			{Name: "status", Type: entity.FieldEnum, Required: true,
+				EnumValues: []string{"active", "inactive"}},
+		},
+		UniqueWhen: []entity.ConditionalUnique{
+			{Fields: []string{"assignee_id"}, WhenField: "status", WhenValue: "active"},
+		},
+	}
+}
+
+func taskConstraintName() string {
+	return entity.ConditionalUniqueConstraintName(entity.ConditionalUnique{
+		Fields: []string{"assignee_id"}, WhenField: "status", WhenValue: "active",
+	})
+}
+
+func TestEngine_Create_ConditionalUniqueConstraint_FieldsDifferFromWhenField_KeysIndependentlyPerFieldValue(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	def := taskLikeDef()
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	// Two DIFFERENT assignees can each have an active Task — this is the
+	// case that distinguishes the general mechanism from roleLikeDef's
+	// degenerate "at most one matching record, period" shape.
+	if _, err := engine.Create(ctx, def, map[string]any{
+		"assignee_id": "alice", "status": "active",
+	}, actor); err != nil {
+		t.Fatalf("create alice's active task: %v", err)
+	}
+	if _, err := engine.Create(ctx, def, map[string]any{
+		"assignee_id": "bob", "status": "active",
+	}, actor); err != nil {
+		t.Fatalf("create bob's active task (different assignee_id, must not collide with alice's): %v", err)
+	}
+
+	// A SECOND active Task for the SAME assignee_id is rejected.
+	_, err := engine.Create(ctx, def, map[string]any{
+		"assignee_id": "alice", "status": "active",
+	}, actor)
+	if !errors.Is(err, ErrUniqueConstraintViolation) {
+		t.Fatalf("expected a second active task for alice to be rejected, got %v", err)
+	}
+	var uce *UniqueConstraintError
+	if !errors.As(err, &uce) {
+		t.Fatalf("expected *UniqueConstraintError, got %T", err)
+	}
+	if uce.ConstraintName != taskConstraintName() {
+		t.Fatalf("ConstraintName = %q, want %q", uce.ConstraintName, taskConstraintName())
+	}
+
+	// Any number of INACTIVE tasks for the SAME assignee_id coexist
+	// freely — the condition never applies to them.
+	for i := 0; i < 3; i++ {
+		if _, err := engine.Create(ctx, def, map[string]any{
+			"assignee_id": "alice", "status": "inactive",
+		}, actor); err != nil {
+			t.Fatalf("create inactive task %d for alice: %v", i, err)
+		}
+	}
+}
+
+func TestEngine_Update_ConditionalUniqueConstraint_FieldsDifferFromWhenField_TransitionRespectsPerValueKey(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	def := taskLikeDef()
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	activeAlice, err := engine.Create(ctx, def, map[string]any{
+		"assignee_id": "alice", "status": "active",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create alice's active task: %v", err)
+	}
+	inactiveAlice, err := engine.Create(ctx, def, map[string]any{
+		"assignee_id": "alice", "status": "inactive",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create alice's inactive task: %v", err)
+	}
+
+	// Activating the SECOND alice task while the first is still active is
+	// rejected — same per-assignee_id key, both now trying to hold it.
+	if _, err := engine.Update(ctx, def, inactiveAlice.ID, map[string]any{
+		"assignee_id": "alice", "status": "active",
+	}, nil, actor); !errors.Is(err, ErrUniqueConstraintViolation) {
+		t.Fatalf("expected activating a second task for alice to be rejected, got %v", err)
+	}
+
+	// Deactivate the first — frees alice's key.
+	if _, err := engine.Update(ctx, def, activeAlice.ID, map[string]any{
+		"assignee_id": "alice", "status": "inactive",
+	}, nil, actor); err != nil {
+		t.Fatalf("deactivate alice's first task: %v", err)
+	}
+
+	// NOW activating the second succeeds — and a bob task, keyed
+	// independently, is unaffected throughout.
+	if _, err := engine.Update(ctx, def, inactiveAlice.ID, map[string]any{
+		"assignee_id": "alice", "status": "active",
+	}, nil, actor); err != nil {
+		t.Fatalf("expected activating alice's second task to succeed once the first is inactive, got %v", err)
+	}
+	if _, err := engine.Create(ctx, def, map[string]any{
+		"assignee_id": "bob", "status": "active",
+	}, actor); err != nil {
+		t.Fatalf("bob's active task must be unaffected by alice's key: %v", err)
+	}
+}
+
+// TestEngine_Create_ConditionalUniqueConstraint_ConcurrentInsertsOneWinsOneFails
+// is TestEngine_Create_UniqueConstraint_ConcurrentInsertsOneWinsOneFails'
+// UniqueWhen counterpart — the Create path shares writeConstraintKey with
+// Unique's own already-covered race, but independent review of
+// uc-infra#201 found no conditional-specific proof the invariant this
+// mechanism exists for actually survives a real race, not just isolated
+// sequential calls.
+func TestEngine_Create_ConditionalUniqueConstraint_ConcurrentInsertsOneWinsOneFails(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	def := roleLikeDef()
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	const attempts = 8
+	var wg sync.WaitGroup
+	results := make([]error, attempts)
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, err := engine.Create(ctx, def, map[string]any{
+				"party_id": fmt.Sprintf("party-%d", i), "role_type": "own_organization",
+			}, actor)
+			results[i] = err
+		}(i)
+	}
+	wg.Wait()
+
+	successes, conflicts, other := 0, 0, 0
+	for _, err := range results {
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, ErrUniqueConstraintViolation):
+			conflicts++
+		default:
+			other++
+			t.Logf("unexpected error type: %v", err)
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("expected exactly 1 successful concurrent create, got %d (conflicts=%d, other=%d)", successes, conflicts, other)
+	}
+	if other != 0 {
+		t.Fatalf("expected every losing attempt to fail as *UniqueConstraintError, got %d unrecognized errors", other)
+	}
+	if conflicts != attempts-1 {
+		t.Fatalf("expected %d conflicts, got %d", attempts-1, conflicts)
+	}
+}
+
+// TestEngine_Update_ConditionalUniqueConstraint_ConcurrentTransitionsIntoConditionOneWins
+// races several PRE-EXISTING, non-matching records all transitioning INTO
+// the condition at once — a code path
+// TestEngine_Create_UniqueConstraint_ConcurrentInsertsOneWinsOneFails
+// (Unique's own concurrency test) never exercises, since Unique has no
+// "transition into applicability" concept distinct from Create: this is
+// updateConstraintKey's own `n==0 → InsertTx` branch racing for real,
+// independent review of uc-infra#201 flagged as new and unproven.
+func TestEngine_Update_ConditionalUniqueConstraint_ConcurrentTransitionsIntoConditionOneWins(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	def := roleLikeDef()
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	const attempts = 6
+	ids := make([]string, attempts)
+	for i := 0; i < attempts; i++ {
+		rec, err := engine.Create(ctx, def, map[string]any{
+			"party_id": fmt.Sprintf("party-%d", i), "role_type": "vendor",
+		}, actor)
+		if err != nil {
+			t.Fatalf("create vendor role %d: %v", i, err)
+		}
+		ids[i] = rec.ID
+	}
+
+	var wg sync.WaitGroup
+	results := make([]error, attempts)
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, err := engine.Update(ctx, def, ids[i], map[string]any{
+				"party_id": fmt.Sprintf("party-%d", i), "role_type": "own_organization",
+			}, nil, actor)
+			results[i] = err
+		}(i)
+	}
+	wg.Wait()
+
+	successes, conflicts, other := 0, 0, 0
+	for _, err := range results {
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, ErrUniqueConstraintViolation):
+			conflicts++
+		default:
+			other++
+			t.Logf("unexpected error type: %v", err)
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("expected exactly 1 successful concurrent transition into own_organization, got %d (conflicts=%d, other=%d)", successes, conflicts, other)
+	}
+	if other != 0 {
+		t.Fatalf("expected every losing attempt to fail as *UniqueConstraintError, got %d unrecognized errors", other)
+	}
+	if conflicts != attempts-1 {
+		t.Fatalf("expected %d conflicts, got %d", attempts-1, conflicts)
+	}
+
+	var keyCount int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM record_unique_keys WHERE entity_type = 'Role' AND constraint_name = $1`,
+		roleConstraintName()).Scan(&keyCount); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if keyCount != 1 {
+		t.Fatalf("expected exactly 1 surviving key row after the race, got %d", keyCount)
+	}
+}

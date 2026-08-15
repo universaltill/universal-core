@@ -11,9 +11,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"mime/multipart"
 	"net"
 	"net/http"
@@ -29,6 +31,7 @@ import (
 
 	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/db"
+	"github.com/universaltill/universal-core/internal/kernel/assets"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
 	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
@@ -955,6 +958,204 @@ func TestUniversalCore_Account_SavedByRealBinarySyncsGLAccounts(t *testing.T) {
 	}
 	if id == "" {
 		t.Fatal("expected a real gl_accounts id")
+	}
+}
+
+// TestUniversalCore_FixedAsset_SavedByRealBinaryGeneratesDepreciationSchedule
+// is the smoke layer for uc-infra#213, the same gap
+// TestUniversalCore_Account_SavedByRealBinarySyncsGLAccounts's own doc
+// comment describes for a different hook: every test proving
+// assets.GenerateDepreciationScheduleOnWrite actually works
+// (internal/kernel/assets/schedule_hook_test.go) registers the hook
+// itself against its own crud.Engine — none of them prove the specific
+// handler.RegisterHook("FixedAsset", assets.
+// GenerateDepreciationScheduleOnWrite) call cmd/universal-core's own
+// main() adds is really wired on the production mux. Unlike the Account
+// test, DepreciationSchedule DOES have a generic /api/records surface
+// (it's an ordinary entity, not a deterministic-core table like
+// gl_accounts), so this reads the generated schedule back through the
+// real running server, not a direct DB query.
+func TestUniversalCore_FixedAsset_SavedByRealBinaryGeneratesDepreciationSchedule(t *testing.T) {
+	controlDSN := testexec.FreshDatabase(t, "uc_test_server_control")
+
+	control := testexec.Open(t, controlDSN)
+	ctx := context.Background()
+	if err := db.ApplyControl(ctx, control); err != nil {
+		t.Fatalf("ApplyControl: %v", err)
+	}
+	router, err := tenantdb.NewRouter(control, controlDSN)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+	defer router.Close()
+	tenantID, err := router.Create(ctx, "FixedAsset Smoke Test", "eu-west")
+	if err != nil {
+		t.Fatalf("router.Create: %v", err)
+	}
+	testexec.DropTenantDatabase(t, testexec.Open(t, controlDSN), tenantID)
+	tenantDB, err := router.Get(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("router.Get: %v", err)
+	}
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "smoke-test-setup"}
+	for _, step := range []func(context.Context, *sql.DB, audit.Actor) error{
+		foundation.Publish, finance.Publish, assets.Publish, assets.PublishForms, assets.PublishStatuses,
+	} {
+		if err := step(ctx, tenantDB, actor); err != nil {
+			t.Fatalf("publish: %v", err)
+		}
+	}
+
+	// in_service, resolved directly against the tenant DB — setup, not
+	// part of what this test is proving (the same posture
+	// TestUniversalCore_Account_SavedByRealBinarySyncsGLAccounts takes
+	// for its own gl_accounts read).
+	records := data.NewRecordRepo(tenantDB)
+	statusTypes, err := records.ListByField(ctx, "StatusType", "code", "fixed_asset_status")
+	if err != nil || len(statusTypes) != 1 {
+		t.Fatalf("resolve fixed_asset_status StatusType: err=%v n=%d", err, len(statusTypes))
+	}
+	statuses, err := records.ListByField(ctx, "Status", "status_type_id", statusTypes[0].ID)
+	if err != nil {
+		t.Fatalf("list Status: %v", err)
+	}
+	// draft, not in_service: a real create through the HTTP layer enforces
+	// the status graph's initial-status rule (crud.Engine's
+	// ValidateStatusTransition, wired at the internal/api layer) — unlike
+	// schedule_hook_test.go's own fixture, which creates directly through
+	// crud.Engine and so never exercises that check. The schedule hook
+	// itself doesn't care about status (assets.Build has no status input),
+	// only PostDueDepreciation does.
+	var draftID string
+	for _, s := range statuses {
+		if code, _ := s.Data["code"].(string); code == "draft" {
+			draftID = s.ID
+		}
+	}
+	if draftID == "" {
+		t.Fatal("fixed_asset_status \"draft\" not seeded")
+	}
+
+	baseURL := startServer(t, controlDSN, "INSECURE_DEV_AUTH=true")
+
+	post := func(path, body string) (*http.Response, string) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, baseURL+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("build request %s: %v", path, err)
+		}
+		req.Header.Set("X-Tenant-ID", tenantID)
+		req.Header.Set("X-Actor-ID", "smoke-test")
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		respBody, _ := io.ReadAll(resp.Body)
+		return resp, string(respBody)
+	}
+
+	// No currency_id — exercises the real server's default-2dp fallback
+	// path too, not just the has-a-currency case.
+	createBody := fmt.Sprintf(`{"asset_number":"FA-SMOKE-1","name":{"en":"Smoke Test Asset"},"acquisition_date":"2026-01-15","cost":3000.0,"salvage_value":0.0,"useful_life_months":3.0,"depreciation_method":"straight_line","status_id":%q}`, draftID)
+	createResp, createRespBody := post("/api/records/FixedAsset", createBody)
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 creating FixedAsset via the real running server, got %d: %s", createResp.StatusCode, createRespBody)
+	}
+	var created struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(createRespBody), &created); err != nil {
+		t.Fatalf("unmarshal create-FixedAsset response: %v", err)
+	}
+
+	// listRecords has no query-param filter — it lists every
+	// DepreciationSchedule row in the tenant. That's fine here: this is a
+	// fresh tenant with exactly one FixedAsset, so every row it returns
+	// belongs to created.Data.ID by construction.
+	listReq, err := http.NewRequest(http.MethodGet, baseURL+"/api/records/DepreciationSchedule", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	listReq.Header.Set("X-Tenant-ID", tenantID)
+	listReq.Header.Set("X-Actor-ID", "smoke-test")
+	listResp, err := http.DefaultClient.Do(listReq)
+	if err != nil {
+		t.Fatalf("GET /api/records/DepreciationSchedule: %v", err)
+	}
+	defer listResp.Body.Close()
+	listRespBody, _ := io.ReadAll(listResp.Body)
+	if listResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 listing DepreciationSchedule, got %d: %s", listResp.StatusCode, listRespBody)
+	}
+	var list struct {
+		Data []struct {
+			ID   string         `json:"id"`
+			Data map[string]any `json:"data"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(listRespBody, &list); err != nil {
+		t.Fatalf("unmarshal DepreciationSchedule list response: %v", err)
+	}
+	if len(list.Data) != 3 {
+		t.Fatalf("expected 3 DepreciationSchedule rows (one per useful_life_months) right after the real server's create — RegisterHook(\"FixedAsset\", ...) may not be wired in main(): got %d: %s", len(list.Data), listRespBody)
+	}
+
+	// uc-infra#236: the same real-binary proof, for
+	// handler.RegisterHook("DepreciationSchedule",
+	// assets.MarkDepreciationScheduleOverriddenOnWrite) — every test
+	// proving that hook actually works
+	// (internal/kernel/assets/schedule_override_hook_test.go) registers
+	// it against its own crud.Engine directly, none of them prove
+	// main()'s own RegisterHook call is really wired on the production
+	// mux. Correct one schedule row through the real running server —
+	// full-replacement JSON body built from the row's own current Data,
+	// matching updateRecord's documented "resend everything" contract —
+	// and confirm the read-back row comes back overridden.
+	target := list.Data[0]
+	corrected := map[string]any{}
+	maps.Copy(corrected, target.Data)
+	corrected["depreciation_amount"] = 950.0
+	correctedBody, err := json.Marshal(corrected)
+	if err != nil {
+		t.Fatalf("marshal corrected DepreciationSchedule body: %v", err)
+	}
+	updateResp, updateRespBody := post("/api/records/DepreciationSchedule/"+target.ID, string(correctedBody))
+	if updateResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 correcting DepreciationSchedule via the real running server, got %d: %s", updateResp.StatusCode, updateRespBody)
+	}
+
+	getReq, err := http.NewRequest(http.MethodGet, baseURL+"/api/records/DepreciationSchedule/"+target.ID, nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	getReq.Header.Set("X-Tenant-ID", tenantID)
+	getReq.Header.Set("X-Actor-ID", "smoke-test")
+	getResp, err := http.DefaultClient.Do(getReq)
+	if err != nil {
+		t.Fatalf("GET /api/records/DepreciationSchedule/%s: %v", target.ID, err)
+	}
+	defer getResp.Body.Close()
+	getRespBody, _ := io.ReadAll(getResp.Body)
+	if getResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 reading back the corrected DepreciationSchedule row, got %d: %s", getResp.StatusCode, getRespBody)
+	}
+	var got struct {
+		Data struct {
+			Data map[string]any `json:"data"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(getRespBody, &got); err != nil {
+		t.Fatalf("unmarshal DepreciationSchedule get response: %v", err)
+	}
+	if got.Data.Data["depreciation_amount"] != 950.0 {
+		t.Fatalf("expected the correction to be stored, got %v", got.Data.Data["depreciation_amount"])
+	}
+	if overridden, _ := got.Data.Data["overridden"].(bool); !overridden {
+		t.Fatalf("expected overridden=true after a real correction through the running server — RegisterHook(\"DepreciationSchedule\", ...) may not be wired in main(): %s", getRespBody)
 	}
 }
 

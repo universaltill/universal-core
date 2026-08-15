@@ -172,6 +172,76 @@ func TestDefinitionValidate(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			// Regression coverage for independent review finding 4 on
+			// uc-infra#212: before that fix, only FieldEnum/FieldBool
+			// Defaults were type-checked here — a wrong-shaped Default on
+			// any other type was harmless dead data (nothing ever read
+			// it). Once crud.Engine.Create started applying Default at
+			// write time for every field type, a wrong-shaped Default
+			// like this one would fail every single Create that omits
+			// the field, at runtime, with no publish-time signal — this
+			// proves it's now caught here instead, the same "fail loud
+			// on schema drift" standard FieldEnum/FieldBool's own checks
+			// already applied.
+			name: "string default not a string",
+			def: Definition{
+				EntityType: "Party",
+				Fields: []Field{
+					{Name: "preferred_language", Type: FieldString, Default: float64(1)},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "string default is a valid string",
+			def: Definition{
+				EntityType: "Party",
+				Fields: []Field{
+					{Name: "preferred_language", Type: FieldString, Default: "en"},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			// Same generic-check coverage, for a bounded numeric field: a
+			// Default violating its own field's Min is exactly the kind
+			// of mistake that used to be inert (Default was never
+			// consulted for FieldNumber) and is now a real, per-write
+			// failure without this check.
+			name: "number default below its own field's min",
+			def: Definition{
+				EntityType: "StockLevel",
+				Fields: []Field{
+					{Name: "qty_on_hand", Type: FieldNumber, Default: float64(-1), Min: Float64Ptr(0)},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "number default within its own field's bounds",
+			def: Definition{
+				EntityType: "StockLevel",
+				Fields: []Field{
+					{Name: "qty_on_hand", Type: FieldNumber, Default: float64(0), Min: Float64Ptr(0)},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			// FieldMoney's Default is subject to the same whole-minor-
+			// units rule a submitted value is (money.FromAny) — a
+			// fractional Default was never checked before this became
+			// generic.
+			name: "money default is not a whole number of minor units",
+			def: Definition{
+				EntityType: "POLine",
+				Fields: []Field{
+					{Name: "line_total", Type: FieldMoney, Default: float64(10.5)},
+				},
+			},
+			wantErr: true,
+		},
+		{
 			// NotBefore only means anything for a date-vs-date comparison
 			// (validateNotBefore time.Parses both sides) — declaring it on
 			// any other type is schema drift to fail loud on.
@@ -566,6 +636,129 @@ func TestDefinitionValidate(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			name: "valid conditional unique constraint (uc-infra#201)",
+			def: Definition{
+				EntityType: "PartyRole",
+				Fields: []Field{
+					{Name: "role_type", Type: FieldEnum, EnumValues: []string{"customer", "vendor", "own_organization"}},
+				},
+				UniqueWhen: []ConditionalUnique{
+					{Fields: []string{"role_type"}, WhenField: "role_type", WhenValue: "own_organization"},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "conditional unique constraint with an empty field set",
+			def: Definition{
+				EntityType: "PartyRole",
+				Fields: []Field{
+					{Name: "role_type", Type: FieldEnum, EnumValues: []string{"own_organization"}},
+				},
+				UniqueWhen: []ConditionalUnique{
+					{Fields: nil, WhenField: "role_type", WhenValue: "own_organization"},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "conditional unique constraint referencing an unknown field",
+			def: Definition{
+				EntityType: "PartyRole",
+				Fields: []Field{
+					{Name: "role_type", Type: FieldEnum, EnumValues: []string{"own_organization"}},
+				},
+				UniqueWhen: []ConditionalUnique{
+					{Fields: []string{"no_such_field"}, WhenField: "role_type", WhenValue: "own_organization"},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "conditional unique constraint repeats a field within one set",
+			def: Definition{
+				EntityType: "PartyRole",
+				Fields: []Field{
+					{Name: "role_type", Type: FieldEnum, EnumValues: []string{"own_organization"}},
+				},
+				UniqueWhen: []ConditionalUnique{
+					{Fields: []string{"role_type", "role_type"}, WhenField: "role_type", WhenValue: "own_organization"},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "conditional unique constraint with no when_field",
+			def: Definition{
+				EntityType: "PartyRole",
+				Fields: []Field{
+					{Name: "role_type", Type: FieldEnum, EnumValues: []string{"own_organization"}},
+				},
+				UniqueWhen: []ConditionalUnique{
+					{Fields: []string{"role_type"}, WhenField: "", WhenValue: "own_organization"},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "conditional unique constraint referencing an unknown when_field",
+			def: Definition{
+				EntityType: "PartyRole",
+				Fields: []Field{
+					{Name: "role_type", Type: FieldEnum, EnumValues: []string{"own_organization"}},
+				},
+				UniqueWhen: []ConditionalUnique{
+					{Fields: []string{"role_type"}, WhenField: "no_such_field", WhenValue: "own_organization"},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "conditional unique constraint with no when_value",
+			def: Definition{
+				EntityType: "PartyRole",
+				Fields: []Field{
+					{Name: "role_type", Type: FieldEnum, EnumValues: []string{"own_organization"}},
+				},
+				UniqueWhen: []ConditionalUnique{
+					{Fields: []string{"role_type"}, WhenField: "role_type", WhenValue: ""},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			// Same Fields/WhenField but different WhenValue are two
+			// DIFFERENT constraints (e.g. two enum values each getting
+			// their own conditional-uniqueness rule would be legitimate,
+			// even though this repo has no such case yet) — only an exact
+			// (Fields, WhenField, WhenValue) repeat is a duplicate.
+			name: "conditional unique constraint declared twice with the same condition is a duplicate",
+			def: Definition{
+				EntityType: "PartyRole",
+				Fields: []Field{
+					{Name: "role_type", Type: FieldEnum, EnumValues: []string{"own_organization"}},
+				},
+				UniqueWhen: []ConditionalUnique{
+					{Fields: []string{"role_type"}, WhenField: "role_type", WhenValue: "own_organization"},
+					{Fields: []string{"role_type"}, WhenField: "role_type", WhenValue: "own_organization"},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "conditional unique constraint on a bool field (Currency.is_base shape)",
+			def: Definition{
+				EntityType: "Currency",
+				Fields: []Field{
+					{Name: "is_base", Type: FieldBool},
+				},
+				UniqueWhen: []ConditionalUnique{
+					{Fields: []string{"is_base"}, WhenField: "is_base", WhenValue: "true"},
+				},
+			},
+			wantErr: false,
+		},
+		{
 			name: "valid max_length on a string field",
 			def: Definition{
 				EntityType: "IssueReport",
@@ -736,5 +929,58 @@ func TestUniqueConstraintName(t *testing.T) {
 	_ = UniqueConstraintName(original)
 	if original[0] != "entry_date" || original[1] != "employee_id" {
 		t.Fatalf("UniqueConstraintName mutated its input slice: %v", original)
+	}
+}
+
+// TestConditionalUniqueConstraintName covers uc-infra#201/ADR-0028's
+// namespacing: same Fields canonicalization as UniqueConstraintName, plus
+// the condition appended so a UniqueWhen constraint can never collide
+// with an ordinary Unique constraint (or a differently-conditioned
+// UniqueWhen constraint) declaring the same Fields.
+func TestConditionalUniqueConstraintName(t *testing.T) {
+	cases := []struct {
+		name string
+		cu   ConditionalUnique
+		want string
+	}{
+		{
+			name: "role_type own_organization",
+			cu:   ConditionalUnique{Fields: []string{"role_type"}, WhenField: "role_type", WhenValue: "own_organization"},
+			want: "role_type?role_type=own_organization",
+		},
+		{
+			name: "is_base true",
+			cu:   ConditionalUnique{Fields: []string{"is_base"}, WhenField: "is_base", WhenValue: "true"},
+			want: "is_base?is_base=true",
+		},
+		{
+			name: "reverse-order Fields canonicalizes the same",
+			cu:   ConditionalUnique{Fields: []string{"b", "a"}, WhenField: "status", WhenValue: "active"},
+			want: "a+b?status=active",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ConditionalUniqueConstraintName(tc.cu); got != tc.want {
+				t.Fatalf("ConditionalUniqueConstraintName(%+v) = %q, want %q", tc.cu, got, tc.want)
+			}
+		})
+	}
+
+	// Never collides with an ordinary UniqueConstraintName on the same
+	// Fields — the whole reason for the "?"-condition suffix.
+	fields := []string{"role_type"}
+	plain := UniqueConstraintName(fields)
+	conditional := ConditionalUniqueConstraintName(ConditionalUnique{Fields: fields, WhenField: "role_type", WhenValue: "own_organization"})
+	if plain == conditional {
+		t.Fatalf("UniqueConstraintName and ConditionalUniqueConstraintName collided on the same Fields: %q", plain)
+	}
+
+	// Two different conditions on the same Fields must never collide
+	// with each other either.
+	a := ConditionalUniqueConstraintName(ConditionalUnique{Fields: fields, WhenField: "role_type", WhenValue: "own_organization"})
+	b := ConditionalUniqueConstraintName(ConditionalUnique{Fields: fields, WhenField: "role_type", WhenValue: "vendor"})
+	if a == b {
+		t.Fatalf("two different conditions on the same Fields collided: %q", a)
 	}
 }

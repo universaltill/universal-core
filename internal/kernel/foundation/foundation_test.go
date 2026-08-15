@@ -138,6 +138,30 @@ func TestPartyRole_OwnOrganizationIsALegalRoleType(t *testing.T) {
 	}
 }
 
+// TestPartyRole_DeclaresConditionalUniqueOnOwnOrganization confirms
+// uc-infra#201/ADR-0028's UniqueWhen declaration on PartyRole v4: at most
+// one live PartyRole with role_type=="own_organization" — see
+// TestCurrency_DeclaresConditionalUniqueOnIsBase for the identical shape
+// on Currency.is_base, and crud/unique_constraints_test.go and
+// cmd/sync-tenant-modules's own ConditionalUnique tests for the generic
+// mechanism's end-to-end coverage (Create/Update/Delete/backfill).
+func TestPartyRole_DeclaresConditionalUniqueOnOwnOrganization(t *testing.T) {
+	def := PartyRole()
+	if def.Version < 4 {
+		t.Errorf("PartyRole is v%d, want >= v4 — the own_organization UniqueWhen constraint (uc-infra#201)", def.Version)
+	}
+	if len(def.UniqueWhen) != 1 {
+		t.Fatalf("PartyRole.UniqueWhen = %v, want exactly one declared entry", def.UniqueWhen)
+	}
+	got := def.UniqueWhen[0]
+	if len(got.Fields) != 1 || got.Fields[0] != "role_type" || got.WhenField != "role_type" || got.WhenValue != "own_organization" {
+		t.Fatalf("PartyRole.UniqueWhen[0] = %+v, want Fields=[role_type] WhenField=role_type WhenValue=own_organization", got)
+	}
+	if err := def.Validate(); err != nil {
+		t.Fatalf("PartyRole must validate as a Definition: %v", err)
+	}
+}
+
 // TestParty_ExistingRecordsStillValidateAfterV3 confirms uc-infra#63's
 // field additions are additive-only: a Party record written before v3
 // existed (no registration_number/contact_first_name/contact_last_name
@@ -219,8 +243,8 @@ func TestCurrency_IsBaseFieldDefaultsFalse(t *testing.T) {
 // Postgres end-to-end case).
 func TestCurrency_UniqueOnCode(t *testing.T) {
 	def := Currency()
-	if def.Version != 5 {
-		t.Errorf("Currency is v%d, want v5 — the code Unique constraint (uc-infra#181)", def.Version)
+	if def.Version < 5 {
+		t.Errorf("Currency is v%d, want >= v5 — the code Unique constraint (uc-infra#181)", def.Version)
 	}
 	if len(def.Unique) != 1 {
 		t.Fatalf("Currency.Unique = %v, want exactly one declared set", def.Unique)
@@ -229,6 +253,28 @@ func TestCurrency_UniqueOnCode(t *testing.T) {
 	got := append([]string(nil), def.Unique[0]...)
 	if len(got) != len(want) || got[0] != want[0] {
 		t.Fatalf("Currency.Unique[0] = %v, want %v", got, want)
+	}
+	if err := def.Validate(); err != nil {
+		t.Fatalf("Currency must validate as a Definition: %v", err)
+	}
+}
+
+// TestCurrency_DeclaresConditionalUniqueOnIsBase confirms uc-infra#201/
+// ADR-0028's UniqueWhen declaration on Currency v6: at most one live
+// Currency with is_base=true — see TestPartyRole_DeclaresConditionalUniqueOnOwnOrganization
+// for the identical shape on PartyRole, and crud/unique_constraints_test.go
+// for the generic mechanism's own end-to-end coverage.
+func TestCurrency_DeclaresConditionalUniqueOnIsBase(t *testing.T) {
+	def := Currency()
+	if def.Version < 6 {
+		t.Errorf("Currency is v%d, want >= v6 — the is_base UniqueWhen constraint (uc-infra#201)", def.Version)
+	}
+	if len(def.UniqueWhen) != 1 {
+		t.Fatalf("Currency.UniqueWhen = %v, want exactly one declared entry", def.UniqueWhen)
+	}
+	got := def.UniqueWhen[0]
+	if len(got.Fields) != 1 || got.Fields[0] != "is_base" || got.WhenField != "is_base" || got.WhenValue != "true" {
+		t.Fatalf("Currency.UniqueWhen[0] = %+v, want Fields=[is_base] WhenField=is_base WhenValue=true", got)
 	}
 	if err := def.Validate(); err != nil {
 		t.Fatalf("Currency must validate as a Definition: %v", err)

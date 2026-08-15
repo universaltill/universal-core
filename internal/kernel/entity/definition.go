@@ -214,6 +214,57 @@ func UniqueConstraintName(fields []string) string {
 	return strings.Join(sorted, "+")
 }
 
+// ConditionalUnique declares one field set that must be unique together,
+// but only among live records where WhenField's value equals WhenValue
+// (uc-infra#201, ADR-0028) — e.g. Fields:["role_type"],
+// WhenField:"role_type", WhenValue:"own_organization" rejects a second
+// PartyRole with role_type=="own_organization" while leaving every other
+// role_type (vendor, customer, ...) unconstrained. A plain Unique on
+// role_type cannot express this: it would cap EVERY role_type at one
+// row, not just own_organization's.
+//
+// WhenValue is always a string, compared against the record's actual
+// WhenField value via the same type-agnostic fmt.Sprint comparison
+// crud.valueMatches already uses for Field.TargetFilter conditions — so
+// a FieldBool's WhenValue is written as the literal "true"/"false"
+// (Currency.is_base) and an enum/string field's WhenValue is its enum
+// value (PartyRole.role_type's "own_organization"), never a typed Go
+// value.
+//
+// Enforced by crud.WriteUniqueConstraintKeys/UpdateUniqueConstraintKeys
+// against record_unique_keys — same mechanism, same *UniqueConstraintError
+// translation as Unique (ADR-0018 §3), extended by ADR-0028 rather than
+// replaced: Fields alone determines key_value, exactly like Unique;
+// WhenField/WhenValue only gate whether a given record participates at
+// all. PartyRole/Currency both happen to declare Fields as exactly
+// [WhenField] — the degenerate case where every participating record
+// necessarily shares the same key_value (there is only one legal value
+// for the field once the condition already fixed it), so in effect "at
+// most one matching record total." That is a property of THOSE two
+// declarations, not of the mechanism: Fields naming a DIFFERENT field
+// than WhenField (e.g. Fields:["assignee_id"], WhenField:"status",
+// WhenValue:"active" — "at most one active record per assignee_id") is
+// equally valid and keys independently per assignee_id, the general case
+// ADR-0028's Consequences section describes. Not a DB-level partial index
+// (ADR-0018 §3(a) already rejected metadata-driven DDL at publish time,
+// and ADR-0028 declined to revisit that for the conditional case).
+type ConditionalUnique struct {
+	Fields    []string `json:"fields"`
+	WhenField string   `json:"when_field"`
+	WhenValue string   `json:"when_value"`
+}
+
+// ConditionalUniqueConstraintName is UniqueConstraintName's UniqueWhen
+// counterpart, namespaced with the condition (via a "?" separator that
+// can never appear in UniqueConstraintName's own "+"-joined output) so a
+// UniqueWhen constraint can never collide, in record_unique_keys'
+// (entity_type, constraint_name) key, with an ordinary Unique constraint
+// — or another UniqueWhen constraint — that happens to declare the same
+// Fields on the same entity type.
+func ConditionalUniqueConstraintName(cu ConditionalUnique) string {
+	return fmt.Sprintf("%s?%s=%s", UniqueConstraintName(cu.Fields), cu.WhenField, cu.WhenValue)
+}
+
 // TargetFilterCondition is one field/value condition a candidate target
 // record must satisfy — see Field.TargetFilter.
 //
@@ -335,6 +386,10 @@ type Definition struct {
 	// constraint, mirroring ordinary SQL NULL-in-a-unique-index semantics
 	// — Required already covers "must always be present" separately.
 	Unique [][]string `json:"unique,omitempty"`
+	// UniqueWhen declares Unique-like constraints that only apply to
+	// records matching a condition — see ConditionalUnique's own doc
+	// comment (uc-infra#201, ADR-0028).
+	UniqueWhen []ConditionalUnique `json:"unique_when,omitempty"`
 }
 
 // Float64Ptr returns a pointer to v — a small helper so every Definition
@@ -417,39 +472,27 @@ func (d *Definition) Validate() error {
 		if f.Type == FieldEnum && len(f.EnumValues) == 0 {
 			return fmt.Errorf("field %q is type enum but has no enum_values", f.Name)
 		}
-		if f.Type == FieldEnum && f.Default != nil {
-			// Default only started being consulted by
-			// internal/kernel/formrender's form rendering once reference/
-			// enum fields got real "unselected" empty-option handling
-			// (2026-07-20) — before that it was declared but inert
-			// everywhere, so a typo'd Default was harmless dead data.
-			// Now it sets the pre-selected <option>, and a Default that
-			// isn't one of EnumValues would silently produce a <select>
-			// with nothing selected despite formrender believing a
-			// default was applied — catch it at definition-validation
-			// time instead, the same "fail loud on schema drift" this
-			// method already applies to enum_values/target.
-			def, ok := f.Default.(string)
-			if !ok {
-				return fmt.Errorf("field %q is type enum but default %v is not a string", f.Name, f.Default)
-			}
-			if !slices.Contains(f.EnumValues, def) {
-				return fmt.Errorf("field %q default %q is not one of its enum_values %v", f.Name, def, f.EnumValues)
-			}
-		}
-		if f.Type == FieldBool && f.Default != nil {
-			// Same reasoning as the FieldEnum check just above, for the
-			// same reason: formrender's new-record rendering only started
-			// consulting a FieldBool's Default once uc-infra#206 closed the
-			// gap where only FieldEnum's was honored. Before that, a
-			// typo'd Default (e.g. the string "true" instead of the bool
-			// true) was harmless dead data; now formrender's type
-			// assertion fails safe and silently renders unchecked, which
-			// is exactly the "believes a default was applied but it
-			// wasn't" failure the enum check exists to catch at
-			// definition-validation time instead of at render time.
-			if _, ok := f.Default.(bool); !ok {
-				return fmt.Errorf("field %q is type bool but default %v is not a bool", f.Name, f.Default)
+		if f.Default != nil {
+			// A Default's value must match its own field's shape —
+			// checked here, at definition-validation/publish time,
+			// against every field type generically, not just FieldEnum/
+			// FieldBool by hand. Originally only those two were checked
+			// (formrender's browser rendering started consulting a
+			// FieldEnum Default on 2026-07-20, then a FieldBool one via
+			// uc-infra#206 — before each, a typo'd Default of the wrong
+			// shape was harmless dead data nothing ever read). uc-infra#212
+			// made this a generic gap, not a two-type one: crud.Engine.
+			// Create's ApplyDefaults now trusts Field.Default verbatim,
+			// for every field type, on every write that omits the field —
+			// so a wrong-shaped Default (a fractional FieldMoney amount,
+			// a non-string FieldReference, an enum value not in
+			// EnumValues) would otherwise fail every single such write at
+			// runtime instead of being caught once, here, at the point
+			// the mistake was actually made. Reuses validateFieldValue —
+			// the identical structural check a submitted value gets — so
+			// a Default is held to the same standard as real record data.
+			if verr := validateFieldValue(d.EntityType, f, f.Default); verr != nil {
+				return fmt.Errorf("field %q: invalid default: %s", f.Name, verr.Detail)
 			}
 		}
 		if f.Type == FieldReference && f.Target == "" {
@@ -577,6 +620,77 @@ func (d *Definition) Validate() error {
 		name := UniqueConstraintName(set)
 		if seenConstraints[name] {
 			return fmt.Errorf("unique constraint on fields %v is declared more than once in %s", set, d.EntityType)
+		}
+		seenConstraints[name] = true
+	}
+	// UniqueWhen checked in its own pass, same reasoning and same
+	// static/shape-only scope as Unique's pass above (uc-infra#201,
+	// ADR-0028) — WhenField/WhenValue add two more shape checks (the
+	// conditioning field must exist, and must actually be declared) on
+	// top of Unique's own. Shares seenConstraints (not a separate map)
+	// with the Unique pass above: ConditionalUniqueConstraintName's "?"
+	// separator makes a same-Fields collision between a Unique and a
+	// UniqueWhen constraint unreachable for any ordinary (snake_case)
+	// field name, but sharing one map means a field name that DID contain
+	// "?" or "+" would be caught here as a declared-twice error instead of
+	// silently colliding in record_unique_keys' (entity_type,
+	// constraint_name) namespace at runtime (independent review of
+	// uc-infra#201).
+	for _, cu := range d.UniqueWhen {
+		if len(cu.Fields) == 0 {
+			return fmt.Errorf("conditional unique constraint in %s has an empty field set", d.EntityType)
+		}
+		seenInSet := make(map[string]bool, len(cu.Fields))
+		for _, name := range cu.Fields {
+			if _, ok := d.FieldByName(name); !ok {
+				return fmt.Errorf("conditional unique constraint in %s references unknown field %q", d.EntityType, name)
+			}
+			if seenInSet[name] {
+				return fmt.Errorf("conditional unique constraint in %s repeats field %q within one constraint", d.EntityType, name)
+			}
+			seenInSet[name] = true
+		}
+		if cu.WhenField == "" {
+			return fmt.Errorf("conditional unique constraint in %s has no when_field", d.EntityType)
+		}
+		whenField, ok := d.FieldByName(cu.WhenField)
+		if !ok {
+			return fmt.Errorf("conditional unique constraint in %s references unknown when_field %q", d.EntityType, cu.WhenField)
+		}
+		if cu.WhenValue == "" {
+			return fmt.Errorf("conditional unique constraint in %s has no when_value", d.EntityType)
+		}
+		// when_value must be a value when_field can actually hold, or the
+		// declared condition is a permanent, silent no-op: valueMatches
+		// (crud package) never matches, no record_unique_keys row is ever
+		// written, and cmd/sync-tenant-modules' backfill reports "0/0" and
+		// stays silent — the constraint LOOKS live (Validate passes, the
+		// Definition publishes) but protects nothing, with no runtime
+		// signal anywhere (independent review of uc-infra#201: found via a
+		// typo'd enum value and a "yes" instead of "true" on a FieldBool,
+		// both of which passed every check that existed before this one).
+		// Same bar Field.Default already clears via validateFieldValue
+		// (below) for the identical "typo a legal-looking value" mistake.
+		switch whenField.Type {
+		case FieldEnum:
+			if !slices.Contains(whenField.EnumValues, cu.WhenValue) {
+				return fmt.Errorf("conditional unique constraint in %s: when_value %q is not one of when_field %q's enum values %v", d.EntityType, cu.WhenValue, cu.WhenField, whenField.EnumValues)
+			}
+		case FieldBool:
+			if cu.WhenValue != "true" && cu.WhenValue != "false" {
+				return fmt.Errorf("conditional unique constraint in %s: when_value %q is not a legal bool literal for when_field %q (must be \"true\" or \"false\")", d.EntityType, cu.WhenValue, cu.WhenField)
+			}
+		case FieldI18nText, FieldMoney, FieldReference:
+			// Structured/compound values: valueMatches' generic fmt.Sprint
+			// comparison can never usefully equal a plain declared string
+			// for these (a map, a money object, an id needing #107's own
+			// canonicalization gap) — not merely unsupported today, but
+			// not a coherent condition to declare at all.
+			return fmt.Errorf("conditional unique constraint in %s: when_field %q is type %q, which cannot be used as a UniqueWhen condition", d.EntityType, cu.WhenField, whenField.Type)
+		}
+		name := ConditionalUniqueConstraintName(cu)
+		if seenConstraints[name] {
+			return fmt.Errorf("conditional unique constraint on fields %v when %s=%q is declared more than once in %s (or collides with another Unique/UniqueWhen constraint's name)", cu.Fields, cu.WhenField, cu.WhenValue, d.EntityType)
 		}
 		seenConstraints[name] = true
 	}

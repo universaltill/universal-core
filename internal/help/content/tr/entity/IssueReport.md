@@ -38,6 +38,7 @@ inceleme görünümüdür.
 - Başlık, açıklama ve durum zorunludur; sesli metin, konsol kaydı, sayfa ve tarayıcı alanları isteğe bağlıdır ve yalnızca tarayıcı bunları gerçekten yakaladığında bulunur.
 - İsteğe bağlı ekran kaydı yaklaşık üç dakikayla sınırlıdır; ortaya çıkan dosya eklenemeyecek kadar büyükse, rapor yine de kayıt olmadan gönderilir.
 - Bir rapordaki her alanın makul ama gerçek bir uzunluk sınırı vardır, bu yüzden bir rapora makul olmayan miktarda metin yapıştırmak sessizce kabul edilmek yerine reddedilir.
+- Önceki bir kayıt yazıya dökülmeyi bitirmeden yeni bir sesli kayıt başlatırsanız, yeni kayıt fiilen başladığı andan itibaren yalnızca onun metni tutulur — önceki kayıt, daha sonra ortaya çıkıp elinizdekinin üzerine yazmak yerine tamamen atılır.
 
 ## Neyle bağlantılıdır
 

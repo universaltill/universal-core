@@ -467,6 +467,334 @@ func TestAPI_PurchasingReport_InsufficientHistoryStates(t *testing.T) {
 	}
 }
 
+// TestAPI_PurchasingReport_ReorderSignalHonorsHiddenSafetyStock is
+// uc-infra#229's own regression test. That issue was a secondhand flag
+// from #222's independent reviewer, raised by analogy ("same shape as
+// #222's ProjectBudgetLine.category leak") but never itself reproduced
+// against real Postgres — this test is that reproduction attempt.
+//
+// safety_stock itself does NOT reproduce as a value-in-output leak:
+// unlike #222's ProjectBudgetActuals (a raw-SQL data.ReportingRepo
+// aggregate with no FieldPermission awareness at all), buildReorderSignals
+// reads ReorderRule through ts.crud — authz.GuardedEngine, which redacts
+// every hidden field out of a row's Data before this handler ever sees it
+// (see GuardedEngine.List/redact). And reorderRowView (this file) has no
+// SafetyStock field to begin with — the number is used only internally, to
+// decide whether a rule fires, and is never rendered as text on any signal
+// row. That is narrower than it might sound: this report's On Hand/
+// Position columns a few lines below (qty_on_hand/qty_available_to_promise,
+// read via the SAME ts.reporting.* raw-SQL path #222 fixed for a different
+// entity) do NOT get this protection — confirmed, independently, as a real
+// leak and filed separately as uc-infra#230. This test's "not a leak"
+// finding is specific to safety_stock; it says nothing about the rest of
+// this report's columns.
+//
+// What this test pins instead is the real, adjacent behavior a hidden
+// safety_stock actually gets: because GuardedEngine.redact deletes the
+// key outright, rule.Data["safety_stock"] misses its type assertion and
+// falls back to the same 0 this file's own doc comment already
+// documents for a genuinely-never-set safety_stock ("missing = 0, per
+// the design") — a redacted actor and a "no safety stock configured"
+// tenant are indistinguishable to this function. That is a real,
+// separate, lower-severity question from a value leak (does a
+// FieldPermission-restricted buyer sometimes silently NOT see a
+// signal an unrestricted buyer sees, because their view of safety_stock
+// collapsed to 0?) — filed as its own follow-up, uc-infra#231, rather
+// than folded into this card: unlike #222's fix, resolving it means
+// picking a business behavior (show the signal anyway? show it with a
+// "some criteria hidden" note? something else?), not just widening an
+// existing redaction predicate.
+func TestAPI_PurchasingReport_ReorderSignalHonorsHiddenSafetyStock(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := purchasing.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("purchasing.Publish: %v", err)
+	}
+	records := data.NewRecordRepo(db)
+
+	mustCreate := func(entityType string, fields map[string]any) string {
+		t.Helper()
+		rec, err := records.Create(ctx, entityType, fields)
+		if err != nil {
+			t.Fatalf("create %s: %v", entityType, err)
+		}
+		return rec.ID
+	}
+
+	// qty_available_to_promise 2 (not 0) deliberately keeps both items off
+	// the stockout-risk table below (internal/data/reporting.go's
+	// StockoutRiskItems filters WHERE atp <= 0) — same fixture-coupling
+	// TestAPI_PurchasingReport_ReorderSignalsDegradeWhenItemDefinitionUnavailable
+	// documents above. Only the reorder-signal path is under test here.
+	itemSS := mustCreate("Item", map[string]any{"sku": "SKU-SS", "name": "Safety Stock Widget", "item_type": "stock"})
+	mustCreate("InventoryItem", map[string]any{"item_id": itemSS, "qty_on_hand": 2, "qty_available_to_promise": 2})
+	// position (2) > reorder_point (1) alone -> only fires if safety_stock
+	// (5) is actually counted: 2 <= 1+5. Chosen deliberately so the two
+	// actors below can only differ on whether THIS rule fires, not on any
+	// rendered number a hidden field might otherwise leak.
+	mustCreate("ReorderRule", map[string]any{
+		"item_id": itemSS, "reorder_point": 1, "safety_stock": 5, "target_lead_time_confidence": "p90",
+	})
+
+	// A second item whose rule fires on reorder_point ALONE (safety_stock
+	// 0, real and redacted alike) — the severity-bearing half uc-infra#231's
+	// own review flagged as missing: a restricted buyer must still see
+	// every signal that doesn't depend on the hidden field, with the real
+	// OnHand/Position/ReorderPoint numbers on that row (reorder_point
+	// itself is never subject to this actor's FieldPermission at all,
+	// unlike safety_stock).
+	itemRP := mustCreate("Item", map[string]any{"sku": "SKU-RP", "name": "Reorder Point Widget", "item_type": "stock"})
+	mustCreate("InventoryItem", map[string]any{"item_id": itemRP, "qty_on_hand": 3, "qty_available_to_promise": 3})
+	mustCreate("ReorderRule", map[string]any{
+		"item_id": itemRP, "reorder_point": 10, "safety_stock": 0, "target_lead_time_confidence": "p90",
+	})
+
+	seedFieldRule(t, db, "restricted-buyer", "user-restricted", "ReorderRule", "safety_stock")
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	// Unrestricted actor: real safety_stock counted, both signals fire.
+	recOpen := getAs(t, mux, "/reports/purchasing", tenantID, "farshid")
+	if recOpen.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recOpen.Code, recOpen.Body.String())
+	}
+	if !strings.Contains(recOpen.Body.String(), "Safety Stock Widget") {
+		t.Errorf("expected the signal to fire for an actor who can see safety_stock (position 2 <= reorder_point 1 + safety_stock 5):\n%s", recOpen.Body.String())
+	}
+	if !strings.Contains(recOpen.Body.String(), "Reorder Point Widget") {
+		t.Errorf("expected the reorder_point-only signal to fire regardless:\n%s", recOpen.Body.String())
+	}
+
+	// Restricted actor: safety_stock is redacted out of ReorderRule.Data
+	// before buildReorderSignals ever reads it, so it falls back to the
+	// same 0 a genuinely-unset safety_stock would use -> 2 <= 1+0 is
+	// false, the Safety Stock Widget signal does not fire. This is the
+	// current, intentional-looking (if debatable — see uc-infra#231)
+	// behavior. It is NOT a value leak: safety_stock has no rendered
+	// column on this report (reorderRowView, above) for the real number 5
+	// to appear in, for either actor.
+	recRestricted := getAs(t, mux, "/reports/purchasing", tenantID, "user-restricted")
+	if recRestricted.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recRestricted.Code, recRestricted.Body.String())
+	}
+	restrictedBody := recRestricted.Body.String()
+	if strings.Contains(restrictedBody, "Safety Stock Widget") {
+		t.Errorf("actor with safety_stock hidden must not see a signal that only fires by counting the real safety_stock value:\n%s", restrictedBody)
+	}
+	// The reorder_point-only signal is NOT affected by safety_stock being
+	// hidden: it must still fire, with its real OnHand/Position/
+	// ReorderPoint numbers, exactly as for the unrestricted actor above —
+	// a hidden safety_stock must not blank signals that never depended on
+	// it (uc-infra#231's own review, finding 3d).
+	wantRPSignal := "<tr><td><a href=\"/forms/Item/" + itemRP + "\">Reorder Point Widget</a></td><td>3</td><td>0</td><td>3</td><td>10</td>"
+	if !strings.Contains(restrictedBody, wantRPSignal) {
+		t.Errorf("expected the reorder_point-only signal row %q to survive safety_stock being hidden:\n%s", wantRPSignal, restrictedBody)
+	}
+}
+
+// TestAPI_PurchasingReport_HiddenInventoryQuantitiesRenderNotAvailable is
+// uc-infra#230's own regression test: the real, empirically-confirmed leak
+// the independent (opus) reviewer found while investigating uc-infra#229
+// (see that test's own doc comment) — qty_on_hand/qty_available_to_promise
+// are read via ts.reporting's raw SQL (data.ReportingRepo), entirely
+// outside the ts.crud-redacted path, in three places on this report: the
+// Stock Summary card's aggregate totals, the Stockout Risk table's
+// per-item columns, and the Reorder Signals table's On Hand/Position
+// columns. Before this fix every one of these rendered the real number to
+// an actor whose role hides the underlying InventoryItem field via a
+// FieldPermission (ADR-0006), the same class of leak uc-infra#222 already
+// fixed once for a different entity/field (ProjectBudgetLine.category).
+//
+// Deliberately covers qty_on_hand and qty_available_to_promise with TWO
+// separate restricted actors (not one actor with both hidden) to prove the
+// two fields are gated independently, not behind one shared "any quantity
+// hidden" flag — hiding one must leave the other's real number visible.
+//
+// Position is checked together with On Hand for the qty_on_hand-hidden
+// actor, not on its own: Position is on_hand+on_order, and On Order is
+// always rendered on the same row, so a visible Position next to a visible
+// On Order would let a restricted actor recover the real on-hand figure
+// by simple subtraction even with the On Hand cell itself correctly
+// blanked (see buildReorderSignals' own comment on why the fix gates both
+// together).
+//
+// This fix does NOT change whether the reorder signal fires: the row
+// below fires purely on real, uncomputed-for-display quantities for every
+// actor (unrestricted and both restricted ones alike) — only the rendered
+// cell is redacted, the fire/no-fire decision is unchanged. That is a
+// deliberate, narrower scope than uc-infra#231's still-open business
+// question about safety_stock: this is "redact the display," not "change
+// what the report decides to show a signal for."
+func TestAPI_PurchasingReport_HiddenInventoryQuantitiesRenderNotAvailable(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := purchasing.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("purchasing.Publish: %v", err)
+	}
+	records := data.NewRecordRepo(db)
+
+	mustCreate := func(entityType string, fields map[string]any) string {
+		t.Helper()
+		rec, err := records.Create(ctx, entityType, fields)
+		if err != nil {
+			t.Fatalf("create %s: %v", entityType, err)
+		}
+		return rec.ID
+	}
+
+	// Deliberately distinct, unambiguous numbers (not 0, not shared with
+	// any other value on this row) so a leaked figure can't hide behind a
+	// coincidental match with reorder_point/on_order elsewhere in the body.
+	// qty_available_to_promise -4 (<=0) also puts this item on the
+	// Stockout Risk table, so this single fixture exercises all three
+	// leak sites uc-infra#230 found, not just the reorder-signal one
+	// uc-infra#229's own regression test already covers.
+	itemID := mustCreate("Item", map[string]any{"sku": "SKU-LEAK", "name": "Leaky Widget", "item_type": "stock"})
+	mustCreate("InventoryItem", map[string]any{"item_id": itemID, "qty_on_hand": 17, "qty_available_to_promise": -4})
+	mustCreate("ReorderRule", map[string]any{"item_id": itemID, "reorder_point": 25, "safety_stock": 0, "target_lead_time_confidence": "p90"})
+
+	seedFieldRule(t, db, "onhand-restricted", "user-onhand-hidden", "InventoryItem", "qty_on_hand")
+	seedFieldRule(t, db, "atp-restricted", "user-atp-hidden", "InventoryItem", "qty_available_to_promise")
+	// A third actor with BOTH fields hidden at once (independent review,
+	// uc-infra#230) — not exercised by either single-field actor above,
+	// and proves the two predicates compose (both flags true
+	// simultaneously) rather than one silently masking the other.
+	//
+	// Deliberately ONE role with two FieldPermission rows, not two
+	// single-field roles granted to the same user: authz.Resolver.
+	// HiddenFields' own contract (authz.go) is a field is hidden only
+	// when EVERY role the actor holds has a hidden=true row for it — two
+	// single-field roles would each fail that unanimity test for the
+	// OTHER role's field, hiding NEITHER, the opposite of what this case
+	// means to test.
+	bothRoleID := seedFieldRule(t, db, "both-restricted", "user-both-hidden", "InventoryItem", "qty_on_hand")
+	mustCreate("FieldPermission", map[string]any{
+		"role_id": bothRoleID, "entity_type": "InventoryItem", "field_name": "qty_available_to_promise", "hidden": true,
+	})
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	// Unrestricted actor: every real number renders, on every table,
+	// including the Stockout Risk heading's own real count.
+	recOpen := getAs(t, mux, "/reports/purchasing", tenantID, "farshid")
+	if recOpen.Code != http.StatusOK {
+		t.Fatalf("unrestricted actor: expected 200, got %d: %s", recOpen.Code, recOpen.Body.String())
+	}
+	openBody := recOpen.Body.String()
+	for _, want := range []string{
+		// Stock Summary card.
+		`<div class="uc-report-card-label">Qty On Hand</div>
+  <div class="uc-report-card-value">17</div>`,
+		`<div class="uc-report-card-label">Qty Available to Promise</div>
+  <div class="uc-report-card-value">-4</div>`,
+		// Stockout Risk heading count + row.
+		"<h2>Stockout Risk (1)</h2>",
+		`<td><a href="/forms/Item/` + itemID + `">SKU-LEAK</a></td><td>Leaky Widget</td><td>17</td><td>-4</td>`,
+		// Reorder Signals row: OnHand=17, OnOrder=0, Position=17, ReorderPoint=25.
+		`<tr><td><a href="/forms/Item/` + itemID + `">Leaky Widget</a></td><td>17</td><td>0</td><td>17</td><td>25</td>`,
+	} {
+		if !strings.Contains(openBody, want) {
+			t.Errorf("unrestricted actor: expected %q in body:\n%s", want, openBody)
+		}
+	}
+
+	// qty_on_hand hidden: On Hand AND Position blank on every table; ATP
+	// (a different field) stays real everywhere. Not asserting "17 never
+	// appears anywhere in the body" as a blanket scan: itemID is a random
+	// UUID and can coincidentally contain "17"/"-4" as a hex substring,
+	// so the precise, anchored per-cell checks below are the real
+	// assertion — they pin exactly which cell shows what, not just
+	// whether a digit sequence occurs somewhere in the page.
+	recOnHand := getAs(t, mux, "/reports/purchasing", tenantID, "user-onhand-hidden")
+	if recOnHand.Code != http.StatusOK {
+		t.Fatalf("qty_on_hand-restricted actor: expected 200, got %d: %s", recOnHand.Code, recOnHand.Body.String())
+	}
+	onHandBody := recOnHand.Body.String()
+	for _, want := range []string{
+		`<div class="uc-report-card-label">Qty On Hand</div>
+  <div class="uc-report-card-value">Not available</div>`,
+		`<div class="uc-report-card-label">Qty Available to Promise</div>
+  <div class="uc-report-card-value">-4</div>`,
+		`<td><a href="/forms/Item/` + itemID + `">SKU-LEAK</a></td><td>Leaky Widget</td><td>Not available</td><td>-4</td>`,
+		`<tr><td><a href="/forms/Item/` + itemID + `">Leaky Widget</a></td><td>Not available</td><td>0</td><td>Not available</td><td>25</td>`,
+	} {
+		if !strings.Contains(onHandBody, want) {
+			t.Errorf("qty_on_hand-restricted actor: expected %q in body:\n%s", want, onHandBody)
+		}
+	}
+
+	// qty_available_to_promise hidden: the Stock Summary card's ATP total
+	// blanks (a straightforward per-cell redaction, like OnHand's own
+	// above). The Stockout Risk section, though, is NOT a per-cell case:
+	// StockoutRiskItems' row membership and stock.StockoutCount are both
+	// filtered/computed server-side from the real, un-redacted
+	// qty_available_to_promise (WHERE atp <= 0), so blanking only the ATP
+	// cell would still leak "this item's real ATP is <= 0" via bare
+	// presence in the list and the heading's own count — the WHOLE
+	// section (heading count AND table) must gate together instead (see
+	// purchasingReportView.StockoutAvailable's own comment). On Hand/
+	// Position stay real everywhere else — hiding ATP must not blank a
+	// field it has no relationship to.
+	recATP := getAs(t, mux, "/reports/purchasing", tenantID, "user-atp-hidden")
+	if recATP.Code != http.StatusOK {
+		t.Fatalf("qty_available_to_promise-restricted actor: expected 200, got %d: %s", recATP.Code, recATP.Body.String())
+	}
+	atpBody := recATP.Body.String()
+	for _, want := range []string{
+		`<div class="uc-report-card-label">Qty On Hand</div>
+  <div class="uc-report-card-value">17</div>`,
+		`<div class="uc-report-card-label">Qty Available to Promise</div>
+  <div class="uc-report-card-value">Not available</div>`,
+		// No "(N)" count suffix on the heading, and no table — just the
+		// section-level not-available notice.
+		"<h2>Stockout Risk</h2>",
+		`<p class="uc-empty">Not available</p>`,
+		`<tr><td><a href="/forms/Item/` + itemID + `">Leaky Widget</a></td><td>17</td><td>0</td><td>17</td><td>25</td>`,
+	} {
+		if !strings.Contains(atpBody, want) {
+			t.Errorf("qty_available_to_promise-restricted actor: expected %q in body:\n%s", want, atpBody)
+		}
+	}
+	if strings.Contains(atpBody, "SKU-LEAK") {
+		t.Errorf("qty_available_to_promise-restricted actor: the Stockout Risk row must not render at all (its membership itself is derived from the hidden field), but SKU-LEAK appears:\n%s", atpBody)
+	}
+	if strings.Contains(atpBody, "Stockout Risk (") {
+		t.Errorf("qty_available_to_promise-restricted actor: the Stockout Risk heading must not show a count derived from the hidden field:\n%s", atpBody)
+	}
+
+	// Both fields hidden at once: every site above blanks/gates
+	// simultaneously — neither predicate silently wins over the other,
+	// and OnOrder/ReorderPoint (fields neither FieldPermission touches)
+	// still render for real.
+	recBoth := getAs(t, mux, "/reports/purchasing", tenantID, "user-both-hidden")
+	if recBoth.Code != http.StatusOK {
+		t.Fatalf("both-restricted actor: expected 200, got %d: %s", recBoth.Code, recBoth.Body.String())
+	}
+	bothBody := recBoth.Body.String()
+	for _, want := range []string{
+		`<div class="uc-report-card-label">Qty On Hand</div>
+  <div class="uc-report-card-value">Not available</div>`,
+		`<div class="uc-report-card-label">Qty Available to Promise</div>
+  <div class="uc-report-card-value">Not available</div>`,
+		"<h2>Stockout Risk</h2>",
+		`<p class="uc-empty">Not available</p>`,
+		`<tr><td><a href="/forms/Item/` + itemID + `">Leaky Widget</a></td><td>Not available</td><td>0</td><td>Not available</td><td>25</td>`,
+	} {
+		if !strings.Contains(bothBody, want) {
+			t.Errorf("both-restricted actor: expected %q in body:\n%s", want, bothBody)
+		}
+	}
+	if strings.Contains(bothBody, "SKU-LEAK") {
+		t.Errorf("both-restricted actor: the Stockout Risk row must not render at all:\n%s", bothBody)
+	}
+}
+
 // TestAPI_PurchasingReport_OnTimeDeliverySection (#11) exercises the
 // on-time-delivery table end to end: a vendor with enough promised-date
 // samples to show a real rate, a vendor with only one (insufficient),
@@ -1158,5 +1486,355 @@ func TestAPI_PurchasingReport_ModuleMenuHidesReportLinkWhenDenied(t *testing.T) 
 	}
 	if strings.Contains(denied.Body.String(), "/reports/purchasing") {
 		t.Fatalf("user-denied (Item read denied, a report dependency) still saw the report link, which leads to a guaranteed 403:\n%s", denied.Body.String())
+	}
+}
+
+// TestAPI_PurchasingReport_HiddenPurchaseOrderPartyItemFieldsRenderNotAvailable
+// is uc-infra#233's own regression test, covering every unredacted
+// ts.reporting raw-SQL render site for PurchaseOrder.total, Party.name,
+// and Item.sku/Item.name this independent-review pass flagged on the
+// purchasing report: PurchaseOrder.total (status cards' Value, vendor
+// table's Spend), Party.name (the vendor table's Name column, AND the
+// Supplier Lead Times/On-Time Delivery/Quality tables' Vendor column —
+// four separate render sites for the same field, all fed by the same
+// vendorNameRedacted flag), and Item.sku/Item.name (stockout table).
+// Before this fix every one of these rendered the real value to an actor
+// whose role hides the underlying field via a FieldPermission
+// (ADR-0006), the same class of leak uc-infra#222 already fixed for a
+// different entity/field on a sibling report (project_budget_report.go —
+// NOT this one; uc-infra#230 is a separate, still-open fix for THIS
+// report's InventoryItem quantities specifically — not covered by this
+// test).
+//
+// An earlier version of this fix/test only covered the vendor-spend
+// table's Name column and missed the other three Party.name render
+// sites entirely — caught by independent review, which also found the
+// first version of this test fixture couldn't have caught it: no
+// completed PurchaseOrder/GoodsReceiptLine meant those three sections
+// rendered their empty states and never exercised the leak at all. The
+// fixture below deliberately includes a completed PO (order_date +
+// received_at) and a quality-bearing GoodsReceiptLine specifically so
+// all three additional Vendor-column sites are populated and checked,
+// not just vacuously absent.
+//
+// Deliberately covers each field with its OWN single-field-restricted
+// actor (not one actor with everything hidden) to prove the four
+// predicates gate independently — hiding one must leave the other
+// three's real values visible — plus one actor with all four hidden at
+// once to prove they compose rather than one silently masking another.
+//
+// Row PRESENCE is asserted as unaffected by any of these four fields
+// (every actor sees the same rows, differing only in which cells read
+// "Not available") — none of total/name/sku drive which rows appear on
+// this report; see the handler's own comments on vendorRowView/
+// stockoutRowView/buildLeadTimeRows for why. (Vendor table row ORDER is
+// a documented, deliberately out-of-scope exception — see the handler's
+// own comment on TopVendorsBySpend's ORDER BY.)
+func TestAPI_PurchasingReport_HiddenPurchaseOrderPartyItemFieldsRenderNotAvailable(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+	ctx := context.Background()
+	if err := purchasing.Publish(ctx, db, humanActor()); err != nil {
+		t.Fatalf("purchasing.Publish: %v", err)
+	}
+	records := data.NewRecordRepo(db)
+
+	mustCreate := func(entityType string, fields map[string]any) string {
+		t.Helper()
+		rec, err := records.Create(ctx, entityType, fields)
+		if err != nil {
+			t.Fatalf("create %s: %v", entityType, err)
+		}
+		return rec.ID
+	}
+
+	status := mustCreate("Status", map[string]any{"code": "approved", "name": "Approved"})
+	vendor := mustCreate("Party", map[string]any{"name": "Acme Corp", "party_type": "organization"})
+	// total is FieldMoney (minor units, uc-infra#136): 500000 -> "5000.00".
+	mustCreate("PurchaseOrder", map[string]any{
+		"po_number": "PO-233", "vendor_id": vendor, "status_id": status, "total": 500000,
+	})
+	// qty_available_to_promise -1 (<=0) puts this item on the Stockout
+	// Risk table so its SKU/Name cells are exercised too.
+	item := mustCreate("Item", map[string]any{"sku": "SKU-LEAK233", "name": "Leaky Widget 233", "item_type": "stock"})
+	mustCreate("InventoryItem", map[string]any{"item_id": item, "qty_on_hand": 9, "qty_available_to_promise": -1})
+
+	// A SECOND Party, also named "Acme Corp" (a distinct record — same
+	// Party.name VALUE, different row), with a completed PurchaseOrder
+	// feeding the Supplier Lead Times / On-Time Delivery / Quality tables
+	// — whose Vendor column reads Party.name through this exact same
+	// unredacted raw-SQL path (independent review of an earlier version
+	// of this fix caught it missing these three tables entirely — see
+	// buildLeadTimeRows' own comment). No status_id here
+	// (CompletedPOLeadTimes/GoodsReceiptLineQualities don't filter on
+	// it), so it never joins the "approved" status breakdown, and it
+	// does NOT touch the FIRST vendor's own Orders/Spend row (still
+	// pinned at "1"/"5000.00" below) since it's a different Party row.
+	// It DOES, however, add its own SEPARATE row to the vendor-spend
+	// table (TopVendorsBySpend has no status filter and groups by v.id,
+	// so this Party's own PurchaseOrder — no `total` set — earns it a
+	// second `<tr>` there with Spend "0.00", same redaction rules
+	// applied independently). Not asserted on by name/value below since
+	// every vendorRow() check here pins the FIRST vendor's row via its
+	// distinguishing "5000.00" spend, but real and worth knowing if this
+	// fixture is ever reused for an exact-row-count assertion.
+	// N=1 leaves every table's own rate/quantile at "Insufficient
+	// history" for either actor — this fixture is about proving the
+	// Vendor CELL redacts, not about exercising the quantile/rate math
+	// those other tests already cover.
+	vendorLT := mustCreate("Party", map[string]any{"name": "Acme Corp", "party_type": "organization"})
+	poLT := mustCreate("PurchaseOrder", map[string]any{
+		"po_number": "PO-233-LT", "vendor_id": vendorLT,
+		"order_date": "2026-08-01", "received_at": "2026-08-05", "promised_delivery_date": "2026-08-05",
+	})
+	grLT := mustCreate("GoodsReceipt", map[string]any{"purchase_order_id": poLT, "received_date": "2026-08-05"})
+	mustCreate("GoodsReceiptLine", map[string]any{
+		"goods_receipt_id": grLT, "qty_received": 10.0, "qty_accepted": 10.0, "qty_rejected": 0.0,
+	})
+
+	seedFieldRule(t, db, "total-restricted", "user-total-hidden", "PurchaseOrder", "total")
+	seedFieldRule(t, db, "partyname-restricted", "user-partyname-hidden", "Party", "name")
+	seedFieldRule(t, db, "sku-restricted", "user-sku-hidden", "Item", "sku")
+	seedFieldRule(t, db, "itemname-restricted", "user-itemname-hidden", "Item", "name")
+	// One role with all four FieldPermission rows, not four single-field
+	// roles granted to the same user: authz.Resolver.HiddenFields' own
+	// contract is a field is hidden only when EVERY role the actor holds
+	// has a hidden=true row for it — four single-field roles would each
+	// fail that unanimity test for the OTHER roles' fields, hiding NONE
+	// of them (the e2e counterpart of this test, purchasing_report_test.go
+	// in internal/e2e, hit exactly this the first time it was written —
+	// see that test's own comment).
+	allRoleID := seedFieldRule(t, db, "all-restricted", "user-all-hidden", "PurchaseOrder", "total")
+	for _, fp := range []struct{ entityType, field string }{
+		{"Party", "name"}, {"Item", "sku"}, {"Item", "name"},
+	} {
+		mustCreate("FieldPermission", map[string]any{
+			"role_id": allRoleID, "entity_type": fp.entityType, "field_name": fp.field, "hidden": true,
+		})
+	}
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	statusCard := func(value string) string {
+		return `<div class="uc-report-card">
+  <div class="uc-report-card-label">Approved</div>
+  <div class="uc-report-card-value">1</div>
+  <div class="uc-report-card-sub">` + value + `</div>
+</div>`
+	}
+	vendorRow := func(name, spend string) string {
+		return `<tr><td>` + name + `</td><td>1</td><td>` + spend + `</td></tr>`
+	}
+	stockoutRow := func(sku, name string) string {
+		return `<tr><td><a href="/forms/Item/` + item + `">` + sku + `</a></td><td>` + name + `</td><td>9</td><td>-1</td></tr>`
+	}
+	// leadTimeRow/onTimeOrQualityRow: the Supplier Lead Times/On-Time
+	// Delivery/Quality tables' per-vendor row for the poLT/grLT fixture
+	// (N=1, always "Insufficient history" for the rate/quantile cells —
+	// see the fixture's own comment for why that's deliberate here).
+	leadTimeRow := func(name string) string {
+		return `<tr><td>` + name + `</td><td>1</td><td>Insufficient history</td><td>Insufficient history</td></tr>`
+	}
+	onTimeOrQualityRow := func(name string) string {
+		return `<tr><td>` + name + `</td><td>1</td><td>Insufficient history</td></tr>`
+	}
+
+	// Unrestricted actor: every real value renders everywhere.
+	openBody := getAs(t, mux, "/reports/purchasing", tenantID, "farshid").Body.String()
+	for _, want := range []string{
+		statusCard("5000.00"),
+		vendorRow("Acme Corp", "5000.00"),
+		stockoutRow("SKU-LEAK233", "Leaky Widget 233"),
+		leadTimeRow("Acme Corp"),
+		onTimeOrQualityRow("Acme Corp"),
+	} {
+		if !strings.Contains(openBody, want) {
+			t.Errorf("unrestricted actor: expected %q in body:\n%s", want, openBody)
+		}
+	}
+
+	// total hidden: status card Value and vendor Spend both blank; vendor
+	// Name (on every one of its four tables) and stockout SKU/Name stay
+	// real — total has no relationship to any of them.
+	totalBody := getAs(t, mux, "/reports/purchasing", tenantID, "user-total-hidden").Body.String()
+	for _, want := range []string{
+		statusCard("Not available"),
+		vendorRow("Acme Corp", "Not available"),
+		stockoutRow("SKU-LEAK233", "Leaky Widget 233"),
+		leadTimeRow("Acme Corp"),
+		onTimeOrQualityRow("Acme Corp"),
+	} {
+		if !strings.Contains(totalBody, want) {
+			t.Errorf("total-restricted actor: expected %q in body:\n%s", want, totalBody)
+		}
+	}
+	if strings.Contains(totalBody, "5000.00") {
+		t.Errorf("total-restricted actor: the real total (5000.00) must not appear anywhere:\n%s", totalBody)
+	}
+
+	// Party.name hidden: the Name cell blanks on ALL FOUR tables that
+	// render it (vendor-spend, Supplier Lead Times, On-Time Delivery,
+	// Quality) — not just the vendor-spend table (independent review of
+	// an earlier version of this fix caught exactly this gap).
+	nameBody := getAs(t, mux, "/reports/purchasing", tenantID, "user-partyname-hidden").Body.String()
+	for _, want := range []string{
+		statusCard("5000.00"),
+		vendorRow("Not available", "5000.00"),
+		stockoutRow("SKU-LEAK233", "Leaky Widget 233"),
+		leadTimeRow("Not available"),
+		onTimeOrQualityRow("Not available"),
+		// The trailing "All vendors" summary row on each of the three
+		// tables must NEVER gate — its label is a locale string
+		// (report.purchasing.leadtime_overall_label), not a real
+		// Party.name, so a redacted actor must still see it plainly
+		// (independent review: this invariant was documented in three
+		// doc comments but pinned by no test until this line — a future
+		// "simplify buildLeadTimeRows' row() closure" edit could
+		// silently gate this row and every other assertion here would
+		// stay green).
+		`<tr><td>All vendors</td><td>1</td><td>Insufficient history</td><td>Insufficient history</td></tr>`,
+	} {
+		if !strings.Contains(nameBody, want) {
+			t.Errorf("party-name-restricted actor: expected %q in body:\n%s", want, nameBody)
+		}
+	}
+	if strings.Contains(nameBody, "Acme Corp") {
+		t.Errorf("party-name-restricted actor: the real vendor name must not appear anywhere:\n%s", nameBody)
+	}
+
+	// Item.sku hidden: only the stockout table's SKU cell blanks; the row
+	// still appears (membership is driven by qty_available_to_promise,
+	// unrelated to sku).
+	skuBody := getAs(t, mux, "/reports/purchasing", tenantID, "user-sku-hidden").Body.String()
+	for _, want := range []string{
+		statusCard("5000.00"),
+		vendorRow("Acme Corp", "5000.00"),
+		stockoutRow("Not available", "Leaky Widget 233"),
+		leadTimeRow("Acme Corp"),
+		onTimeOrQualityRow("Acme Corp"),
+	} {
+		if !strings.Contains(skuBody, want) {
+			t.Errorf("sku-restricted actor: expected %q in body:\n%s", want, skuBody)
+		}
+	}
+	if strings.Contains(skuBody, "SKU-LEAK233") {
+		t.Errorf("sku-restricted actor: the real SKU must not appear anywhere:\n%s", skuBody)
+	}
+
+	// Item.name hidden: only the stockout table's Name cell blanks.
+	itemNameBody := getAs(t, mux, "/reports/purchasing", tenantID, "user-itemname-hidden").Body.String()
+	for _, want := range []string{
+		statusCard("5000.00"),
+		vendorRow("Acme Corp", "5000.00"),
+		stockoutRow("SKU-LEAK233", "Not available"),
+		leadTimeRow("Acme Corp"),
+		onTimeOrQualityRow("Acme Corp"),
+	} {
+		if !strings.Contains(itemNameBody, want) {
+			t.Errorf("item-name-restricted actor: expected %q in body:\n%s", want, itemNameBody)
+		}
+	}
+	if strings.Contains(itemNameBody, "Leaky Widget 233") {
+		t.Errorf("item-name-restricted actor: the real item name must not appear anywhere:\n%s", itemNameBody)
+	}
+
+	// All four hidden at once: every site blanks simultaneously, and the
+	// row/card still appear (membership never depended on any of these
+	// four fields).
+	allBody := getAs(t, mux, "/reports/purchasing", tenantID, "user-all-hidden").Body.String()
+	for _, want := range []string{
+		statusCard("Not available"),
+		vendorRow("Not available", "Not available"),
+		stockoutRow("Not available", "Not available"),
+		leadTimeRow("Not available"),
+		onTimeOrQualityRow("Not available"),
+	} {
+		if !strings.Contains(allBody, want) {
+			t.Errorf("all-restricted actor: expected %q in body:\n%s", want, allBody)
+		}
+	}
+	for _, leaked := range []string{"5000.00", "Acme Corp", "SKU-LEAK233", "Leaky Widget 233"} {
+		if strings.Contains(allBody, leaked) {
+			t.Errorf("all-restricted actor: %q must not appear anywhere:\n%s", leaked, allBody)
+		}
+	}
+}
+
+// TestPurchaseOrderTotalRedacted_TestPartyNameRedacted_TestItemSKURedacted_TestItemNameRedacted
+// (uc-infra#233, following project_budget_report_test.go's own
+// TestProjectBudgetLinePlannedRedacted_.../
+// TestProjectBudgetLineCategoryRedacted_... precedent) pins all four
+// predicates' truth tables directly, at the smallest possible unit — the
+// guard against a typo in a field-name literal silently disabling a
+// redaction with no unit-level signal.
+func TestPurchaseOrderTotalRedacted_TestPartyNameRedacted_TestItemSKURedacted_TestItemNameRedacted(t *testing.T) {
+	cases := []struct {
+		name         string
+		hidden       map[string]bool
+		wantTotal    bool
+		wantName     bool
+		wantSKU      bool
+		wantItemName bool
+	}{
+		{"nothing hidden", map[string]bool{}, false, false, false, false},
+		{"nil map", nil, false, false, false, false},
+		{"total hidden", map[string]bool{"total": true}, true, false, false, false},
+		{"name hidden", map[string]bool{"name": true}, false, true, false, true}, // name is shared by partyNameRedacted/itemNameRedacted's own field literal
+		{"sku hidden", map[string]bool{"sku": true}, false, false, true, false},
+		{"unrelated field hidden", map[string]bool{"vendor_id": true}, false, false, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := purchaseOrderTotalRedacted(tc.hidden); got != tc.wantTotal {
+				t.Errorf("purchaseOrderTotalRedacted(%v) = %v, want %v", tc.hidden, got, tc.wantTotal)
+			}
+			if got := partyNameRedacted(tc.hidden); got != tc.wantName {
+				t.Errorf("partyNameRedacted(%v) = %v, want %v", tc.hidden, got, tc.wantName)
+			}
+			if got := itemSKURedacted(tc.hidden); got != tc.wantSKU {
+				t.Errorf("itemSKURedacted(%v) = %v, want %v", tc.hidden, got, tc.wantSKU)
+			}
+			if got := itemNameRedacted(tc.hidden); got != tc.wantItemName {
+				t.Errorf("itemNameRedacted(%v) = %v, want %v", tc.hidden, got, tc.wantItemName)
+			}
+		})
+	}
+}
+
+// TestInventoryItemOnHandRedacted_TestInventoryItemATPRedacted (uc-infra#230,
+// independent review) pins both predicates' full truth tables directly, at
+// the smallest possible unit — mirroring project_budget_report_test.go's
+// own TestProjectBudgetLinePlannedRedacted_.../
+// TestProjectBudgetLineCategoryRedacted_... tests for the equivalent
+// predicates on a different entity. This is the guard against a typo in
+// either field-name literal silently disabling the whole fix: a bare
+// inline map lookup at each call site would have no unit-level test of
+// its own, only the slower, coarser HTTP-level regression test to catch
+// a mistake here.
+func TestInventoryItemOnHandRedacted_TestInventoryItemATPRedacted(t *testing.T) {
+	cases := []struct {
+		name       string
+		hidden     map[string]bool
+		wantOnHand bool
+		wantATP    bool
+	}{
+		{"nothing hidden", map[string]bool{}, false, false},
+		{"nil map", nil, false, false},
+		{"qty_on_hand hidden", map[string]bool{"qty_on_hand": true}, true, false},
+		{"qty_available_to_promise hidden", map[string]bool{"qty_available_to_promise": true}, false, true},
+		{"both hidden", map[string]bool{"qty_on_hand": true, "qty_available_to_promise": true}, true, true},
+		{"unrelated field hidden", map[string]bool{"item_id": true}, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := inventoryItemOnHandRedacted(tc.hidden); got != tc.wantOnHand {
+				t.Errorf("inventoryItemOnHandRedacted(%v) = %v, want %v", tc.hidden, got, tc.wantOnHand)
+			}
+			if got := inventoryItemATPRedacted(tc.hidden); got != tc.wantATP {
+				t.Errorf("inventoryItemATPRedacted(%v) = %v, want %v", tc.hidden, got, tc.wantATP)
+			}
+		})
 	}
 }

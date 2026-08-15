@@ -94,6 +94,56 @@ func (h *Handler) requireReportRead(w http.ResponseWriter, r *http.Request, rc *
 	return true
 }
 
+// purchaseOrderTotalRedacted/partyNameRedacted/itemSKURedacted/
+// itemNameRedacted (uc-infra#233) each answer whether THIS ACTOR's
+// FieldPermission hides one specific field this report reads through
+// ts.reporting's raw SQL (data.ReportingRepo) — entirely outside the
+// ts.crud-redacted path a generated CRUD page or form would otherwise
+// apply. Kept as their own named, unit-tested predicates rather than an
+// inline map lookup at each call site, same reasoning
+// project_budget_report.go's projectBudgetLinePlannedRedacted/
+// projectBudgetLineCategoryRedacted and this file's own
+// inventoryItemOnHandRedacted/inventoryItemATPRedacted (uc-infra#230,
+// merged into this file first) already give: a typo in a literal field
+// name would otherwise silently disable the redaction with no
+// unit-test-level signal, only a slower, coarser HTTP-level regression
+// test to (maybe) catch it.
+func purchaseOrderTotalRedacted(hidden map[string]bool) bool {
+	return hidden["total"]
+}
+
+func partyNameRedacted(hidden map[string]bool) bool {
+	return hidden["name"]
+}
+
+func itemSKURedacted(hidden map[string]bool) bool {
+	return hidden["sku"]
+}
+
+func itemNameRedacted(hidden map[string]bool) bool {
+	return hidden["name"]
+}
+
+// inventoryItemOnHandRedacted/inventoryItemATPRedacted (uc-infra#230)
+// answer whether THIS ACTOR's FieldPermission hides
+// InventoryItem.qty_on_hand/qty_available_to_promise specifically — kept
+// as their own named, unit-tested predicates (mirroring
+// project_budget_report.go's projectBudgetLinePlannedRedacted/
+// projectBudgetLineCategoryRedacted, and for the same reason its own doc
+// comment gives: the two field-name gates this report cares about live in
+// one place and at the same unit-test level) rather than an inline map
+// lookup at each call site. A typo in either literal (independent review
+// flagged this as untested before these existed) would otherwise silently
+// disable the whole fix — the boolean stays false, every quantity renders
+// for real, and only a full HTTP-level integration test would catch it.
+func inventoryItemOnHandRedacted(hidden map[string]bool) bool {
+	return hidden["qty_on_hand"]
+}
+
+func inventoryItemATPRedacted(hidden map[string]bool) bool {
+	return hidden["qty_available_to_promise"]
+}
+
 // renderPurchasingReport is the "mgmt reporting workbench" QUEUE.md's
 // design-partner opportunity entry has been tracking since the
 // purchasing-module increment: a read-only, at-a-glance view over the
@@ -107,10 +157,15 @@ func (h *Handler) requireReportRead(w http.ResponseWriter, r *http.Request, rc *
 // R9 workflow alerts — the report shows signals, it doesn't act on
 // them.
 //
-// Plain server-rendered HTML, no htmx/JS — same reasoning
-// list-page-pagination's own review doc gave for skipping a browser e2e
-// test: there's no client-side interactivity here for a browser-only
-// bug class to hide in.
+// Plain server-rendered HTML, no htmx/JS — but this page DOES have real
+// browser e2e coverage (internal/e2e/purchasing_report_test.go), unlike
+// what an earlier version of this comment claimed ("no client-side
+// interactivity, so no browser-only bug class to hide in" — independent
+// review of uc-infra#230 caught the claim going stale: it was never true
+// once this file grew its own e2e tests, and uc-infra#230's own fix added
+// two more specifically because a rendered-HTML-string assertion cannot
+// prove a value is absent from the live DOM the way project_budget_report.go's
+// redaction e2e tests already established for a different entity/field).
 func (h *Handler) renderPurchasingReport(w http.ResponseWriter, r *http.Request) {
 	rc, ok := requestContext(w, r)
 	if !ok {
@@ -127,6 +182,56 @@ func (h *Handler) renderPurchasingReport(w http.ResponseWriter, r *http.Request)
 	if !h.requireReportRead(w, r, &rc, ts, locale, purchasingReportEntityTypes) {
 		return
 	}
+
+	// PurchaseOrder.total, Party.name, Item.sku/Item.name (uc-infra#233),
+	// and InventoryItem.qty_on_hand/qty_available_to_promise (uc-infra#230)
+	// can each be hidden per-role via a FieldPermission (ADR-0006) — same
+	// mechanism project_budget_report.go's own redaction already uses
+	// (HiddenFields answers for one (actor, entity type) pair, and every
+	// row of a given entity type on this page shares the same actor).
+	// Together these two fixes cover every ts.reporting-raw-SQL-read
+	// field on this report that's FieldPermission-hideable: the status
+	// cards' Value, the vendor table's Spend/Name, the Supplier Lead
+	// Times/On-Time Delivery/Quality tables' Vendor column, the stockout
+	// table's SKU/Name/OnHand, the Stock Summary card's two totals, and
+	// the Reorder Signals table's OnHand/Position — all read through this
+	// exact same unredacted raw-SQL path. Party.name in particular
+	// renders on FOUR separate tables on this one page (vendor spend,
+	// lead time, on-time delivery, quality) — vendorNameRedacted below is
+	// threaded into all four call sites, not just the vendor-spend one
+	// (an earlier draft of uc-infra#233's fix missed the other three;
+	// caught by independent review before it shipped).
+	//
+	// The reorder table's Item name is deliberately NOT covered here —
+	// buildReorderSignals already reads it through ts.crud.Get, which
+	// redacts on its own; resolving Item's HiddenFields a second time for
+	// that one field would be redundant, not a gap.
+	hiddenPOFields, err := ts.crud.HiddenFields(ctx, "PurchaseOrder")
+	if err != nil {
+		writeInternalError(w, "resolve PurchaseOrder field visibility", err)
+		return
+	}
+	hiddenPartyFields, err := ts.crud.HiddenFields(ctx, "Party")
+	if err != nil {
+		writeInternalError(w, "resolve Party field visibility", err)
+		return
+	}
+	hiddenItemFields, err := ts.crud.HiddenFields(ctx, "Item")
+	if err != nil {
+		writeInternalError(w, "resolve Item field visibility", err)
+		return
+	}
+	hiddenInventoryFields, err := ts.crud.HiddenFields(ctx, "InventoryItem")
+	if err != nil {
+		writeInternalError(w, "resolve InventoryItem field visibility", err)
+		return
+	}
+	totalRedacted := purchaseOrderTotalRedacted(hiddenPOFields)
+	vendorNameRedacted := partyNameRedacted(hiddenPartyFields)
+	skuRedacted := itemSKURedacted(hiddenItemFields)
+	stockoutNameRedacted := itemNameRedacted(hiddenItemFields)
+	onHandRedacted := inventoryItemOnHandRedacted(hiddenInventoryFields)
+	atpRedacted := inventoryItemATPRedacted(hiddenInventoryFields)
 
 	statusRows, err := ts.reporting.PurchaseOrderStatusBreakdown(ctx)
 	if err != nil {
@@ -177,7 +282,7 @@ func (h *Handler) renderPurchasingReport(w http.ResponseWriter, r *http.Request)
 	}
 	qualityStats := forecast.ComputeQuality(qualitySamples(qualityLines))
 
-	signals, err := h.buildReorderSignals(ctx, ts, stats, locale)
+	signals, err := h.buildReorderSignals(ctx, ts, stats, locale, onHandRedacted)
 	if err != nil {
 		writeInternalError(w, "build reorder signals", err)
 		return
@@ -185,6 +290,7 @@ func (h *Handler) renderPurchasingReport(w http.ResponseWriter, r *http.Request)
 
 	view := purchasingReportView{
 		Title:         h.catalog.T(locale, "report.purchasing.title"),
+		NotAvailable:  h.catalog.T(locale, "report.purchasing.not_available"),
 		StatusHeading: h.catalog.T(locale, "report.purchasing.status_heading"),
 		VendorHeading: h.catalog.T(locale, "report.purchasing.vendor_heading"),
 		VendorEmpty:   h.catalog.T(locale, "report.purchasing.vendor_empty"),
@@ -208,9 +314,6 @@ func (h *Handler) renderPurchasingReport(w http.ResponseWriter, r *http.Request)
 		StockoutOnHandCol: h.catalog.TOrDefault(locale, "field.InventoryItem.qty_on_hand", "Qty On Hand"),
 		StockoutATPCol:    h.catalog.TOrDefault(locale, "field.InventoryItem.qty_available_to_promise", "Qty Available to Promise"),
 		StockItemCount:    strconv.Itoa(stock.ItemCount),
-		StockOnHand:       formrender.FormatFieldValue(stock.TotalOnHand),
-		StockATP:          formrender.FormatFieldValue(stock.TotalATP),
-		StockoutCount:     strconv.Itoa(stock.StockoutCount),
 
 		LeadTimeHeading:    h.catalog.T(locale, "report.purchasing.leadtime_heading"),
 		LeadTimeEmpty:      h.catalog.T(locale, "report.purchasing.leadtime_empty"),
@@ -245,40 +348,135 @@ func (h *Handler) renderPurchasingReport(w http.ResponseWriter, r *http.Request)
 	// project_budget_report.go established.
 	purchasingReportTopicID := help.RouteTopicID("reports/purchasing")
 	view.Help = h.buildHelpView(locale, purchasingReportTopicID, help.HasContent(locale, purchasingReportTopicID))
-	view.LeadTimeRows = h.buildLeadTimeRows(stats, leadTimes, locale)
-	view.OnTimeRows = h.buildOnTimeRows(onTimeStats, leadTimes, locale)
-	view.QualityRows = h.buildQualityRows(qualityStats, qualityLines, locale)
+	// StockOnHand/StockATP are aggregates over the same
+	// FieldPermission-hidden InventoryItem fields as every per-row
+	// quantity on this report (uc-infra#230) — a role that can't see
+	// qty_on_hand on one InventoryItem record can't see it summed across
+	// all of them either, so the card renders NotAvailable instead of a
+	// real total the same way a redacted ProjectBudgetLine.planned_amount
+	// sum does (project_budget_report.go's plannedRedacted).
+	if !onHandRedacted {
+		view.StockOnHandAvailable = true
+		view.StockOnHand = formrender.FormatFieldValue(stock.TotalOnHand)
+	}
+	if !atpRedacted {
+		view.StockATPAvailable = true
+		view.StockATP = formrender.FormatFieldValue(stock.TotalATP)
+	}
+	// StockoutAvailable (uc-infra#230) gates
+	// the WHOLE Stockout Risk section, not just its OnHand/ATP cell text,
+	// when qty_available_to_promise is hidden — StockoutRiskItems'
+	// membership (which items appear at all) AND stock.StockoutCount (the
+	// heading's own "(N)") are BOTH computed server-side from the real,
+	// un-redacted qty_available_to_promise (WHERE atp <= 0), so blanking
+	// only the per-row ATP cell would still leave a restricted actor able
+	// to read off "this item's real ATP is <= 0" from bare list
+	// membership, and the real count of such items from the heading —
+	// exactly the value the FieldPermission exists to hide, just
+	// expressed as a threshold fact instead of the number itself. Unlike
+	// buildReorderSignals' own OnHand/Position redaction (which leaves
+	// the fire/no-fire decision itself untouched — a deliberate,
+	// documented deferral to the same business-behavior question
+	// uc-infra#231 raises for safety_stock), there is no equivalent
+	// "should this alert still fire regardless" argument for a plain
+	// report list: it exists only to be read, so the safe default is not
+	// computing it for display at all when its filter criterion is
+	// hidden from the viewer, the same way an actor can't derive "how
+	// many ProjectBudgetLine rows exist in a hidden category" from
+	// project_budget_report.go's redaction either.
+	view.StockoutAvailable = !atpRedacted
+	if !atpRedacted {
+		view.StockoutCount = strconv.Itoa(stock.StockoutCount)
+	}
+	view.LeadTimeRows = h.buildLeadTimeRows(stats, leadTimes, locale, vendorNameRedacted)
+	view.OnTimeRows = h.buildOnTimeRows(onTimeStats, leadTimes, locale, vendorNameRedacted)
+	view.QualityRows = h.buildQualityRows(qualityStats, qualityLines, locale, vendorNameRedacted)
 	for _, status := range poStatusDisplayOrder {
 		row, ok := byStatus[status]
 		if !ok {
 			continue
 		}
-		view.StatusCards = append(view.StatusCards, statusCardView{
+		// Count is NOT gated on totalRedacted: byStatus's presence and
+		// row.Count both come from PurchaseOrderStatusBreakdown's
+		// count(*), which has nothing to do with PurchaseOrder.total —
+		// only the sub-value line (Value) is derived from the
+		// FieldPermission-hideable field.
+		card := statusCardView{
 			Label: h.catalog.TOrDefault(locale, "field.PurchaseOrder.status."+status, status),
 			Count: strconv.Itoa(row.Count),
+		}
+		if !totalRedacted {
+			card.ValueAvailable = true
 			// row.Value is money.Money (minor units, uc-infra#136) — a
 			// plain FormatFieldValue call would print the raw integer
 			// ("9500") instead of the major-unit decimal a human reads as
 			// money ("95.00"), the same fix formrender's own FieldMoney
 			// cases already apply (uc-infra#68).
-			Value: row.Value.String(),
-		})
+			card.Value = row.Value.String()
+		}
+		view.StatusCards = append(view.StatusCards, card)
 	}
+	// Row PRESENCE in the vendor table (TopVendorsBySpend's own
+	// ORDER BY spend DESC LIMIT $1) is still computed from the real,
+	// un-redacted PurchaseOrder.total even when Spend itself renders
+	// NotAvailable below — a restricted actor sees the correct top-N
+	// vendors in the correct relative order without ever seeing the
+	// number that order is based on. Deliberately left open here rather
+	// than silently gating the whole row (which vendor a business buys
+	// from at all is not itself a value FieldPermission on `total`
+	// protects) — a residual-ordering concern, same "mechanical display
+	// redaction, not a business-behavior call" scope this fix draws
+	// relative to uc-infra#231/#232's still-open fire/no-fire questions
+	// for a different field on a different table. NOT fixed here; if
+	// this needs closing, it is its own follow-up card, the same way
+	// #231/#232 are their own cards rather than silently folded into
+	// #230's.
 	for _, v := range vendors {
-		view.Vendors = append(view.Vendors, vendorRowView{
-			Name:   v.VendorName,
-			Orders: strconv.Itoa(v.OrderCount),
-			Spend:  v.Total.String(),
-		})
+		row := vendorRowView{Orders: strconv.Itoa(v.OrderCount)}
+		if !vendorNameRedacted {
+			row.NameAvailable = true
+			row.Name = v.VendorName
+		}
+		if !totalRedacted {
+			row.SpendAvailable = true
+			row.Spend = v.Total.String()
+		}
+		view.Vendors = append(view.Vendors, row)
 	}
-	for _, item := range stockouts {
-		view.Stockouts = append(view.Stockouts, stockoutRowView{
-			SKU:    item.SKU,
-			Name:   item.Name,
-			OnHand: formrender.FormatFieldValue(item.QtyOnHand),
-			ATP:    formrender.FormatFieldValue(item.QtyATP),
-			Href:   "/forms/Item/" + item.ItemID,
-		})
+	// The whole loop is skipped, not just the ATP cell, when atpRedacted
+	// — see view.StockoutAvailable's own comment above for why row
+	// MEMBERSHIP here is itself derived from the real, hidden
+	// qty_available_to_promise (StockoutRiskItems' WHERE atp <= 0), not
+	// just the displayed number. SKU/Name redaction (uc-infra#233) is
+	// orthogonal to that: within an already-included row, hiding
+	// Item.sku/Item.name blanks only their own cells and has no
+	// relationship to whether the row appears at all.
+	if !atpRedacted {
+		for _, item := range stockouts {
+			row := stockoutRowView{
+				ATP:  formrender.FormatFieldValue(item.QtyATP),
+				Href: "/forms/Item/" + item.ItemID,
+			}
+			if !skuRedacted {
+				row.SKUAvailable = true
+				row.SKU = item.SKU
+			}
+			if !stockoutNameRedacted {
+				row.NameAvailable = true
+				row.Name = item.Name
+			}
+			// OnHand is still checked against its OWN FieldPermission
+			// independently (uc-infra#230): qty_on_hand and
+			// qty_available_to_promise are separate fields, and a role
+			// that hides only qty_on_hand must still see this
+			// (atp-driven) section normally, with just its OnHand
+			// column blanked.
+			if !onHandRedacted {
+				row.OnHandAvailable = true
+				row.OnHand = formrender.FormatFieldValue(item.QtyOnHand)
+			}
+			view.Stockouts = append(view.Stockouts, row)
+		}
 	}
 
 	var buf bytes.Buffer
@@ -401,7 +599,23 @@ func formatRate(rate float64) string {
 // than a number — never a fabricated quantile (issue #30's BA note R1).
 // Vendor display names come from the same rows the samples came from
 // (CompletedPOLeadTimes already joins Party), no second lookup.
-func (h *Handler) buildLeadTimeRows(stats forecast.Result, rows []data.CompletedPOLeadTime, locale string) []leadTimeRowView {
+//
+// vendorNameRedacted (uc-infra#233) blanks the per-vendor Vendor cell to
+// NotAvailable when Party.name is hidden from this actor — this table
+// reads Party.name through the exact same unredacted ts.reporting raw
+// SQL as the vendor-spend table above (an earlier version of this fix
+// missed this table entirely; independent review caught it). The
+// trailing "All vendors" summary row is NEVER gated — its label is a
+// locale string (report.purchasing.leadtime_overall_label), not a real
+// Party.name, so there is nothing to redact there.
+//
+// Sort ORDER is still computed from the real, un-redacted vendor names
+// even when a redacted actor sees every Vendor cell blank — same
+// documented, deliberately out-of-scope residual channel as the
+// vendor-spend table's own ORDER BY (see renderPurchasingReport's
+// comment above the vendors loop): fixing this table's cell display is
+// this card's job, closing a name-ordering side channel is not.
+func (h *Handler) buildLeadTimeRows(stats forecast.Result, rows []data.CompletedPOLeadTime, locale string, vendorNameRedacted bool) []leadTimeRowView {
 	if stats.Overall.N == 0 {
 		return nil
 	}
@@ -412,8 +626,11 @@ func (h *Handler) buildLeadTimeRows(stats forecast.Result, rows []data.Completed
 		nameByVendor[r.VendorID] = r.VendorName
 	}
 
-	row := func(label string, s forecast.LeadTimeStats) leadTimeRowView {
-		v := leadTimeRowView{Vendor: label, N: strconv.Itoa(s.N), P50: insufficient, P90: insufficient}
+	row := func(label string, available bool, s forecast.LeadTimeStats) leadTimeRowView {
+		v := leadTimeRowView{VendorAvailable: available, N: strconv.Itoa(s.N), P50: insufficient, P90: insufficient}
+		if available {
+			v.Vendor = label
+		}
 		if s.Sufficient() {
 			v.P50, v.P90 = formatDays(s.P50Days), formatDays(s.P90Days)
 		}
@@ -434,9 +651,9 @@ func (h *Handler) buildLeadTimeRows(stats forecast.Result, rows []data.Completed
 
 	out := make([]leadTimeRowView, 0, len(vendorIDs)+1)
 	for _, id := range vendorIDs {
-		out = append(out, row(nameByVendor[id], stats.ByVendor[id]))
+		out = append(out, row(nameByVendor[id], !vendorNameRedacted, stats.ByVendor[id]))
 	}
-	out = append(out, row(h.catalog.T(locale, "report.purchasing.leadtime_overall_label"), stats.Overall))
+	out = append(out, row(h.catalog.T(locale, "report.purchasing.leadtime_overall_label"), true, stats.Overall))
 	return out
 }
 
@@ -457,7 +674,10 @@ func (h *Handler) buildLeadTimeRows(stats forecast.Result, rows []data.Completed
 // several promised orders that never showed up at all won't have those
 // counted against it here — the "Orders Received" column header (not
 // bare "Orders") is the honest label for what N actually counts.
-func (h *Handler) buildOnTimeRows(stats forecast.OnTimeResult, rows []data.CompletedPOLeadTime, locale string) []onTimeRowView {
+// vendorNameRedacted (uc-infra#233): see buildLeadTimeRows' own comment
+// — same gate, same table shape, same reasoning, applied to this table's
+// Vendor column.
+func (h *Handler) buildOnTimeRows(stats forecast.OnTimeResult, rows []data.CompletedPOLeadTime, locale string, vendorNameRedacted bool) []onTimeRowView {
 	if stats.Overall.N == 0 {
 		return nil
 	}
@@ -468,8 +688,11 @@ func (h *Handler) buildOnTimeRows(stats forecast.OnTimeResult, rows []data.Compl
 		nameByVendor[r.VendorID] = r.VendorName
 	}
 
-	row := func(label string, s forecast.OnTimeStats) onTimeRowView {
-		v := onTimeRowView{Vendor: label, N: strconv.Itoa(s.N), Rate: insufficient}
+	row := func(label string, available bool, s forecast.OnTimeStats) onTimeRowView {
+		v := onTimeRowView{VendorAvailable: available, N: strconv.Itoa(s.N), Rate: insufficient}
+		if available {
+			v.Vendor = label
+		}
 		if s.Sufficient() {
 			v.Rate = formatRate(s.Rate())
 		}
@@ -490,9 +713,9 @@ func (h *Handler) buildOnTimeRows(stats forecast.OnTimeResult, rows []data.Compl
 
 	out := make([]onTimeRowView, 0, len(vendorIDs)+1)
 	for _, id := range vendorIDs {
-		out = append(out, row(nameByVendor[id], stats.ByVendor[id]))
+		out = append(out, row(nameByVendor[id], !vendorNameRedacted, stats.ByVendor[id]))
 	}
-	out = append(out, row(h.catalog.T(locale, "report.purchasing.leadtime_overall_label"), stats.Overall))
+	out = append(out, row(h.catalog.T(locale, "report.purchasing.leadtime_overall_label"), true, stats.Overall))
 	return out
 }
 
@@ -508,7 +731,10 @@ func (h *Handler) buildOnTimeRows(stats forecast.OnTimeResult, rows []data.Compl
 // sign of no purchasing activity at all — the empty state's own copy
 // says so, same reasoning buildOnTimeRows' doc comment gives for its own
 // empty case.
-func (h *Handler) buildQualityRows(stats forecast.QualityResult, rows []data.GoodsReceiptLineQuality, locale string) []qualityRowView {
+// vendorNameRedacted (uc-infra#233): see buildLeadTimeRows' own comment
+// — same gate, same table shape, same reasoning, applied to this table's
+// Vendor column.
+func (h *Handler) buildQualityRows(stats forecast.QualityResult, rows []data.GoodsReceiptLineQuality, locale string, vendorNameRedacted bool) []qualityRowView {
 	if stats.Overall.N == 0 {
 		return nil
 	}
@@ -519,8 +745,11 @@ func (h *Handler) buildQualityRows(stats forecast.QualityResult, rows []data.Goo
 		nameByVendor[r.VendorID] = r.VendorName
 	}
 
-	row := func(label string, s forecast.QualityStats) qualityRowView {
-		v := qualityRowView{Vendor: label, N: strconv.Itoa(s.N), Rate: insufficient}
+	row := func(label string, available bool, s forecast.QualityStats) qualityRowView {
+		v := qualityRowView{VendorAvailable: available, N: strconv.Itoa(s.N), Rate: insufficient}
+		if available {
+			v.Vendor = label
+		}
 		if s.Sufficient() {
 			v.Rate = formatRate(s.Rate())
 		}
@@ -541,9 +770,9 @@ func (h *Handler) buildQualityRows(stats forecast.QualityResult, rows []data.Goo
 
 	out := make([]qualityRowView, 0, len(vendorIDs)+1)
 	for _, id := range vendorIDs {
-		out = append(out, row(nameByVendor[id], stats.ByVendor[id]))
+		out = append(out, row(nameByVendor[id], !vendorNameRedacted, stats.ByVendor[id]))
 	}
-	out = append(out, row(h.catalog.T(locale, "report.purchasing.leadtime_overall_label"), stats.Overall))
+	out = append(out, row(h.catalog.T(locale, "report.purchasing.leadtime_overall_label"), true, stats.Overall))
 	return out
 }
 
@@ -595,7 +824,42 @@ func (h *Handler) buildQualityRows(stats forecast.QualityResult, rows []data.Goo
 // somehow did arrive would still correctly hard-fail below, same as any
 // other unexpected error, rather than silently showing a wrong "no
 // signals" state to someone who might otherwise have seen real ones.
-func (h *Handler) buildReorderSignals(ctx context.Context, ts tenantScope, stats forecast.Result, locale string) ([]reorderRowView, error) {
+//
+// onHandRedacted (uc-infra#230, resolved once by the caller — see
+// renderPurchasingReport's own comment) gates the row's rendered
+// On Hand AND Position cells together, not just On Hand alone: Position
+// is on_hand+on_order, and OnOrder is always rendered on this same row,
+// so leaving Position visible while blanking On Hand would let an actor
+// simply subtract the two visible numbers to recover the real on-hand
+// figure their FieldPermission hides. This deliberately does NOT change
+// whether a rule fires: the redaction question here is about what a
+// restricted actor is SHOWN, not what the report computes — the
+// fire/no-fire decision below always uses the real on-hand quantity
+// (same "compute for real, only widen the display redaction" fix shape
+// uc-infra#230 itself describes as the mechanical option, distinct from
+// the actual business-behavior call uc-infra#231 left to Farshid for the
+// analogous safety_stock question).
+//
+// This blanks the CELLS, not the row's existence — independent review
+// correctly flagged that as a real, NOT fully closed residual channel,
+// not just a theoretical one: a rendered row means
+// on_hand+on_order <= reorder_point+safety_stock, and OnOrder/
+// ReorderPoint/safety_stock (via forecast.Fires) are all either rendered
+// unconditionally on this same row or otherwise visible, so an actor can
+// solve for a bound on the real on_hand from row presence/absence alone
+// even with both cells reading "Not available" — in the sharpest case
+// (reorder_point=0, safety_stock=0, on_order=0, and qty_on_hand's own
+// Min:0 bound) a fired row means on_hand==0 EXACTLY, fully recovered.
+// Deliberately left open here rather than silently "fixed" by also
+// gating row presence: unlike the cell redaction above, that would
+// change whether an operationally-real reorder alert reaches a
+// restricted buyer at all — the same shape of business-behavior call
+// uc-infra#231 already left to Farshid for safety_stock's own,
+// analogous effect on this same fire decision, not a mechanical
+// display-widening this handler should default past on its own. Tracked
+// as its own follow-up, uc-infra#232, rather than left for a future
+// reader to assume "gates OnHand/Position" means "leaks nothing."
+func (h *Handler) buildReorderSignals(ctx context.Context, ts tenantScope, stats forecast.Result, locale string, onHandRedacted bool) ([]reorderRowView, error) {
 	reorderDef, err := ts.entityDef(ctx, "ReorderRule")
 	if errors.Is(err, data.ErrNotFound) {
 		return nil, nil
@@ -677,15 +941,20 @@ func (h *Handler) buildReorderSignals(ctx context.Context, ts tenantScope, stats
 			expected = strings.ReplaceAll(contextTmpl, "{days}", formatDays(days))
 		}
 
-		out = append(out, reorderRowView{
+		row := reorderRowView{
 			Item:         itemName,
 			Href:         "/forms/Item/" + itemID,
-			OnHand:       formrender.FormatFieldValue(onHandByItem[itemID]),
 			OnOrder:      formrender.FormatFieldValue(onOrderByItem[itemID]),
-			Position:     formrender.FormatFieldValue(position),
 			ReorderPoint: formrender.FormatFieldValue(reorderPoint),
 			Expected:     expected,
-		})
+		}
+		if !onHandRedacted {
+			row.OnHandAvailable = true
+			row.OnHand = formrender.FormatFieldValue(onHandByItem[itemID])
+			row.PositionAvailable = true
+			row.Position = formrender.FormatFieldValue(position)
+		}
+		out = append(out, row)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Item != out[j].Item {
@@ -698,6 +967,13 @@ func (h *Handler) buildReorderSignals(ctx context.Context, ts tenantScope, stats
 
 type purchasingReportView struct {
 	Title string
+
+	// NotAvailable (uc-infra#230/#233) is the placeholder every
+	// FieldPermission-hideable cell on this report renders instead of a
+	// real value when the acting role's FieldPermission hides the field
+	// it comes from — same "resolved once, reused by every guard on the
+	// page" shape as project_budget_report.go's own NotAvailable.
+	NotAvailable string
 
 	StatusHeading string
 	StatusCards   []statusCardView
@@ -714,11 +990,27 @@ type purchasingReportView struct {
 	StockOnHandLabel string
 	StockATPLabel    string
 	StockItemCount   string
-	StockOnHand      string
-	StockATP         string
+	// StockOnHandAvailable/StockATPAvailable (uc-infra#230) distinguish a
+	// real aggregate from "not available" (qty_on_hand/
+	// qty_available_to_promise hidden from this actor) — collapsing the
+	// two would render a real total to an actor whose FieldPermission
+	// hides the per-record field it's summed from.
+	StockOnHandAvailable bool
+	StockOnHand          string
+	StockATPAvailable    bool
+	StockATP             string
 
-	StockoutHeading   string
-	StockoutEmpty     string
+	StockoutHeading string
+	StockoutEmpty   string
+	// StockoutAvailable (uc-infra#230) is false when
+	// qty_available_to_promise is hidden from this actor: the whole
+	// section (heading count AND table rows) is gated together, not
+	// per-cell, because StockoutRiskItems' row membership and
+	// stock.StockoutCount are both filtered/computed server-side from the
+	// real, un-redacted value (WHERE atp <= 0) — see the handler's own
+	// comment on why a per-cell blank alone would still leak "this item's
+	// real ATP is <= 0" via bare presence in the list.
+	StockoutAvailable bool
 	StockoutSKUCol    string
 	StockoutNameCol   string
 	StockoutOnHandCol string
@@ -764,52 +1056,99 @@ type purchasingReportView struct {
 }
 
 type leadTimeRowView struct {
-	Vendor string
-	N      string
-	P50    string
-	P90    string
+	// VendorAvailable (uc-infra#233) gates Party.name — false only for a
+	// per-vendor row when the actor's FieldPermission hides it; the
+	// trailing "All vendors" summary row is never gated (its Vendor value
+	// is a locale label, not a real Party.name).
+	VendorAvailable bool
+	Vendor          string
+	N               string
+	P50             string
+	P90             string
 }
 
 type onTimeRowView struct {
-	Vendor string
-	N      string
-	Rate   string
+	// VendorAvailable (uc-infra#233): see leadTimeRowView's own comment.
+	VendorAvailable bool
+	Vendor          string
+	N               string
+	Rate            string
 }
 
 type qualityRowView struct {
-	Vendor string
-	N      string
-	Rate   string
+	// VendorAvailable (uc-infra#233): see leadTimeRowView's own comment.
+	VendorAvailable bool
+	Vendor          string
+	N               string
+	Rate            string
 }
 
 type reorderRowView struct {
-	Item         string
-	Href         string
-	OnHand       string
-	OnOrder      string
-	Position     string
-	ReorderPoint string
-	Expected     string
+	Item string
+	Href string
+	// OnHandAvailable/PositionAvailable (uc-infra#230) are set together,
+	// never independently — see buildReorderSignals' own comment on why
+	// Position must be redacted whenever OnHand is: OnOrder is always
+	// rendered on this same row, and Position is on_hand+on_order, so a
+	// visible Position next to a visible OnOrder would let an actor
+	// recover the real on-hand figure their FieldPermission hides.
+	OnHandAvailable   bool
+	OnHand            string
+	OnOrder           string
+	PositionAvailable bool
+	Position          string
+	ReorderPoint      string
+	Expected          string
 }
 
 type statusCardView struct {
 	Label string
 	Count string
-	Value string
+	// ValueAvailable (uc-infra#233) distinguishes a real
+	// PurchaseOrder.total sum from "not available" (total hidden from
+	// this actor) — collapsing the two would render a real aggregate to
+	// an actor whose FieldPermission hides the per-record field it's
+	// summed from. Count is never gated the same way — it comes from
+	// count(*), unrelated to total.
+	ValueAvailable bool
+	Value          string
 }
 
 type vendorRowView struct {
-	Name   string
-	Orders string
-	Spend  string
+	// NameAvailable/SpendAvailable (uc-infra#233) gate Party.name and
+	// PurchaseOrder.total independently — a role hiding only one of the
+	// two must still see the other's real value on this same row.
+	NameAvailable  bool
+	Name           string
+	Orders         string
+	SpendAvailable bool
+	Spend          string
 }
 
 type stockoutRowView struct {
-	SKU    string
-	Name   string
-	OnHand string
-	ATP    string
-	Href   string
+	// SKUAvailable/NameAvailable (uc-infra#233) gate Item.sku and
+	// Item.name independently, same reasoning as vendorRowView's own
+	// NameAvailable/SpendAvailable pair above. Row membership itself is
+	// unaffected by either — see the handler's own comment on why this
+	// table's inclusion criterion (qty_available_to_promise) has no
+	// relationship to SKU/name.
+	SKUAvailable  bool
+	SKU           string
+	NameAvailable bool
+	Name          string
+	// OnHandAvailable (uc-infra#230) gates only this row's OnHand cell,
+	// independently of ATP: unlike reorderRowView's OnHandAvailable/
+	// PositionAvailable pair, this table has no visible OnOrder column to
+	// combine with OnHand and recover a hidden figure, so qty_on_hand is
+	// gated on its own FieldPermission alone. ATP has no equivalent
+	// per-row flag: a stockoutRowView only ever exists when ATP itself is
+	// available (see purchasingReportView.StockoutAvailable) — row
+	// membership itself is derived from the real ATP value, so there is
+	// no "row present, ATP cell blank" state to represent.
+	OnHandAvailable bool
+	OnHand          string
+	ATP             string
+	Href            string
 }
 
 var purchasingReportTmpl = template.Must(template.New("purchasingReport").Parse(`
@@ -821,7 +1160,7 @@ var purchasingReportTmpl = template.Must(template.New("purchasingReport").Parse(
 <div class="uc-report-card">
   <div class="uc-report-card-label">{{.Label}}</div>
   <div class="uc-report-card-value">{{.Count}}</div>
-  <div class="uc-report-card-sub">{{.Value}}</div>
+  <div class="uc-report-card-sub">{{if .ValueAvailable}}{{.Value}}{{else}}{{$.NotAvailable}}{{end}}</div>
 </div>
 {{end}}
 </div>
@@ -832,7 +1171,7 @@ var purchasingReportTmpl = template.Must(template.New("purchasingReport").Parse(
 <thead><tr><th>{{.VendorNameCol}}</th><th>{{.VendorOrdersCol}}</th><th>{{.VendorSpendCol}}</th></tr></thead>
 <tbody>
 {{range .Vendors}}
-<tr><td>{{.Name}}</td><td>{{.Orders}}</td><td>{{.Spend}}</td></tr>
+<tr><td>{{if .NameAvailable}}{{.Name}}{{else}}{{$.NotAvailable}}{{end}}</td><td>{{.Orders}}</td><td>{{if .SpendAvailable}}{{.Spend}}{{else}}{{$.NotAvailable}}{{end}}</td></tr>
 {{end}}
 </tbody>
 </table>
@@ -848,21 +1187,23 @@ var purchasingReportTmpl = template.Must(template.New("purchasingReport").Parse(
 </div>
 <div class="uc-report-card">
   <div class="uc-report-card-label">{{.StockOnHandLabel}}</div>
-  <div class="uc-report-card-value">{{.StockOnHand}}</div>
+  <div class="uc-report-card-value">{{if .StockOnHandAvailable}}{{.StockOnHand}}{{else}}{{.NotAvailable}}{{end}}</div>
 </div>
 <div class="uc-report-card">
   <div class="uc-report-card-label">{{.StockATPLabel}}</div>
-  <div class="uc-report-card-value">{{.StockATP}}</div>
+  <div class="uc-report-card-value">{{if .StockATPAvailable}}{{.StockATP}}{{else}}{{.NotAvailable}}{{end}}</div>
 </div>
 </div>
 
-<h2>{{.StockoutHeading}} ({{.StockoutCount}})</h2>
-{{if .Stockouts}}
+<h2>{{.StockoutHeading}}{{if .StockoutAvailable}} ({{.StockoutCount}}){{end}}</h2>
+{{if not .StockoutAvailable}}
+<p class="uc-empty">{{.NotAvailable}}</p>
+{{else if .Stockouts}}
 <table class="uc-table">
 <thead><tr><th>{{.StockoutSKUCol}}</th><th>{{.StockoutNameCol}}</th><th>{{.StockoutOnHandCol}}</th><th>{{.StockoutATPCol}}</th></tr></thead>
 <tbody>
 {{range .Stockouts}}
-<tr><td><a href="{{.Href}}">{{.SKU}}</a></td><td>{{.Name}}</td><td>{{.OnHand}}</td><td>{{.ATP}}</td></tr>
+<tr><td><a href="{{.Href}}">{{if .SKUAvailable}}{{.SKU}}{{else}}{{$.NotAvailable}}{{end}}</a></td><td>{{if .NameAvailable}}{{.Name}}{{else}}{{$.NotAvailable}}{{end}}</td><td>{{if .OnHandAvailable}}{{.OnHand}}{{else}}{{$.NotAvailable}}{{end}}</td><td>{{.ATP}}</td></tr>
 {{end}}
 </tbody>
 </table>
@@ -876,7 +1217,7 @@ var purchasingReportTmpl = template.Must(template.New("purchasingReport").Parse(
 <thead><tr><th>{{.LeadTimeVendorCol}}</th><th>{{.LeadTimeSamplesCol}}</th><th>{{.LeadTimeP50Col}}</th><th>{{.LeadTimeP90Col}}</th></tr></thead>
 <tbody>
 {{range .LeadTimeRows}}
-<tr><td>{{.Vendor}}</td><td>{{.N}}</td><td>{{.P50}}</td><td>{{.P90}}</td></tr>
+<tr><td>{{if .VendorAvailable}}{{.Vendor}}{{else}}{{$.NotAvailable}}{{end}}</td><td>{{.N}}</td><td>{{.P50}}</td><td>{{.P90}}</td></tr>
 {{end}}
 </tbody>
 </table>
@@ -890,7 +1231,7 @@ var purchasingReportTmpl = template.Must(template.New("purchasingReport").Parse(
 <thead><tr><th>{{.OnTimeVendorCol}}</th><th>{{.OnTimeSamplesCol}}</th><th>{{.OnTimeRateCol}}</th></tr></thead>
 <tbody>
 {{range .OnTimeRows}}
-<tr><td>{{.Vendor}}</td><td>{{.N}}</td><td>{{.Rate}}</td></tr>
+<tr><td>{{if .VendorAvailable}}{{.Vendor}}{{else}}{{$.NotAvailable}}{{end}}</td><td>{{.N}}</td><td>{{.Rate}}</td></tr>
 {{end}}
 </tbody>
 </table>
@@ -904,7 +1245,7 @@ var purchasingReportTmpl = template.Must(template.New("purchasingReport").Parse(
 <thead><tr><th>{{.QualityVendorCol}}</th><th>{{.QualitySamplesCol}}</th><th>{{.QualityRateCol}}</th></tr></thead>
 <tbody>
 {{range .QualityRows}}
-<tr><td>{{.Vendor}}</td><td>{{.N}}</td><td>{{.Rate}}</td></tr>
+<tr><td>{{if .VendorAvailable}}{{.Vendor}}{{else}}{{$.NotAvailable}}{{end}}</td><td>{{.N}}</td><td>{{.Rate}}</td></tr>
 {{end}}
 </tbody>
 </table>
@@ -918,7 +1259,7 @@ var purchasingReportTmpl = template.Must(template.New("purchasingReport").Parse(
 <thead><tr><th>{{.ReorderItemCol}}</th><th>{{.ReorderOnHandCol}}</th><th>{{.ReorderOnOrderCol}}</th><th>{{.ReorderPositionCol}}</th><th>{{.ReorderPointCol}}</th><th>{{.ReorderExpectedCol}}</th></tr></thead>
 <tbody>
 {{range .ReorderRows}}
-<tr><td><a href="{{.Href}}">{{.Item}}</a></td><td>{{.OnHand}}</td><td>{{.OnOrder}}</td><td>{{.Position}}</td><td>{{.ReorderPoint}}</td><td>{{.Expected}}</td></tr>
+<tr><td><a href="{{.Href}}">{{.Item}}</a></td><td>{{if .OnHandAvailable}}{{.OnHand}}{{else}}{{$.NotAvailable}}{{end}}</td><td>{{.OnOrder}}</td><td>{{if .PositionAvailable}}{{.Position}}{{else}}{{$.NotAvailable}}{{end}}</td><td>{{.ReorderPoint}}</td><td>{{.Expected}}</td></tr>
 {{end}}
 </tbody>
 </table>

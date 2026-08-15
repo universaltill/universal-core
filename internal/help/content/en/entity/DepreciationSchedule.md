@@ -12,12 +12,13 @@ afterward.
 
 ## When to use it
 
-Add or correct schedule rows on the **Fixed Asset** form's Depreciation
-Schedule section when you register an asset or need to fix a period
-that's wrong. A straight-line schedule spreads an asset's depreciable
-amount (cost minus salvage value) evenly across its useful life in
-months, with each row's book value equal to the previous row's book
-value minus that row's depreciation amount, ending at the salvage
+You won't normally add these rows by hand — saving a **Fixed Asset**
+generates its whole schedule automatically (see that entity's own help
+topic). Come here to review it, or to correct a period that's wrong
+before it's posted. A straight-line schedule spreads an asset's
+depreciable amount (cost minus salvage value) evenly across its useful
+life in months, with each row's book value equal to the previous row's
+book value minus that row's depreciation amount, ending at the salvage
 value.
 
 ## Rules to know
@@ -32,6 +33,17 @@ value.
 - **Posted**, once set, marks the row as already posted to the ledger. A
   posted row reflects a real accounting entry — correct it with the same
   care you'd correct any other posted record.
+- Correcting a row here is remembered as a deliberate override: it
+  survives a later, unrelated save of the row's own Fixed Asset instead
+  of being silently regenerated back to what its current terms would
+  compute, and it no longer causes such a save to be rejected on its
+  own. A change to the asset's actual depreciation terms (Cost, Salvage
+  Value, Useful Life, Depreciation Method, Acquisition Date, Currency)
+  still regenerates or rejects the schedule exactly as described on the
+  Fixed Asset topic — a correction only excuses its own row, not the
+  rest of the schedule, from that check. A corrected row shows
+  **Overridden** on the Fixed Asset's own Depreciation Schedule summary,
+  so it's visible at a glance which periods were touched by hand.
 
 ## What it connects to
 

@@ -160,6 +160,210 @@ func TestEngine_Create_RecordsAIActorIdentity(t *testing.T) {
 	}
 }
 
+// defaultingVendorDef mirrors vendorDef but with a Default declared on
+// each non-string field type this package's own Definition.Validate
+// type-checks Default for (bool, enum), used to prove engine.Create
+// applies entity.Field.Default end-to-end against a real tenant
+// database, not just at the entity.ApplyDefaults unit level.
+func defaultingVendorDef() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "Vendor",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "name", Type: entity.FieldString, Required: true},
+			{Name: "lead_time_days", Type: entity.FieldNumber},
+			{Name: "active", Type: entity.FieldBool, Default: true},
+			{Name: "payment_terms", Type: entity.FieldEnum, EnumValues: []string{"prepaid", "DP", "TT", "LC"}, Default: "DP"},
+		},
+	}
+}
+
+// TestEngine_Create_AppliesFieldDefaultForOmittedFields is the
+// integration-level proof for uc-infra#212: a field genuinely absent
+// from the create payload — not just zero-valued — gets its
+// Definition-declared Default, for every field type that carries one,
+// through the real validate-then-persist path against a real tenant
+// database. See internal/kernel/entity's TestApplyDefaults for the pure
+// per-type unit coverage this exercises end-to-end.
+func TestEngine_Create_AppliesFieldDefaultForOmittedFields(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	def := defaultingVendorDef()
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	rec, err := engine.Create(ctx, def, map[string]any{"name": "Acme Textiles"}, actor)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	got, err := engine.Get(ctx, def, rec.ID)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if got.Data["active"] != true {
+		t.Errorf("Data[\"active\"] = %v, want Definition-declared Default true", got.Data["active"])
+	}
+	if got.Data["payment_terms"] != "DP" {
+		t.Errorf(`Data["payment_terms"] = %v, want Definition-declared Default "DP"`, got.Data["payment_terms"])
+	}
+	if _, present := got.Data["lead_time_days"]; present {
+		t.Errorf(`Data["lead_time_days"] = %v, want left absent (no Default declared, field not required)`, got.Data["lead_time_days"])
+	}
+}
+
+// TestEngine_Create_ExplicitValueNotOverriddenByDefault is the
+// companion case: a caller that explicitly submits a value for a
+// defaulted field — including bool's own zero value, false, which
+// entity.ValidateRecord accepts unlike an empty string against
+// FieldEnum's closed EnumValues set — is making a real choice, not
+// omitting the field, and engine.Create must persist exactly that,
+// never substitute the Definition's Default over an explicitly-set
+// value.
+func TestEngine_Create_ExplicitValueNotOverriddenByDefault(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	def := defaultingVendorDef()
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	rec, err := engine.Create(ctx, def, map[string]any{
+		"name":          "Acme Textiles",
+		"active":        false, // bool's own zero value — a real, explicit choice
+		"payment_terms": "TT",  // valid, but not the declared Default "DP"
+	}, actor)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	got, err := engine.Get(ctx, def, rec.ID)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if got.Data["active"] != false {
+		t.Errorf(`Data["active"] = %v, want explicit false preserved, not overridden by Default true`, got.Data["active"])
+	}
+	if got.Data["payment_terms"] != "TT" {
+		t.Errorf(`Data["payment_terms"] = %v, want explicit "TT" preserved, not overridden by Default "DP"`, got.Data["payment_terms"])
+	}
+}
+
+// TestEngine_Create_HookMutatingI18nDefaultDoesNotLeakToNextCreate is the
+// integration-level proof for uc-infra#219, end to end through the real
+// path a shipped Hook would take: data.Record.Data is the very map
+// entity.ApplyDefaults wrote a FieldI18nText Default into
+// (data.RecordRepo.CreateTx returns the same map it was handed), and
+// runHook passes that same rec straight to any registered Hook. Before
+// the fix, a hook mutating rec.Data[i18nField] in place here would
+// corrupt the shared *entity.Definition's own Field.Default for every
+// later Create against that Definition — this simulates exactly that
+// hook shape and proves it can no longer happen. See
+// internal/kernel/entity's TestApplyDefaults/TestCloneDefault for the
+// pure per-function unit coverage this exercises through the real
+// database-backed write path.
+func TestEngine_Create_HookMutatingI18nDefaultDoesNotLeakToNextCreate(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	def := &entity.Definition{
+		EntityType: "Asset",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "name", Type: entity.FieldString, Required: true},
+			{Name: "notes", Type: entity.FieldI18nText, Default: map[string]any{"en": "No notes yet"}},
+		},
+	}
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	// A hook that mutates the record's own i18n_text field in place —
+	// not a hypothetical, just an ordinary in-place edit a real Hook
+	// could plausibly make (e.g. appending an audit note to a shared
+	// text field) with no reason to suspect it's touching Definition
+	// state rather than its own record's data.
+	engine.SetHook("Asset", func(_ context.Context, _ *sql.Tx, _ *entity.Definition, rec data.Record, _ audit.Action, _ audit.Actor) error {
+		if notes, ok := rec.Data["notes"].(map[string]any); ok {
+			notes["en"] = "mutated by record #1's hook"
+		}
+		return nil
+	})
+
+	rec1, err := engine.Create(ctx, def, map[string]any{"name": "Forklift"}, actor)
+	if err != nil {
+		t.Fatalf("Create #1: %v", err)
+	}
+	// The hook fires after data.RecordRepo.CreateTx has already inserted
+	// (marshaled-to-JSON) record #1's row, so its in-place mutation of
+	// rec.Data never reaches what's actually stored for record #1 either
+	// way — that's not the invariant this test is after. What matters is
+	// whether the hook's mutation reached the map ApplyDefaults handed
+	// out, i.e. the *Definition's own Default, checked directly below.
+	rec1Notes, ok := rec1.Data["notes"].(map[string]any)
+	if !ok || rec1Notes["en"] != "mutated by record #1's hook" {
+		t.Fatalf("expected the hook's own mutation to have actually landed on rec1.Data (sanity check on the test itself): %v", rec1.Data["notes"])
+	}
+
+	// The Definition's own Default must be untouched by record #1's
+	// hook — this is the actual invariant uc-infra#219 protects.
+	defDefault, ok := def.Fields[1].Default.(map[string]any)
+	if !ok {
+		t.Fatalf("def.Fields[1].Default = %v (%T), want map[string]any", def.Fields[1].Default, def.Fields[1].Default)
+	}
+	if defDefault["en"] != "No notes yet" {
+		t.Fatalf("def.Fields[1].Default[\"en\"] = %v, want the Definition's own stored Default left untouched by record #1's hook", defDefault["en"])
+	}
+
+	rec2, err := engine.Create(ctx, def, map[string]any{"name": "Pallet Jack"}, actor)
+	if err != nil {
+		t.Fatalf("Create #2: %v", err)
+	}
+	got2, err := engine.Get(ctx, def, rec2.ID)
+	if err != nil {
+		t.Fatalf("Get #2: %v", err)
+	}
+	notes2, ok := got2.Data["notes"].(map[string]any)
+	if !ok || notes2["en"] != "No notes yet" {
+		t.Errorf(`record #2's notes = %v, want the pristine Default "No notes yet" — record #1's hook mutation must not leak into record #2`, got2.Data["notes"])
+	}
+}
+
+// TestEngine_Create_NilFieldsMapDoesNotPanic proves Create's own nil
+// normalization (immediately above the entity.ApplyDefaults call) does
+// its job. entity.ApplyDefaults writes into the map it's given, and
+// writing into a nil map panics — a Definition with no Required fields
+// was previously a valid nil-fields Create (entity.ValidateRecord reads
+// a nil map safely, and there's nothing Required to fail on), so it
+// must not start panicking now that Create also writes into that map to
+// apply Defaults. Every field here is optional and has a Default, so
+// this test only passes if the nil map actually got normalized AND
+// Defaults actually got applied to the (former-nil) map — either
+// omitted step would either panic or leave the record undefaulted.
+func TestEngine_Create_NilFieldsMapDoesNotPanic(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	def := &entity.Definition{
+		EntityType: "Vendor",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "active", Type: entity.FieldBool, Default: true},
+		},
+	}
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	rec, err := engine.Create(ctx, def, nil, actor)
+	if err != nil {
+		t.Fatalf("Create with a nil fields map should succeed (no Required fields), got: %v", err)
+	}
+
+	got, err := engine.Get(ctx, def, rec.ID)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if got.Data["active"] != true {
+		t.Errorf(`Data["active"] = %v, want the Default true applied to the normalized (former-nil) map`, got.Data["active"])
+	}
+}
+
 func TestEngine_Create_ValidationFailure_WritesNothing(t *testing.T) {
 	db := freshTenantDB(t)
 	ctx := context.Background()

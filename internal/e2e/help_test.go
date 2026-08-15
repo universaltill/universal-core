@@ -240,6 +240,44 @@ func testHelpServer(t *testing.T) (srv *httptest.Server, tenantID string, tenant
 	return testServer(t)
 }
 
+// retryWithBudget calls attempt repeatedly, each time against a *fresh*
+// sub-context bounded at perAttempt, until one call succeeds or budget's
+// wall-clock deadline passes. Pulled out as its own context/time-only
+// helper (no chromedp dependency) specifically so this retry behavior is
+// unit-testable without a real browser — see TestRetryWithBudget_ below.
+//
+// This exists because of a real bug (uc-infra#203): an earlier version of
+// navigateBackAndWait's loop below called chromedp.Run directly against
+// the *outer* ctx on every iteration, on the assumption that
+// chromedp.WithPollingTimeout(2*time.Second) bounded each call to ~2s so
+// the wall-clock loop would get several tries within its 10-second
+// budget. It doesn't: WithPollingTimeout is a page-side argument to the
+// injected polling JS, not a Go-side deadline on chromedp.Run itself —
+// independent review (uc-infra#203) traced chromedp's own poll.go and
+// confirmed a single chromedp.Run(ctx, chromedp.Poll(...)) call blocks
+// Go-side until *ctx* itself is done, not until its own polling timeout
+// elapses, if the browser never resolves the awaited promise (exactly
+// what happens on the back-forward-cache restore this function exists to
+// handle — see navigateBackAndWait's own comment). So the old loop's
+// first iteration could silently consume the *entire* remaining outer
+// context by itself, leaving zero budget for a second attempt — a retry
+// loop that, on the exact path it was built to retry, never actually
+// retried. Deriving a real per-attempt sub-context here is what makes
+// the budget genuine.
+func retryWithBudget(ctx context.Context, budget, perAttempt time.Duration, attempt func(context.Context) error) error {
+	deadline := time.Now().Add(budget)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		attemptCtx, cancel := context.WithTimeout(ctx, perAttempt)
+		lastErr = attempt(attemptCtx)
+		cancel()
+		if lastErr == nil {
+			return nil
+		}
+	}
+	return lastErr
+}
+
 // navigateBackAndWait drives one browser-back gesture at the CDP level —
 // the same page.NavigateToHistoryEntry call chromedp.NavigateBack itself
 // issues (see that function's own source in the chromedp module) — then
@@ -253,6 +291,11 @@ func testHelpServer(t *testing.T) (srv *httptest.Server, tenantID string, tenant
 // Retries a few times on "Cannot find context with specified id", the one
 // transient error seen immediately after triggering the navigation, while
 // the old page's JS execution context is still being torn down.
+//
+// The poll itself goes through retryWithBudget (see its own doc comment
+// for why a naive wall-clock loop over a shared context isn't enough) so
+// a wedged poll can't silently eat the whole 10-second retry budget in
+// one bite.
 func navigateBackAndWait(ctx context.Context, wantExpr string) error {
 	trigger := chromedp.ActionFunc(func(ctx context.Context) error {
 		cur, entries, err := page.GetNavigationHistory().Do(ctx)
@@ -268,15 +311,65 @@ func navigateBackAndWait(ctx context.Context, wantExpr string) error {
 		return fmt.Errorf("trigger back navigation: %w", err)
 	}
 
-	deadline := time.Now().Add(10 * time.Second)
-	var lastErr error
-	for time.Now().Before(deadline) {
-		lastErr = chromedp.Run(ctx, chromedp.Poll(wantExpr, nil, chromedp.WithPollingTimeout(2*time.Second)))
-		if lastErr == nil {
-			return nil
-		}
+	start := time.Now()
+	err := retryWithBudget(ctx, 10*time.Second, 2*time.Second, func(attemptCtx context.Context) error {
+		return chromedp.Run(attemptCtx, chromedp.Poll(wantExpr, nil, chromedp.WithPollingTimeout(2*time.Second)))
+	})
+	if err != nil {
+		// Self-diagnosing on failure: a bare "context deadline exceeded"
+		// with no other detail is exactly what made this bug slow to
+		// pin down in the first place (uc-infra#203).
+		var loc string
+		_ = chromedp.Run(ctx, chromedp.Location(&loc))
+		return fmt.Errorf("wait for %q after %s (last known location %q): %w", wantExpr, time.Since(start).Round(time.Millisecond), loc, err)
 	}
-	return lastErr
+	return nil
+}
+
+// TestRetryWithBudget_RetriesRatherThanLettingOneAttemptEatTheBudget is
+// the regression test for uc-infra#203's real root cause: a fake attempt
+// that always hangs until its own sub-context is canceled must still be
+// called more than once within budget — proving retryWithBudget bounds
+// each call rather than letting the first one block until the *outer*
+// context (here, context.Background(), which never expires on its own)
+// is done. Against the pre-fix shape (attempt run directly against the
+// shared outer context, no per-attempt sub-context), this exact case
+// would hang forever instead of failing after ~budget.
+func TestRetryWithBudget_RetriesRatherThanLettingOneAttemptEatTheBudget(t *testing.T) {
+	var calls int
+	err := retryWithBudget(context.Background(), 300*time.Millisecond, 50*time.Millisecond, func(attemptCtx context.Context) error {
+		calls++
+		<-attemptCtx.Done() // only a real per-attempt bound ever unblocks this
+		return attemptCtx.Err()
+	})
+	if err == nil {
+		t.Fatal("expected retryWithBudget to return an error once its budget is exhausted, got nil")
+	}
+	if calls < 3 {
+		t.Fatalf("expected several bounded attempts within the 300ms budget at 50ms each, got %d call(s) — a single attempt consuming the whole budget is the exact uc-infra#203 bug", calls)
+	}
+}
+
+// TestRetryWithBudget_SucceedsOnALaterAttempt proves the other half of
+// the contract: retryWithBudget must actually return nil (not just
+// "eventually stop calling attempt") once a later attempt succeeds,
+// including when earlier attempts genuinely used up their own sub-context.
+func TestRetryWithBudget_SucceedsOnALaterAttempt(t *testing.T) {
+	var calls int
+	err := retryWithBudget(context.Background(), 300*time.Millisecond, 20*time.Millisecond, func(attemptCtx context.Context) error {
+		calls++
+		if calls < 3 {
+			<-attemptCtx.Done()
+			return attemptCtx.Err()
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("expected the 3rd attempt to succeed, got error: %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("expected exactly 3 attempts (fail, fail, succeed), got %d", calls)
+	}
 }
 
 // waitForHelpTopicCount polls #uc-help-topic-results for its current
@@ -455,7 +548,16 @@ func TestHelp_SearchNarrowing_DiacriticFold_RealBrowser(t *testing.T) {
 func TestHelp_TopicSelectionAndBackForward_RealBrowser(t *testing.T) {
 	withDevAuthEnabled(t)
 	srv, tenantID, _ := testHelpServer(t)
-	ctx := browserCtx(t, tenantID)
+	// browserCtxWithTimeout, not the package's plain 30-second browserCtx
+	// (uc-infra#203): belt-and-braces headroom for this test's several
+	// real navigations, now that navigateBackAndWait's own retry loop is
+	// the actual fix (its doc comment has the real root cause — a single
+	// wedged poll could previously consume the whole outer context in
+	// one bite, budget or no budget). A genuinely stuck back-navigation
+	// still fails, just after its own bounded retries run out well
+	// inside this deadline, not by racing the rest of the test for a
+	// slice of it.
+	ctx := browserCtxWithTimeout(t, tenantID, 60*time.Second)
 
 	if err := chromedp.Run(ctx,
 		chromedp.Navigate(srv.URL+"/help"),
@@ -506,7 +608,7 @@ func TestHelp_TopicSelectionAndBackForward_RealBrowser(t *testing.T) {
 	// event) never resolves when Chrome serves the previous page straight
 	// out of the back-forward cache rather than issuing a new network
 	// request — verified by reproducing it, not assumed: with
-	// chromedp.NavigateBack this test hangs to its 30s context deadline
+	// chromedp.NavigateBack this test hangs to its full context deadline
 	// every run against this package's real headless Chrome, and a
 	// history.back() JS-eval equivalent was flaky the same way across
 	// repeated runs. navigateBackAndWait below drives the identical

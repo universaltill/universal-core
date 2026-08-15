@@ -52,19 +52,20 @@ func Account() *entity.Definition {
 			// (record_unique_keys), not just an application convention.
 			//
 			// NOT enforced immutable once written: renaming an existing
-			// Account's code is still allowed, and SyncGLAccountOnWrite
-			// upserts gl_accounts by the NEW code — the OLD code's
-			// gl_accounts row is orphaned (left behind, still active,
-			// no longer reachable from any Account), not renamed or
-			// deactivated in place, because gl_accounts carries no link
-			// back to the Account record it came from to find it by.
-			// Real gap (uc-infra#204 independent review, finding 2),
-			// deliberately not closed in this change — closing it
-			// properly needs gl_accounts to gain a source-record
-			// linkage (a migration) or Account.code to become
-			// immutable-after-create, either of which is a bigger,
-			// separable change; tracked as its own backlog card rather
-			// than expanding this one.
+			// Account's code is allowed by design (uc-infra#205 chose this
+			// over making code immutable — a typo'd code should stay
+			// fixable). gl_accounts carries a durable link back to the
+			// Account record it was projected from (source_record_id,
+			// 0009_gl_accounts_source_record_id.sql), so
+			// SyncGLAccountOnWrite/SyncGLAccounts
+			// (GLAccountRepo.UpsertBySourceRecord) update the SAME
+			// gl_accounts row in place on a rename — no orphan, the old
+			// code stops resolving. See ADR-0004's 2026-08-14 addendum for
+			// the full decision and its known edge case: renaming onto a
+			// code still held by a pre-uc-infra#205 orphaned row (one that
+			// predates this fix and had no live Account to backfill-link to)
+			// fails the write outright rather than silently hijacking that
+			// row.
 			{Name: "code", Type: entity.FieldString, Required: true},
 			{Name: "name", Type: entity.FieldString, Required: true},
 			{Name: "type", Type: entity.FieldEnum, Required: true,

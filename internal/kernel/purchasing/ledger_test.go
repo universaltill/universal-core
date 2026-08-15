@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -727,6 +728,87 @@ func TestPostGoodsReceiptLineToLedger_InventoryItemNotPublished_FailsWithWrapped
 	}
 }
 
+// TestPostGoodsReceiptLineToLedger_InventoryItemCreditAppliesFieldDefaults
+// is the regression test for uc-infra#218 (split from #212's independent
+// review): creditInventoryOnReceipt creates the new InventoryItem row via
+// the low-level records.CreateTx, not crud.Engine.Create, so it never got
+// Engine.Create's own entity.ApplyDefaults call. Every field this hardcoded
+// credit path sets (item_id/facility_id/qty_on_hand/qty_available_to_
+// promise) happens to always be explicit, so this was latent, not an
+// observed bug — this test proves it by publishing a v6 InventoryItem
+// Definition that adds one more Required field carrying a Default this
+// credit path does NOT set. Before uc-infra#218's fix, this would fail
+// validation ("condition_code is required"); after it, ledger.go's own
+// explicit entity.ApplyDefaults(def, fields) call (mirroring internal/
+// api/handlers.go's identical pre-Engine.Create call) fills it in, same
+// as every other write path into this Definition already does.
+func TestPostGoodsReceiptLineToLedger_InventoryItemCreditAppliesFieldDefaults(t *testing.T) {
+	fx := setUpGoodsReceiptFixture(t, 12.50)
+	fx.engine.SetHook("GoodsReceiptLine", PostGoodsReceiptLineToLedger)
+	ctx := context.Background()
+	actor := humanActor()
+
+	withConditionCode := &entity.Definition{
+		EntityType: "InventoryItem",
+		Version:    6,
+		Module:     "purchasing",
+		Fields: []entity.Field{
+			{Name: "item_id", Type: entity.FieldReference, Required: true, Target: "Item"},
+			{Name: "facility_id", Type: entity.FieldReference, Required: true, Target: "Facility"},
+			{Name: "qty_on_hand", Type: entity.FieldNumber, Required: true, Default: float64(0), Min: entity.Float64Ptr(0)},
+			{Name: "qty_available_to_promise", Type: entity.FieldNumber, Required: true, Default: float64(0)},
+			// Not set anywhere in creditInventoryOnReceipt's own fields
+			// map — only entity.ApplyDefaults can supply it.
+			{Name: "condition_code", Type: entity.FieldString, Required: true, Default: "good"},
+		},
+		// GetPublished/GetPublishedTx return the HIGHEST published
+		// version (see the sibling test above), so publishing v6 makes
+		// it authoritative without needing to roll back v5 first — and
+		// keeps v5's Unique(item_id, facility_id), which this credit's
+		// own upsert/retry design depends on.
+		Unique: [][]string{{"item_id", "facility_id"}},
+	}
+	raw, err := json.Marshal(withConditionCode)
+	if err != nil {
+		t.Fatalf("marshal InventoryItem v6: %v", err)
+	}
+	repo := data.NewEntityDefinitionRepo(fx.tenantDB)
+	if _, err := repo.CreateDraft(ctx, withConditionCode.EntityType, withConditionCode.Version, raw, actor); err != nil {
+		t.Fatalf("CreateDraft: %v", err)
+	}
+	if err := repo.Approve(ctx, withConditionCode.EntityType, withConditionCode.Version, actor); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	if err := repo.Publish(ctx, withConditionCode.EntityType, withConditionCode.Version, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	gr, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceipt"), map[string]any{
+		"purchase_order_id": fx.poID, "received_date": "2026-01-10", "facility_id": fx.facilityID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create GoodsReceipt: %v", err)
+	}
+
+	if _, err = fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"), map[string]any{
+		"goods_receipt_id": gr.ID, "po_line_id": fx.poLineID,
+		"item_id": fx.itemID, "qty_received": float64(4),
+	}, actor); err != nil {
+		t.Fatalf("create GoodsReceiptLine: expected condition_code's Default to satisfy its own Required check via entity.ApplyDefaults, got: %v", err)
+	}
+
+	invRecs, err := fx.engine.List(ctx, defFor(t, fx.tenantDB, "InventoryItem"))
+	if err != nil {
+		t.Fatalf("list InventoryItem: %v", err)
+	}
+	if len(invRecs) != 1 {
+		t.Fatalf("expected exactly 1 InventoryItem row, got %d", len(invRecs))
+	}
+	if got, _ := invRecs[0].Data["condition_code"].(string); got != "good" {
+		t.Fatalf("expected creditInventoryOnReceipt to apply condition_code's Default (\"good\") for the omitted field, got %q", got)
+	}
+}
+
 // TestPostGoodsReceiptLineToLedger_PublishedDefinitionUnmarshalFails_WrapsTheError
 // covers creditInventoryOnReceipt's entity.Unmarshal error branch —
 // independent review, uc-infra#165: EntityDefinitionRepo.CreateDraft only
@@ -859,6 +941,107 @@ func TestPostGoodsReceiptLineToLedger_SecondReceiptUpsertsInventoryItem(t *testi
 	}
 	if createAuditCount != 1 {
 		t.Fatalf("expected exactly 1 create audit row for the InventoryItem, got %d", createAuditCount)
+	}
+}
+
+// TestPostGoodsReceiptLineToLedger_SecondReceiptPreservesUntouchedFields is
+// the regression test for uc-infra#226 (split from uc-infra#218's
+// independent review): creditInventoryOnReceipt's update-existing branch
+// used to build a brand-new 4-key fields map
+// (item_id/facility_id/qty_on_hand/qty_available_to_promise) and hand it
+// straight to data.RecordRepo.UpdateTx, which is a full replacement
+// (`SET data = $1`) — so any field on the stored InventoryItem row
+// outside those four was silently erased on every second-and-later
+// receipt for the same (item, facility). This is deliberately NOT about
+// entity.ApplyDefaults/Field.Default (uc-infra#218/#227 cover that): it
+// sets the extra field via a plain generic Update, the same way any
+// other writer of InventoryItem (a form edit, an import) would, to prove
+// the update branch preserves a field it never itself touches, not just
+// one a Default happens to supply.
+func TestPostGoodsReceiptLineToLedger_SecondReceiptPreservesUntouchedFields(t *testing.T) {
+	fx := setUpGoodsReceiptFixture(t, 12.50)
+	fx.engine.SetHook("GoodsReceiptLine", PostGoodsReceiptLineToLedger)
+	ctx := context.Background()
+	actor := humanActor()
+
+	compiledIn := InventoryItem()
+	withLotNote := *compiledIn
+	withLotNote.Version = compiledIn.Version + 1
+	withLotNote.Fields = append(append([]entity.Field{}, compiledIn.Fields...),
+		entity.Field{Name: "lot_note", Type: entity.FieldString},
+	)
+	raw, err := json.Marshal(&withLotNote)
+	if err != nil {
+		t.Fatalf("marshal InventoryItem with lot_note: %v", err)
+	}
+	repo := data.NewEntityDefinitionRepo(fx.tenantDB)
+	if _, err := repo.CreateDraft(ctx, withLotNote.EntityType, withLotNote.Version, raw, actor); err != nil {
+		t.Fatalf("CreateDraft: %v", err)
+	}
+	if err := repo.Approve(ctx, withLotNote.EntityType, withLotNote.Version, actor); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	if err := repo.Publish(ctx, withLotNote.EntityType, withLotNote.Version, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	gr, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceipt"), map[string]any{
+		"purchase_order_id": fx.poID, "received_date": "2026-01-10", "facility_id": fx.facilityID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create GoodsReceipt: %v", err)
+	}
+
+	if _, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"), map[string]any{
+		"goods_receipt_id": gr.ID, "po_line_id": fx.poLineID,
+		"item_id": fx.itemID, "qty_received": float64(4),
+	}, actor); err != nil {
+		t.Fatalf("create first GoodsReceiptLine: %v", err)
+	}
+
+	// Simulate a tenant-added field getting a real value on the row via
+	// some OTHER write path — a plain generic Update, the same shape a
+	// form edit or import would produce — deliberately not this credit
+	// hook itself, which never sets lot_note.
+	invDef := defFor(t, fx.tenantDB, "InventoryItem")
+	invRecs, err := fx.engine.List(ctx, invDef)
+	if err != nil {
+		t.Fatalf("list InventoryItem: %v", err)
+	}
+	if len(invRecs) != 1 {
+		t.Fatalf("expected exactly 1 InventoryItem row after the first receipt, got %d", len(invRecs))
+	}
+	inv := invRecs[0]
+	version := inv.Version
+	if _, err := fx.engine.Update(ctx, invDef, inv.ID, map[string]any{
+		"item_id": inv.Data["item_id"], "facility_id": inv.Data["facility_id"],
+		"qty_on_hand": inv.Data["qty_on_hand"], "qty_available_to_promise": inv.Data["qty_available_to_promise"],
+		"lot_note": "batch 42",
+	}, &version, actor); err != nil {
+		t.Fatalf("set lot_note on InventoryItem: %v", err)
+	}
+
+	// Second receipt for the SAME (item, facility) — takes the update
+	// branch this issue is about.
+	if _, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"), map[string]any{
+		"goods_receipt_id": gr.ID, "po_line_id": fx.poLineID,
+		"item_id": fx.itemID, "qty_received": float64(6),
+	}, actor); err != nil {
+		t.Fatalf("create second GoodsReceiptLine: %v", err)
+	}
+
+	after, err := fx.engine.Get(ctx, invDef, inv.ID)
+	if err != nil {
+		t.Fatalf("re-read InventoryItem: %v", err)
+	}
+	if got, _ := after.Data["lot_note"].(string); got != "batch 42" {
+		t.Fatalf(`InventoryItem.lot_note = %q after a second receipt for the same (item, facility), want "batch 42" — a field the credit path itself doesn't touch must survive the update, not be erased by a full-replacement write`, got)
+	}
+	if got, _ := after.Data["qty_on_hand"].(float64); got != 10 {
+		t.Errorf("InventoryItem.qty_on_hand = %v, want 10 (4 + 6, upserted)", got)
+	}
+	if got, _ := after.Data["qty_available_to_promise"].(float64); got != 10 {
+		t.Errorf("InventoryItem.qty_available_to_promise = %v, want 10 (4 + 6, upserted)", got)
 	}
 }
 
@@ -1060,6 +1243,379 @@ func TestPostGoodsReceiptLineToLedger_DuplicateLegacyRows_ReturnsDiagnosableErro
 	}
 	if len(lines) != 0 {
 		t.Fatalf("expected the GoodsReceiptLine create to roll back entirely alongside the failed credit, got %d lines", len(lines))
+	}
+}
+
+// TestPostGoodsReceiptLineToLedger_TenantUniqueConstraintConflict_NamesTheRightConstraint
+// is the regression test for uc-infra#226's independent review finding 3:
+// creditInventoryOnReceipt's update branch now merges the FULL stored row
+// (uc-infra#226's own fix) before calling crud.UpdateUniqueConstraintKeys,
+// which makes a tenant-added Unique set (beyond the (item_id, facility_id)
+// this function's own upsert/retry design depends on) genuinely evaluated
+// for the first time — previously the bare 4-key map made any such
+// constraint permanently "inapplicable," so it could never conflict (and,
+// as an unwanted side effect, silently DROPPED the updated row's own key
+// for it every time — the erasure bug's unique-key twin). A real conflict
+// on that OTHER constraint must be reported as itself, not misattributed
+// to the (item_id, facility_id) duplicate-legacy-rows case the sibling
+// branch below handles.
+func TestPostGoodsReceiptLineToLedger_TenantUniqueConstraintConflict_NamesTheRightConstraint(t *testing.T) {
+	fx := setUpGoodsReceiptFixture(t, 12.50)
+	fx.engine.SetHook("GoodsReceiptLine", PostGoodsReceiptLineToLedger)
+	ctx := context.Background()
+	actor := humanActor()
+
+	compiledIn := InventoryItem()
+	withLotCode := *compiledIn
+	withLotCode.Version = compiledIn.Version + 1
+	withLotCode.Fields = append(append([]entity.Field{}, compiledIn.Fields...),
+		entity.Field{Name: "lot_code", Type: entity.FieldString},
+	)
+	withLotCode.Unique = append(append([][]string{}, compiledIn.Unique...), []string{"lot_code"})
+	raw, err := json.Marshal(&withLotCode)
+	if err != nil {
+		t.Fatalf("marshal InventoryItem with lot_code: %v", err)
+	}
+	repo := data.NewEntityDefinitionRepo(fx.tenantDB)
+	if _, err := repo.CreateDraft(ctx, withLotCode.EntityType, withLotCode.Version, raw, actor); err != nil {
+		t.Fatalf("CreateDraft: %v", err)
+	}
+	if err := repo.Approve(ctx, withLotCode.EntityType, withLotCode.Version, actor); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	if err := repo.Publish(ctx, withLotCode.EntityType, withLotCode.Version, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	invDef := defFor(t, fx.tenantDB, "InventoryItem")
+
+	otherItem, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "Item"), map[string]any{
+		"sku": "SKU-2", "name": "Widget 2", "item_type": "stock",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create second Item: %v", err)
+	}
+	otherFacility, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "Facility"), map[string]any{
+		"code": "OTHER", "name": "Other Warehouse", "facility_type": "warehouse", "is_active": true,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create second Facility: %v", err)
+	}
+
+	// rowB: a genuinely different InventoryItem that legitimately owns
+	// lot_code "L1" — created through the engine, so it gets a real
+	// record_unique_keys row for the lot_code constraint.
+	rowB, err := fx.engine.Create(ctx, invDef, map[string]any{
+		"item_id": otherItem.ID, "facility_id": otherFacility.ID,
+		"qty_on_hand": float64(0), "qty_available_to_promise": float64(0),
+		"lot_code": "L1",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create InventoryItem rowB with lot_code L1: %v", err)
+	}
+
+	// rowA: the row the real receipt below will upsert into. Created with
+	// its own distinct lot_code first (so ITS OWN creation doesn't
+	// collide with rowB), then its stored data is rewritten directly to
+	// "L1" and its own lot_code unique-key entry is dropped — reproducing
+	// exactly the state this test's own doc comment describes: a row
+	// whose stored value already reads "L1" but whose own key for that
+	// constraint is missing, while another live row (rowB) genuinely
+	// holds it.
+	rowA, err := fx.engine.Create(ctx, invDef, map[string]any{
+		"item_id": fx.itemID, "facility_id": fx.facilityID,
+		"qty_on_hand": float64(0), "qty_available_to_promise": float64(0),
+		"lot_code": "L1-rowA-placeholder",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create InventoryItem rowA: %v", err)
+	}
+	if _, err := fx.tenantDB.ExecContext(ctx,
+		`UPDATE records SET data = jsonb_set(data, '{lot_code}', to_jsonb('L1'::text)) WHERE id = $1`,
+		rowA.ID,
+	); err != nil {
+		t.Fatalf("rewrite rowA lot_code: %v", err)
+	}
+	lotCodeConstraint := entity.UniqueConstraintName([]string{"lot_code"})
+	if err := data.NewRecordUniqueKeyRepo(fx.tenantDB).DeleteForConstraintTx(ctx, fx.tenantDB, "InventoryItem", lotCodeConstraint, rowA.ID); err != nil {
+		t.Fatalf("drop rowA's own lot_code unique key: %v", err)
+	}
+
+	gr, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceipt"), map[string]any{
+		"purchase_order_id": fx.poID, "received_date": "2026-01-10", "facility_id": fx.facilityID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create GoodsReceipt: %v", err)
+	}
+	_, err = fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"), map[string]any{
+		"goods_receipt_id": gr.ID, "po_line_id": fx.poLineID,
+		"item_id": fx.itemID, "qty_received": float64(4),
+	}, actor)
+	if err == nil {
+		t.Fatal("expected the receipt to fail: rowA's own lot_code now collides with rowB's live unique key")
+	}
+	if !strings.Contains(err.Error(), "tenant-added Unique constraint") {
+		t.Fatalf("expected the tenant-added-constraint error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), lotCodeConstraint) {
+		t.Fatalf("expected the error to name the lot_code constraint (%s), got: %v", lotCodeConstraint, err)
+	}
+	if strings.Contains(err.Error(), "duplicate live InventoryItem rows for (item_id, facility_id)") {
+		t.Fatalf("must NOT misattribute this to the (item_id, facility_id) duplicate-rows case, got: %v", err)
+	}
+
+	// Rolled back cleanly: rowB untouched, no GoodsReceiptLine landed.
+	unchangedB, err := fx.engine.Get(ctx, invDef, rowB.ID)
+	if err != nil {
+		t.Fatalf("get rowB: %v", err)
+	}
+	if got, _ := unchangedB.Data["lot_code"].(string); got != "L1" {
+		t.Errorf("rowB.lot_code = %q, want unchanged \"L1\"", got)
+	}
+	lines, err := fx.engine.List(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"))
+	if err != nil {
+		t.Fatalf("list GoodsReceiptLine: %v", err)
+	}
+	if len(lines) != 0 {
+		t.Fatalf("expected the GoodsReceiptLine create to roll back entirely alongside the failed credit, got %d lines", len(lines))
+	}
+}
+
+// TestPostGoodsReceiptLineToLedger_SecondReceiptUpdateAuditDiffIsNarrow is
+// the regression test for uc-infra#226's independent review finding 2:
+// the update branch's audit entry must record only what THIS credit
+// actually changed (item_id/facility_id/qty_on_hand/
+// qty_available_to_promise), matching every sibling merge site in this
+// file (clearVendorInvoiceMatchException, MatchVendorInvoiceOnUpdate) —
+// not the full merged row uc-infra#226's fix now writes to the record
+// itself. Passing the full row to audit.New would make every tenant-added
+// field look "changed" in audit_log on every receipt, even though the
+// credit never touches it.
+func TestPostGoodsReceiptLineToLedger_SecondReceiptUpdateAuditDiffIsNarrow(t *testing.T) {
+	fx := setUpGoodsReceiptFixture(t, 12.50)
+	fx.engine.SetHook("GoodsReceiptLine", PostGoodsReceiptLineToLedger)
+	ctx := context.Background()
+	actor := humanActor()
+
+	compiledIn := InventoryItem()
+	withLotNote := *compiledIn
+	withLotNote.Version = compiledIn.Version + 1
+	withLotNote.Fields = append(append([]entity.Field{}, compiledIn.Fields...),
+		entity.Field{Name: "lot_note", Type: entity.FieldString},
+	)
+	raw, err := json.Marshal(&withLotNote)
+	if err != nil {
+		t.Fatalf("marshal InventoryItem with lot_note: %v", err)
+	}
+	repo := data.NewEntityDefinitionRepo(fx.tenantDB)
+	if _, err := repo.CreateDraft(ctx, withLotNote.EntityType, withLotNote.Version, raw, actor); err != nil {
+		t.Fatalf("CreateDraft: %v", err)
+	}
+	if err := repo.Approve(ctx, withLotNote.EntityType, withLotNote.Version, actor); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	if err := repo.Publish(ctx, withLotNote.EntityType, withLotNote.Version, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	invDef := defFor(t, fx.tenantDB, "InventoryItem")
+
+	gr, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceipt"), map[string]any{
+		"purchase_order_id": fx.poID, "received_date": "2026-01-10", "facility_id": fx.facilityID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create GoodsReceipt: %v", err)
+	}
+	if _, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"), map[string]any{
+		"goods_receipt_id": gr.ID, "po_line_id": fx.poLineID,
+		"item_id": fx.itemID, "qty_received": float64(4),
+	}, actor); err != nil {
+		t.Fatalf("create first GoodsReceiptLine: %v", err)
+	}
+
+	invRecs, err := fx.engine.List(ctx, invDef)
+	if err != nil {
+		t.Fatalf("list InventoryItem: %v", err)
+	}
+	if len(invRecs) != 1 {
+		t.Fatalf("expected exactly 1 InventoryItem row after the first receipt, got %d", len(invRecs))
+	}
+	inv := invRecs[0]
+	version := inv.Version
+	if _, err := fx.engine.Update(ctx, invDef, inv.ID, map[string]any{
+		"item_id": inv.Data["item_id"], "facility_id": inv.Data["facility_id"],
+		"qty_on_hand": inv.Data["qty_on_hand"], "qty_available_to_promise": inv.Data["qty_available_to_promise"],
+		"lot_note": "batch 42",
+	}, &version, actor); err != nil {
+		t.Fatalf("set lot_note on InventoryItem: %v", err)
+	}
+
+	// Second receipt for the SAME (item, facility) — the update branch.
+	if _, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"), map[string]any{
+		"goods_receipt_id": gr.ID, "po_line_id": fx.poLineID,
+		"item_id": fx.itemID, "qty_received": float64(6),
+	}, actor); err != nil {
+		t.Fatalf("create second GoodsReceiptLine: %v", err)
+	}
+
+	var diffJSON []byte
+	if err := fx.tenantDB.QueryRowContext(ctx,
+		`SELECT diff FROM audit_log WHERE entity_type = 'InventoryItem' AND record_id = $1 AND action = 'update' ORDER BY created_at DESC LIMIT 1`,
+		inv.ID,
+	).Scan(&diffJSON); err != nil {
+		t.Fatalf("read InventoryItem update audit diff: %v", err)
+	}
+	var diff map[string]any
+	if err := json.Unmarshal(diffJSON, &diff); err != nil {
+		t.Fatalf("unmarshal audit diff: %v", err)
+	}
+	if _, present := diff["lot_note"]; present {
+		t.Fatalf("audit diff for the credit's own update must not include lot_note (a field this credit never touches), got: %v", diff)
+	}
+	wantKeys := []string{"item_id", "facility_id", "qty_on_hand", "qty_available_to_promise"}
+	if len(diff) != len(wantKeys) {
+		t.Fatalf("audit diff = %v, want exactly the credit's own %v", diff, wantKeys)
+	}
+	for _, k := range wantKeys {
+		if _, present := diff[k]; !present {
+			t.Errorf("audit diff missing expected key %q: %v", k, diff)
+		}
+	}
+}
+
+// TestPostGoodsReceiptLineToLedger_SecondReceiptDoesNotApplyDefaults is the
+// regression test for uc-infra#227 (split from uc-infra#218's independent
+// review, blocked on uc-infra#226 landing first): creditInventoryOnReceipt's
+// update-existing branch deliberately does NOT call entity.ApplyDefaults —
+// unlike the create branch (uc-infra#218) — because UpdateTx used to be a
+// full replacement, and defaulting an omitted field there would have
+// silently resurrected it. uc-infra#226 fixed that erasure by merging onto
+// existing.Data instead of rebuilding a bare map, but that merge is NOT a
+// substitute for ApplyDefaults: a field genuinely absent from existing.Data
+// (never written by any prior path, not merely erased) stays absent after
+// the merge too, rather than being silently backfilled to its Default.
+//
+// Before uc-infra#226, "reverted to Default" and "erased" were
+// indistinguishable (both landed as absent); now that the merge preserves
+// what IS in existing.Data, this test can finally isolate the case where a
+// field was never in existing.Data to begin with — the only case
+// entity.ApplyDefaults being wrongly reachable from this branch would
+// actually change: publish InventoryItem v5 (no condition_code) and take
+// the create branch first, so the resulting row has no condition_code key
+// at all — not "good", not "", genuinely absent, the same as
+// TestPostGoodsReceiptLineToLedger_InventoryItemCreditAppliesFieldDefaults's
+// pre-fix state. THEN publish v6 (condition_code Required, Default "good")
+// and take the update branch for the same (item, facility). If
+// ApplyDefaults were ever mistakenly added to the update branch, this
+// second receipt would silently succeed with condition_code == "good"; with
+// today's correct code it must fail loudly instead — entity.ValidateRecord
+// runs against the newly-published v6 def, condition_code is Required, and
+// nothing in the update branch's own fields map (mergedRecordData's copy of
+// existing.Data plus the credit's own 4-key overrides) supplies it.
+func TestPostGoodsReceiptLineToLedger_SecondReceiptDoesNotApplyDefaults(t *testing.T) {
+	fx := setUpGoodsReceiptFixture(t, 12.50)
+	fx.engine.SetHook("GoodsReceiptLine", PostGoodsReceiptLineToLedger)
+	ctx := context.Background()
+	actor := humanActor()
+	invDef := defFor(t, fx.tenantDB, "InventoryItem")
+
+	gr, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceipt"), map[string]any{
+		"purchase_order_id": fx.poID, "received_date": "2026-01-10", "facility_id": fx.facilityID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create GoodsReceipt: %v", err)
+	}
+
+	// First receipt — take the create branch while only v5 (no
+	// condition_code) is published, so the resulting InventoryItem row
+	// has no condition_code key whatsoever, not just an empty one.
+	if _, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"), map[string]any{
+		"goods_receipt_id": gr.ID, "po_line_id": fx.poLineID,
+		"item_id": fx.itemID, "qty_received": float64(4),
+	}, actor); err != nil {
+		t.Fatalf("create first GoodsReceiptLine: %v", err)
+	}
+	invRecs, err := fx.engine.List(ctx, invDef)
+	if err != nil {
+		t.Fatalf("list InventoryItem: %v", err)
+	}
+	if len(invRecs) != 1 {
+		t.Fatalf("expected exactly 1 InventoryItem row after the first receipt, got %d", len(invRecs))
+	}
+	inv := invRecs[0]
+	if _, present := inv.Data["condition_code"]; present {
+		t.Fatalf("expected condition_code to be entirely absent after the first receipt (v5 doesn't declare it), got: %v", inv.Data["condition_code"])
+	}
+
+	// Now publish v6, adding condition_code as Required with a Default —
+	// after this InventoryItem row already exists without it.
+	withConditionCode := &entity.Definition{
+		EntityType: "InventoryItem",
+		Version:    6,
+		Module:     "purchasing",
+		Fields: []entity.Field{
+			{Name: "item_id", Type: entity.FieldReference, Required: true, Target: "Item"},
+			{Name: "facility_id", Type: entity.FieldReference, Required: true, Target: "Facility"},
+			{Name: "qty_on_hand", Type: entity.FieldNumber, Required: true, Default: float64(0), Min: entity.Float64Ptr(0)},
+			{Name: "qty_available_to_promise", Type: entity.FieldNumber, Required: true, Default: float64(0)},
+			{Name: "condition_code", Type: entity.FieldString, Required: true, Default: "good"},
+		},
+		Unique: [][]string{{"item_id", "facility_id"}},
+	}
+	raw, err := json.Marshal(withConditionCode)
+	if err != nil {
+		t.Fatalf("marshal InventoryItem v6: %v", err)
+	}
+	repo := data.NewEntityDefinitionRepo(fx.tenantDB)
+	if _, err := repo.CreateDraft(ctx, withConditionCode.EntityType, withConditionCode.Version, raw, actor); err != nil {
+		t.Fatalf("CreateDraft: %v", err)
+	}
+	if err := repo.Approve(ctx, withConditionCode.EntityType, withConditionCode.Version, actor); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	if err := repo.Publish(ctx, withConditionCode.EntityType, withConditionCode.Version, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	// Second receipt for the SAME (item, facility) — takes the update
+	// branch. existing.Data has no condition_code, the branch's own
+	// overrides don't set it either, and (this is the point of the
+	// test) nothing calls ApplyDefaults to backfill it — so validating
+	// the merged fields against the now-published v6 def must fail.
+	_, err = fx.engine.Create(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"), map[string]any{
+		"goods_receipt_id": gr.ID, "po_line_id": fx.poLineID,
+		"item_id": fx.itemID, "qty_received": float64(6),
+	}, actor)
+	if err == nil {
+		t.Fatal("expected the second GoodsReceiptLine create to fail: condition_code is Required on the now-published v6 InventoryItem and the update branch must not silently default it")
+	}
+	var verr *entity.ValidationError
+	if !errors.As(err, &verr) {
+		t.Fatalf("expected a *entity.ValidationError, got %T: %v", err, err)
+	}
+	if verr.FieldName != "condition_code" {
+		t.Fatalf("expected the validation failure to name condition_code, got %+v", verr)
+	}
+
+	// All-or-nothing: the second receipt's own GoodsReceiptLine must not
+	// exist, and the InventoryItem row must be exactly as the first
+	// receipt left it — still no condition_code, and not bumped by the
+	// second receipt's qty (proving the update branch's own write, not
+	// just the credit's validation-time view, never landed either).
+	lineRecs, err := fx.engine.List(ctx, defFor(t, fx.tenantDB, "GoodsReceiptLine"))
+	if err != nil {
+		t.Fatalf("list GoodsReceiptLine: %v", err)
+	}
+	if len(lineRecs) != 1 {
+		t.Fatalf("expected exactly 1 GoodsReceiptLine (the first, successful one) after the second's rollback, got %d", len(lineRecs))
+	}
+	after, err := fx.engine.Get(ctx, invDef, inv.ID)
+	if err != nil {
+		t.Fatalf("re-read InventoryItem: %v", err)
+	}
+	if _, present := after.Data["condition_code"]; present {
+		t.Fatalf("expected condition_code to still be entirely absent after the failed second receipt, got: %v", after.Data["condition_code"])
+	}
+	if got, _ := numberFieldValue(after.Data["qty_on_hand"]); got != 4 {
+		t.Fatalf("expected InventoryItem.qty_on_hand to still be 4 (unchanged by the rolled-back second receipt), got %v", got)
 	}
 }
 
@@ -1834,8 +2390,13 @@ func TestMatchVendorInvoiceOnUpdate_MismatchedTotal_RedirectsToMatchException(t 
 		t.Fatalf("expected the mismatched transition to land in match_exception, got status_id=%v", got.Data["status_id"])
 	}
 	reason, _ := got.Data["match_exception_reason"].(string)
-	if !strings.Contains(reason, "999.00") || !strings.Contains(reason, "125.00") {
-		t.Fatalf("expected match_exception_reason to name both totals, got %q", reason)
+	// %v, not a fixed 2dp format (independent review, uc-infra#193: a
+	// hardcoded %.2f here would truncate a >2dp currency's real total —
+	// see vendorInvoiceMatchDetail's own comment on its reason string),
+	// so a whole-number amount like 999.00 prints as "999", not "999.00".
+	want := fmt.Sprintf("total 999 (99900 minor units) does not match received value 125 (12500 minor units) for PurchaseOrder %s", fx.poID)
+	if reason != want {
+		t.Fatalf("expected match_exception_reason %q, got %q", want, reason)
 	}
 }
 
@@ -1884,6 +2445,424 @@ func TestMatchVendorInvoiceOnUpdate_WrongVendor_RedirectsToMatchException(t *tes
 	reason, _ := got.Data["match_exception_reason"].(string)
 	if !strings.Contains(reason, otherVendor.ID) {
 		t.Fatalf("expected match_exception_reason to name the invoice's own vendor_id %q, got %q", otherVendor.ID, reason)
+	}
+}
+
+// TestMatchVendorInvoiceOnUpdate_CurrencyMismatch_RedirectsToMatchException
+// (uc-infra#193) confirms the new currency_id leg of the 3-way match:
+// an invoice whose currency_id explicitly names a DIFFERENT currency
+// than the PurchaseOrder it's billing against redirects to
+// match_exception even though the plain numeric totals agree exactly —
+// same "a value-only check isn't enough" shape as the existing
+// wrong-vendor test above, for the field this task adds a check for.
+// Before this task, nothing compared these two fields at all: this is a
+// genuinely new check, not a rescale of an existing one.
+func TestMatchVendorInvoiceOnUpdate_CurrencyMismatch_RedirectsToMatchException(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if err := PublishStatuses(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("PublishStatuses: %v", err)
+	}
+	engine := crud.NewEngine(tenantDB)
+
+	usd, err := engine.Create(ctx, defFor(t, tenantDB, "Currency"), map[string]any{
+		"code": "USD", "name": "US Dollar", "minor_unit": float64(2),
+	}, actor)
+	if err != nil {
+		t.Fatalf("create USD Currency: %v", err)
+	}
+	eur, err := engine.Create(ctx, defFor(t, tenantDB, "Currency"), map[string]any{
+		"code": "EUR", "name": "Euro", "minor_unit": float64(2),
+	}, actor)
+	if err != nil {
+		t.Fatalf("create EUR Currency: %v", err)
+	}
+
+	vendor := createVendorParty(t, ctx, engine, tenantDB, "Acme Textiles", actor)
+	item, err := engine.Create(ctx, defFor(t, tenantDB, "Item"), map[string]any{
+		"sku": "SKU-1", "name": "Widget", "item_type": "stock",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create Item: %v", err)
+	}
+	facility, err := engine.Create(ctx, defFor(t, tenantDB, "Facility"), map[string]any{
+		"code": "MAIN", "name": "Main Warehouse", "facility_type": "warehouse", "is_active": true,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create Facility: %v", err)
+	}
+	draftPOStatusID := statusIDByCode(t, engine, tenantDB, "purchase_order_status", "draft")
+	po, err := engine.Create(ctx, defFor(t, tenantDB, "PurchaseOrder"), map[string]any{
+		"po_number": "PO-1", "vendor_id": vendor.ID, "order_date": "2026-01-01",
+		"status_id": draftPOStatusID, "currency_id": usd.ID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create PurchaseOrder: %v", err)
+	}
+	line, err := engine.Create(ctx, defFor(t, tenantDB, "POLine"), map[string]any{
+		"purchase_order_id": po.ID, "item_id": item.ID, "qty": 10.0, "unit_price": ledger.ToMinorUnits(12.50),
+	}, actor)
+	if err != nil {
+		t.Fatalf("create POLine: %v", err)
+	}
+	gr, err := engine.Create(ctx, defFor(t, tenantDB, "GoodsReceipt"), map[string]any{
+		"purchase_order_id": po.ID, "received_date": "2026-01-10", "facility_id": facility.ID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create GoodsReceipt: %v", err)
+	}
+	if _, err := engine.Create(ctx, defFor(t, tenantDB, "GoodsReceiptLine"), map[string]any{
+		"goods_receipt_id": gr.ID, "po_line_id": line.ID, "item_id": item.ID, "qty_received": 10.0,
+	}, actor); err != nil {
+		t.Fatalf("create GoodsReceiptLine: %v", err)
+	}
+
+	draftInvStatusID := statusIDByCode(t, engine, tenantDB, "vendor_invoice_status", "draft")
+	inv, err := engine.Create(ctx, defFor(t, tenantDB, "VendorInvoice"), map[string]any{
+		"invoice_number": "VINV-1", "purchase_order_id": po.ID, "vendor_id": vendor.ID,
+		"invoice_date": "2026-01-15", "status_id": draftInvStatusID, "total": 125.00, // agrees numerically
+		"currency_id": eur.ID, // but disagrees with the PO's own USD
+	}, actor)
+	if err != nil {
+		t.Fatalf("create VendorInvoice: %v", err)
+	}
+
+	engine.SetHook("VendorInvoice", MatchVendorInvoiceOnUpdate)
+	matchedStatusID := statusIDByCode(t, engine, tenantDB, "vendor_invoice_status", "matched")
+	exceptionStatusID := statusIDByCode(t, engine, tenantDB, "vendor_invoice_status", "match_exception")
+	version := inv.Version
+	if _, err := engine.Update(ctx, defFor(t, tenantDB, "VendorInvoice"), inv.ID, map[string]any{
+		"invoice_number": "VINV-1", "purchase_order_id": po.ID, "vendor_id": vendor.ID,
+		"invoice_date": "2026-01-15", "status_id": matchedStatusID, "total": 125.00, "currency_id": eur.ID,
+	}, &version, actor); err != nil {
+		t.Fatalf("expected the redirect to succeed (no rollback), got: %v", err)
+	}
+	got, err := engine.Get(ctx, defFor(t, tenantDB, "VendorInvoice"), inv.ID)
+	if err != nil {
+		t.Fatalf("get VendorInvoice: %v", err)
+	}
+	if got.Data["status_id"] != exceptionStatusID {
+		t.Fatalf("expected the currency mismatch to land in match_exception despite matching totals, got status_id=%v", got.Data["status_id"])
+	}
+	reason, _ := got.Data["match_exception_reason"].(string)
+	if !strings.Contains(reason, eur.ID) || !strings.Contains(reason, usd.ID) {
+		t.Fatalf("expected match_exception_reason to name both currency_ids (invoice %q, PO %q), got %q", eur.ID, usd.ID, reason)
+	}
+}
+
+// TestVendorInvoiceMatch_NonDefaultCurrencyScale_ResolvesRealMinorUnits
+// (uc-infra#193) is the direct regression test for the fix's core claim:
+// resolving minorUnit from the PurchaseOrder's real currency_id, not the
+// package's fixed money.Decimals=2. Uses a 0-decimal-place currency
+// (JPY-style, same fixture shape as assets'
+// TestCurrencyMinorUnit_ResolvesNonDefaultScale) so the two scales are
+// unmistakably different (0 vs 2) rather than coincidentally producing
+// the same minor-unit numbers.
+//
+// The mismatch case is the part that actually distinguishes old
+// behavior from new: before this fix, receivedValueForPurchaseOrder
+// summed POLine.unit_price's raw stored minor-unit integers directly
+// (always effectively 2dp, since money.Money is fixed at that scale),
+// and vendorInvoiceMatchDetail's own total conversion was hardcoded to
+// money.Decimals too — so a mismatch here would have been reported as
+// "13000 minor units" vs "12000 minor units" (both scaled ×100 too
+// large for a real 0dp currency). After this fix, both sides resolve
+// and convert at the PO's real 0dp scale: "130 minor units" vs "120
+// minor units". Asserting on the SMALL numbers is what actually catches
+// a regression back to the old fixed-2dp conversion — asserting only on
+// the matched/match_exception verdict would not, since that verdict is
+// scale-invariant when both sides are (mis)scaled identically, which is
+// exactly what made the old code's bug easy to miss.
+func TestVendorInvoiceMatch_NonDefaultCurrencyScale_ResolvesRealMinorUnits(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if err := PublishStatuses(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("PublishStatuses: %v", err)
+	}
+	engine := crud.NewEngine(tenantDB)
+
+	jpy, err := engine.Create(ctx, defFor(t, tenantDB, "Currency"), map[string]any{
+		"code": "JPY", "name": "Japanese Yen", "minor_unit": float64(0),
+	}, actor)
+	if err != nil {
+		t.Fatalf("create JPY Currency: %v", err)
+	}
+	vendor := createVendorParty(t, ctx, engine, tenantDB, "Acme Textiles", actor)
+	item, err := engine.Create(ctx, defFor(t, tenantDB, "Item"), map[string]any{
+		"sku": "SKU-1", "name": "Widget", "item_type": "stock",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create Item: %v", err)
+	}
+	facility, err := engine.Create(ctx, defFor(t, tenantDB, "Facility"), map[string]any{
+		"code": "MAIN", "name": "Main Warehouse", "facility_type": "warehouse", "is_active": true,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create Facility: %v", err)
+	}
+	draftPOStatusID := statusIDByCode(t, engine, tenantDB, "purchase_order_status", "draft")
+	po, err := engine.Create(ctx, defFor(t, tenantDB, "PurchaseOrder"), map[string]any{
+		"po_number": "PO-1", "vendor_id": vendor.ID, "order_date": "2026-01-01",
+		"status_id": draftPOStatusID, "currency_id": jpy.ID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create PurchaseOrder: %v", err)
+	}
+	// unit_price is entered as a human-typed major-unit amount and
+	// stored via ledger.ToMinorUnits, same convention every other
+	// fixture in this file uses — qty 10 x 12.00 = a real received value
+	// of 120.00 (major units), regardless of which currency it's in.
+	line, err := engine.Create(ctx, defFor(t, tenantDB, "POLine"), map[string]any{
+		"purchase_order_id": po.ID, "item_id": item.ID, "qty": 10.0, "unit_price": ledger.ToMinorUnits(12.00),
+	}, actor)
+	if err != nil {
+		t.Fatalf("create POLine: %v", err)
+	}
+	gr, err := engine.Create(ctx, defFor(t, tenantDB, "GoodsReceipt"), map[string]any{
+		"purchase_order_id": po.ID, "received_date": "2026-01-10", "facility_id": facility.ID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create GoodsReceipt: %v", err)
+	}
+	if _, err := engine.Create(ctx, defFor(t, tenantDB, "GoodsReceiptLine"), map[string]any{
+		"goods_receipt_id": gr.ID, "po_line_id": line.ID, "item_id": item.ID, "qty_received": 10.0,
+	}, actor); err != nil {
+		t.Fatalf("create GoodsReceiptLine: %v", err)
+	}
+
+	engine.SetHook("VendorInvoice", MatchVendorInvoiceOnUpdate)
+	draftInvStatusID := statusIDByCode(t, engine, tenantDB, "vendor_invoice_status", "draft")
+	matchedStatusID := statusIDByCode(t, engine, tenantDB, "vendor_invoice_status", "matched")
+	exceptionStatusID := statusIDByCode(t, engine, tenantDB, "vendor_invoice_status", "match_exception")
+
+	t.Run("agrees at the real 0dp scale", func(t *testing.T) {
+		inv, err := engine.Create(ctx, defFor(t, tenantDB, "VendorInvoice"), map[string]any{
+			"invoice_number": "VINV-OK", "purchase_order_id": po.ID, "vendor_id": vendor.ID,
+			"invoice_date": "2026-01-15", "status_id": draftInvStatusID, "total": 120.00, "currency_id": jpy.ID,
+		}, actor)
+		if err != nil {
+			t.Fatalf("create VendorInvoice: %v", err)
+		}
+		version := inv.Version
+		if _, err := engine.Update(ctx, defFor(t, tenantDB, "VendorInvoice"), inv.ID, map[string]any{
+			"invoice_number": "VINV-OK", "purchase_order_id": po.ID, "vendor_id": vendor.ID,
+			"invoice_date": "2026-01-15", "status_id": matchedStatusID, "total": 120.00, "currency_id": jpy.ID,
+		}, &version, actor); err != nil {
+			t.Fatalf("expected the transition to succeed, got: %v", err)
+		}
+		got, err := engine.Get(ctx, defFor(t, tenantDB, "VendorInvoice"), inv.ID)
+		if err != nil {
+			t.Fatalf("get VendorInvoice: %v", err)
+		}
+		if got.Data["status_id"] != matchedStatusID {
+			t.Fatalf("expected a genuinely-agreeing 0dp-currency invoice to match, got status_id=%v", got.Data["status_id"])
+		}
+	})
+
+	t.Run("mismatch reports the real 0dp minor-unit counts, not the 2dp-inflated ones", func(t *testing.T) {
+		inv, err := engine.Create(ctx, defFor(t, tenantDB, "VendorInvoice"), map[string]any{
+			"invoice_number": "VINV-BAD", "purchase_order_id": po.ID, "vendor_id": vendor.ID,
+			"invoice_date": "2026-01-15", "status_id": draftInvStatusID, "total": 130.00, "currency_id": jpy.ID,
+		}, actor)
+		if err != nil {
+			t.Fatalf("create VendorInvoice: %v", err)
+		}
+		version := inv.Version
+		if _, err := engine.Update(ctx, defFor(t, tenantDB, "VendorInvoice"), inv.ID, map[string]any{
+			"invoice_number": "VINV-BAD", "purchase_order_id": po.ID, "vendor_id": vendor.ID,
+			"invoice_date": "2026-01-15", "status_id": matchedStatusID, "total": 130.00, "currency_id": jpy.ID,
+		}, &version, actor); err != nil {
+			t.Fatalf("expected the redirect to succeed (no rollback), got: %v", err)
+		}
+		got, err := engine.Get(ctx, defFor(t, tenantDB, "VendorInvoice"), inv.ID)
+		if err != nil {
+			t.Fatalf("get VendorInvoice: %v", err)
+		}
+		if got.Data["status_id"] != exceptionStatusID {
+			t.Fatalf("expected the real mismatch to land in match_exception, got status_id=%v", got.Data["status_id"])
+		}
+		reason, _ := got.Data["match_exception_reason"].(string)
+		// Full expected string, not just the two "N minor units" substrings
+		// (independent review, uc-infra#193's own first draft: a narrow
+		// substring check like the old one here didn't catch that the
+		// major-unit figures were wrong — money.Money(receivedMinor).Major()
+		// misreported "120 minor units" as received value "1.20" instead
+		// of "120", since it unconditionally divides by money's fixed 2dp
+		// scale rather than the resolved 0dp one. Asserting the FULL
+		// string is what actually catches that class of bug.)
+		want := fmt.Sprintf("total 130 (130 minor units) does not match received value 120 (120 minor units) for PurchaseOrder %s", po.ID)
+		if reason != want {
+			t.Fatalf("expected match_exception_reason %q, got %q — a 2dp-inflated 13000/12000 or a wrong "+
+				"major-unit figure here would mean minorUnit resolution or its display regressed", want, reason)
+		}
+	})
+}
+
+// TestVendorInvoiceMatch_UnresolvableCurrencyID_FallsBackToDefaultScale
+// (uc-infra#193) confirms the "unresolvable currency degrades to
+// money.Decimals, not a hard failure" fallback — same posture
+// assets.PostDueDepreciation already established for the identical
+// situation — using a currency_id that doesn't resolve to any real
+// Currency row (a dangling reference, tolerated per ADR-0007) rather
+// than an empty one, so this exercises the currencyMinorUnitTx error
+// path specifically, not just the "no currency_id at all" path every
+// other test in this file already covers.
+func TestVendorInvoiceMatch_UnresolvableCurrencyID_FallsBackToDefaultScale(t *testing.T) {
+	fx := setUpVendorInvoiceFixture(t, 10, 12.50, 10) // received value 125.00 at the default 2dp scale
+	ctx := context.Background()
+
+	// Give the PurchaseOrder a currency_id that doesn't resolve to any
+	// real Currency row.
+	poDef := defFor(t, fx.tenantDB, "PurchaseOrder")
+	po, err := fx.engine.Get(ctx, poDef, fx.poID)
+	if err != nil {
+		t.Fatalf("get PurchaseOrder: %v", err)
+	}
+	poVersion := po.Version
+	if _, err := fx.engine.Update(ctx, poDef, fx.poID, map[string]any{
+		"po_number": "PO-1", "vendor_id": fx.vendorID, "order_date": "2026-01-01",
+		"status_id": po.Data["status_id"], "currency_id": "00000000-0000-0000-0000-000000000000",
+	}, &poVersion, humanActor()); err != nil {
+		t.Fatalf("update PurchaseOrder currency_id: %v", err)
+	}
+
+	fx.engine.SetHook("VendorInvoice", MatchVendorInvoiceOnUpdate)
+	inv := createDraftVendorInvoice(t, fx, 125.00) // agrees at the 2dp fallback scale
+
+	matchedStatusID := statusIDByCode(t, fx.engine, fx.tenantDB, "vendor_invoice_status", "matched")
+	version := inv.Version
+	if _, err := fx.engine.Update(ctx, defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID, map[string]any{
+		"invoice_number": "VINV-1", "purchase_order_id": fx.poID, "vendor_id": fx.vendorID,
+		"invoice_date": "2026-01-15", "status_id": matchedStatusID, "total": 125.00,
+	}, &version, humanActor()); err != nil {
+		t.Fatalf("expected the transition to succeed despite the unresolvable currency_id, got: %v", err)
+	}
+	got, err := fx.engine.Get(ctx, defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID)
+	if err != nil {
+		t.Fatalf("get VendorInvoice: %v", err)
+	}
+	if got.Data["status_id"] != matchedStatusID {
+		t.Fatalf("expected an unresolvable PO currency_id to fall back to the 2dp default (not fail the match), got status_id=%v", got.Data["status_id"])
+	}
+}
+
+// TestMatchVendorInvoiceOnUpdate_OutOfRangeCurrencyMinorUnit_FallsBackToDefaultScale
+// (uc-infra#193, independent review) confirms currencyMinorUnitTx's
+// range check: a Currency row whose minor_unit is OUTSIDE
+// [0, money.MaxMinorUnitScale] — reachable only via a legacy row written
+// before Currency's own [0,6] bound landed (Version 3, uc-infra#80), not
+// through the ordinary entity.ValidateRecord-guarded Create path, so
+// this writes it directly via data.RecordRepo, bypassing entity
+// validation the same way this file's own
+// TestPostGoodsReceiptLineToLedger_DuplicateLegacyRows_ReturnsDiagnosableError
+// simulates a legacy row — degrades to the money.Decimals fallback, the
+// same as an unresolvable/missing currency_id, rather than hard-failing
+// the whole match via money.FromMajorUnits's own range check.
+func TestMatchVendorInvoiceOnUpdate_OutOfRangeCurrencyMinorUnit_FallsBackToDefaultScale(t *testing.T) {
+	fx := setUpVendorInvoiceFixture(t, 10, 12.50, 10) // received value 125.00 at the default 2dp scale
+	ctx := context.Background()
+
+	records := data.NewRecordRepo(fx.tenantDB)
+	corrupt, err := records.Create(ctx, "Currency", map[string]any{
+		"code": "XXX", "name": "Corrupt Legacy Currency", "minor_unit": float64(9), // outside [0,6]
+	})
+	if err != nil {
+		t.Fatalf("create corrupt Currency row: %v", err)
+	}
+
+	poDef := defFor(t, fx.tenantDB, "PurchaseOrder")
+	po, err := fx.engine.Get(ctx, poDef, fx.poID)
+	if err != nil {
+		t.Fatalf("get PurchaseOrder: %v", err)
+	}
+	poVersion := po.Version
+	if _, err := fx.engine.Update(ctx, poDef, fx.poID, map[string]any{
+		"po_number": "PO-1", "vendor_id": fx.vendorID, "order_date": "2026-01-01",
+		"status_id": po.Data["status_id"], "currency_id": corrupt.ID,
+	}, &poVersion, humanActor()); err != nil {
+		t.Fatalf("update PurchaseOrder currency_id: %v", err)
+	}
+
+	fx.engine.SetHook("VendorInvoice", MatchVendorInvoiceOnUpdate)
+	inv := createDraftVendorInvoice(t, fx, 125.00) // agrees at the 2dp fallback scale
+
+	matchedStatusID := statusIDByCode(t, fx.engine, fx.tenantDB, "vendor_invoice_status", "matched")
+	version := inv.Version
+	if _, err := fx.engine.Update(ctx, defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID, map[string]any{
+		"invoice_number": "VINV-1", "purchase_order_id": fx.poID, "vendor_id": fx.vendorID,
+		"invoice_date": "2026-01-15", "status_id": matchedStatusID, "total": 125.00,
+	}, &version, humanActor()); err != nil {
+		t.Fatalf("expected the transition to succeed despite the corrupt minor_unit (fallback, not a hard failure), got: %v", err)
+	}
+	got, err := fx.engine.Get(ctx, defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID)
+	if err != nil {
+		t.Fatalf("get VendorInvoice: %v", err)
+	}
+	if got.Data["status_id"] != matchedStatusID {
+		t.Fatalf("expected an out-of-range Currency.minor_unit to fall back to the 2dp default (not fail the match), got status_id=%v", got.Data["status_id"])
+	}
+}
+
+// TestMatchVendorInvoiceOnUpdate_InvoiceCurrencySetPOCurrencyBlank_NotAMismatch
+// (uc-infra#193, independent review) confirms the currency_id mismatch
+// check only fires when BOTH sides assert a currency — unlike vendor_id
+// (where an empty invoice vendor_id IS itself a mismatch), a
+// PurchaseOrder written before uc-infra#193 (or any tenant that hasn't
+// adopted per-document currencies) has a blank currency_id, and that
+// blank isn't a claim the invoice's own currency_id can disagree with.
+// The regression this guards: an early version of this check compared
+// invoiceCurrencyID != poCurrencyID without also requiring poCurrencyID
+// non-empty, which would have redirected every such existing PO/invoice
+// pairing to match_exception on its very next save.
+func TestMatchVendorInvoiceOnUpdate_InvoiceCurrencySetPOCurrencyBlank_NotAMismatch(t *testing.T) {
+	fx := setUpVendorInvoiceFixture(t, 10, 12.50, 10) // received value 125.00; PO has no currency_id
+	ctx := context.Background()
+
+	usd, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "Currency"), map[string]any{
+		"code": "USD", "name": "US Dollar", "minor_unit": float64(2),
+	}, humanActor())
+	if err != nil {
+		t.Fatalf("create USD Currency: %v", err)
+	}
+
+	fx.engine.SetHook("VendorInvoice", MatchVendorInvoiceOnUpdate)
+	draftStatusID := statusIDByCode(t, fx.engine, fx.tenantDB, "vendor_invoice_status", "draft")
+	inv, err := fx.engine.Create(ctx, defFor(t, fx.tenantDB, "VendorInvoice"), map[string]any{
+		"invoice_number": "VINV-1", "purchase_order_id": fx.poID, "vendor_id": fx.vendorID,
+		"invoice_date": "2026-01-15", "status_id": draftStatusID, "total": 125.00, "currency_id": usd.ID,
+	}, humanActor())
+	if err != nil {
+		t.Fatalf("create VendorInvoice: %v", err)
+	}
+
+	matchedStatusID := statusIDByCode(t, fx.engine, fx.tenantDB, "vendor_invoice_status", "matched")
+	version := inv.Version
+	if _, err := fx.engine.Update(ctx, defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID, map[string]any{
+		"invoice_number": "VINV-1", "purchase_order_id": fx.poID, "vendor_id": fx.vendorID,
+		"invoice_date": "2026-01-15", "status_id": matchedStatusID, "total": 125.00, "currency_id": usd.ID,
+	}, &version, humanActor()); err != nil {
+		t.Fatalf("expected the transition to succeed (no currency mismatch), got: %v", err)
+	}
+	got, err := fx.engine.Get(ctx, defFor(t, fx.tenantDB, "VendorInvoice"), inv.ID)
+	if err != nil {
+		t.Fatalf("get VendorInvoice: %v", err)
+	}
+	if got.Data["status_id"] != matchedStatusID {
+		t.Fatalf("expected an invoice currency_id with no PO currency_id to set to match (not flagged as a mismatch), got status_id=%v", got.Data["status_id"])
 	}
 }
 
@@ -2278,8 +3257,11 @@ func TestMatchVendorInvoiceOnUpdate_SecondConsecutiveFailure_UpdatesReason(t *te
 		t.Fatalf("get VendorInvoice: %v", err)
 	}
 	firstReason, _ := first.Data["match_exception_reason"].(string)
-	if !strings.Contains(firstReason, "999.00") {
-		t.Fatalf("expected the first reason to mention 999.00, got %q", firstReason)
+	// "999", not "999.00" — %v formatting, not a fixed 2dp format
+	// (independent review, uc-infra#193, see the MismatchedTotal test
+	// above for why).
+	if !strings.Contains(firstReason, "999") {
+		t.Fatalf("expected the first reason to mention 999, got %q", firstReason)
 	}
 
 	// Retry with a DIFFERENT wrong total — still disagrees, but not the
@@ -2298,11 +3280,11 @@ func TestMatchVendorInvoiceOnUpdate_SecondConsecutiveFailure_UpdatesReason(t *te
 		t.Fatalf("get VendorInvoice: %v", err)
 	}
 	secondReason, _ := second.Data["match_exception_reason"].(string)
-	if !strings.Contains(secondReason, "777.00") {
-		t.Fatalf("expected the second reason to mention the new total 777.00, got %q", secondReason)
+	if !strings.Contains(secondReason, "777") {
+		t.Fatalf("expected the second reason to mention the new total 777, got %q", secondReason)
 	}
-	if strings.Contains(secondReason, "999.00") {
-		t.Fatalf("expected the reason to be replaced, not accumulated — still mentions the old 999.00: %q", secondReason)
+	if strings.Contains(secondReason, "999") {
+		t.Fatalf("expected the reason to be replaced, not accumulated — still mentions the old 999: %q", secondReason)
 	}
 }
 

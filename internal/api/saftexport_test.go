@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -433,6 +434,18 @@ func TestSAFTExport_NoOwnOrganizationFallsBackToNA(t *testing.T) {
 // holding own_organization is a data-quality problem the export has no
 // business guessing at (see foundation.PartyRole's own doc comment) — it
 // must degrade to NA exactly like the zero-match case, never pick one.
+//
+// As of uc-infra#201/ADR-0028 (PartyRole v4), a second own_organization
+// PartyRole can no longer be produced through the ordinary API/
+// crud.Engine path at all — foundation.PartyRole.UniqueWhen rejects it
+// with *crud.UniqueConstraintError (see
+// TestSAFTExport_SecondOwnOrganizationRoleRejectedByEngine, below). The
+// state this test covers is now reachable only as legacy data that
+// predates that constraint, so the second role is written straight via
+// data.NewRecordRepo, bypassing crud.Engine entirely — same technique
+// crud/unique_constraints_test.go's own pre-existing-record tests use —
+// simulating a tenant that hasn't synced to v4 yet, or already held this
+// collision before that version's backfill ran.
 func TestSAFTExport_AmbiguousOwnOrganizationFallsBackToNA(t *testing.T) {
 	router := newTestRouter(t)
 	withDevAuthEnabled(t)
@@ -459,9 +472,18 @@ func TestSAFTExport_AmbiguousOwnOrganizationFallsBackToNA(t *testing.T) {
 		return envelope.Data
 	}
 
+	records := data.NewRecordRepo(db)
 	for i, name := range []string{"Org One", "Org Two"} {
 		org := post("/api/records/Party", `{"party_type":"organization","name":"`+name+`","registration_number":"REG-`+string(rune('A'+i))+`"}`)
-		post("/api/records/PartyRole", `{"party_id":"`+org["id"].(string)+`","role_type":"own_organization"}`)
+		if i == 0 {
+			post("/api/records/PartyRole", `{"party_id":"`+org["id"].(string)+`","role_type":"own_organization"}`)
+			continue
+		}
+		if _, err := records.Create(context.Background(), "PartyRole", map[string]any{
+			"party_id": org["id"].(string), "role_type": "own_organization",
+		}); err != nil {
+			t.Fatalf("create pre-existing second own_organization PartyRole: %v", err)
+		}
 	}
 
 	req := newRequest("GET", "/export/saft?from=2026-01-01&to=2026-12-31", tenantID, "farshid", nil)
@@ -532,15 +554,25 @@ func TestSAFTExport_OwnOrganizationPartyDeletedAfterRoleFallsBackToNA(t *testing
 }
 
 // TestSAFTExport_DuplicateOwnOrganizationRolesOnOneParty (independent
-// review, uc-infra#63): nothing in the generic entity/crud layer makes
-// PartyRole rows unique, so assigning the own_organization role twice to
-// the SAME Party is a click away. Two rows naming one party is not the
-// ambiguity the degrade-to-NA rule exists for — every row agrees on which
-// Party is the tenant, so resolving it is not a guess. Counting ROWS
-// rather than distinct parties would quietly swap a configured company
-// profile back to NA (a statutory misstatement with no visible cause);
-// saftParties already dedupes its own role→party join by party id for
-// exactly this reason.
+// review, uc-infra#63): two PartyRole rows both naming the SAME Party as
+// own_organization is not the ambiguity the degrade-to-NA rule exists
+// for — every row agrees on which Party is the tenant, so resolving it
+// is not a guess. Counting ROWS rather than distinct parties would
+// quietly swap a configured company profile back to NA (a statutory
+// misstatement with no visible cause); saftParties already dedupes its
+// own role→party join by party id for exactly this reason.
+//
+// As of uc-infra#201/ADR-0028 (PartyRole v4), this state is no longer
+// reachable through the ordinary API/crud.Engine path — assigning the
+// role a second time, even to the same Party, is rejected the same way
+// a second DIFFERENT Party would be (see
+// TestSAFTExport_SecondOwnOrganizationRoleRejectedByEngine, below): the
+// underlying invariant was always "at most one own_organization row,
+// full stop," never "at most one per party." The second row here is
+// therefore written straight via data.NewRecordRepo, bypassing
+// crud.Engine, simulating legacy data that predates the constraint —
+// same technique as TestSAFTExport_AmbiguousOwnOrganizationFallsBackToNA
+// above.
 func TestSAFTExport_DuplicateOwnOrganizationRolesOnOneParty(t *testing.T) {
 	router := newTestRouter(t)
 	withDevAuthEnabled(t)
@@ -570,7 +602,11 @@ func TestSAFTExport_DuplicateOwnOrganizationRolesOnOneParty(t *testing.T) {
 	org := post("/api/records/Party", `{"party_type":"organization","name":"Demo Organization",`+
 		`"registration_number":"REG-12345","contact_first_name":"Jane","contact_last_name":"Doe"}`)
 	post("/api/records/PartyRole", `{"party_id":"`+org["id"].(string)+`","role_type":"own_organization"}`)
-	post("/api/records/PartyRole", `{"party_id":"`+org["id"].(string)+`","role_type":"own_organization"}`)
+	if _, err := data.NewRecordRepo(db).Create(context.Background(), "PartyRole", map[string]any{
+		"party_id": org["id"].(string), "role_type": "own_organization",
+	}); err != nil {
+		t.Fatalf("create pre-existing duplicate own_organization PartyRole: %v", err)
+	}
 
 	req := newRequest("GET", "/export/saft?from=2026-01-01&to=2026-12-31", tenantID, "farshid", nil)
 	rec := httptest.NewRecorder()
@@ -588,6 +624,86 @@ func TestSAFTExport_DuplicateOwnOrganizationRolesOnOneParty(t *testing.T) {
 	}
 	if len(c.Contact) != 1 || c.Contact[0].ContactPerson.FirstName != "Jane" || c.Contact[0].ContactPerson.LastName != "Doe" {
 		t.Errorf("Contact = %+v, want Jane/Doe", c.Contact)
+	}
+}
+
+// TestSAFTExport_SecondOwnOrganizationRoleRejectedByEngine is the
+// regression test for the write-time guarantee uc-infra#201/ADR-0028
+// actually adds: a second own_organization PartyRole, whether for a
+// different Party or the same one, is now rejected outright by
+// crud.Engine.Create — the two tests above (
+// TestSAFTExport_AmbiguousOwnOrganizationFallsBackToNA,
+// TestSAFTExport_DuplicateOwnOrganizationRolesOnOneParty) both used to
+// prove this was silently possible before this change; this proves it
+// no longer is, for the real product write path both those tests still
+// exercise for their read-side/export behavior.
+func TestSAFTExport_SecondOwnOrganizationRoleRejectedByEngine(t *testing.T) {
+	router := newTestRouter(t)
+	_, db := newTestTenant(t, router)
+
+	ctx := context.Background()
+	actor := humanActor()
+	if err := foundation.Publish(ctx, db, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	engine := crud.NewEngine(db)
+
+	orgA, err := engine.Create(ctx, foundation.Party(), map[string]any{
+		"party_type": "organization", "name": "Org One",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create Party One: %v", err)
+	}
+	orgB, err := engine.Create(ctx, foundation.Party(), map[string]any{
+		"party_type": "organization", "name": "Org Two",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create Party Two: %v", err)
+	}
+
+	if _, err := engine.Create(ctx, foundation.PartyRole(), map[string]any{
+		"party_id": orgA.ID, "role_type": "own_organization",
+	}, actor); err != nil {
+		t.Fatalf("create first own_organization PartyRole: %v", err)
+	}
+
+	wantName := entity.ConditionalUniqueConstraintName(entity.ConditionalUnique{
+		Fields: []string{"role_type"}, WhenField: "role_type", WhenValue: "own_organization",
+	})
+
+	// A different Party claiming the same role is rejected...
+	if _, err := engine.Create(ctx, foundation.PartyRole(), map[string]any{
+		"party_id": orgB.ID, "role_type": "own_organization",
+	}, actor); err == nil {
+		t.Fatal("expected a second own_organization PartyRole (different Party) to be rejected, got nil error")
+	} else {
+		var uce *crud.UniqueConstraintError
+		if !errors.As(err, &uce) {
+			t.Fatalf("expected *crud.UniqueConstraintError, got %T: %v", err, err)
+		}
+		if uce.ConstraintName != wantName {
+			t.Fatalf("unexpected constraint name %q", uce.ConstraintName)
+		}
+	}
+
+	// ...and so is the SAME Party claiming it twice.
+	if _, err := engine.Create(ctx, foundation.PartyRole(), map[string]any{
+		"party_id": orgA.ID, "role_type": "own_organization",
+	}, actor); err == nil {
+		t.Fatal("expected a second own_organization PartyRole (same Party) to be rejected, got nil error")
+	} else {
+		var uce *crud.UniqueConstraintError
+		if !errors.As(err, &uce) {
+			t.Fatalf("expected *crud.UniqueConstraintError, got %T: %v", err, err)
+		}
+	}
+
+	// An ordinary, non-own_organization role for the second Party is
+	// unaffected — the constraint is conditional, not a blanket cap.
+	if _, err := engine.Create(ctx, foundation.PartyRole(), map[string]any{
+		"party_id": orgB.ID, "role_type": "vendor",
+	}, actor); err != nil {
+		t.Fatalf("create vendor PartyRole for a different Party: %v", err)
 	}
 }
 

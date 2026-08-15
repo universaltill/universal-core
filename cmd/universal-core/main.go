@@ -22,6 +22,7 @@ import (
 	"github.com/universaltill/universal-core/internal/httpx"
 	"github.com/universaltill/universal-core/internal/i18n"
 	"github.com/universaltill/universal-core/internal/kernel/aiassist"
+	"github.com/universaltill/universal-core/internal/kernel/assets"
 	"github.com/universaltill/universal-core/internal/kernel/blobstore"
 	"github.com/universaltill/universal-core/internal/kernel/finance"
 	"github.com/universaltill/universal-core/internal/kernel/purchasing"
@@ -332,6 +333,19 @@ func main() {
 	// CRUD screen — previously nothing outside cmd/seed-demo-data ever
 	// called finance.SyncGLAccounts at all.
 	handler.RegisterHook("Account", finance.SyncGLAccountOnWrite)
+	// uc-infra#213: depreciation.Build (assets.Build) had no caller
+	// anywhere in the shipped application — a FixedAsset created through
+	// this real HTTP path got an empty Depreciation Schedule section with
+	// nothing for PostDueDepreciation/PostDueDepreciationBatch to post.
+	// See assets.GenerateDepreciationScheduleOnWrite's own doc comment
+	// for the create/update behavior.
+	handler.RegisterHook("FixedAsset", assets.GenerateDepreciationScheduleOnWrite)
+	// uc-infra#236: a real user's DepreciationScheduleForm correction
+	// needs marking as an override the moment it's saved through this
+	// real HTTP path, so GenerateDepreciationScheduleOnWrite above can
+	// tell it apart from a hook-generated row — see
+	// MarkDepreciationScheduleOverriddenOnWrite's own doc comment.
+	handler.RegisterHook("DepreciationSchedule", assets.MarkDepreciationScheduleOverriddenOnWrite)
 	handler.Routes(mux)
 
 	// The durable workflow job queue (internal/kernel/workflow.Queue) has

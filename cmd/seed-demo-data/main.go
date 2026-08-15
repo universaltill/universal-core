@@ -104,6 +104,22 @@ func main() {
 	// exercising the standalone sweep path directly rather than only
 	// through its own package tests.
 	engine.SetHook("Account", finance.SyncGLAccountOnWrite)
+	// uc-infra#213: same wiring as cmd/universal-core's real HTTP path —
+	// seedFixedAssets' FixedAsset creates/updates below now generate and
+	// reconcile their DepreciationSchedule rows through this hook as they
+	// happen, the same as a real user's create/edit would, instead of a
+	// hand-built approximation of what the hook produces.
+	engine.SetHook("FixedAsset", assets.GenerateDepreciationScheduleOnWrite)
+	// uc-infra#236: same wiring as cmd/universal-core's real HTTP path —
+	// see MarkDepreciationScheduleOverriddenOnWrite's own doc comment.
+	// Inert in THIS binary today (nothing below calls engine.Update on
+	// "DepreciationSchedule" directly — seedFixedAssets only writes
+	// FixedAsset, and its generated schedule rows go through
+	// GenerateDepreciationScheduleOnWrite's own insertSchedule, which
+	// bypasses crud.Engine and this hook entirely, same as a real
+	// user's generated rows would) — kept for wiring parity with the
+	// real HTTP path rather than because this command exercises it.
+	engine.SetHook("DepreciationSchedule", assets.MarkDepreciationScheduleOverriddenOnWrite)
 
 	s := &seeder{
 		ctx:        context.Background(),
@@ -409,23 +425,27 @@ func (s *seeder) seedFinance() map[string]string {
 	return accountIDs
 }
 
-// seedFixedAssets registers three representative assets and generates
-// each one's real depreciation schedule through assets.Build — not a
-// hand-written table of plausible-looking rows, so the demo tenant
-// shows exactly what the shipped arithmetic produces, remainder
-// distribution included (FA-1003's base does not divide evenly, and its
-// term is short enough that the step-down is visible in the seeded
-// rows).
+// seedFixedAssets registers three representative assets. Their
+// depreciation schedules are no longer built by hand here (uc-infra#213):
+// this command's engine now registers
+// assets.GenerateDepreciationScheduleOnWrite, the same "FixedAsset" hook
+// cmd/universal-core wires for real requests, so the schedule is
+// generated (and, on a repair run below, reconciled) exactly the way a
+// real tenant's would be — the demo tenant is no longer a hand-curated
+// approximation of the shipped arithmetic, it's a direct product of it.
+//
+// A repair run (this command re-run after some schedule rows were lost —
+// see TestSeedDemoData_RepairsPartialDepreciationSchedule) can no longer
+// rely on getOrCreate's own "already exists, skip" idempotency to reach
+// the hook, since the hook only runs on Create/Update, never on a no-op
+// read. So every asset gets an explicit Update, every run, with its own
+// unchanged fields — the hook's own reconciliation (schedule_hook.go:
+// scheduleMatches) makes this a cheap no-op in the ordinary case and a
+// real repair in the truncated-schedule case, without this file having
+// to duplicate that comparison itself.
 func (s *seeder) seedFixedAssets(currencies, accounts, vendors map[string]string) {
-	scheduleDef := s.def("DepreciationSchedule")
-
-	// The currency's own minor_unit drives the conversion — FixedAsset
-	// carries currency_id precisely so the scale is never guessed, and
-	// an earlier draft hardcoded 2 anyway (independent review). The demo
-	// chart seeds four currencies, so "it's all USD" was never true.
+	def := s.def("FixedAsset")
 	usdID := currencies["USD"]
-	scale := s.currencyMinorUnit(usdID)
-	div := math.Pow(10, float64(scale))
 
 	for _, a := range []struct {
 		number, name, location, acquired string
@@ -434,22 +454,12 @@ func (s *seeder) seedFixedAssets(currencies, accounts, vendors map[string]string
 	}{
 		{"FA-1001", "Delivery Van", "Main Depot", "2026-01-15", 48000, 6000, 60},
 		{"FA-1002", "Warehouse Racking", "Main Depot", "2026-02-01", 12500, 0, 120},
-		// A term whose base does NOT divide evenly, short enough that the
-		// step-down from 833.34 to 833.33 lands inside the seeded rows —
-		// so the demo tenant actually exhibits the remainder distribution
-		// rather than merely claiming to.
+		// A term whose base does NOT divide evenly — so the demo tenant
+		// actually exhibits depreciation.Build's remainder distribution
+		// (833.34 stepping down to 833.33) rather than merely claiming to.
 		{"FA-1003", "Forklift Battery", "Main Depot", "2026-03-01", 10000, 0, 12},
 	} {
-		costMinor, err := assets.MinorUnits(a.cost, scale)
-		if err != nil {
-			log.Fatalf("convert cost for %s: %v", a.number, err)
-		}
-		salvageMinor, err := assets.MinorUnits(a.salvage, scale)
-		if err != nil {
-			log.Fatalf("convert salvage for %s: %v", a.number, err)
-		}
-
-		assetID := s.getOrCreate("FixedAsset", "asset_number", a.number, map[string]any{
+		fields := map[string]any{
 			"asset_number":                        a.number,
 			"name":                                map[string]any{"en": a.name},
 			"location":                            a.location,
@@ -463,51 +473,10 @@ func (s *seeder) seedFixedAssets(currencies, accounts, vendors map[string]string
 			"asset_account_id":                    accounts["1400"],
 			"accumulated_depreciation_account_id": accounts["1450"],
 			"depreciation_expense_account_id":     accounts["5300"],
-		})
-
-		periods, err := assets.Build(assets.Input{
-			Method:           assets.MethodStraightLine,
-			AcquisitionDate:  a.acquired,
-			CostMinor:        costMinor,
-			SalvageMinor:     salvageMinor,
-			UsefulLifeMonths: a.months,
-		})
-		if err != nil {
-			log.Fatalf("build depreciation schedule for %s: %v", a.number, err)
 		}
-
-		// Idempotency is per SEQUENCE, not per asset: an interrupted run
-		// leaves a partial schedule, and "this asset already has some
-		// rows" would strand it there forever. Same extend-the-prefix
-		// discipline seedPurchaseOrders already applies to stage dates
-		// (independent review caught this file shipping below its own
-		// established bar).
-		existing, err := s.crud.ListByField(s.ctx, scheduleDef, "fixed_asset_id", assetID)
-		if err != nil {
-			log.Fatalf("list existing schedule for %s: %v", a.number, err)
-		}
-		seeded := make(map[int]bool, len(existing))
-		for _, row := range existing {
-			if seq, ok := row.Data["sequence"].(float64); ok {
-				seeded[int(seq)] = true
-			}
-		}
-		// Only the first year of each schedule is seeded: 60 or 120 rows
-		// per asset would bury the rest of the demo data without showing
-		// anything the first twelve don't.
-		for _, p := range periods[:min(12, len(periods))] {
-			if seeded[p.Sequence] {
-				continue
-			}
-			if _, err := s.crud.Create(s.ctx, scheduleDef, map[string]any{
-				"fixed_asset_id":      assetID,
-				"sequence":            float64(p.Sequence),
-				"period_end":          p.PeriodEnd,
-				"depreciation_amount": float64(p.DepreciationMinor) / div,
-				"book_value":          float64(p.BookValueMinor) / div,
-			}, s.actor); err != nil {
-				log.Fatalf("create DepreciationSchedule %s/%d: %v", a.number, p.Sequence, err)
-			}
+		assetID := s.getOrCreate("FixedAsset", "asset_number", a.number, fields)
+		if _, err := s.crud.Update(s.ctx, def, assetID, fields, nil, s.actor); err != nil {
+			log.Fatalf("reconcile FixedAsset %s depreciation schedule: %v", a.number, err)
 		}
 	}
 
@@ -568,24 +537,6 @@ func (s *seeder) seedMaintenanceOrders(currencies, vendors map[string]string) {
 		}
 		s.getOrCreate("MaintenanceOrder", "order_number", m.number, fields)
 	}
-}
-
-// currencyMinorUnit reads a Currency record's scale, defaulting to the
-// entity's own default of 2 when the record is missing or malformed —
-// the same value foundation.Currency() declares, so the fallback can
-// never disagree with the schema.
-func (s *seeder) currencyMinorUnit(currencyID string) int {
-	if currencyID == "" {
-		return 2
-	}
-	rec, err := s.crud.Get(s.ctx, s.def("Currency"), currencyID)
-	if err != nil {
-		return 2
-	}
-	if v, ok := rec.Data["minor_unit"].(float64); ok {
-		return int(v)
-	}
-	return 2
 }
 
 // seedRoles gives a tenant reference-data example Roles (foundation.Role,

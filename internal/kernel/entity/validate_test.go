@@ -816,3 +816,290 @@ func TestValidateRecord_ValidationErrorStructured(t *testing.T) {
 		}
 	})
 }
+
+// applyDefaultsDef mirrors vendorDef but with a Default declared on
+// every non-string field type this package actually type-checks
+// Default for (FieldBool, FieldEnum), plus an undefaulted field
+// (lead_time_days) and a Required field with its own Default
+// (is_active) to prove ApplyDefaults runs before ValidateRecord's
+// Required check.
+func applyDefaultsDef() *Definition {
+	return &Definition{
+		EntityType: "Vendor",
+		Version:    1,
+		Fields: []Field{
+			{Name: "name", Type: FieldString, Required: true, Default: "Unnamed Vendor"},
+			{Name: "lead_time_days", Type: FieldNumber},
+			{Name: "active", Type: FieldBool, Required: true, Default: true},
+			{Name: "payment_terms", Type: FieldEnum, EnumValues: []string{"prepaid", "DP", "TT", "LC"}, Default: "DP"},
+		},
+	}
+}
+
+func TestApplyDefaults(t *testing.T) {
+	def := applyDefaultsDef()
+
+	t.Run("omitted fields get their declared Default, per type", func(t *testing.T) {
+		data := map[string]any{}
+		ApplyDefaults(def, data)
+		if data["name"] != "Unnamed Vendor" {
+			t.Errorf("name = %v, want default string", data["name"])
+		}
+		if data["active"] != true {
+			t.Errorf("active = %v, want default bool true", data["active"])
+		}
+		if data["payment_terms"] != "DP" {
+			t.Errorf("payment_terms = %v, want default enum \"DP\"", data["payment_terms"])
+		}
+		if _, present := data["lead_time_days"]; present {
+			t.Errorf("lead_time_days = %v, want left absent (no Default declared)", data["lead_time_days"])
+		}
+	})
+
+	t.Run("a nil map is left alone, not panicked on", func(t *testing.T) {
+		var data map[string]any // nil, deliberately — not map[string]any{}
+		ApplyDefaults(def, data)
+		if data != nil {
+			t.Errorf("expected data to remain nil (a value parameter can't turn a caller's nil map non-nil), got %#v", data)
+		}
+	})
+
+	t.Run("nil value is treated as absent, same as a missing key", func(t *testing.T) {
+		data := map[string]any{"active": nil}
+		ApplyDefaults(def, data)
+		if data["active"] != true {
+			t.Errorf("active = %v, want default bool true to replace explicit nil", data["active"])
+		}
+	})
+
+	t.Run("explicit zero values are never overridden", func(t *testing.T) {
+		data := map[string]any{
+			"name":          "",
+			"active":        false,
+			"payment_terms": "",
+		}
+		ApplyDefaults(def, data)
+		if data["name"] != "" {
+			t.Errorf("name = %v, want explicit \"\" preserved", data["name"])
+		}
+		if data["active"] != false {
+			t.Errorf("active = %v, want explicit false preserved", data["active"])
+		}
+		if data["payment_terms"] != "" {
+			t.Errorf(`payment_terms = %v, want explicit "" preserved`, data["payment_terms"])
+		}
+	})
+
+	t.Run("explicitly-set non-zero values are never overridden", func(t *testing.T) {
+		data := map[string]any{
+			"name":          "Acme Textiles",
+			"active":        false,
+			"payment_terms": "LC",
+		}
+		ApplyDefaults(def, data)
+		if data["name"] != "Acme Textiles" || data["active"] != false || data["payment_terms"] != "LC" {
+			t.Fatalf("ApplyDefaults must not touch explicitly-set fields, got: %+v", data)
+		}
+	})
+
+	t.Run("a Required field's own Default satisfies ValidateRecord when omitted", func(t *testing.T) {
+		data := map[string]any{"payment_terms": "TT"}
+		ApplyDefaults(def, data)
+		if err := ValidateRecord(def, data); err != nil {
+			t.Fatalf("expected ApplyDefaults to satisfy Required 'name'/'active', got: %v", err)
+		}
+	})
+
+	t.Run("field with no Default declared is left untouched, present or absent", func(t *testing.T) {
+		data := map[string]any{"lead_time_days": float64(45)}
+		ApplyDefaults(def, data)
+		if data["lead_time_days"] != float64(45) {
+			t.Errorf("lead_time_days = %v, want untouched explicit value", data["lead_time_days"])
+		}
+	})
+
+	t.Run("Default is applied uniformly across every field type, not just bool/enum/string", func(t *testing.T) {
+		def := &Definition{EntityType: "Asset", Fields: []Field{
+			{Name: "quantity", Type: FieldNumber, Default: float64(1)},
+			{Name: "acquired_on", Type: FieldDate, Default: "2026-01-01"},
+			// float64, not int64: a published Definition's Default is
+			// always a JSON-round-tripped value by the time a real
+			// caller sees it (entity.Unmarshal decodes every JSON
+			// number as float64 — handlers.go's own decoder), so
+			// int64(0) here would assert a shape no real Definition can
+			// actually carry, however Go-legal it is to construct one
+			// in a test literal directly.
+			{Name: "cost", Type: FieldMoney, Default: float64(0)},
+			{Name: "owner_id", Type: FieldReference, Target: "Party", Default: "party-default-id"},
+			{Name: "notes", Type: FieldI18nText, Default: map[string]any{"en": "No notes yet"}},
+		}}
+		data := map[string]any{}
+		ApplyDefaults(def, data)
+		if data["quantity"] != float64(1) {
+			t.Errorf("quantity = %v, want default number", data["quantity"])
+		}
+		if data["acquired_on"] != "2026-01-01" {
+			t.Errorf("acquired_on = %v, want default date", data["acquired_on"])
+		}
+		if data["cost"] != float64(0) {
+			t.Errorf("cost = %v, want default money", data["cost"])
+		}
+		if data["owner_id"] != "party-default-id" {
+			t.Errorf("owner_id = %v, want default reference id", data["owner_id"])
+		}
+		notes, ok := data["notes"].(map[string]any)
+		if !ok || notes["en"] != "No notes yet" {
+			t.Errorf("notes = %v, want default i18n_text map", data["notes"])
+		}
+	})
+
+	// Regression test for uc-infra#219: a reference-typed Default
+	// (FieldI18nText's map[string]any) must never be handed out by the
+	// same underlying map twice. Before the fix, `data[f.Name] =
+	// f.Default` copied the reference, not the value — mutating the map
+	// ApplyDefaults wrote into a record's data would silently corrupt
+	// the Definition's own Field.Default for every later record of that
+	// type, in-process. This never surfaced through crud.Engine.Create
+	// today only because no shipped Hook mutates rec.Data in place; this
+	// test proves the invariant directly, at the one function actually
+	// responsible for it, rather than relying on that being true forever.
+	t.Run("a FieldI18nText Default is never aliased across two ApplyDefaults calls", func(t *testing.T) {
+		def := &Definition{EntityType: "Asset", Fields: []Field{
+			{Name: "notes", Type: FieldI18nText, Default: map[string]any{"en": "No notes yet"}},
+		}}
+
+		first := map[string]any{}
+		ApplyDefaults(def, first)
+		firstNotes, ok := first["notes"].(map[string]any)
+		if !ok {
+			t.Fatalf("first[\"notes\"] = %v, want an i18n_text map", first["notes"])
+		}
+
+		// Simulate a hook mutating the record's own data map in place —
+		// exactly the shape crud.Engine.Create's runHook would allow,
+		// since data.Record.Data is the very map ApplyDefaults wrote
+		// into (internal/data/records.go's CreateTx returns the same
+		// map it was handed).
+		firstNotes["en"] = "Corrupted by a hook mutating record #1"
+
+		second := map[string]any{}
+		ApplyDefaults(def, second)
+		secondNotes, ok := second["notes"].(map[string]any)
+		if !ok {
+			t.Fatalf("second[\"notes\"] = %v, want an i18n_text map", second["notes"])
+		}
+		if secondNotes["en"] != "No notes yet" {
+			t.Errorf(`second["notes"]["en"] = %v, want the Definition's pristine Default "No notes yet" — record #1's mutation leaked into record #2's default`, secondNotes["en"])
+		}
+
+		// And the Definition's own Default, read directly, must also be
+		// untouched — the actual invariant this function protects: the
+		// Definition is shared, long-lived, reused-across-many-records
+		// state, and no per-record write may ever mutate it.
+		defDefault := def.Fields[0].Default.(map[string]any)
+		if defDefault["en"] != "No notes yet" {
+			t.Errorf(`def.Fields[0].Default["en"] = %v, want the Definition's own stored Default left untouched by any caller's later mutation`, defDefault["en"])
+		}
+	})
+}
+
+// TestApplyDefaults_ConcurrentCreatesDoNotRace is the sharper half of
+// uc-infra#219's independent review (finding S2): before the fix, two
+// goroutines calling ApplyDefaults against one shared *Definition and
+// then mutating their own returned FieldI18nText map were not just
+// risking a logic bug (record #2 silently getting record #1's mutated
+// default) — they were both writing into the exact same underlying map,
+// a genuine concurrent map write that Go's runtime detects as fatal
+// (`fatal error: concurrent map writes`), unrecoverable and uncatchable,
+// unlike a normal panic. cloneDefault makes ApplyDefaults strictly
+// read-only on def, so many goroutines sharing one *Definition (the
+// ordinary case — csvimport/sqlsource reuse one *Definition across many
+// rows, and nothing about that today is single-threaded by contract)
+// must never race. Run with `go test -race` to actually catch a
+// regression here — without -race this test can pass even against the
+// pre-fix code, since a lost update is silent and a concurrent-map-write
+// crash is timing-dependent, not guaranteed on every run.
+func TestApplyDefaults_ConcurrentCreatesDoNotRace(t *testing.T) {
+	def := &Definition{EntityType: "Asset", Fields: []Field{
+		{Name: "notes", Type: FieldI18nText, Default: map[string]any{"en": "No notes yet"}},
+	}}
+
+	const n = 50
+	done := make(chan map[string]any, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			data := map[string]any{}
+			ApplyDefaults(def, data)
+			// Simulate a hook mutating this goroutine's own returned
+			// record data in place — exactly the shape that raced
+			// against def.Fields[0].Default pre-fix.
+			if notes, ok := data["notes"].(map[string]any); ok {
+				notes["en"] = "mutated by a concurrent goroutine"
+			}
+			done <- data
+		}()
+	}
+
+	for i := 0; i < n; i++ {
+		<-done
+	}
+
+	defDefault := def.Fields[0].Default.(map[string]any)
+	if defDefault["en"] != "No notes yet" {
+		t.Errorf(`after %d concurrent ApplyDefaults+mutate calls, def.Fields[0].Default["en"] = %v, want the Definition's own stored Default left untouched`, n, defDefault["en"])
+	}
+}
+
+func TestCloneDefault(t *testing.T) {
+	t.Run("a map value is copied into a distinct map with equal contents", func(t *testing.T) {
+		src := map[string]any{"en": "Hello", "tr": "Merhaba"}
+		got := cloneDefault(src)
+		gotMap, ok := got.(map[string]any)
+		if !ok {
+			t.Fatalf("cloneDefault(map) = %T, want map[string]any", got)
+		}
+		if len(gotMap) != len(src) || gotMap["en"] != "Hello" || gotMap["tr"] != "Merhaba" {
+			t.Errorf("cloneDefault(%v) = %v, want an equal-contents copy", src, gotMap)
+		}
+		gotMap["en"] = "mutated"
+		if src["en"] != "Hello" {
+			t.Errorf("mutating the clone changed the source map: src[\"en\"] = %v, want \"Hello\" untouched", src["en"])
+		}
+	})
+
+	// A typed-nil map[string]any Default (Field{Type: FieldI18nText,
+	// Default: map[string]any(nil)}) passes Definition.Validate (its
+	// FieldI18nText shape check ranges over a nil map without error) and
+	// ApplyDefaults's own `f.Default == nil` guard (a non-nil interface
+	// holding a nil map isn't a nil interface), so this shape does reach
+	// cloneDefault in practice, not just in this test. maps.Clone(nil)
+	// returning nil — not a non-nil empty map — preserves the pre-#219
+	// persisted shape ("notes":null, not "notes":{}) for exactly this
+	// case; a hand-rolled `make(map[string]any, len(m))` would silently
+	// change that (uc-infra#219's own independent review, finding S1).
+	t.Run("a nil map is returned as nil, not normalized to a non-nil empty map", func(t *testing.T) {
+		var src map[string]any
+		got := cloneDefault(src)
+		gotMap, ok := got.(map[string]any)
+		if !ok {
+			t.Fatalf("cloneDefault(nil map) = %T, want map[string]any", got)
+		}
+		if gotMap != nil {
+			t.Errorf("cloneDefault(nil map) = %#v, want nil (preserving the pre-existing persisted shape), not a normalized empty map", gotMap)
+		}
+	})
+
+	t.Run("every scalar Default type is returned unchanged, not wrapped or copied", func(t *testing.T) {
+		for _, v := range []any{"a string", float64(42), true, false, float64(0), ""} {
+			if got := cloneDefault(v); got != v {
+				t.Errorf("cloneDefault(%v) = %v (%T), want the identical scalar back", v, got, got)
+			}
+		}
+	})
+
+	t.Run("nil is returned unchanged", func(t *testing.T) {
+		if got := cloneDefault(nil); got != nil {
+			t.Errorf("cloneDefault(nil) = %v, want nil", got)
+		}
+	})
+}

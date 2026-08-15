@@ -260,20 +260,20 @@ func TestSyncGLAccountOnWrite_DuplicateCode_RejectedNotSilentlyOverwritten(t *te
 	}
 }
 
-// TestSyncGLAccountOnWrite_RenamingCodeOrphansThePreviousGLAccountsRow
-// pins down, deliberately, a real limitation independent review found
-// (finding 2) that this change does not close: gl_accounts is keyed by
-// Account.code (UpsertByCode), and nothing links a gl_accounts row back
-// to the Account record it was projected from. Renaming an existing
-// Account's code — legal; code is Unique but not immutable, see
-// Account()'s own doc comment — makes this hook upsert a NEW gl_accounts
-// row under the new code, while the OLD code's row is left behind,
-// active, orphaned. This test exists so that behavior can't silently
-// change (for better or worse) without this test having to change too —
-// not as an endorsement of the behavior. Closing it properly needs
-// gl_accounts to gain a source-record link (a migration) or Account.code
-// to become immutable after create; tracked as a separate backlog card.
-func TestSyncGLAccountOnWrite_RenamingCodeOrphansThePreviousGLAccountsRow(t *testing.T) {
+// TestSyncGLAccountOnWrite_RenamingCodeUpdatesTheSameRowInPlace asserts
+// the uc-infra#205 fix: gl_accounts is now keyed by source_record_id
+// (GLAccountRepo.UpsertBySourceRecord), a durable link back to the
+// Account record it was projected from — not by code alone
+// (UpsertByCode, still used by every other caller that has no Account
+// record to link to). Renaming an existing Account's code — legal; code
+// is Unique but not immutable, see Account()'s own doc comment — must
+// now update the SAME gl_accounts row in place: same id, new code, old
+// code no longer resolves to anything. Before this fix (see git
+// history for the prior version of this test, then named
+// ...OrphansThePreviousGLAccountsRow) a rename inserted a second row
+// under the new code and left the old code's row behind, active,
+// unreachable.
+func TestSyncGLAccountOnWrite_RenamingCodeUpdatesTheSameRowInPlace(t *testing.T) {
 	tenantDB := freshTenantDB(t)
 	ctx := context.Background()
 	actor := humanActor()
@@ -296,6 +296,12 @@ func TestSyncGLAccountOnWrite_RenamingCodeOrphansThePreviousGLAccountsRow(t *tes
 		t.Fatalf("create Account: %v", err)
 	}
 
+	glAccounts := data.NewGLAccountRepo(tenantDB)
+	originalID, _, err := glAccounts.IDByCode(ctx, "1000")
+	if err != nil {
+		t.Fatalf("expected a gl_accounts row for code 1000 right after create, got: %v", err)
+	}
+
 	version := rec.Version
 	if _, err := engine.Update(ctx, accountDefinition, rec.ID, map[string]any{
 		"code": "1100", "name": "Assets", "type": "asset", "is_active": true,
@@ -303,50 +309,51 @@ func TestSyncGLAccountOnWrite_RenamingCodeOrphansThePreviousGLAccountsRow(t *tes
 		t.Fatalf("update Account's code: %v", err)
 	}
 
-	glAccounts := data.NewGLAccountRepo(tenantDB)
-	if _, _, err := glAccounts.IDByCode(ctx, "1100"); err != nil {
+	newID, isActive, err := glAccounts.IDByCode(ctx, "1100")
+	if err != nil {
 		t.Fatalf("expected a gl_accounts row for the NEW code 1100, got: %v", err)
 	}
-	// Documents today's real gap: the OLD code's row is still there,
-	// unchanged, orphaned — not cleaned up, not deactivated.
-	oldID, oldActive, err := glAccounts.IDByCode(ctx, "1000")
-	if err != nil {
-		t.Fatalf("expected the OLD code 1000's gl_accounts row to still exist (orphaned, not this fix's job to clean up), got: %v", err)
+	if newID != originalID {
+		t.Fatalf("expected the rename to update the SAME gl_accounts row in place (id %q), got a different row (id %q)", originalID, newID)
 	}
-	if !oldActive {
-		t.Fatal("expected the orphaned old-code row to still read as active — this hook never touches it once the code changes")
+	if !isActive {
+		t.Fatal("expected the renamed row to still read as active")
 	}
-	if oldID == "" {
-		t.Fatal("expected a real id for the orphaned row")
+
+	// The fix's whole point: the OLD code must no longer resolve to
+	// anything — no orphaned row left reachable under it.
+	if _, _, err := glAccounts.IDByCode(ctx, "1000"); !errors.Is(err, data.ErrNotFound) {
+		t.Fatalf("expected the OLD code 1000 to no longer resolve after the rename, got: %v", err)
+	}
+
+	// Exactly one gl_accounts row total for this Account — not two.
+	var count int
+	if err := tenantDB.QueryRowContext(ctx, `SELECT count(*) FROM gl_accounts WHERE source_record_id = $1`, rec.ID).Scan(&count); err != nil {
+		t.Fatalf("count gl_accounts rows for source_record_id: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 gl_accounts row linked to this Account record, got %d", count)
 	}
 }
 
-// TestSyncGLAccountOnWrite_IsActiveOmittedOnCreate_StoresInactive pins
-// down another real gap independent review found (finding 5): a
-// programmatic engine.Create call that omits a field entirely never
-// consults that field's declared entity.Field.Default — nothing in
-// internal/kernel/crud or internal/kernel/entity applies Default at
-// write time, for any field type, not just FieldBool.
+// TestSyncGLAccountOnWrite_IsActiveOmittedOnCreate_StoresActive asserts
+// the fixed behavior uc-infra#212 shipped: crud.Engine.Create now
+// applies entity.Field.Default for any field genuinely absent from the
+// payload, for every field type, before validation/persistence
+// (internal/kernel/entity.ApplyDefaults). Previously named
+// ...StoresInactive and pinned the opposite (buggy) behavior — renamed
+// and flipped once this closed, per this test's own prior doc comment.
 //
-// uc-infra#206 closed the half of this gap that actually reached a real
-// admin: internal/kernel/formrender's new-record rendering now honors a
-// FieldBool's Default the same way it already did for FieldEnum, so the
-// ordinary UI create flow this test's own history worried about (an
-// admin who never touches the "Active" checkbox) now submits
-// is_active=true explicitly — the checkbox itself renders pre-checked,
-// so the browser's own hidden-false/checkbox-true submission trick
-// carries the real value through, and engine.Create receives it SET,
-// not omitted, once the request comes from that fixed form.
-//
-// This test's own path bypasses formrender entirely — engine.Create is
-// called directly with is_active left out of the payload, which is
-// exactly what a non-browser caller (CSV import, a future API create,
-// this test itself) still does. That deeper gap — Default is a
-// Definition-level declaration formrender now reads but crud/entity
-// still never does — is unchanged by #206 and is genuinely a separate,
-// broader change (every field type, every non-form write path), so it
-// stays open rather than folded into #206's narrower rendering fix.
-func TestSyncGLAccountOnWrite_IsActiveOmittedOnCreate_StoresInactive(t *testing.T) {
+// uc-infra#206 already closed the half of this gap that reached a real
+// admin through the UI: internal/kernel/formrender's new-record
+// rendering honors a FieldBool's Default (the checkbox renders
+// pre-checked), so a browser create flow was never actually affected by
+// the deeper gap this test exercises. This test's own path bypasses
+// formrender entirely — engine.Create is called directly with
+// is_active left out of the payload, exactly what a non-browser caller
+// (CSV import, a direct API/engine.Create call) does — and is the case
+// #212 closed.
+func TestSyncGLAccountOnWrite_IsActiveOmittedOnCreate_StoresActive(t *testing.T) {
 	tenantDB := freshTenantDB(t)
 	ctx := context.Background()
 	actor := humanActor()
@@ -363,7 +370,7 @@ func TestSyncGLAccountOnWrite_IsActiveOmittedOnCreate_StoresInactive(t *testing.
 	engine.SetHook("Account", SyncGLAccountOnWrite)
 
 	// is_active deliberately omitted — Account()'s Default:true is a
-	// Definition-level declaration, not something Create fills in.
+	// Definition-level declaration; engine.Create must fill it in now.
 	if _, err := engine.Create(ctx, accountDefinition, map[string]any{
 		"code": "1000", "name": "Assets", "type": "asset",
 	}, actor); err != nil {
@@ -374,8 +381,8 @@ func TestSyncGLAccountOnWrite_IsActiveOmittedOnCreate_StoresInactive(t *testing.
 	if err != nil {
 		t.Fatalf("IDByCode: %v", err)
 	}
-	if isActive {
-		t.Fatal("expected today's real (pre-existing, cross-module) gap to store is_active=false when omitted via a direct engine.Create call — if this now passes with isActive=true, crud/entity started applying Field.Default at write time and this test (and uc-infra#212) should be revisited; formrender's own half of this gap is already closed by uc-infra#206")
+	if !isActive {
+		t.Fatal("expected engine.Create to apply Account's Default:true for the omitted is_active field (uc-infra#212) — got is_active=false")
 	}
 }
 

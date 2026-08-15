@@ -246,6 +246,38 @@ func (h *Handler) issueReportTranscribe(w http.ResponseWriter, r *http.Request) 
 	locale := localeFromRequest(w, r)
 	transcript, err := h.speech.Transcribe(r.Context(), file, filename, locale)
 	if err != nil {
+		// uc-infra#239, independent review: a superseded take's client-side
+		// AbortController closes this connection, which cancels r.Context()
+		// and — since Transcribe threads it through to the outbound Whisper
+		// call — surfaces here as a plain request-failed error wrapping
+		// context.Canceled, exactly like any other network failure. That is
+		// now a ROUTINE outcome of a normal fast re-take (the whole point of
+		// #239's own fix), not a real transcription failure: the client that
+		// issued this request is already gone and never sees this response
+		// either way, so writeInternalError's log.Printf would misreport an
+		// ordinary abort as a genuine ASR/network fault indistinguishable
+		// from one in the logs. r.Context().Err() (rather than
+		// errors.Is(err, context.Canceled) against speechassist's wrapped
+		// error) is checked directly: it's the actual, authoritative signal
+		// for "this request's own context ended," independent of exactly how
+		// speechassist/net/http happened to wrap the underlying error.
+		//
+		// Independent review, nitpick: this is a superset of "client
+		// aborted" — it also silences a genuine Whisper-side failure on the
+		// rarer coincidence that the client happened to disconnect first
+		// (e.g. the person closed the tab while a real outage was in
+		// progress), and would (in principle, not reachable through this
+		// deployment's own net/http server + a real browser fetch(), which
+		// always closes the connection on abort) mask a reverse-proxy-level
+		// cancellation unrelated to any client AbortController. Accepted:
+		// either way the original caller is already gone and was never
+		// going to see this response, so the only real cost is a missed
+		// log line in an already-rare coincidence — a smaller cost than
+		// this endpoint's other alternative, misreporting every ordinary
+		// fast re-take as a genuine ASR fault.
+		if r.Context().Err() != nil {
+			return
+		}
 		writeInternalError(w, "transcribe voice note", err)
 		return
 	}
@@ -624,9 +656,113 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
   var statusEl = document.getElementById("uc-issue-record-status");
   var transcriptEl = document.getElementById("uc-issue-transcript");
   var descriptionEl = document.getElementById("uc-issue-description");
+  // mediaRecorder identifies "the currently active recording" for the
+  // Stop branch below (mediaRecorder.stop()) AND, since uc-infra#223, for
+  // onstop's own thisRecorder identity check further down — reassigning
+  // it on every Record click is still safe: whenever recording === true,
+  // mediaRecorder is provably the take that owns that flag (both are set
+  // together, synchronously, in the same task), so a stale take's onstop
+  // comparing against the reassigned value is exactly how it tells it no
+  // longer owns the current recording/button state. chunks is NOT
+  // declared here (uc-infra#196): it
+  // used to be a shared outer-scope array, reset in place on every Record
+  // click and read by whichever take's onstop happened to fire, whenever
+  // that was. Stop resets recording/the button label synchronously, but
+  // a real MediaRecorder's onstop/ondataavailable fire asynchronously — a
+  // fast Stop-then-Record-again, before the first take's onstop has
+  // actually run, let the second take's reset wipe the shared array out
+  // from under the first take's still-pending upload. chunks is now
+  // declared fresh with var inside the getUserMedia .then() callback
+  // below instead, so every take gets its own array that its own
+  // ondataavailable/onstop close over — a var inside a function body is
+  // scoped to that specific invocation, not shared across the callback's
+  // repeated invocations, so no other closure machinery is needed.
   var mediaRecorder = null;
-  var chunks = [];
   var recording = false;
+  // uc-infra#238: recordAttemptGeneration/recordingGeneration replace the
+  // three transcribe-write guards' old "mediaRecorder === thisRecorder"
+  // check (mediaRecorder/thisRecorder above are now used ONLY for the Stop
+  // button branch and onstop's own button-label resync — an unrelated
+  // concern this issue leaves untouched). Independent review of uc-infra
+  // #221 found recorder *identity* is the wrong proxy for "is a stale
+  // take's write safe to drop": it changes the moment a NEW MediaRecorder
+  // is merely constructed, not when a take actually starts recording or
+  // definitively fails — two narrow, reachable gaps fell out of that
+  // mismatch (this issue's own "Gap A"/"Gap B"). Two independent counters
+  // close both:
+  //   - recordAttemptGeneration bumps once per Record click, synchronously,
+  //     before getUserMedia is even called — it marks "the user's most
+  //     recent intent," the thing that should own the STATUS LINE
+  //     (statusEl) regardless of whether this attempt goes on to succeed or
+  //     fail. Gap B (a getUserMedia rejection never reassigns
+  //     mediaRecorder, so a still-in-flight older take's later success used
+  //     to silently wipe the freshly-shown "permission denied" message) is
+  //     closed because the click alone — independent of any MediaRecorder
+  //     ever existing — already claims this generation.
+  //   - recordingGeneration bumps only once a take's mediaRecorder.start()
+  //     actually succeeds — it marks "the most recent take whose data is
+  //     real," the thing that should own the TRANSCRIPT/DESCRIPTION
+  //     fields. Gap A (mediaRecorder.start() throwing after
+  //     "mediaRecorder = new MediaRecorder(stream)" already reassigned the
+  //     shared variable, which used to make an older, entirely legitimate
+  //     still-in-flight take look "superseded" and silently drop its
+  //     transcript even though nothing ever actually replaced it) is
+  //     closed because a failed start never bumps this counter — the older
+  //     take's data-generation check still passes.
+  // recordAttemptGeneration bumps synchronously at click time, strictly
+  // before recordingGeneration can bump (which needs a round trip through
+  // getUserMedia first) — so for the ordinary case where a click goes on
+  // to a successful start, there IS a real window (the whole
+  // permission-prompt wait) where the two counters disagree about which
+  // take currently owns the status line, not just on a click that fails.
+  // Independent review: that window is harmless only because the click
+  // handler clears statusEl synchronously, in the same turn as the
+  // recordAttemptGeneration bump (see that call site's own comment) — an
+  // OLDER take's status write is correctly suppressed starting at the
+  // click, and something new is visibly shown starting at the exact same
+  // moment, so the disagreement is never user-observable. Without that
+  // clear, the two counters would have left a real, user-visible gap
+  // (the status line stuck on a stale "Transcribing…", or a stale take's
+  // own error silently swallowed) for as long as the permission prompt
+  // stayed unanswered — this was caught by review, not shipped.
+  var recordAttemptGeneration = 0;
+  var recordingGeneration = 0;
+  // transcribeAbortController identifies "the most recent recordingGeneration-
+  // owning attempt's own request-cancellation handle" — one level down
+  // from recordingGeneration itself (deliberately NOT recordAttemptGeneration
+  // — see below), one level below: aborting it cancels that take's
+  // in-flight /issue-report/transcribe fetch (uc-infra#239, the
+  // AbortController design pass uc-infra#238's own commit deferred here)
+  // instead of only letting the recordingGeneration guard drop its result
+  // silently once it eventually resolves. Dropping the result already
+  // stopped a stale take's response from being *applied*; this stops the
+  // request from being *sent at all* past the point it's genuinely
+  // superseded, cutting real ASR load on a fast re-take sequence.
+  // Reassigned (after aborting whatever it previously pointed to) at the
+  // exact same moment myRecordingGeneration = ++recordingGeneration runs
+  // in the getUserMedia().then() callback below — i.e. once a NEW take
+  // has actually reached a successful mediaRecorder.start(), the same
+  // event that makes recordingGeneration itself advance.
+  //
+  // Deliberately NOT tied to recordAttemptGeneration / the Record click
+  // itself, despite that being the more obvious "supersede now" signal
+  // (and this fix's own first draft did exactly that): independent review
+  // caught that a click alone doesn't mean the PREVIOUS take's data has
+  // actually been superseded — recordAttemptGeneration and
+  // recordingGeneration deliberately disagree while a new attempt's own
+  // getUserMedia/mediaRecorder.start() hasn't yet succeeded (uc-infra#238's
+  // whole point: recordAttemptGeneration owns the status line eagerly,
+  // recordingGeneration owns the transcript/description only once data is
+  // real). Aborting at click time would cancel a still-legitimate EARLIER
+  // take's real, in-flight transcribe call whenever the new attempt's own
+  // start() throws or its getUserMedia rejects (#238's Gap A/Gap B,
+  // respectively) — destroying a transcript recordingGeneration's own
+  // .then guard would otherwise have correctly let land, since nothing
+  // genuinely superseded it in that case. Tying cancellation to
+  // recordingGeneration's own bump instead means "this take's request was
+  // cancelled" and "this take's eventual result would have been dropped
+  // anyway" are now the same condition, not two independently-timed ones.
+  var transcribeAbortController = null;
 
   // Deliberately an if/else, NOT an early "return" out of the whole IIFE
   // (independent review, uc-infra#92: the earlier version DID return
@@ -663,7 +799,24 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
 
     recordBtn.addEventListener("click", function() {
       if (recording) {
-        mediaRecorder.stop();
+        // uc-infra#223: mediaRecorder can already be "inactive" here
+        // without this click being the cause — the underlying
+        // MediaStream can end on its own (mic permission revoked
+        // mid-recording, the input device unplugged/disabled, or any
+        // other browser-initiated track-ended event), which a real
+        // MediaRecorder reacts to by transitioning itself to "inactive"
+        // and firing onstop, exactly as an explicit .stop() call would.
+        // Before this fix nothing here checked for that: the button
+        // still read "Stop recording" (only onstop's own reset below
+        // resyncs it, and — before this fix — onstop never did), so a
+        // click on it read as a genuine Stop and called .stop() again on
+        // an already-inactive recorder, throwing InvalidStateError per
+        // the MediaStream Recording spec — uncaught, inside this click
+        // handler. Same guard shape uc-infra#220 already uses for the
+        // screen-record handler's own version of this bug.
+        if (mediaRecorder && mediaRecorder.state !== "inactive") {
+          mediaRecorder.stop();
+        }
         recording = false;
         recordBtn.textContent = {{.RecordLabel}};
         return;
@@ -684,6 +837,27 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
         // recorders after the fact.
         return;
       }
+      // uc-infra#238: claims this click's own attempt generation
+      // synchronously, before getUserMedia is even called — see the outer
+      // recordAttemptGeneration/recordingGeneration comment above for why
+      // this alone (independent of whether the attempt below goes on to
+      // succeed or fail) is what closes Gap B. The immediate clear right
+      // below is NOT cosmetic (independent review): claiming the status
+      // line here without also writing to it left a real window open —
+      // getUserMedia's own permission prompt can stay pending indefinitely
+      // (the person simply doesn't answer it yet), during which an OLDER
+      // take's still-in-flight transcribe result now fails this guard (as
+      // intended) but nothing NEW has been written yet either, so the
+      // status line was left stuck showing that older take's stale
+      // "Transcribing…" — or, worse, silently swallowing that older take's
+      // own real transcribe error — for as long as the prompt sits
+      // unanswered. Clearing synchronously here makes "claim the status
+      // line" and "show something for it" atomic, the same guarantee the
+      // old identity guard got for free by only transferring ownership at
+      // "new MediaRecorder(stream)", a point always immediately followed
+      // by a write (the success/throw branches below).
+      var myAttemptGeneration = ++recordAttemptGeneration;
+      statusEl.textContent = "";
       recordBtn.disabled = true;
       navigator.mediaDevices.getUserMedia({ audio: true }).then(function(stream) {
         recordBtn.disabled = false;
@@ -700,21 +874,129 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
         // recorder takes none), so this catches any other constructor
         // failure instead.
         try {
-          chunks = [];
+          // Local to this .then() invocation (uc-infra#196) — see the
+          // outer-scope comment above for why this can no longer be the
+          // shared chunks the old code reassigned here.
+          var chunks = [];
           mediaRecorder = new MediaRecorder(stream);
+          // uc-infra#223: this take's own recorder instance, captured at
+          // creation time so onstop below can tell whether it's still the
+          // current take by the time it actually fires — see onstop's own
+          // comment for why that check matters.
+          var thisRecorder = mediaRecorder;
+          // uc-infra#238: declared here (before use), assigned only once
+          // mediaRecorder.start() below actually succeeds — see the
+          // outer-scope comment for why that (as opposed to claiming it at
+          // construction, like thisRecorder above, or at click time, like
+          // recordAttemptGeneration) is what closes Gap A. Left undefined
+          // if start() throws, which is what a failed take's onstop/
+          // transcribe callbacks — which never fire in that case — would
+          // otherwise have read.
+          var myRecordingGeneration;
+          // uc-infra#239: thisController mirrors myRecordingGeneration
+          // exactly — declared here (undefined), only actually ARMED
+          // (previous attempt's controller aborted, this attempt's own
+          // controller stored) once mediaRecorder.start() below actually
+          // succeeds. Independent review of this fix's own first draft
+          // caught a real bug in aborting any earlier (e.g. at click time,
+          // right alongside recordAttemptGeneration's own bump): cancelling
+          // the PREVIOUS attempt's transcribe request must track
+          // recordingGeneration, not recordAttemptGeneration — the exact
+          // distinction uc-infra#238 drew between which counter owns the
+          // status line (recordAttemptGeneration) versus the transcript/
+          // description (recordingGeneration, deliberately looser — see
+          // that counter's own outer-scope comment). Aborting eagerly
+          // would cancel a still-legitimate EARLIER take's real, in-flight
+          // transcribe call whenever THIS attempt's own start() throws or
+          // its getUserMedia never even resolves (uc-infra#238's Gap A/
+          // Gap B) — silently destroying a transcript that
+          // recordingGeneration's own guard would otherwise have let land
+          // normally, since nothing genuinely superseded it in that case.
+          var thisController;
           mediaRecorder.ondataavailable = function(e) { if (e.data.size > 0) chunks.push(e.data); };
           mediaRecorder.onstop = function() {
+            // uc-infra#223: resync recording/the button label here too,
+            // not just on an explicit Stop click, so a browser-initiated
+            // end of the stream (see the click handler's own comment
+            // above) re-syncs the button on its own instead of leaving it
+            // stuck reading Stop until another click limps it back via
+            // the guard there. Guarded on mediaRecorder === thisRecorder
+            // (uc-infra#196's own "fast Stop-then-Record-again" scenario,
+            // documented on the outer mediaRecorder var above): a stale
+            // take's onstop can fire after a newer take has already
+            // started and reassigned the shared mediaRecorder variable —
+            // resetting unconditionally here would stomp that newer
+            // take's own "Stop recording" state right out from under it.
+            // Harmless/idempotent on the ordinary explicit-Stop path,
+            // where the click handler has already reset both
+            // synchronously before this async callback even runs.
+            if (mediaRecorder === thisRecorder) {
+              recording = false;
+              recordBtn.textContent = {{.RecordLabel}};
+            }
             stream.getTracks().forEach(function(t) { t.stop(); });
             var blob = new Blob(chunks, { type: "audio/webm" });
-            statusEl.textContent = {{.TranscribingLabel}};
+            // uc-infra#221 (guard introduced) / uc-infra#238 (guard
+            // corrected): #196 legitimized a fast Stop-then-Record-again as
+            // a supported flow (isolating each take's audio bytes so they
+            // can no longer mix), but every write below this point used to
+            // be unconditional, so a still-in-flight earlier take's
+            // "Transcribing…" status, its eventual transcript/description,
+            // or its transcribe error could each land on screen *after* a
+            // newer take had already started — clobbering whatever the
+            // newer, currently-visible take had shown, or (for transcript/
+            // description) silently overwriting user edits made in the
+            // meantime with a stale take's result. Since uc-infra#239, this
+            // take's request is also cancelled outright the moment a LATER
+            // take genuinely supersedes it — i.e. the moment that later
+            // take's own recordingGeneration bump fires (see
+            // transcribeAbortController's own outer-scope comment for why
+            // that specific event, not the Record click itself). That is
+            // deliberately the *same* condition the myRecordingGeneration
+            // !== recordingGeneration guard below already checks — not a
+            // separate, independently-timed layer — so cancellation and
+            // "would this result have been dropped anyway" never disagree:
+            // a request only ever gets cancelled when its own result was
+            // already going to be discarded. The status-line write
+            // immediately below stays governed by recordAttemptGeneration
+            // exactly as before (uc-infra#238) — recordAttemptGeneration
+            // and recordingGeneration can and do diverge while a newer
+            // attempt's getUserMedia/start() is still pending, so a stale
+            // take's status write can still be (and needs to still be)
+            // guarded out here well before that take's own request is ever
+            // cancelled. Re-checked at every write below (not just once
+            // here), since a newer take can start (or fail to start) at
+            // any point while this fetch is still in flight. Guarded on
+            // recordAttemptGeneration, NOT recorder identity (uc-infra
+            // #238: identity changes the instant a new MediaRecorder is
+            // merely constructed, even one whose own .start() goes on to
+            // throw — recordAttemptGeneration instead tracks the user's
+            // actual Record clicks, see the outer-scope comment for the
+            // full rationale).
+            if (myAttemptGeneration === recordAttemptGeneration) {
+              statusEl.textContent = {{.TranscribingLabel}};
+            }
             var form = new FormData();
             form.append("audio", blob, "note.webm");
-            fetch({{.TranscribeHref}}, { method: "POST", body: form })
+            fetch({{.TranscribeHref}}, { method: "POST", body: form, signal: thisController.signal })
               .then(function(resp) {
                 if (!resp.ok) { return resp.text().then(function(t) { throw new Error(extractErrorMessage(t)); }); }
                 return resp.text();
               })
               .then(function(text) {
+                // uc-infra#238: transcript/description are guarded on
+                // recordingGeneration specifically (not recordAttemptGeneration,
+                // which the statusEl write above and the catch below use) —
+                // this take's actual recorded data must still land even if a
+                // LATER take's own attempt went on to fail (Gap A: a failed
+                // start must not silently drop a still-legitimate earlier
+                // take's transcript, since nothing genuine ever superseded
+                // it). recordingGeneration only advances on a take that
+                // actually reached a successful mediaRecorder.start(), so a
+                // failed later attempt never invalidates this check.
+                if (myRecordingGeneration !== recordingGeneration) {
+                  return;
+                }
                 // Both assignments below are clamped defensively
                 // (uc-infra#174, independent review): text is the ASR
                 // server's own response, script-assigned to .value, so
@@ -742,14 +1024,55 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
                   combined = combined.slice(0, {{.DescriptionMaxLength}});
                 }
                 descriptionEl.value = combined;
-                statusEl.textContent = "";
+                // uc-infra#238: this clear is a STATUS-LINE write (unlike
+                // the transcript/description writes just above), so it uses
+                // recordAttemptGeneration, same as the "Transcribing…" write
+                // that opened this onstop handler — a later take's own
+                // failure (Gap B: e.g. a getUserMedia rejection, which never
+                // even reaches this file's mediaRecorder var) must keep
+                // owning the status line, not have this take's own
+                // late-arriving success silently erase it.
+                if (myAttemptGeneration === recordAttemptGeneration) {
+                  statusEl.textContent = "";
+                }
               })
               .catch(function(err) {
-                statusEl.textContent = String(err.message || err);
+                // uc-infra#238: same recordAttemptGeneration guard as the
+                // success path's statusEl clear above — a stale take's
+                // transcribe failure must not stomp a newer attempt's own
+                // in-progress/idle/error status line.
+                if (myAttemptGeneration === recordAttemptGeneration) {
+                  statusEl.textContent = String(err.message || err);
+                }
               });
           };
           mediaRecorder.start();
           recording = true;
+          // uc-infra#238: assigned only now that mediaRecorder.start() has
+          // actually succeeded (declared earlier, next to thisRecorder —
+          // see that declaration's own comment for why this timing is what
+          // closes Gap A).
+          myRecordingGeneration = ++recordingGeneration;
+          // uc-infra#239: only NOW — once this attempt has genuinely
+          // become the new recordingGeneration-owning take — is the
+          // PREVIOUS attempt's own transcribe request actually cancelled
+          // (see thisController's own declaration above for why any
+          // earlier point would be wrong). Safe to call unconditionally
+          // even if the previous attempt's fetch already settled, was
+          // never sent (its own getUserMedia never resolved, so its
+          // thisController was never armed either), or doesn't exist yet
+          // (the very first successful take): AbortController.abort() on
+          // an already-settled/never-armed/undefined-checked-via-the-if
+          // controller is a spec no-op, and aborting a controller before
+          // fetch() is ever called on it just makes that later fetch()
+          // call reject immediately with AbortError once it does run —
+          // caught by the same recordAttemptGeneration guard every
+          // stale-take status write site below already uses.
+          if (transcribeAbortController) {
+            transcribeAbortController.abort();
+          }
+          thisController = new AbortController();
+          transcribeAbortController = thisController;
           recordBtn.textContent = {{.StopLabel}};
           statusEl.textContent = "";
         } catch (e) {
@@ -776,12 +1099,30 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
     var previewWrap = document.getElementById("uc-issue-screenrecord-preview-wrap");
     var previewEl = document.getElementById("uc-issue-screenrecord-preview");
     var fileInput = document.getElementById("uc-issue-screenrecord-file");
+    // screenRecorder identifies "the currently active recording" for the
+    // Stop branch below AND the auto-stop timeout's own guard further
+    // down — both are fine to read the reassigned outer value, since both
+    // only ever act on whatever recording is current right now. (The mic
+    // handler's mediaRecorder is read in one more place since uc-infra#223
+    // — its onstop's own thisRecorder identity check — for the same
+    // "always fine to read the reassigned current value" reason.)
+    // screenChunks/screenTimerId/screenAutoStopId/screenStartedAt
+    // are NOT declared here (uc-infra#196, same defense-in-depth fix as
+    // the mic handler) — each is now declared fresh with var inside the
+    // getDisplayMedia .then() callback below, so every take gets its own
+    // copies. Verified against this handler's actual Stop branch that,
+    // unlike the mic handler, screenRecording/the button label are only
+    // ever reset inside onstop, never synchronously on Stop click — so a
+    // screen-record "Stop then Record again" click sequence can't reach a
+    // second recording the way the mic race description depends on (the
+    // second click is read as another Stop, not a new Record, until
+    // onstop has already run). This fix is kept anyway for consistency
+    // with the mic handler and because it closes a latent hazard rather
+    // than a currently-reachable one — if Stop's reset timing is ever
+    // changed to be synchronous (matching the mic handler), this would
+    // otherwise become live at that point instead of being caught here.
     var screenRecorder = null;
-    var screenChunks = [];
     var screenRecording = false;
-    var screenTimerId = null;
-    var screenAutoStopId = null;
-    var screenStartedAt = 0;
 
     // revokePreviousPreview releases the previous recording's blob: URL
     // (if any) before a new one replaces it — independent review,
@@ -802,7 +1143,17 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
     } else {
       screenBtn.addEventListener("click", function() {
         if (screenRecording) {
-          screenRecorder.stop();
+          // uc-infra#220: screenRecording is only ever reset inside onstop
+          // (see the outer-scope comment above), never synchronously here,
+          // so a redundant Stop click before the first click's onstop has
+          // fired would otherwise call .stop() a second time on a recorder
+          // the spec already transitioned to "inactive" synchronously as
+          // part of the first .stop() call — an uncaught InvalidStateError
+          // inside this handler. Same guard the auto-stop timeout below
+          // already uses against the same spec behavior.
+          if (screenRecorder && screenRecorder.state !== "inactive") {
+            screenRecorder.stop();
+          }
           return;
         }
         if (screenBtn.disabled) {
@@ -821,7 +1172,9 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
         screenBtn.disabled = true;
         navigator.mediaDevices.getDisplayMedia({ video: true }).then(function(stream) {
           screenBtn.disabled = false;
-          screenChunks = [];
+          // Local to this .then() invocation (uc-infra#196) — see the
+          // outer-scope comment above.
+          var screenChunks = [];
           // try/catch around everything from the MediaRecorder
           // constructor fallback through screenRecorder.start(), not
           // just the primary constructor call (independent review,
@@ -900,8 +1253,19 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
             screenRecorder.start();
             screenRecording = true;
             screenBtn.textContent = {{.StopLabel}};
-            screenStartedAt = Date.now();
-            screenTimerId = setInterval(function() {
+            // Local to this .then() invocation (uc-infra#196), same as
+            // screenChunks above — independent review: this was left
+            // shared in an earlier draft even though only the per-take
+            // interval callback just below reads it, which would have
+            // let a still-running earlier take's ticker read a newer
+            // take's start time once started.
+            var screenStartedAt = Date.now();
+            // Also local (uc-infra#196) — onstop's clearInterval/
+            // clearTimeout calls above (in the onstop handler defined
+            // earlier in this same .then() callback) close over these via
+            // the normal closure/hoisting rules, same as every other
+            // local var in this scope.
+            var screenTimerId = setInterval(function() {
               var elapsed = Math.floor((Date.now() - screenStartedAt) / 1000);
               var m = Math.floor(elapsed / 60);
               var s = elapsed % 60;
@@ -913,7 +1277,7 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
             // mid-recording server round-trip; the blob.size check above
             // is what actually bounds the upload, since duration alone
             // doesn't bound bytes at an unpredictable real-world bitrate.
-            screenAutoStopId = setTimeout(function() {
+            var screenAutoStopId = setTimeout(function() {
               if (screenRecording && screenRecorder && screenRecorder.state !== "inactive") {
                 screenRecorder.stop();
               }

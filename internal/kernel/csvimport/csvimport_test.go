@@ -440,6 +440,40 @@ func TestCommit_WritesOnlyRowsThatPassValidation(t *testing.T) {
 	}
 }
 
+// TestCommit_UnmappedColumnGetsFieldDefault confirms csvimport benefits
+// automatically from uc-infra#212 (crud.Engine.Create now applies
+// entity.Field.Default for any field genuinely absent from the create
+// payload) with no csvimport-specific change: a column this row's
+// mapping never touches — vendorDef's is_active, Default: true — is
+// absent from buildRowData's output entirely, exactly the "omitted, not
+// just zero-valued" case Commit's own engine.Create call now fills in.
+func TestCommit_UnmappedColumnGetsFieldDefault(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	engine := crud.NewEngine(db)
+	def := vendorDef()
+
+	csvData := "Vendor Name,Lead Time\nAcme,60\n"
+
+	// is_active deliberately left out of the mapping — buildRowData never
+	// puts a key for it in the row's data map at all.
+	results, err := Commit(ctx, strings.NewReader(csvData), def, ColumnMapping{"Vendor Name": "name", "Lead Time": "lead_time_days"}, engine, humanActor())
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if len(results) != 1 || results[0].Err != nil || results[0].RecordID == "" {
+		t.Fatalf("expected row to commit successfully, got %+v", results)
+	}
+
+	rec, err := engine.Get(ctx, def, results[0].RecordID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if isActive, _ := rec.Data["is_active"].(bool); !isActive {
+		t.Fatalf("expected is_active's Definition-declared Default:true to be applied when the column is unmapped, got Data[\"is_active\"]=%v", rec.Data["is_active"])
+	}
+}
+
 // TestCommit_WritesAuditRowsPerRecord confirms each committed row goes
 // through crud.Engine.Create — meaning it gets an audit_log row with
 // actor identity — not a bulk bypass around the normal write path.

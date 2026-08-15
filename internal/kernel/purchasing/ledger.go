@@ -366,12 +366,35 @@ func creditInventoryOnReceipt(ctx context.Context, tx *sql.Tx, records *data.Rec
 		if found {
 			existingOnHand, _ := numberFieldValue(existing.Data["qty_on_hand"])
 			existingATP, _ := numberFieldValue(existing.Data["qty_available_to_promise"])
-			fields := map[string]any{
+			// overrides is what THIS credit actually changes — kept
+			// separate from the merged write map below so the audit
+			// entry records only the real diff, matching this file's own
+			// mergedRecordData convention (clearVendorInvoiceMatchException/
+			// MatchVendorInvoiceOnUpdate above) rather than every field on
+			// the row appearing "changed" on every receipt.
+			overrides := map[string]any{
 				"item_id":                  itemID,
 				"facility_id":              facilityID,
 				"qty_on_hand":              existingOnHand + qty,
 				"qty_available_to_promise": existingATP + qty,
 			}
+			// mergedRecordData, not overrides alone (uc-infra#226):
+			// data.RecordRepo.UpdateTx is a full replacement (`SET data =
+			// $1`), so writing just these four keys silently erased every
+			// other field on the row — latent before uc-infra#218 made a
+			// tenant-added defaulted field reachable via the create
+			// branch in the first place, live the moment a second
+			// receipt for the same (item, facility) took this branch.
+			fields := mergedRecordData(existing.Data, overrides)
+			// Validates the FULL merged row, not just overrides — a
+			// stored value on some other field that already violates the
+			// tenant's current published def (e.g. a Min/MaxLength/enum
+			// tightened since this row was written) now fails this
+			// receipt loudly instead of silently carrying the stale
+			// value forward. Deliberate (this kernel fails loud over
+			// silent elsewhere in this file — see unitPriceMinor above),
+			// but worth knowing: it can block a goods receipt over a
+			// data-quality problem on a field this credit never touches.
 			if err := entity.ValidateRecord(def, fields); err != nil {
 				return fmt.Errorf("build InventoryItem credit for GoodsReceiptLine %s: %w", goodsReceiptLineID, err)
 			}
@@ -388,6 +411,24 @@ func creditInventoryOnReceipt(ctx context.Context, tx *sql.Tx, records *data.Rec
 			if err := crud.UpdateUniqueConstraintKeys(ctx, tx, keys, def, existing.ID, fields); err != nil {
 				var uce *crud.UniqueConstraintError
 				if errors.As(err, &uce) {
+					if uce.ConstraintName != requiredUnique {
+						// A DIFFERENT Unique set the tenant added to
+						// InventoryItem (not the (item_id, facility_id)
+						// this function's own upsert/retry design depends
+						// on) rejected this write — e.g. two live rows
+						// already share a tenant-added unique field's
+						// value. Passing the full merged `fields` above
+						// (rather than the old bare 4-key map) is what
+						// makes this newly reachable: a tenant-added
+						// Unique set's key field is now genuinely present
+						// with its real value instead of always absent.
+						// Not the duplicate-(item,facility)-rows case
+						// below, and a sync-tenant-modules backfill
+						// against THAT constraint wouldn't fix this one —
+						// name the constraint that actually conflicted
+						// instead of misattributing it.
+						return fmt.Errorf("credit InventoryItem for GoodsReceiptLine %s: tenant-added Unique constraint %q rejected this InventoryItem update: %w", goodsReceiptLineID, uce.ConstraintName, err)
+					}
 					// GetByFieldsQ picked `existing` as the oldest live
 					// row for this (item, facility), but ANOTHER live
 					// row already holds this pair's record_unique_keys
@@ -406,7 +447,7 @@ func creditInventoryOnReceipt(ctx context.Context, tx *sql.Tx, records *data.Rec
 				}
 				return fmt.Errorf("reconcile InventoryItem %s unique keys: %w", existing.ID, err)
 			}
-			auditEntry, err := audit.New("InventoryItem", existing.ID, audit.ActionUpdate, actor, fields)
+			auditEntry, err := audit.New("InventoryItem", existing.ID, audit.ActionUpdate, actor, overrides)
 			if err != nil {
 				return fmt.Errorf("build audit entry for InventoryItem %s: %w", existing.ID, err)
 			}
@@ -422,6 +463,42 @@ func creditInventoryOnReceipt(ctx context.Context, tx *sql.Tx, records *data.Rec
 			"qty_on_hand":              qty,
 			"qty_available_to_promise": qty,
 		}
+		// This creates via the low-level records.CreateTx below, not
+		// crud.Engine.Create — the SAVEPOINT-based retry-on-unique-
+		// conflict dance a few lines down needs to run inside the
+		// caller's own *sql.Tx (handed to this hook by crud.Hook's
+		// signature), and Engine.Create always opens its own transaction.
+		// That means this call site never gets Engine.Create's internal
+		// entity.ApplyDefaults call, so it must apply the tenant's
+		// published InventoryItem Definition's Field.Default itself,
+		// explicitly (uc-infra#218, split from #212's independent
+		// review) — before validation, so a Default can satisfy its own
+		// field's Required check. internal/api/handlers.go calls
+		// ApplyDefaults explicitly ahead of crud.Engine.Create too, for
+		// a different reason (so its own pre-check agrees with what
+		// Create will do internally) — cited here only because the
+		// ordering-before-validation rationale is the same, not because
+		// the two callers share a motive. Currently a no-op in practice
+		// (item_id/facility_id/qty_on_hand/qty_available_to_promise are
+		// always set explicitly above), but a future field added to
+		// InventoryItem with a Default would otherwise silently diverge
+		// from every other write path into this Definition the moment
+		// this call omitted it.
+		//
+		// Deliberately NOT added to the update-existing branch above
+		// (the `if found {` block) — entity.ApplyDefaults's own doc
+		// comment explains why: data.RecordRepo.UpdateTx is a full
+		// replacement (`SET data = $1`), so defaulting an omitted field
+		// there would silently resurrect it instead of leaving it
+		// erased, same as crud.Engine.Update's own exclusion. Filed as
+		// uc-infra#226/#227 (independent review): that erasure was
+		// already latent for any tenant-added defaulted field, but this
+		// fix makes it newly *reachable* (a first receipt can now store
+		// such a field via this branch; a second receipt for the same
+		// (item, facility) hits the update branch and erases or
+		// hard-fails on it), and today nothing pins this exclusion with
+		// a test — not fixed here, out of scope for #218 itself.
+		entity.ApplyDefaults(def, fields)
 		if err := entity.ValidateRecord(def, fields); err != nil {
 			return fmt.Errorf("build InventoryItem credit for GoodsReceiptLine %s: %w", goodsReceiptLineID, err)
 		}
@@ -881,9 +958,17 @@ func statusIDByCodeTx(ctx context.Context, tx *sql.Tx, records *data.RecordRepo,
 // invoice's own data: a missing purchase_order_id (Required at the
 // schema level — entity.ValidateRecord should already block this before
 // a hook ever runs; this is a defensive check for a hook invoked
-// directly, bypassing that) and genuine infrastructure failures (a real
-// DB error, not "not found") — those still fail closed, same as this
-// hook's very first version did for every case.
+// directly, bypassing that), genuine infrastructure failures (a real
+// DB error, not "not found"), and — since uc-infra#193 — a corrupt
+// money value discovered while resolving the currency-aware minor-unit
+// scale (a NaN/±Inf/overflow qty_received on a GoodsReceiptLine, or a
+// Currency row whose own minor_unit is out of range) surfacing through
+// receivedValueForPurchaseOrder's own money.FromMajorUnits call. That
+// last case is debatable (the corrupt data isn't on the invoice being
+// saved, it's on a GoodsReceiptLine its own editor can't fix from here)
+// but is treated the same as a corrupt total below: a data problem, not
+// an ordinary business disagreement — those still fail closed, same as
+// this hook's very first version did for every case.
 func vendorInvoiceMatchDetail(ctx context.Context, tx *sql.Tx, records *data.RecordRepo, rec data.Record) (string, error) {
 	poID, _ := rec.Data["purchase_order_id"].(string)
 	if poID == "" {
@@ -909,14 +994,66 @@ func vendorInvoiceMatchDetail(ctx context.Context, tx *sql.Tx, records *data.Rec
 		return fmt.Sprintf("VendorInvoice vendor_id %q does not match PurchaseOrder %s's own vendor_id %q",
 			vendorID, poID, poVendorID), nil
 	}
+	// A related but NOT identical check to the vendor_id one above: an
+	// invoice that explicitly names a currency different from the PO
+	// it's billing against is a real business disagreement (uc-infra#193),
+	// not something the value comparison below can safely paper over —
+	// see the minorUnit resolution immediately below for why PurchaseOrder's
+	// own currency_id, not the invoice's, is what the match's shared scale
+	// is actually resolved against. Unlike vendor_id (where an EMPTY
+	// invoice vendor_id is itself a mismatch), currency_id only flags a
+	// disagreement when BOTH sides assert one and they differ: an invoice
+	// that leaves currency_id blank isn't asserting anything to disagree
+	// with, and neither is a PurchaseOrder written before uc-infra#193
+	// (or any tenant that simply hasn't adopted per-document currencies)
+	// — flagging that pairing would turn every such existing PO/invoice
+	// combination into a match_exception on its next save, reading
+	// "currency_id ... does not match ... own currency_id \"\"", which
+	// is confusing copy for "the PO simply doesn't have one" and not
+	// this task's intent (independent review, uc-infra#193).
+	invoiceCurrencyID, _ := rec.Data["currency_id"].(string)
+	poCurrencyID, _ := po.Data["currency_id"].(string)
+	if invoiceCurrencyID != "" && poCurrencyID != "" && invoiceCurrencyID != poCurrencyID {
+		return fmt.Sprintf("VendorInvoice currency_id %q does not match PurchaseOrder %s's own currency_id %q",
+			invoiceCurrencyID, poID, poCurrencyID), nil
+	}
 
-	receivedMinor, hasLines, err := receivedValueForPurchaseOrder(ctx, tx, records, poID)
+	// minorUnit is resolved from the PurchaseOrder's own currency_id, not
+	// the invoice's (uc-infra#193): POLine.unit_price — what
+	// receivedValueForPurchaseOrder below actually sums — has no
+	// currency_id of its own, so it's implicitly denominated in whatever
+	// currency its parent PurchaseOrder names. Falling back to
+	// money.Decimals (2dp) when currency_id is empty or unresolvable
+	// matches every existing invoice/PO pair that never sets one, and the
+	// same "unresolvable currency degrades to the default, not a hard
+	// failure" posture assets.PostDueDepreciation already established.
+	minorUnit := money.Decimals
+	if poCurrencyID != "" {
+		if v, err := currencyMinorUnitTx(ctx, tx, records, poCurrencyID); err == nil {
+			minorUnit = v
+		}
+	}
+
+	receivedMinor, hasLines, err := receivedValueForPurchaseOrder(ctx, tx, records, poID, minorUnit)
 	if err != nil {
 		return "", fmt.Errorf("%w: compute received value for PurchaseOrder %s: %w", ErrVendorInvoiceMatchFailed, poID, err)
 	}
 	if !hasLines {
 		return fmt.Sprintf("PurchaseOrder %s has no POLines yet", poID), nil
 	}
+	// receivedMinor == 0 is now scale-relative, not always "literally
+	// zero received" (independent review, uc-infra#193): at a low-
+	// precision currency (0dp), a genuine partial receipt worth under
+	// 0.5 major units rounds to 0 here even though something real was
+	// received. Documented, accepted tradeoff of matching at the
+	// currency's own real precision rather than papering over it with a
+	// scale receivedMinor and totalMinor don't actually share — the
+	// alternative (comparing at a scale finer than the real currency
+	// supports) is exactly the "two different scales" hazard this task
+	// exists to close, see the totalMinorMoney comment below. Not
+	// separately tested — same class of low-value-currency edge case as
+	// the KWD/3dp precision gap noted where receivedValueForPurchaseOrder
+	// itself is documented, deferred rather than fixed in this task.
 	if receivedMinor == 0 {
 		return fmt.Sprintf("PurchaseOrder %s has nothing received against it yet", poID), nil
 	}
@@ -924,24 +1061,21 @@ func vendorInvoiceMatchDetail(ctx context.Context, tx *sql.Tx, records *data.Rec
 	// — that field is NOT part of uc-infra#136's migration, so it still
 	// needs converting to minor units here.
 	//
-	// Deliberately NOT currency-aware via this invoice's own currency_id
-	// (uc-infra#163 investigated this: unlike sales.PostCustomerInvoiceToLedger,
-	// which posts a standalone Dr/Cr pair at whatever scale is chosen, this
-	// comparison's OTHER side — receivedMinor, from receivedValueForPurchaseOrder
-	// below — sums POLine.unit_price, which is money.Money and therefore
-	// pinned at this package's fixed, currency-agnostic money.Decimals (2dp)
-	// scale by design, not the PO's or invoice's own currency. Converting
-	// totalMinor at a real per-currency scale while receivedMinor stays
-	// pinned at 2dp would compare two different scales and silently break
-	// this match for any non-2dp currency — worse than today's already-
-	// documented fixed-2dp assumption, not better. A correct fix needs
-	// receivedValueForPurchaseOrder itself to become currency-aware too
-	// (recovering a major-unit amount from POLine.unit_price and
-	// re-scaling), which is a bigger, separately-scoped change — tracked
-	// as uc-infra#193 (filed this cycle) rather than ballooned into
-	// this one. money.FromMajorUnits still buys this call site the
-	// NaN/±Inf/overflow validation ledger.ToMinorUnits never had.
-	totalMinorMoney, err := money.FromMajorUnits(total, money.Decimals)
+	// Converted at minorUnit (the PurchaseOrder's own resolved currency
+	// scale, above), not the fixed money.Decimals — uc-infra#163 first
+	// investigated a currency-aware conversion here and found it unsafe:
+	// this comparison's OTHER side, receivedMinor, was hardcoded to this
+	// package's fixed 2dp scale (POLine.unit_price is money.Money,
+	// itself always stored at 2dp regardless of currency), so converting
+	// only totalMinor at a real per-currency scale would have compared
+	// two different scales and silently broken this match for any
+	// non-2dp currency. uc-infra#193 closes that gap: both sides now
+	// resolve and convert at the SAME minorUnit — see
+	// receivedValueForPurchaseOrder's own doc comment for how it
+	// recovers a major-unit amount from money.Money-typed unit_price
+	// before re-scaling. money.FromMajorUnits still buys this call site
+	// the NaN/±Inf/overflow validation ledger.ToMinorUnits never had.
+	totalMinorMoney, err := money.FromMajorUnits(total, minorUnit)
 	if err != nil {
 		// A corrupt total (NaN/±Inf/overflow) is a data problem this
 		// invoice's own record can't answer for — not an ordinary
@@ -951,24 +1085,90 @@ func vendorInvoiceMatchDetail(ctx context.Context, tx *sql.Tx, records *data.Rec
 		return "", fmt.Errorf("%w: VendorInvoice %s: convert total to minor units: %w", ErrVendorInvoiceMatchFailed, rec.ID, err)
 	}
 	if totalMinor := int64(totalMinorMoney); receivedMinor != totalMinor {
-		return fmt.Sprintf("total %.2f (%d minor units) does not match received value %.2f (%d minor units) for PurchaseOrder %s",
-			total, totalMinor, money.Money(receivedMinor).Major(), receivedMinor, poID), nil
+		// %v, not %.2f, for both major-unit figures (independent review,
+		// uc-infra#193: a fixed 2dp format silently truncates a >2dp
+		// currency's real total, e.g. KWD 12.345 -> "12.35"). And
+		// receivedMinor's major-unit figure is majorAtScale(receivedMinor,
+		// minorUnit), NOT money.Money(receivedMinor).Major() — that was
+		// this task's own first-draft bug, caught in independent review:
+		// Money.Major() unconditionally divides by money's fixed 2dp
+		// scale (money.go's own package doc comment), which was correct
+		// back when receivedMinor was always 2dp, but receivedMinor is
+		// now at the CALLER-resolved minorUnit above, which can differ —
+		// treating it as fixed-2dp again here would print a value off by
+		// a power of 10 in exactly the field a human reads to resolve
+		// the exception.
+		return fmt.Sprintf("total %v (%d minor units) does not match received value %v (%d minor units) for PurchaseOrder %s",
+			total, totalMinor, majorAtScale(receivedMinor, minorUnit), receivedMinor, poID), nil
 	}
 	return "", nil
+}
+
+// majorAtScale renders a minor-unit integer as a major-unit float at an
+// explicit scale — the display-only inverse of money.FromMajorUnits at
+// a scale other than money.Money's own fixed money.Decimals (which is
+// all Money.Major() can ever assume). Needed here because
+// vendorInvoiceMatchDetail's match_exception_reason reports receivedMinor
+// at the CALLER-resolved minorUnit (uc-infra#193), not money's fixed
+// 2dp scale, so money.Money(receivedMinor).Major() would silently
+// misreport it — see this function's one call site for the concrete
+// bug independent review caught.
+func majorAtScale(minor int64, minorUnit int) float64 {
+	return float64(minor) / math.Pow(10, float64(minorUnit))
+}
+
+// currencyMinorUnitTx resolves a Currency record id to its minor_unit
+// scale — the purchasing-package-local twin of assets.currencyMinorUnit
+// (that one is unexported to package assets, and purchasing has no
+// business importing another module's internals for a two-line lookup,
+// so this is a deliberate small duplication, not a missed reuse).
+// Returns an error — which vendorInvoiceMatchDetail's own caller treats
+// as "unresolvable, fall back to money.Decimals" — not just when the
+// row is missing or malformed, but also when minor_unit is OUTSIDE
+// [0, money.MaxMinorUnitScale] (independent review, uc-infra#193): a
+// Currency row written before Version 3's [0,6] bound (uc-infra#80)
+// could still carry a corrupt value today, and letting a merely-corrupt
+// (not missing) minor_unit resolve "successfully" here would otherwise
+// bypass the fallback and hard-fail the whole match via
+// money.FromMajorUnits's own range check instead — contrary to the
+// documented "unresolvable degrades to the default, never a hard
+// failure" posture this function exists to provide.
+func currencyMinorUnitTx(ctx context.Context, tx *sql.Tx, records *data.RecordRepo, currencyID string) (int, error) {
+	currency, err := records.GetTx(ctx, tx, "Currency", currencyID)
+	if err != nil {
+		return 0, fmt.Errorf("resolve Currency %s: %w", currencyID, err)
+	}
+	v, ok := currency.Data["minor_unit"].(float64)
+	if !ok {
+		return 0, fmt.Errorf("Currency %s has no minor_unit", currencyID)
+	}
+	if v < 0 || v > money.MaxMinorUnitScale {
+		return 0, fmt.Errorf("Currency %s has out-of-range minor_unit %v", currencyID, v)
+	}
+	return int(v), nil
 }
 
 // receivedValueForPurchaseOrder sums qty_received x unit_price across
 // every GoodsReceiptLine posted against one of poID's own POLines — the
 // "how much has actually been received, and at what value" side of the
-// 3-way match. Returns the sum in MINOR units (uc-infra#136:
-// POLine.unit_price is FieldMoney now, so a per-line qty*price product
-// is already minor-unit-scaled — see this function's own body for why
-// that means plain int64(math.Round(...)) at the end, not
-// ledger.ToMinorUnits, the same distinction PostGoodsReceiptLineToLedger's
-// own amountMinor computation draws). hasLines reports whether poID has
-// any POLine at all (a PO header can legitimately exist with none yet —
-// POLine is its own separate CRUD-able entity, created after the
-// header, per POLine's own doc comment — so "no lines" is a normal
+// 3-way match. Returns the sum in MINOR units at the CALLER-resolved
+// minorUnit scale (uc-infra#193: minorUnit is the PurchaseOrder's own
+// resolved currency scale, not necessarily this package's fixed
+// money.Decimals — see vendorInvoiceMatchDetail's own resolution of it).
+// POLine.unit_price is money.Money (uc-infra#136), which is itself
+// always STORED at this package's fixed 2dp scale regardless of what
+// currency it nominally represents (money's own package doc comment) —
+// so each line's price is first recovered as a real major-unit amount
+// via Money.Major() (which only ever divides by that fixed stored
+// scale), multiplied by qty in major-unit float space, summed, and
+// converted to minor units ONCE at the resolved minorUnit via
+// money.FromMajorUnits — not per-line, and not via money.Decimals.
+// That single final conversion is also where the NaN/±Inf/overflow
+// validation money.FromMajorUnits provides now applies to this sum too
+// (the old int64(math.Round(sum)) had none). hasLines reports whether
+// poID has any POLine at all (a PO header can legitimately exist with
+// none yet — POLine is its own separate CRUD-able entity, created after
+// the header, per POLine's own doc comment — so "no lines" is a normal
 // in-progress state for vendorInvoiceMatchDetail to redirect on, not
 // this function's own concern to fail over). No SQL filter exists for
 // this (this kernel's generic records table has no per-field query
@@ -977,7 +1177,7 @@ func vendorInvoiceMatchDetail(ctx context.Context, tx *sql.Tx, records *data.Rec
 // same shape ledger.checkPeriodOpen already established for "no
 // field-level query, filter every row of a bounded entity type in
 // application code."
-func receivedValueForPurchaseOrder(ctx context.Context, tx *sql.Tx, records *data.RecordRepo, poID string) (receivedMinor int64, hasLines bool, err error) {
+func receivedValueForPurchaseOrder(ctx context.Context, tx *sql.Tx, records *data.RecordRepo, poID string, minorUnit int) (receivedMinor int64, hasLines bool, err error) {
 	poLines, err := records.ListTx(ctx, tx, "POLine")
 	if err != nil {
 		return 0, false, fmt.Errorf("list POLine: %w", err)
@@ -1001,13 +1201,16 @@ func receivedValueForPurchaseOrder(ctx context.Context, tx *sql.Tx, records *dat
 	if err != nil {
 		return 0, false, fmt.Errorf("list GoodsReceiptLine: %w", err)
 	}
-	// Accumulated as float64 and rounded to int64 only ONCE at the end,
-	// not per-line: qty is a fractional FieldNumber, so each line's own
-	// qty*priceMinor product can itself be fractional (e.g. 2.5 units at
-	// 1050 minor units = 2625.0, already exact, but a less round qty
-	// wouldn't be), and rounding once after summing avoids compounding a
+	// Accumulated as a major-unit float64 and converted to minor units
+	// only ONCE at the end, not per-line: qty is a fractional
+	// FieldNumber, so each line's own qty*price product can itself be
+	// fractional, and rounding once after summing avoids compounding a
 	// separate rounding error into every individual line before they're
-	// added together.
+	// added together. Each price is recovered via Money.Major() (always
+	// divides by this package's fixed stored scale, uc-infra#193 — see
+	// this function's own doc comment) before multiplying by qty, so the
+	// sum stays in major-unit space until the single final conversion
+	// below, at the caller-resolved minorUnit.
 	//
 	// NOT the same strategy PostGoodsReceiptLineToLedger's own
 	// amountMinor computation uses (independent review, uc-infra#136:
@@ -1022,7 +1225,7 @@ func receivedValueForPurchaseOrder(ctx context.Context, tx *sql.Tx, records *dat
 	// (not introduced by this migration) rounding-strategy mismatch
 	// between "what got posted" and "what this match compares against",
 	// tracked as its own gap rather than papered over here.
-	var sum float64
+	var sumMajor float64
 	for _, l := range grLines {
 		poLineID, _ := l.Data["po_line_id"].(string)
 		priceMinor, ok := unitPriceMinorByLineID[poLineID]
@@ -1030,7 +1233,11 @@ func receivedValueForPurchaseOrder(ctx context.Context, tx *sql.Tx, records *dat
 			continue
 		}
 		qty, _ := l.Data["qty_received"].(float64)
-		sum += qty * float64(priceMinor)
+		sumMajor += qty * priceMinor.Major()
 	}
-	return int64(math.Round(sum)), true, nil
+	receivedMoney, err := money.FromMajorUnits(sumMajor, minorUnit)
+	if err != nil {
+		return 0, true, fmt.Errorf("convert received value to minor units: %w", err)
+	}
+	return int64(receivedMoney), true, nil
 }

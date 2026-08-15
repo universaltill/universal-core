@@ -109,7 +109,7 @@ func TestHelp_RealProjectsAssetsContent_RendersInViewer_RealBrowser(t *testing.T
 		// appear in the English body — so this fails on a silent en
 		// fallback the same way help_real_content_test.go's own Role(ar)
 		// case guards against.
-		for _, want := range []string{"دارایی ثابت", "این بخش خودبه‌خود پر نمی‌شود"} {
+		for _, want := range []string{"دارایی ثابت", "شما ردیف‌ها را دستی اضافه نمی‌کنید"} {
 			if !strings.Contains(bodyText, want) {
 				t.Errorf("expected real FixedAsset (fa) content %q in rendered page, got body text:\n%s", want, bodyText)
 			}
@@ -119,7 +119,7 @@ func TestHelp_RealProjectsAssetsContent_RendersInViewer_RealBrowser(t *testing.T
 		// (help.Index.resolve does fall back to en when a locale's file
 		// is missing/blank), this English phrase would be sitting right
 		// in the rendered body text.
-		if strings.Contains(bodyText, "does not fill itself in automatically") {
+		if strings.Contains(bodyText, "Saving the asset generates this section automatically") {
 			t.Errorf("fa render appears to have fallen back to the English body text instead of the real Farsi translation")
 		}
 	})

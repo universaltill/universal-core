@@ -3,9 +3,11 @@ package assets
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
@@ -203,6 +205,64 @@ func (fx depreciationFixture) createScheduleRow(t *testing.T, assetID string, se
 		t.Fatalf("create DepreciationSchedule row %d: %v", sequence, err)
 	}
 	return rec.ID
+}
+
+// markSchedulePosted sets posted_at on a DepreciationSchedule row via
+// the raw records repo (data.NewRecordRepo(fx.tenantDB).Update),
+// bypassing crud.Engine and every hook registered on it — the same
+// non-engine path production posting actually takes
+// (postAssetDepreciation, ledger.go's own records.UpdateTx calls). Using
+// fx.engine.Update here instead (as earlier versions of this file's own
+// tests did) would also run MarkDepreciationScheduleOverriddenOnWrite,
+// which recomputes `overridden` from the row's own content — a row
+// posted with no content change would come back overridden=false either
+// way, matching production behavior fine — but a test asserting "this
+// row is posted, this OTHER row is the one still overridden" needs the
+// posting write itself to introduce no side effect of its own, so tests
+// that care about that distinction use this helper rather than
+// fx.engine.Update (uc-infra#236 independent review finding F4).
+//
+// Also bumps assetID's own posted_period_count by 1 (uc-infra#202) —
+// production's real posting path (incrementFixedAssetPostedPeriodCount)
+// always does this in the SAME transaction as the posted_at write
+// above, so a test helper claiming to match "the same non-engine path
+// production posting actually takes" must keep doing both, not just the
+// first. Callers that deliberately want to simulate a row posted
+// WITHOUT the counter following it (e.g. a pre-Version-4/not-yet-
+// backfilled asset) should not use this helper — see
+// TestPostDueDepreciation_UnbackfilledCounterDoesNotHealPrematurely for
+// that scenario built by hand instead.
+func (fx depreciationFixture) markSchedulePosted(t *testing.T, assetID, rowID, periodEnd string) {
+	t.Helper()
+	ctx := context.Background()
+	records := data.NewRecordRepo(fx.tenantDB)
+
+	row, err := fx.engine.Get(ctx, publishedDef(t, fx.tenantDB, "DepreciationSchedule"), rowID)
+	if err != nil {
+		t.Fatalf("Get DepreciationSchedule %s: %v", rowID, err)
+	}
+	fields := map[string]any{}
+	for k, v := range row.Data {
+		fields[k] = v
+	}
+	fields["posted_at"] = periodEnd
+	if _, err := records.Update(ctx, "DepreciationSchedule", rowID, fields, nil); err != nil {
+		t.Fatalf("mark DepreciationSchedule %s posted: %v", rowID, err)
+	}
+
+	asset, err := records.Get(ctx, "FixedAsset", assetID)
+	if err != nil {
+		t.Fatalf("Get FixedAsset %s: %v", assetID, err)
+	}
+	count, _ := asset.Data["posted_period_count"].(float64)
+	assetFields := map[string]any{}
+	for k, v := range asset.Data {
+		assetFields[k] = v
+	}
+	assetFields["posted_period_count"] = count + 1
+	if _, err := records.Update(ctx, "FixedAsset", assetID, assetFields, nil); err != nil {
+		t.Fatalf("bump FixedAsset %s posted_period_count: %v", assetID, err)
+	}
 }
 
 func (fx depreciationFixture) statusCode(t *testing.T, entityType, id string) string {
@@ -547,22 +607,9 @@ func TestPostDueDepreciation_AlreadyFullyPostedButNotTransitioned_HealsOnNextRun
 	fx := setUpDepreciationFixture(t)
 	ctx := context.Background()
 	assetID := fx.createAsset(t, "in_service", false) // useful_life_months: 3
-	scheduleDef := publishedDef(t, fx.tenantDB, "DepreciationSchedule")
 	for seq, periodEnd := range map[int]string{1: "2020-01-31", 2: "2020-02-29", 3: "2020-03-31"} {
 		id := fx.createScheduleRow(t, assetID, seq, periodEnd, 1000.00, 0.00)
-		rec, err := fx.engine.Get(ctx, scheduleDef, id)
-		if err != nil {
-			t.Fatalf("Get row %d: %v", seq, err)
-		}
-		fields := map[string]any{}
-		for k, v := range rec.Data {
-			fields[k] = v
-		}
-		fields["posted_at"] = periodEnd
-		version := rec.Version
-		if _, err := fx.engine.Update(ctx, scheduleDef, id, fields, &version, humanActor()); err != nil {
-			t.Fatalf("directly mark row %d posted: %v", seq, err)
-		}
+		fx.markSchedulePosted(t, assetID, id, periodEnd)
 	}
 	if code := fx.statusCode(t, "FixedAsset", assetID); code != "in_service" {
 		t.Fatalf("setup: asset should still be in_service (never ran PostDueDepreciation), got %q", code)
@@ -625,14 +672,16 @@ func TestPostDueDepreciation_IdempotentRerun_AssetStaysInService(t *testing.T) {
 	}
 }
 
-// TestPostDueDepreciation_WritesAuditRows confirms all three mutating
+// TestPostDueDepreciation_WritesAuditRows confirms all four mutating
 // write paths (DepreciationSchedule.posted_at via a real posting,
 // DepreciationSchedule.posted_at via the zero-amount markPosted path,
-// and FixedAsset.status_id's transition) each write a real audit_log
-// row with the system actor (ADR-0008) — not just that the code that
-// builds and inserts them compiles and runs without erroring, which a
-// green suite with no audit assertion at all cannot distinguish from
-// "the insert silently no-ops."
+// FixedAsset.posted_period_count's own increment (uc-infra#202,
+// incrementFixedAssetPostedPeriodCount — one per posted row, on EITHER
+// path above), and FixedAsset.status_id's transition) each write a real
+// audit_log row with the system actor (ADR-0008) — not just that the
+// code that builds and inserts them compiles and runs without erroring,
+// which a green suite with no audit assertion at all cannot distinguish
+// from "the insert silently no-ops."
 func TestPostDueDepreciation_WritesAuditRows(t *testing.T) {
 	fx := setUpDepreciationFixture(t)
 	ctx := context.Background()
@@ -662,11 +711,47 @@ func TestPostDueDepreciation_WritesAuditRows(t *testing.T) {
 	if n := fx.auditCount(t, "DepreciationSchedule", zeroRowID, "update", "system"); n != 1 {
 		t.Errorf("audit_log rows for the zero-amount DepreciationSchedule row = %d, want 1", n)
 	}
-	if n := fx.auditCount(t, "FixedAsset", lifeAssetID, "update", "system"); n != 1 {
-		t.Errorf("audit_log rows for the FixedAsset status transition = %d, want 1", n)
+	// postedAssetID/zeroAssetID each posted exactly 1 row, so each gets
+	// exactly 1 posted_period_count-increment audit row (uc-infra#202)
+	// — no status transition for either (a single row against a
+	// multi-period useful_life_months doesn't exhaust the schedule).
+	if n := fx.auditCount(t, "FixedAsset", postedAssetID, "update", "system"); n != 1 {
+		t.Errorf("audit_log rows for the posted-path FixedAsset's posted_period_count increment = %d, want 1", n)
+	}
+	if n := fx.auditCount(t, "FixedAsset", zeroAssetID, "update", "system"); n != 1 {
+		t.Errorf("audit_log rows for the zero-amount-path FixedAsset's posted_period_count increment = %d, want 1", n)
+	}
+	// lifeAssetID posted 3 rows (3 posted_period_count-increment audit
+	// rows) plus the fully_depreciated status transition itself (1 more)
+	// = 4, not 1 — the pre-uc-infra#202 count this assertion used to
+	// expect covered only the transition, before FixedAsset had any
+	// other reason to be written during posting.
+	if n := fx.auditCount(t, "FixedAsset", lifeAssetID, "update", "system"); n != 4 {
+		t.Errorf("audit_log rows for the FixedAsset that fully depreciated = %d, want 4 (3 posted_period_count increments + 1 status transition)", n)
 	}
 	if code := fx.statusCode(t, "FixedAsset", lifeAssetID); code != "fully_depreciated" {
 		t.Fatalf("setup check: expected lifeAssetID to have transitioned, got %q", code)
+	}
+
+	// Independent review's finding: a row-count assertion alone can't
+	// tell "audited the right field with the right value" apart from
+	// "audited the wrong field the right number of times" — read the
+	// posted-path FixedAsset's own audit_log diff payload directly and
+	// confirm it actually names posted_period_count with the value the
+	// field itself now holds (1, from its one real posting).
+	var diffRaw []byte
+	if err := fx.tenantDB.QueryRow(
+		`SELECT diff FROM audit_log WHERE entity_type = 'FixedAsset' AND record_id = $1 AND action = 'update' AND actor_type = 'system'`,
+		postedAssetID,
+	).Scan(&diffRaw); err != nil {
+		t.Fatalf("read FixedAsset %s audit diff: %v", postedAssetID, err)
+	}
+	var diff map[string]any
+	if err := json.Unmarshal(diffRaw, &diff); err != nil {
+		t.Fatalf("unmarshal audit diff: %v", err)
+	}
+	if v, ok := diff["posted_period_count"].(float64); !ok || v != 1 {
+		t.Errorf("posted-path FixedAsset audit diff = %v, want {\"posted_period_count\": 1}", diff)
 	}
 }
 
@@ -1143,19 +1228,7 @@ func TestPostDueDepreciationBatch_ReportsTruncatedWhenHealingSweepHitsCap(t *tes
 		// AlreadyFullyPostedButNotTransitioned_HealsOnNextRun uses) so
 		// the schedule is genuinely exhausted but the fully_depreciated
 		// transition never ran.
-		row, err := fx.engine.Get(ctx, publishedDef(t, fx.tenantDB, "DepreciationSchedule"), rowID)
-		if err != nil {
-			t.Fatalf("Get row for asset %d: %v", i+1, err)
-		}
-		fields := map[string]any{}
-		for k, v := range row.Data {
-			fields[k] = v
-		}
-		fields["posted_at"] = "2020-01-31"
-		version := row.Version
-		if _, err := fx.engine.Update(ctx, publishedDef(t, fx.tenantDB, "DepreciationSchedule"), rowID, fields, &version, humanActor()); err != nil {
-			t.Fatalf("mark row posted for asset %d: %v", i+1, err)
-		}
+		fx.markSchedulePosted(t, assetID, rowID, "2020-01-31")
 		assetIDs[i] = assetID
 	}
 
@@ -1234,19 +1307,7 @@ func TestPostDueDepreciationBatch_DoesNotReportTruncatedWhenHealingSweepIsPerman
 	for i := 0; i < numStuckAssets; i++ {
 		assetID := fx.createAssetWithLife(t, fmt.Sprintf("FA-permastuck-%d", i+1), 1)
 		rowID := fx.createScheduleRow(t, assetID, 1, "2020-01-31", 1000.00, 0.00)
-		row, err := fx.engine.Get(ctx, publishedDef(t, fx.tenantDB, "DepreciationSchedule"), rowID)
-		if err != nil {
-			t.Fatalf("Get row for asset %d: %v", i+1, err)
-		}
-		fields := map[string]any{}
-		for k, v := range row.Data {
-			fields[k] = v
-		}
-		fields["posted_at"] = "2020-01-31"
-		version := row.Version
-		if _, err := fx.engine.Update(ctx, publishedDef(t, fx.tenantDB, "DepreciationSchedule"), rowID, fields, &version, humanActor()); err != nil {
-			t.Fatalf("mark row posted for asset %d: %v", i+1, err)
-		}
+		fx.markSchedulePosted(t, assetID, rowID, "2020-01-31")
 		assetIDs[i] = assetID
 	}
 
@@ -1352,5 +1413,263 @@ func TestPostDueDepreciationBatch_PropagatesContextCancellation(t *testing.T) {
 	}
 	if truncated {
 		t.Errorf("truncated = true, want false on an error return")
+	}
+}
+
+// TestPostDueDepreciation_PostedPeriodCountReflectsPostedRows is the
+// direct regression test for uc-infra#202's own core mechanism:
+// incrementFixedAssetPostedPeriodCount must actually leave
+// FixedAsset.posted_period_count matching how many DepreciationSchedule
+// rows this asset has genuinely posted — not just that the completion
+// sweep still, emergently, arrives at the right answer (the other tests
+// in this file already prove that indirectly). Covers both write paths
+// on the SAME asset — a real ledger posting (postDepreciationRow's
+// non-zero branch) and the zero-amount markPosted branch — so a bug
+// that only incremented on one of the two wouldn't hide behind the
+// other.
+func TestPostDueDepreciation_PostedPeriodCountReflectsPostedRows(t *testing.T) {
+	fx := setUpDepreciationFixture(t)
+	ctx := context.Background()
+	assetID := fx.createAsset(t, "in_service", false)                   // useful_life_months: 3
+	fx.createScheduleRow(t, assetID, 1, "2020-01-31", 1000.00, 2000.00) // real posting
+	fx.createScheduleRow(t, assetID, 2, "2020-02-29", 0.00, 2000.00)    // zero-amount
+
+	posted, err := PostDueDepreciation(ctx, fx.tenantDB, SchedulerActor())
+	if err != nil {
+		t.Fatalf("PostDueDepreciation: %v", err)
+	}
+	if posted != 2 {
+		// postDepreciationRow returns ok=true for the zero-amount branch
+		// too (no journal entry, but the row genuinely completed), so
+		// PostDueDepreciation's own "posted" return counts both —
+		// posted_period_count (checked below) must agree.
+		t.Fatalf("posted = %d, want 2", posted)
+	}
+
+	asset, err := data.NewRecordRepo(fx.tenantDB).Get(ctx, "FixedAsset", assetID)
+	if err != nil {
+		t.Fatalf("Get FixedAsset: %v", err)
+	}
+	if count, _ := asset.Data["posted_period_count"].(float64); count != 2 {
+		t.Errorf("posted_period_count = %v, want 2 (one real posting + one zero-amount)", count)
+	}
+	// Only 2 of 3 useful_life_months periods entered — must stay
+	// in_service, not read as complete.
+	if code := fx.statusCode(t, "FixedAsset", assetID); code != "in_service" {
+		t.Errorf("FixedAsset status = %q, want in_service (schedule not yet exhausted)", code)
+	}
+}
+
+// TestPostDueDepreciation_UnbackfilledCounterDoesNotHealPrematurely is
+// the direct regression test for the fail-safe property
+// data.LifeCompleteGroupOptions.ParentCounterField's own doc comment
+// promises: an asset whose DepreciationSchedule is genuinely fully
+// posted by some means OTHER than postDepreciationRow/markPosted (here:
+// direct SQL, simulating a pre-Version-4 row that predates
+// posted_period_count and hasn't been backfilled yet —
+// cmd/backfill-fixedasset-posted-period-count) must NOT be healed by
+// the counter fast path just because its child rows are, in reality,
+// actually done. Deliberately the OPPOSITE setup from every other
+// healing test in this file (which all use markSchedulePosted, keeping
+// the counter honest) — this one exists to pin the safe failure
+// direction (never-heals-early, not silently-transitions-wrong) that is
+// what makes shipping the counter mechanism ahead of every tenant's own
+// backfill run acceptable at all.
+func TestPostDueDepreciation_UnbackfilledCounterDoesNotHealPrematurely(t *testing.T) {
+	fx := setUpDepreciationFixture(t)
+	ctx := context.Background()
+	assetID := fx.createAsset(t, "in_service", false) // useful_life_months: 3
+	for seq, periodEnd := range map[int]string{1: "2020-01-31", 2: "2020-02-29", 3: "2020-03-31"} {
+		id := fx.createScheduleRow(t, assetID, seq, periodEnd, 1000.00, 0.00)
+		// Raw SQL, deliberately bypassing markSchedulePosted (and
+		// therefore posted_period_count) — the exact shape a row
+		// written before FixedAsset's Version 4 bump, never backfilled,
+		// would be in.
+		if _, err := fx.tenantDB.ExecContext(ctx,
+			`UPDATE records SET data = jsonb_set(data, '{posted_at}', to_jsonb($1::text)) WHERE id = $2::uuid`,
+			periodEnd, id,
+		); err != nil {
+			t.Fatalf("directly mark row %d posted (bypassing the counter): %v", seq, err)
+		}
+	}
+	asset, err := data.NewRecordRepo(fx.tenantDB).Get(ctx, "FixedAsset", assetID)
+	if err != nil {
+		t.Fatalf("Get FixedAsset: %v", err)
+	}
+	if count, _ := asset.Data["posted_period_count"].(float64); count != 0 {
+		t.Fatalf("setup: posted_period_count = %v, want 0 (unbackfilled)", count)
+	}
+
+	posted, err := PostDueDepreciation(ctx, fx.tenantDB, SchedulerActor())
+	if err != nil {
+		t.Fatalf("PostDueDepreciation: %v", err)
+	}
+	if posted != 0 {
+		t.Fatalf("posted = %d, want 0 — every row was already marked posted before this call", posted)
+	}
+	if code := fx.statusCode(t, "FixedAsset", assetID); code != "in_service" {
+		t.Errorf("FixedAsset status = %q, want in_service — the counter fast path must not heal an asset whose posted_period_count hasn't caught up with its real child rows yet (see cmd/backfill-fixedasset-posted-period-count)", code)
+	}
+}
+
+// TestPostDepreciation_DoesNotDeadlockAgainstOrdinaryFixedAssetSave is
+// the direct regression test for independent review's BLOCKER finding
+// on this decision's first draft: incrementFixedAssetPostedPeriodCount
+// writing FixedAsset AFTER its DepreciationSchedule row (the original
+// order) formed a real ABBA lock cycle against crud.Engine.Update's own
+// lock order for an ordinary FixedAsset save (FixedAsset write, THEN
+// GenerateDepreciationScheduleOnWrite's FOR UPDATE on its
+// DepreciationSchedule children) — reproduced directly against a real
+// Postgres. incrementFixedAssetPostedPeriodCount's own callers
+// (postDepreciationRow, markPosted) now take the FixedAsset lock
+// FIRST, matching that order.
+//
+// This reconstructs both orderings' exact lock-acquisition sequence
+// with manual synchronization — the same pattern internal/data's own
+// TestRecordRepo_ListByFieldForUpdateTx_BlocksConcurrentUpdate uses —
+// rather than relying on real-world timing to happen to interleave
+// badly, which would make this test flaky-by-luck instead of a real
+// regression guard.
+func TestPostDepreciation_DoesNotDeadlockAgainstOrdinaryFixedAssetSave(t *testing.T) {
+	fx := setUpDepreciationFixture(t)
+	ctx := context.Background()
+	assetID := fx.createAsset(t, "in_service", false) // useful_life_months: 3
+	fx.createScheduleRow(t, assetID, 1, "2020-01-31", 1000.00, 2000.00)
+	records := data.NewRecordRepo(fx.tenantDB)
+
+	// txA plays the "ordinary FixedAsset save" role: lock/write
+	// FixedAsset first (crud.Engine.Update's own first step), same as
+	// GenerateDepreciationScheduleOnWrite's caller would have already
+	// done by the time that hook runs.
+	txA, err := fx.tenantDB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin txA: %v", err)
+	}
+	defer txA.Rollback() //nolint:errcheck
+
+	asset, err := records.GetTx(ctx, txA, "FixedAsset", assetID)
+	if err != nil {
+		t.Fatalf("txA: GetTx FixedAsset: %v", err)
+	}
+	version := asset.Version
+	if _, err := records.UpdateTx(ctx, txA, "FixedAsset", assetID, asset.Data, &version); err != nil {
+		t.Fatalf("txA: lock FixedAsset: %v", err)
+	}
+
+	// txB plays the "posting" role, via the real production function —
+	// started concurrently while txA already holds the FixedAsset lock.
+	// Under the fix, this must BLOCK on FixedAsset (not deadlock, not
+	// error) until txA releases it.
+	done := make(chan error, 1)
+	go func() {
+		txB, err := fx.tenantDB.BeginTx(ctx, nil)
+		if err != nil {
+			done <- fmt.Errorf("begin txB: %w", err)
+			return
+		}
+		defer txB.Rollback() //nolint:errcheck
+		done <- incrementFixedAssetPostedPeriodCount(ctx, txB, records, assetID, humanActor())
+	}()
+
+	select {
+	case err := <-done:
+		t.Fatalf("expected txB to block behind txA's FixedAsset lock, but it completed (err=%v)", err)
+	case <-time.After(300 * time.Millisecond):
+		// Still blocked, as expected.
+	}
+
+	// txA now takes its OWN FOR UPDATE lock on the DepreciationSchedule
+	// children — the exact step that, under the OLD (schedule-row-first)
+	// posting order, txB would already be holding, closing the cycle.
+	// Under the fix, txB is blocked on FixedAsset alone and holds
+	// nothing txA needs, so this must succeed immediately, not hang or
+	// return a "deadlock detected" error.
+	lockDone := make(chan error, 1)
+	go func() {
+		_, err := records.ListByFieldForUpdateTx(ctx, txA, "DepreciationSchedule", "fixed_asset_id", assetID)
+		lockDone <- err
+	}()
+	select {
+	case err := <-lockDone:
+		if err != nil {
+			t.Fatalf("txA: lock DepreciationSchedule children: %v (a non-nil error here, especially one mentioning \"deadlock\", is exactly the regression this test exists to catch)", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("txA's own DepreciationSchedule lock never completed — txA is waiting on a lock txB should never hold, which is the deadlock shape this test exists to catch")
+	}
+
+	// txA's own update (even though it wrote back the same data)
+	// genuinely advanced FixedAsset's version, so once txB's blocked
+	// UPDATE finally runs it legitimately loses an ordinary optimistic-
+	// concurrency race against the row txA just committed — a real,
+	// EXPECTED outcome of two concurrent writers touching the same row
+	// (uc-infra#202 independent review's own MINOR finding 6: this is
+	// new, self-healing contention this decision accepts, not a bug).
+	// That is a completely different failure shape from a deadlock:
+	// ErrVersionConflict means Postgres let both transactions proceed
+	// and one lost a fair race; "deadlock detected" means Postgres had
+	// to unilaterally kill one to break a lock cycle neither would ever
+	// have escaped on its own. This test's whole job is telling those
+	// two apart — only the second one is the regression.
+	if err := txA.Commit(); err != nil {
+		t.Fatalf("commit txA: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil && strings.Contains(strings.ToLower(err.Error()), "deadlock") {
+			t.Fatalf("txB got a real Postgres deadlock, not just a lost version race: %v", err)
+		}
+		// err == nil (txB won the race) or a version conflict (txB lost
+		// it) are both acceptable — see the comment above.
+	case <-time.After(5 * time.Second):
+		t.Fatal("txB never completed after txA released the lock — it may still be blocked, which is itself a hang this test should catch")
+	}
+}
+
+// TestHealStuckFullyDepreciatedAssets_SpoofedCounterDoesNotTransitionPrematurely
+// is the direct regression test for independent review's other MAJOR
+// finding: posted_period_count is an ordinary entity.FieldNumber with
+// no write protection (unlike, say, DepreciationSchedule.overridden,
+// which schedule_hook.go recomputes on every write rather than trusting
+// the caller — uc-infra#236 finding F3). Anything with ordinary write
+// access to FixedAsset (a hidden form field, a raw API call) can set
+// posted_period_count to any value, including one that falsely claims
+// quota met. verifyLifeComplete is what stops that from ever causing an
+// actual (irreversible — no fully_depreciated -> in_service edge exists)
+// transition: it re-derives the true answer from the real
+// DepreciationSchedule rows before healStuckFullyDepreciatedAssets ever
+// calls transitionToFullyDepreciated, so a candidate the counter
+// surfaced but can't back up is silently excluded, not healed.
+func TestHealStuckFullyDepreciatedAssets_SpoofedCounterDoesNotTransitionPrematurely(t *testing.T) {
+	fx := setUpDepreciationFixture(t)
+	ctx := context.Background()
+	assetID := fx.createAsset(t, "in_service", false) // useful_life_months: 3
+	// Only 1 of 3 periods actually entered, none due yet (period_end far
+	// in the future) — genuinely nowhere near complete.
+	fx.createScheduleRow(t, assetID, 1, "2099-01-31", 1000.00, 2000.00)
+
+	// Spoof the counter directly (the exact hidden-field/API path
+	// independent review demonstrated), claiming the full quota met.
+	records := data.NewRecordRepo(fx.tenantDB)
+	asset, err := records.Get(ctx, "FixedAsset", assetID)
+	if err != nil {
+		t.Fatalf("Get FixedAsset: %v", err)
+	}
+	spoofedFields := map[string]any{}
+	for k, v := range asset.Data {
+		spoofedFields[k] = v
+	}
+	spoofedFields["posted_period_count"] = float64(3)
+	if _, err := records.Update(ctx, "FixedAsset", assetID, spoofedFields, nil); err != nil {
+		t.Fatalf("spoof posted_period_count: %v", err)
+	}
+
+	if _, err := PostDueDepreciation(ctx, fx.tenantDB, SchedulerActor()); err != nil {
+		t.Fatalf("PostDueDepreciation: %v", err)
+	}
+
+	if code := fx.statusCode(t, "FixedAsset", assetID); code != "in_service" {
+		t.Errorf("FixedAsset status = %q, want in_service — a spoofed posted_period_count must not be enough on its own to transition an asset whose real schedule is nowhere near complete", code)
 	}
 }
