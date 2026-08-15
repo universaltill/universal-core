@@ -112,6 +112,16 @@ jobs:
           git fetch origin ${{ github.event.pull_request.base.sha }} --depth=1
           git show ${{ github.event.pull_request.base.sha }}:internal/help/coverage_test.go > "${RUNNER_TEMP}/base-coverage_test.go" 2>/dev/null || true
           .github/scripts/check-help-allowlist.sh internal/help/coverage_test.go "${RUNNER_TEMP}/base-coverage_test.go"
+      # Same self-test-before-trusting-it discipline as the two self-test
+      # steps above, for emit-failure-annotations.sh (uc-infra#251) — see
+      # that script's own header for what it does and why. Placed after
+      # both self-test/tamper-check pairs, not between them, so it
+      # doesn't split either pairing (found in independent review of this
+      # exact change). No pull_request-only tamper check of its own to
+      # pair with — this script has no ratchet-able value for a PR to
+      # tamper with, unlike the two above.
+      - name: Failure-annotation script self-test
+        run: .github/scripts/emit-failure-annotations_test.sh
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -316,8 +326,21 @@ jobs:
       # 376KB, every `--- FAIL:` marker retained). The outer fence uses
       # four backticks so a test's own output containing a plain ``` (e.g.
       # dumping Markdown content) can't close it early.
-      - name: Publish failing test output to step summary
+      - name: Publish failing test output to step summary and annotations
         if: failure()
+        # uc-infra#251: $GITHUB_STEP_SUMMARY (below) has no REST/GraphQL
+        # API exposure — great for a human reading the Actions UI, useless
+        # to a cloud pipeline session with no browser and no blob-storage
+        # log access (every channel such a session can reach was tried
+        # and failed; see that issue's own writeup for the full list).
+        # The Checks API's annotations ARE reachable that way, so the same
+        # EXTRACT this step already computes is also handed to
+        # emit-failure-annotations.sh, which chunks and escapes it into
+        # ::error:: workflow commands — see that script's own header for
+        # the chunking/escaping rationale. Written to a temp file rather
+        # than passed as an argv string: EXTRACT can be large enough
+        # (capped at 900000 chars below, same as the summary) to risk
+        # exceeding a shell's argument-length limit.
         run: |
           LOG="${RUNNER_TEMP}/test-output.log"
           {
@@ -334,8 +357,15 @@ jobs:
               echo '````'
               printf '%s\n' "$EXTRACT" | tail -c 900000
               echo '````'
+              printf '%s' "$EXTRACT" | tail -c 900000 > "${RUNNER_TEMP}/test-failure-extract.txt"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -f "${RUNNER_TEMP}/test-failure-extract.txt" ]; then
+            .github/scripts/emit-failure-annotations.sh "${RUNNER_TEMP}/test-failure-extract.txt"
+          else
+            echo "::error::Test step failure detail unavailable — test-output.log not found (an earlier step likely failed first); check the job's other steps for which one actually failed."
+          fi
 
       - name: Coverage gate
         if: always()
