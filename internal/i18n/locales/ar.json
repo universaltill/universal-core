@@ -494,6 +494,7 @@
   "field.FixedAsset.depreciation_expense_account_id": "حساب مصروف الإهلاك",
   "field.FixedAsset.accumulated_depreciation_account_id": "حساب مجمع الإهلاك",
   "field.FixedAsset.status_id": "الحالة",
+  "field.FixedAsset.posted_period_count": "الفترات المرحّلة",
   "field.DepreciationSchedule.fixed_asset_id": "الأصل الثابت",
   "field.DepreciationSchedule.sequence": "التسلسل",
   "field.DepreciationSchedule.period_end": "نهاية الفترة",

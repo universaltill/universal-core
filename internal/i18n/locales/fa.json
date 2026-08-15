@@ -494,6 +494,7 @@
   "field.FixedAsset.depreciation_expense_account_id": "حساب هزینه استهلاک",
   "field.FixedAsset.accumulated_depreciation_account_id": "حساب استهلاک انباشته",
   "field.FixedAsset.status_id": "وضعیت",
+  "field.FixedAsset.posted_period_count": "دوره‌های ثبت‌شده",
   "field.DepreciationSchedule.fixed_asset_id": "دارایی ثابت",
   "field.DepreciationSchedule.sequence": "ترتیب",
   "field.DepreciationSchedule.period_end": "پایان دوره",

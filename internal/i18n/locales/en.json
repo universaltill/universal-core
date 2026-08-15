@@ -494,6 +494,7 @@
   "field.FixedAsset.depreciation_expense_account_id": "Depreciation Expense Account",
   "field.FixedAsset.accumulated_depreciation_account_id": "Accumulated Depreciation Account",
   "field.FixedAsset.status_id": "Status",
+  "field.FixedAsset.posted_period_count": "Posted Periods",
   "field.DepreciationSchedule.fixed_asset_id": "Fixed Asset",
   "field.DepreciationSchedule.sequence": "Sequence",
   "field.DepreciationSchedule.period_end": "Period End",
