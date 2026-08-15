@@ -108,6 +108,16 @@ func (c *Catalog) TOrDefault(locale, key, fallback string) string {
 	return fallback
 }
 
+// FallbackChain returns the ordered locale candidates ResolveLocalized
+// tries before falling back to "any translation" — exact locale, its
+// base language, the catalog's fallback locale, and the fallback's own
+// base language. Exported so callers building their own locale-aware
+// query (e.g. internal/api's i18n-aware sort) can mirror the same
+// precedence ResolveLocalized uses, without duplicating it.
+func (c *Catalog) FallbackChain(locale string) []string {
+	return []string{locale, baseLang(locale), c.fallback, baseLang(c.fallback)}
+}
+
 // ResolveLocalized resolves a record's multilingual value (an entity
 // FieldI18nText, ADR-0009) for the given viewer locale. v is the raw
 // value straight off the JSONB data column: for an i18n_text field it is a
@@ -131,7 +141,7 @@ func (c *Catalog) ResolveLocalized(v any, locale string) (string, bool) {
 		s, _ := m[loc].(string)
 		return s
 	}
-	for _, loc := range []string{locale, baseLang(locale), c.fallback, baseLang(c.fallback)} {
+	for _, loc := range c.FallbackChain(locale) {
 		if s := str(loc); s != "" {
 			return s, true
 		}

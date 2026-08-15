@@ -159,3 +159,107 @@ func TestI18nText_RealBrowser(t *testing.T) {
 		t.Fatalf("expected the reloaded picker to show the Turkish label 'Adet', got %q", currentLabel)
 	}
 }
+
+// TestI18nText_RealBrowser_SearchNarrowsAndSortsByViewerLocale is the
+// real-browser proof for the i18n-aware reference-picker search/sort fix
+// (uc-infra#249 item 1): before this fix, searchReferenceOptions forced
+// canSortFilter = false for any entity.FieldI18nText label field, so a
+// picker targeting one always degraded to an unsorted, unfiltered capped
+// listing — every record, in creation order, regardless of what was typed.
+// TestI18nText_RealBrowser above only ever seeds ONE MultiUnit record, so
+// it cannot distinguish "real per-locale filter/sort" from "degraded
+// unfiltered listing that happens to contain the one record" — both look
+// identical with a single row. This test seeds three, so a real DOM
+// assertion can tell the two apart:
+//
+//  1. Typing a Turkish substring that matches only SOME records' Turkish
+//     translation must narrow the rendered option list to just those
+//     matches, not render all three — proves the EXISTS/jsonb_each_text
+//     filter is real, not the old degrade-to-everything behaviour.
+//  2. The matching options must render in Turkish alphabetical order, NOT
+//     creation order — the two are deliberately made to disagree (the
+//     alphabetically-first match is created LAST) so a passing assertion
+//     can only mean the new SortI18nLocales/COALESCE sort actually ran,
+//     not a coincidence of insertion order.
+func TestI18nText_RealBrowser_SearchNarrowsAndSortsByViewerLocale(t *testing.T) {
+	withDevAuthEnabled(t)
+	srv, tenantID, tenantDB := testServer(t)
+
+	unitDef := &entity.Definition{
+		EntityType: "MultiUnit",
+		Version:    1,
+		Fields:     []entity.Field{{Name: "name", Type: entity.FieldI18nText, Required: true}},
+	}
+	unitForm := &form.Definition{
+		EntityType: "MultiUnit",
+		Version:    1,
+		Sections: []form.Section{{Title: "Details", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "name", Label: "Name"}}}},
+		Actions: []form.Action{{Label: "Save", Op: form.OpSave}},
+	}
+	widgetDef := &entity.Definition{
+		EntityType: "Widget2",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "sku", Type: entity.FieldString, Required: true},
+			{Name: "unit_id", Type: entity.FieldReference, Target: "MultiUnit"},
+		},
+	}
+	widgetForm := &form.Definition{
+		EntityType: "Widget2",
+		Version:    1,
+		Sections: []form.Section{{Title: "Details", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "sku", Label: "SKU"}, {Name: "unit_id", Label: "Unit"}}}},
+		Actions: []form.Action{{Label: "Save", Op: form.OpSave}},
+	}
+	publishDef(t, tenantDB, unitDef, unitForm)
+	publishDef(t, tenantDB, widgetDef, widgetForm)
+
+	ctx := browserCtx(t, tenantID)
+
+	// Deliberate creation order: "Adres" (address) first, "Kutu" (box, a
+	// non-match) second, "Adet" (unit) LAST. "Adet" sorts alphabetically
+	// BEFORE "Adres" in Turkish ('e' < 'r') despite being created after it
+	// — so a filtered+sorted result of [Adet, Adres] can only come from a
+	// real locale-aware sort, not from creation order surviving unchanged.
+	for _, u := range []struct{ en, tr string }{
+		{"Address unit", "Adres"},
+		{"Box", "Kutu"},
+		{"Each", "Adet"},
+	} {
+		if err := chromedp.Run(ctx,
+			chromedp.Navigate(srv.URL+"/forms/MultiUnit/new"),
+			chromedp.WaitVisible(`form.uc-form`, chromedp.ByQuery),
+			chromedp.SetValue(`input[name="name.en"]`, u.en, chromedp.ByQuery),
+			chromedp.SetValue(`input[name="name.tr"]`, u.tr, chromedp.ByQuery),
+			submitForm(),
+		); err != nil {
+			t.Fatalf("seed MultiUnit %q/%q: %v", u.en, u.tr, err)
+		}
+		savedRecordID(t, ctx, "MultiUnit")
+	}
+
+	// On a Turkish-locale Widget2 form, type "Ad" into the unit picker —
+	// matches "Adet" and "Adres" but not "Kutu".
+	scope := `.uc-ref[data-field="unit_id"]`
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(srv.URL+"/forms/Widget2/new?lang=tr"),
+		chromedp.WaitVisible(`form.uc-form`, chromedp.ByQuery),
+		chromedp.SendKeys(scope+` .uc-ref-search`, "Ad", chromedp.ByQuery),
+		chromedp.WaitVisible(scope+` .uc-ref-option`, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("type-ahead 'Ad': %v", err)
+	}
+
+	var labels []string
+	if err := chromedp.Run(ctx, chromedp.Evaluate(
+		`Array.prototype.map.call(document.querySelectorAll('`+scope+` .uc-ref-option'),function(e){return e.textContent;})`,
+		&labels,
+	)); err != nil {
+		t.Fatalf("read narrowed+sorted options: %v", err)
+	}
+	want := []string{"Adet", "Adres"}
+	if len(labels) != len(want) || labels[0] != want[0] || labels[1] != want[1] {
+		t.Fatalf("expected the Turkish type-ahead to narrow to %v in Turkish-alphabetical order (real per-locale filter+sort, not the old degrade-to-everything-in-creation-order behaviour), got %v", want, labels)
+	}
+}

@@ -483,6 +483,364 @@ func TestRecordRepo_ListPageFilteredEscapesLikeWildcards(t *testing.T) {
 	}
 }
 
+// TestRecordRepo_ListPageFilteredI18nText_MatchesNonDefaultLocale is the
+// core proof of FilterI18nText (ADR-0009): a substring present only in a
+// NON-default locale's translation must match, case-insensitively (same
+// as the plain ILIKE path) — a plain `data->>field ILIKE` would instead
+// match against the field's raw serialized JSON text, which is not what a
+// human typing into a picker means.
+func TestRecordRepo_ListPageFilteredI18nText_MatchesNonDefaultLocale(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(db)
+
+	if _, err := repo.Create(ctx, "MultiUnit", map[string]any{"name": map[string]any{"en": "Approved", "tr": "Onaylandı"}}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := repo.Create(ctx, "MultiUnit", map[string]any{"name": map[string]any{"en": "Rejected", "tr": "Reddedildi"}}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// "onay" is a substring only of the Turkish translation "Onaylandı",
+	// and is typed lower-case here on purpose — ILIKE is case-insensitive.
+	got, err := repo.ListPageFiltered(ctx, "MultiUnit", ListPageOptions{
+		FilterField: "name", FilterValue: "onay", FilterI18nText: true, Limit: 10,
+	})
+	if err != nil {
+		t.Fatalf("ListPageFiltered FilterI18nText: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected exactly 1 match, got %d: %+v", len(got), got)
+	}
+	name, ok := got[0].Data["name"].(map[string]any)
+	if !ok || name["en"] != "Approved" {
+		t.Fatalf("expected the Approved/Onaylandı record, got %+v", got[0].Data)
+	}
+}
+
+// TestRecordRepo_ListPageFilteredI18nText_LegacyPlainStringAndAbsentField
+// is the empirical proof (not just reasoning) that the CASE/jsonb_typeof
+// guard in front of jsonb_each_text actually works against real Postgres:
+// jsonb_each_text raises a real error on scalar jsonb input, and Postgres
+// does not guarantee AND short-circuits subquery evaluation order, so this
+// must be proven against a live database, not just read as safe.
+//
+// It also proves the trailing OR clause's own contract (independent
+// review): a legacy pre-migration row's plain-string value MUST still be
+// findable — recordLabel (internal/api/handlers.go) deliberately falls
+// through to render such a row's raw string as itself rather than a UUID,
+// specifically so it stays visible in a picker, and a filter that could
+// never find a still-visible row would be a real regression from the
+// pre-fix (fully unfiltered) behaviour, not just a documented gap. A row
+// with the field entirely ABSENT is a genuinely different case — nothing
+// to render or match either way — and must still not match.
+func TestRecordRepo_ListPageFilteredI18nText_LegacyPlainStringAndAbsentField(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(db)
+
+	// A legacy row predating the string->i18n_text migration: the field
+	// still holds a plain JSON string, not a locale->string object.
+	legacy, err := repo.Create(ctx, "MultiUnit", map[string]any{"name": "LegacyEach"})
+	if err != nil {
+		t.Fatalf("create legacy: %v", err)
+	}
+	// A row where the field is entirely absent from data.
+	absent, err := repo.Create(ctx, "MultiUnit", map[string]any{})
+	if err != nil {
+		t.Fatalf("create absent: %v", err)
+	}
+	// An ordinary, well-formed i18n object for a positive control.
+	control, err := repo.Create(ctx, "MultiUnit", map[string]any{"name": map[string]any{"en": "Each"}})
+	if err != nil {
+		t.Fatalf("create control: %v", err)
+	}
+
+	// Must not error against the legacy scalar, and must MATCH it — not
+	// the old "match neither" behaviour.
+	legacyHit, err := repo.ListPageFiltered(ctx, "MultiUnit", ListPageOptions{
+		FilterField: "name", FilterValue: "Legacy", FilterI18nText: true, Limit: 10,
+	})
+	if err != nil {
+		t.Fatalf("legacy plain-string value must not error the query: %v", err)
+	}
+	if len(legacyHit) != 1 || legacyHit[0].ID != legacy.ID {
+		t.Fatalf("expected the legacy plain-string row to match its own visible text, got %+v", legacyHit)
+	}
+
+	// The absent-field row must not error and must not match ANY query —
+	// there's genuinely nothing there to match.
+	absentMiss, err := repo.ListPageFiltered(ctx, "MultiUnit", ListPageOptions{
+		FilterField: "name", FilterValue: "x", FilterI18nText: true, Limit: 10,
+	})
+	if err != nil {
+		t.Fatalf("absent field must not error the query: %v", err)
+	}
+	for _, r := range absentMiss {
+		if r.ID == absent.ID {
+			t.Fatalf("an absent field must never match FilterI18nText, got %+v", r)
+		}
+	}
+
+	// The well-formed control also matches "Each" — and so does the
+	// legacy row itself now ("LegacyEach" contains "Each" as a
+	// substring), which is exactly the point: the guard doesn't
+	// accidentally suppress real matches on EITHER shape. Assert both
+	// expected ids are present rather than a bare count, so this doesn't
+	// depend on the two fixtures' text never overlapping.
+	hit, err := repo.ListPageFiltered(ctx, "MultiUnit", ListPageOptions{
+		FilterField: "name", FilterValue: "Each", FilterI18nText: true, Limit: 10,
+	})
+	if err != nil {
+		t.Fatalf("ListPageFiltered FilterI18nText: %v", err)
+	}
+	gotIDs := map[string]bool{}
+	for _, r := range hit {
+		gotIDs[r.ID] = true
+	}
+	if len(hit) != 2 || !gotIDs[legacy.ID] || !gotIDs[control.ID] {
+		t.Fatalf("expected both the legacy row (LegacyEach) and the well-formed control (Each) to match, got %+v", hit)
+	}
+}
+
+// TestRecordRepo_ListPageFilteredI18nText_Sort proves SortI18nLocales
+// orders by the first locale in the given priority chain that a record
+// actually has, falling back to the next locale per record — not a
+// query-wide single-locale sort — and sorts a record with none of the
+// given locales NULL/last.
+func TestRecordRepo_ListPageFilteredI18nText_Sort(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(db)
+
+	// hasTr: sorts by its own "tr" value ("Bravo").
+	hasTr, err := repo.Create(ctx, "MultiUnit", map[string]any{"name": map[string]any{"en": "Zulu", "tr": "Bravo"}})
+	if err != nil {
+		t.Fatalf("create hasTr: %v", err)
+	}
+	// hasEnOnly: no "tr" key at all, falls back to its "en" value ("Charlie").
+	hasEnOnly, err := repo.Create(ctx, "MultiUnit", map[string]any{"name": map[string]any{"en": "Charlie"}})
+	if err != nil {
+		t.Fatalf("create hasEnOnly: %v", err)
+	}
+	// hasNeither: neither "tr" nor "en" — must sort NULL/last.
+	hasNeither, err := repo.Create(ctx, "MultiUnit", map[string]any{"name": map[string]any{"fa": "something"}})
+	if err != nil {
+		t.Fatalf("create hasNeither: %v", err)
+	}
+
+	got, err := repo.ListPageFiltered(ctx, "MultiUnit", ListPageOptions{
+		SortField: "name", SortI18nLocales: []string{"tr", "en"}, Limit: 10,
+	})
+	if err != nil {
+		t.Fatalf("ListPageFiltered SortI18nLocales: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("expected 3 records, got %d: %+v", len(got), got)
+	}
+	// Effective sort keys: hasTr="Bravo", hasEnOnly="Charlie",
+	// hasNeither=NULL (NULLS LAST) → hasTr, hasEnOnly, hasNeither.
+	wantOrder := []string{hasTr.ID, hasEnOnly.ID, hasNeither.ID}
+	for i, id := range wantOrder {
+		if got[i].ID != id {
+			t.Fatalf("wrong sort order at position %d: got %+v, want ids in order %v", i, got, wantOrder)
+		}
+	}
+}
+
+// TestRecordRepo_ListPageFilteredI18nText_SortLegacyPlainStringAndAbsentField
+// is the SortI18nLocales counterpart of
+// TestRecordRepo_ListPageFilteredI18nText_LegacyPlainStringAndAbsentField:
+// proves, against real Postgres, that a legacy plain-string value sorts by
+// its OWN value (consistent with the filter side now finding it, and with
+// recordLabel rendering it as itself) rather than NULL/last, while a
+// genuine i18n object with none of the requested locales — a case that
+// looks similar (no per-locale match) but is NOT the same as a legacy
+// scalar — still sorts NULL/last exactly as
+// TestRecordRepo_ListPageFilteredI18nText_Sort's own hasNeither case
+// already pins. Both must coexist correctly in one query, not just in
+// isolation, so the jsonb_typeof(...) = 'string' guard is proven to
+// distinguish them rather than just proven not to error.
+func TestRecordRepo_ListPageFilteredI18nText_SortLegacyPlainStringAndAbsentField(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(db)
+
+	// legacy: a plain scalar string — must sort by "Charlie" itself.
+	legacy, err := repo.Create(ctx, "MultiUnit", map[string]any{"name": "Charlie"})
+	if err != nil {
+		t.Fatalf("create legacy: %v", err)
+	}
+	// wellFormed: a real i18n object matching one of the requested locales
+	// — must sort by "Bravo", ahead of the legacy row alphabetically.
+	wellFormed, err := repo.Create(ctx, "MultiUnit", map[string]any{"name": map[string]any{"en": "Bravo"}})
+	if err != nil {
+		t.Fatalf("create wellFormed: %v", err)
+	}
+	// noMatch: a real i18n object with NONE of the requested locales —
+	// must sort NULL/last, same as before this fix, NOT fall through to
+	// the legacy-string branch.
+	noMatch, err := repo.Create(ctx, "MultiUnit", map[string]any{"name": map[string]any{"fa": "Alpha"}})
+	if err != nil {
+		t.Fatalf("create noMatch: %v", err)
+	}
+	// absent: field entirely missing — must also sort NULL/last.
+	absent, err := repo.Create(ctx, "MultiUnit", map[string]any{})
+	if err != nil {
+		t.Fatalf("create absent: %v", err)
+	}
+
+	got, err := repo.ListPageFiltered(ctx, "MultiUnit", ListPageOptions{
+		SortField: "name", SortI18nLocales: []string{"en"}, Limit: 10,
+	})
+	if err != nil {
+		t.Fatalf("ListPageFiltered SortI18nLocales: %v", err)
+	}
+	if len(got) != 4 {
+		t.Fatalf("expected 4 records, got %d: %+v", len(got), got)
+	}
+	// Effective sort keys: wellFormed="Bravo", legacy="Charlie",
+	// noMatch/absent=NULL (NULLS LAST, tiebroken by id).
+	if got[0].ID != wellFormed.ID || got[1].ID != legacy.ID {
+		t.Fatalf("expected [wellFormed(Bravo), legacy(Charlie), ...] first, got %+v", got)
+	}
+	tailIDs := map[string]bool{got[2].ID: true, got[3].ID: true}
+	if !tailIDs[noMatch.ID] || !tailIDs[absent.ID] {
+		t.Fatalf("expected noMatch and absent last (NULLS LAST), got %+v", got)
+	}
+}
+
+// TestRecordRepo_ListPageFilteredI18nText_EscapesLikeWildcards is the
+// FilterI18nText counterpart of
+// TestRecordRepo_ListPageFilteredEscapesLikeWildcards — that test only
+// covers the plain ILIKE branch; escapeLike is applied identically on the
+// i18n branch (see filterWhereClause) but had no dedicated proof.
+func TestRecordRepo_ListPageFilteredI18nText_EscapesLikeWildcards(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(db)
+
+	if _, err := repo.Create(ctx, "MultiUnit", map[string]any{"name": map[string]any{"en": "50% Off"}}); err != nil {
+		t.Fatalf("create literal-percent: %v", err)
+	}
+	if _, err := repo.Create(ctx, "MultiUnit", map[string]any{"name": map[string]any{"en": "Anything Off"}}); err != nil {
+		t.Fatalf("create unrelated: %v", err)
+	}
+
+	// A literal "%" must match itself only — not act as a wildcard that
+	// would also match "Anything Off".
+	got, err := repo.ListPageFiltered(ctx, "MultiUnit", ListPageOptions{
+		FilterField: "name", FilterValue: "50%", FilterI18nText: true, Limit: 10,
+	})
+	if err != nil {
+		t.Fatalf("ListPageFiltered FilterI18nText: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected the literal \"50%%\" match only, got %d: %+v", len(got), got)
+	}
+	name, _ := got[0].Data["name"].(map[string]any)
+	if name["en"] != "50% Off" {
+		t.Fatalf("expected the literal-percent record, got %+v", got[0].Data)
+	}
+}
+
+// TestRecordRepo_ListPageFilteredI18nTextSortTakesPrecedenceOverNumeric
+// pins the precedence ListPageOptions.SortI18nLocales' own doc comment
+// documents but nothing previously tested: when both SortI18nLocales and
+// SortNumeric are set (a caller misconfiguration this repo's convention is
+// never to happen, but "never happens" isn't "cannot happen"), the i18n
+// sort must win, not silently produce a numeric-cast error/garbage order
+// on text data.
+func TestRecordRepo_ListPageFilteredI18nTextSortTakesPrecedenceOverNumeric(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(db)
+
+	first, err := repo.Create(ctx, "MultiUnit", map[string]any{"name": map[string]any{"en": "Alpha"}})
+	if err != nil {
+		t.Fatalf("create first: %v", err)
+	}
+	second, err := repo.Create(ctx, "MultiUnit", map[string]any{"name": map[string]any{"en": "Bravo"}})
+	if err != nil {
+		t.Fatalf("create second: %v", err)
+	}
+
+	got, err := repo.ListPageFiltered(ctx, "MultiUnit", ListPageOptions{
+		SortField: "name", SortI18nLocales: []string{"en"}, SortNumeric: true, Limit: 10,
+	})
+	if err != nil {
+		t.Fatalf("ListPageFiltered SortI18nLocales+SortNumeric: %v", err)
+	}
+	if len(got) != 2 || got[0].ID != first.ID || got[1].ID != second.ID {
+		t.Fatalf("expected the i18n text sort (Alpha, Bravo) to take precedence over SortNumeric, got %+v", got)
+	}
+}
+
+// TestRecordRepo_ListPageFilteredI18nText_FieldNameCannotInject is the
+// FilterI18nText/SortI18nLocales counterpart of
+// TestRecordRepo_ListPageFilteredFieldNameCannotInject — that test only
+// exercises the plain ILIKE/text-sort path; this proves a hostile field
+// name is equally inert on the new i18n-aware code paths.
+func TestRecordRepo_ListPageFilteredI18nText_FieldNameCannotInject(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(db)
+	if _, err := repo.Create(ctx, "MultiUnit", map[string]any{"name": map[string]any{"en": "safe"}}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	hostile := "name'); DROP TABLE records; --"
+
+	if _, err := repo.ListPageFiltered(ctx, "MultiUnit", ListPageOptions{
+		FilterField: hostile, FilterValue: "x", FilterI18nText: true, Limit: 10,
+	}); err != nil {
+		t.Fatalf("hostile FilterI18nText field should be inert, not error: %v", err)
+	}
+	if _, err := repo.ListPageFiltered(ctx, "MultiUnit", ListPageOptions{
+		SortField: hostile, SortI18nLocales: []string{"en", "tr'); DROP TABLE records; --"}, Limit: 10,
+	}); err != nil {
+		t.Fatalf("hostile SortI18nLocales field/locale should be inert, not error: %v", err)
+	}
+	// The table must still be there.
+	if _, err := repo.Create(ctx, "MultiUnit", map[string]any{"name": map[string]any{"en": "still here"}}); err != nil {
+		t.Fatalf("records table was harmed by a hostile field/locale name: %v", err)
+	}
+}
+
+// TestRecordRepo_CountFilteredI18nText confirms CountFiltered's row count
+// matches ListPageFiltered's own result set for the same FilterI18nText
+// filter — the contract CountFiltered's own doc comment describes, and it
+// shares filterWhereClause with ListPageFiltered so this also proves the
+// i18n branch is wired into both call sites, not just one.
+func TestRecordRepo_CountFilteredI18nText(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	repo := NewRecordRepo(db)
+
+	if _, err := repo.Create(ctx, "MultiUnit", map[string]any{"name": map[string]any{"en": "Approved", "tr": "Onaylandı"}}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := repo.Create(ctx, "MultiUnit", map[string]any{"name": map[string]any{"en": "Rejected", "tr": "Reddedildi"}}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	opts := ListPageOptions{FilterField: "name", FilterValue: "onay", FilterI18nText: true, Limit: 10}
+	rows, err := repo.ListPageFiltered(ctx, "MultiUnit", opts)
+	if err != nil {
+		t.Fatalf("ListPageFiltered: %v", err)
+	}
+	n, err := repo.CountFiltered(ctx, "MultiUnit", opts)
+	if err != nil {
+		t.Fatalf("CountFiltered: %v", err)
+	}
+	if n != len(rows) {
+		t.Fatalf("CountFiltered (%d) does not match ListPageFiltered row count (%d)", n, len(rows))
+	}
+	if n != 1 {
+		t.Fatalf("expected exactly 1 match, got %d", n)
+	}
+}
+
 // TestRecordRepo_ListPageFilteredEqualsFilters (uc-infra#78): EqualsFilters
 // is an exact-match condition ANDed onto the query, independent of
 // FilterField's own substring search — proves both that it filters at all

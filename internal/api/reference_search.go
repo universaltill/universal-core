@@ -56,22 +56,58 @@ func (h *Handler) searchReferenceOptions(w http.ResponseWriter, r *http.Request)
 	// declares name).
 	labelField := referenceLabelFieldFor(def)
 
-	// Decide whether the label field can drive the sort/filter query.
-	// It CAN'T when:
-	//   - it's hidden from this viewer (a FieldPermission, ADR-0006): the
-	//     guarded engine's rejectHiddenSortFilter would 403 the whole
-	//     request, breaking the picker for a role that can read the entity
-	//     but not that one field.
-	//   - it's an i18n_text field (ADR-0009): the stored value is a JSON
-	//     object, so `data->>'name'` sorts/filters by the whole object's
-	//     text, which is meaningless. Localized filtering needs a per-locale
-	//     JSONB expression index and is deferred (ties into #64).
-	// In both cases we degrade to an unsorted, unfiltered capped listing
-	// (the labels are still resolved below) rather than failing — the same
-	// graceful degradation referenceLabelFor uses. Controlled-vocabulary
-	// targets, the ones that get i18n labels, have few rows, so an unfiltered
-	// capped list is still usable.
+	// Decide whether the label field can drive the sort/filter query. It
+	// CAN'T when it's hidden from this viewer (a FieldPermission,
+	// ADR-0006): the guarded engine's rejectHiddenSortFilter would 403 the
+	// whole request, breaking the picker for a role that can read the
+	// entity but not that one field. In that case we degrade to an
+	// unsorted, unfiltered capped listing (the labels are still resolved
+	// below) rather than failing — the same graceful degradation
+	// referenceLabelFor uses.
+	//
+	// When the label field is an i18n_text field (ADR-0009), the stored
+	// value is a locale->string JSON object, not plain text — sort/filter
+	// use the viewer-locale-aware ListPageOptions.SortI18nLocales/
+	// FilterI18nText mechanism instead of the plain data->>field path, so
+	// this no longer needs to degrade. No per-locale JSONB index backs
+	// this (uc-infra#95's separate, larger deferred "dynamic DDL" scope)
+	// — FilterI18nText is a plain EXISTS/jsonb_each_text scan and
+	// SortI18nLocales an unindexable COALESCE, on the SAME i18n_text
+	// targets listview.go's own sortFilterableField comment already notes
+	// are NOT rare, low-cardinality controlled vocabularies (Project/Task/
+	// FixedAsset are unbounded transactional entities). Every debounced
+	// keystroke against one of those pickers is therefore a sequential
+	// scan today; accepted for now because the pre-fix degraded path was
+	// already a sequential scan (ListPageFiltered's own unfiltered listing
+	// still reads every row), not a regression — but real usage volume
+	// should decide whether uc-infra#95's indexing work gets prioritized,
+	// not this comment alone.
+	//
+	// FilterI18nText deliberately matches a query against EVERY locale's
+	// translation (OR-across-locales), not just the viewer's own resolved
+	// label — a scoped BA/Architect call for THIS endpoint (uc-infra#249),
+	// not an oversight. This is a real, intentional divergence from
+	// listview.go's referenceIDsMatching, which resolves matches
+	// APPLICATION-side against only the viewer-locale label specifically
+	// to avoid cross-locale matches (uc-infra#245's own review called that
+	// exact behaviour a defect for the list-column filter). The two
+	// surfaces now behave differently on purpose: a picker's whole job is
+	// helping someone FIND a record from partial/uncertain knowledge of
+	// its label (they may have typed the term they know it by in another
+	// language), where a false-negative (a real match not surfacing)
+	// costs more than an occasional label with no visible relationship to
+	// what was typed; a list column's filter is narrowing an already-
+	// visible column the user is reading top-to-bottom, where a result
+	// with no visible relationship to the query reads as broken. If this
+	// divergence ever gets "fixed" by a future change, that has to be a
+	// deliberate call in one direction, not an accidental copy-paste from
+	// whichever of the two this comment or listview.go's own is read
+	// first. (The narrower "en" matches literally everything defect
+	// #245 fixed does NOT recur here: jsonb_each_text yields each
+	// locale's VALUE, never its key, so a query never matches against a
+	// locale code by accident.)
 	canSortFilter := labelField != ""
+	i18nText := false
 	if canSortFilter {
 		hidden, err := ts.crud.HiddenFields(r.Context(), entityType)
 		if err != nil {
@@ -82,7 +118,7 @@ func (h *Handler) searchReferenceOptions(w http.ResponseWriter, r *http.Request)
 			canSortFilter = false
 		}
 		if f, ok := def.FieldByName(labelField); ok && f.Type == entity.FieldI18nText {
-			canSortFilter = false
+			i18nText = true
 		}
 	}
 
@@ -97,9 +133,24 @@ func (h *Handler) searchReferenceOptions(w http.ResponseWriter, r *http.Request)
 	}
 	if canSortFilter {
 		opts.SortField = labelField
+		if i18nText {
+			// Dedupe here, not inside Catalog.FallbackChain itself —
+			// FallbackChain's own contract (and its pinned test) is to
+			// return ResolveLocalized's exact walked sequence, duplicates
+			// included (e.g. FallbackChain("en") is
+			// ["en","en","en","en"]: base language of "en" is "en" again,
+			// and the catalog fallback commonly IS "en"). Left undeduped,
+			// every COALESCE arm this drives would carry redundant
+			// identical branches — harmless for correctness, but that's
+			// 2 bind params and one extraction evaluated per row per
+			// comparison for nothing. Order-preserving so precedence is
+			// unchanged.
+			opts.SortI18nLocales = dedupeLocales(h.catalog.FallbackChain(locale))
+		}
 		if q != "" {
 			opts.FilterField = labelField
 			opts.FilterValue = q
+			opts.FilterI18nText = i18nText
 		}
 	}
 
@@ -153,4 +204,20 @@ func (h *Handler) searchReferenceOptions(w http.ResponseWriter, r *http.Request)
 		out = append(out, formrender.ReferenceOption{ID: rec.ID, Label: h.recordLabel(def, rec, locale)})
 	}
 	httpx.WriteJSON(w, http.StatusOK, out)
+}
+
+// dedupeLocales drops repeat locale codes from a Catalog.FallbackChain
+// result while preserving order (and therefore precedence) — see its call
+// site's own doc comment for why this belongs here rather than inside
+// FallbackChain itself.
+func dedupeLocales(locales []string) []string {
+	seen := make(map[string]bool, len(locales))
+	out := make([]string, 0, len(locales))
+	for _, l := range locales {
+		if !seen[l] {
+			seen[l] = true
+			out = append(out, l)
+		}
+	}
+	return out
 }
