@@ -483,7 +483,7 @@ func TestEngine_ResolveReferenceFilter_EntityJoinCondition(t *testing.T) {
 	if !ok {
 		t.Fatal("assignee_id field not found")
 	}
-	opts, err := engine.ResolveReferenceFilter(ctx, assigneeField, "")
+	opts, err := engine.ResolveReferenceFilter(ctx, assignmentDef(), assigneeField, "")
 	if err != nil {
 		t.Fatalf("ResolveReferenceFilter: %v", err)
 	}
@@ -534,7 +534,7 @@ func TestEngine_ResolveReferenceFilter_MustMatchParentField(t *testing.T) {
 	if !ok {
 		t.Fatal("parent_item_id field not found")
 	}
-	opts, err := engine.ResolveReferenceFilter(ctx, parentField, "group-a")
+	opts, err := engine.ResolveReferenceFilter(ctx, def, parentField, "group-a")
 	if err != nil {
 		t.Fatalf("ResolveReferenceFilter: %v", err)
 	}
@@ -561,7 +561,7 @@ func TestEngine_ResolveReferenceFilter_EmptySiblingValueAppliesNoRestriction(t *
 	if !ok {
 		t.Fatal("parent_item_id field not found")
 	}
-	opts, err := engine.ResolveReferenceFilter(ctx, parentField, "")
+	opts, err := engine.ResolveReferenceFilter(ctx, def, parentField, "")
 	if err != nil {
 		t.Fatalf("ResolveReferenceFilter: %v", err)
 	}
@@ -570,6 +570,172 @@ func TestEngine_ResolveReferenceFilter_EmptySiblingValueAppliesNoRestriction(t *
 	}
 	if opts.IDIn != nil {
 		t.Fatalf("expected no IDIn restriction for a field with no TargetFilter, got %v", opts.IDIn)
+	}
+}
+
+// --- status_id auto-scoping to sourceDef's own StatusType (ADR-0032,
+// uc-infra#250) — no declared TargetFilter involved at all; the
+// narrowing is derived purely from sourceDef.StatusTypeCode, the exact
+// fixtures status_test.go's ValidateStatusTransition tests already use
+// for the equivalent write-path scoping. ---
+
+// partyDef is purchaseOrderDef's counterpart for a SECOND, distinct
+// StatusTypeCode ("party_status") — used below to prove the narrowing
+// is actually keyed on sourceDef.StatusTypeCode, not incidentally
+// narrowed to whichever StatusType happens to be seeded/created first
+// (independent review, ADR-0032/uc-infra#250: the original version of
+// this test used only ONE real sourceDef, so a bug that hardcoded
+// "purchase_order_status" — or "the first StatusType row in the
+// tenant" — instead of actually reading sourceDef.StatusTypeCode would
+// still have passed it).
+func partyDef() *entity.Definition {
+	return &entity.Definition{
+		EntityType:     "Party",
+		Version:        1,
+		StatusTypeCode: "party_status",
+		Fields: []entity.Field{
+			{Name: "status_id", Type: entity.FieldReference, Required: true, Target: "Status"},
+		},
+	}
+}
+
+func TestEngine_ResolveReferenceFilter_StatusIDScopedToOwnStatusType(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+	fx := seedStatusFixture(t, ctx, engine)
+
+	// A second StatusType/Status pair, seeded AFTER purchase_order_status
+	// (so ordering can't accidentally make it "the narrowing" either) —
+	// party_status's own Active status.
+	otherType, err := engine.Create(ctx, statusTypeDef(), map[string]any{
+		"entity_type": "Party", "code": "party_status", "name": "Party Status",
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed other status type: %v", err)
+	}
+	activeStatus, err := engine.Create(ctx, statusDef(), map[string]any{
+		"status_type_id": otherType.ID, "code": "active", "name": "Active", "is_initial": true,
+	}, actor)
+	if err != nil {
+		t.Fatalf("seed other status: %v", err)
+	}
+
+	poDef := purchaseOrderDef()
+	poStatusField, ok := poDef.FieldByName("status_id")
+	if !ok {
+		t.Fatal("status_id field not found on purchaseOrderDef")
+	}
+	partyD := partyDef()
+	partyStatusField, ok := partyD.FieldByName("status_id")
+	if !ok {
+		t.Fatal("status_id field not found on partyDef")
+	}
+
+	// PurchaseOrder's own picker: draft + submitted only.
+	poOpts, err := engine.ResolveReferenceFilter(ctx, poDef, poStatusField, "")
+	if err != nil {
+		t.Fatalf("ResolveReferenceFilter(purchaseOrderDef): %v", err)
+	}
+	if len(poOpts.EqualsFilters) != 1 || poOpts.EqualsFilters[0].Field != "status_type_id" {
+		t.Fatalf("expected exactly one status_type_id EqualsFilters entry, got %+v", poOpts.EqualsFilters)
+	}
+	poRecs, err := engine.ListPageFiltered(ctx, statusDef(), data.ListPageOptions{Limit: 10, EqualsFilters: poOpts.EqualsFilters})
+	if err != nil {
+		t.Fatalf("ListPageFiltered with resolved EqualsFilters (PurchaseOrder): %v", err)
+	}
+	if len(poRecs) != 2 {
+		t.Fatalf("expected exactly the 2 purchase_order_status statuses (draft, submitted), got %+v", poRecs)
+	}
+	gotIDs := map[string]bool{poRecs[0].ID: true, poRecs[1].ID: true}
+	if !gotIDs[fx.draftID] || !gotIDs[fx.submittedID] {
+		t.Fatalf("expected draft (%s) and submitted (%s) in results, got %+v", fx.draftID, fx.submittedID, poRecs)
+	}
+	for _, rec := range poRecs {
+		if rec.Data["code"] == "active" {
+			t.Fatalf("expected party_status's Active status excluded from PurchaseOrder's picker, got %+v", poRecs)
+		}
+	}
+
+	// SAME target field shape, DIFFERENT sourceDef (Party, StatusTypeCode
+	// "party_status") — must narrow to the OPPOSITE set: Active only,
+	// draft/submitted excluded. This is the actual proof the EqualsFilters
+	// value tracks sourceDef.StatusTypeCode rather than being constant.
+	partyOpts, err := engine.ResolveReferenceFilter(ctx, partyD, partyStatusField, "")
+	if err != nil {
+		t.Fatalf("ResolveReferenceFilter(partyDef): %v", err)
+	}
+	if len(partyOpts.EqualsFilters) != 1 || partyOpts.EqualsFilters[0].Field != "status_type_id" {
+		t.Fatalf("expected exactly one status_type_id EqualsFilters entry, got %+v", partyOpts.EqualsFilters)
+	}
+	if partyOpts.EqualsFilters[0].Value == poOpts.EqualsFilters[0].Value {
+		t.Fatalf("expected a DIFFERENT status_type_id than PurchaseOrder's own — got the same value %q for both sourceDefs", partyOpts.EqualsFilters[0].Value)
+	}
+	partyRecs, err := engine.ListPageFiltered(ctx, statusDef(), data.ListPageOptions{Limit: 10, EqualsFilters: partyOpts.EqualsFilters})
+	if err != nil {
+		t.Fatalf("ListPageFiltered with resolved EqualsFilters (Party): %v", err)
+	}
+	if len(partyRecs) != 1 || partyRecs[0].ID != activeStatus.ID {
+		t.Fatalf("expected exactly party_status's Active status, got %+v", partyRecs)
+	}
+}
+
+func TestEngine_ResolveReferenceFilter_StatusIDFieldWithoutStatusTypeCodeNotNarrowed(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	engine := NewEngine(db)
+
+	// A field shaped exactly like a real status_id field (name, type,
+	// target) but declared on a Definition with NO StatusTypeCode —
+	// entity.Definition.Validate() would never let a real module publish
+	// this shape (it only REQUIRES status_id when StatusTypeCode is set,
+	// it doesn't forbid the field existing without it), but
+	// ResolveReferenceFilter must not infer scoping from field
+	// name/target alone, only from sourceDef.StatusTypeCode explicitly —
+	// this proves the guard checks both, not just the field's own shape.
+	def := &entity.Definition{
+		EntityType: "Widget",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "status_id", Type: entity.FieldReference, Target: "Status"},
+		},
+	}
+	statusField, ok := def.FieldByName("status_id")
+	if !ok {
+		t.Fatal("status_id field not found")
+	}
+
+	opts, err := engine.ResolveReferenceFilter(ctx, def, statusField, "")
+	if err != nil {
+		t.Fatalf("ResolveReferenceFilter: %v", err)
+	}
+	if len(opts.EqualsFilters) != 0 {
+		t.Fatalf("expected no auto-narrowing for a Definition with no StatusTypeCode, got %+v", opts.EqualsFilters)
+	}
+}
+
+func TestEngine_ResolveReferenceFilter_StatusIDUnresolvableStatusTypeCodeReturnsError(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	// Deliberately no seedStatusFixture call — purchase_order_status is
+	// not published for this tenant, matching
+	// TestValidateStatusTransition_CreateRequiresStatusID's sibling
+	// "not published" gap on the write-path check this mirrors.
+
+	def := purchaseOrderDef()
+	statusField, ok := def.FieldByName("status_id")
+	if !ok {
+		t.Fatal("status_id field not found")
+	}
+
+	_, err := engine.ResolveReferenceFilter(ctx, def, statusField, "")
+	if err == nil {
+		t.Fatal("expected an error resolving picker narrowing for an unpublished StatusTypeCode, not a silent skip")
+	}
+	if !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("expected the error to wrap ErrInvalidTransition (same sentinel statusTypeIDByCode already uses), got %v", err)
 	}
 }
 

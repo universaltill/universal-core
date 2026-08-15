@@ -1125,7 +1125,37 @@ func (g *GuardedEngine) ValidateStatusTransition(ctx context.Context, def *entit
 // Narrowing this further needs TargetConstraintError to carry the join's
 // field names, not attempted here (uc-infra#106 follow-up, tracked
 // separately rather than expanding this fix's scope).
-func (g *GuardedEngine) ResolveReferenceFilter(ctx context.Context, f entity.Field, siblingValue string) (data.ListPageOptions, error) {
+// sourceDef is the Definition declaring f — see crud.Engine.
+// ResolveReferenceFilter's own doc comment. Disclosure-wise it's passed
+// straight through to g.raw with no extra gate for the ADR-0032
+// status_id auto-scoping it enables: resolving sourceDef.StatusTypeCode
+// reads StatusType via the same ungated path ValidateStatusTransition
+// (also a bare delegate, just above) already reads it through today —
+// not a new disclosure.
+//
+// AVAILABILITY, unlike disclosure, DOES need a gate here (independent
+// review, ADR-0032/uc-infra#250): g.raw's status_id auto-scoping adds an
+// EqualsFilters{Field: StatusTypeIDFieldName} entry unconditionally, on
+// every status-managed entity's picker, with no per-Definition opt-out
+// — unlike a declared Field.TargetFilter (which a module author chooses
+// to add), nobody decided to wire this per field. ListPageFiltered's own
+// rejectHiddenSortFilter denies the ENTIRE request outright when ANY
+// EqualsFilters entry names a field hidden from this actor
+// (authz.go's rejectHiddenSortFilter, uc-infra#78 follow-up) — so if a
+// tenant merely hides Status.status_type_id via FieldPermission (a
+// plausible, reasonable admin choice: it's a technical id field, not
+// business content), EVERY status_id picker in the product 403s
+// outright, and since status_id is Required (entity/definition.go's
+// Validate), that actor can no longer save the form at all. Dropped
+// below instead — same "narrow less, don't break the picker outright"
+// posture the entity-join TargetFilter case above already takes, and
+// for the identical underlying reason: an auto-applied narrowing this
+// wrapper is responsible for keeping optional at the read layer, not
+// something rejectHiddenSortFilter should be allowed to escalate into a
+// hard failure the way it deliberately does for a caller-supplied
+// MustMatchParentField value (see rejectHiddenSortFilter's own doc
+// comment on why THAT case stays a denial, not a drop).
+func (g *GuardedEngine) ResolveReferenceFilter(ctx context.Context, sourceDef *entity.Definition, f entity.Field, siblingValue string) (data.ListPageOptions, error) {
 	if len(f.TargetFilter) > 0 {
 		readable := make([]entity.TargetFilterCondition, 0, len(f.TargetFilter))
 		for _, cond := range f.TargetFilter {
@@ -1149,5 +1179,24 @@ func (g *GuardedEngine) ResolveReferenceFilter(ctx context.Context, f entity.Fie
 		}
 		f.TargetFilter = readable
 	}
-	return g.raw.ResolveReferenceFilter(ctx, f, siblingValue)
+	opts, err := g.raw.ResolveReferenceFilter(ctx, sourceDef, f, siblingValue)
+	if err != nil {
+		return data.ListPageOptions{}, err
+	}
+	if f.Name == entity.StatusIDFieldName && f.Target == "Status" {
+		hiddenOnTarget, err := g.res.HiddenFields(ctx, f.Target)
+		if err != nil {
+			return data.ListPageOptions{}, err
+		}
+		if hiddenOnTarget[entity.StatusTypeIDFieldName] {
+			kept := opts.EqualsFilters[:0]
+			for _, eq := range opts.EqualsFilters {
+				if eq.Field != entity.StatusTypeIDFieldName {
+					kept = append(kept, eq)
+				}
+			}
+			opts.EqualsFilters = kept
+		}
+	}
+	return opts, nil
 }

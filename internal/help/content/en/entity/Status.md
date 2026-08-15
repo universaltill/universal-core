@@ -44,6 +44,10 @@ brand-new lifecycle from scratch on a new Status Type.
   Cancelled. Trying to move a purchase order straight from Draft to
   Received — skipping Submitted and Approved — is rejected, because no
   Status Transition connects them directly.
+- A record's Status picker only offers statuses that belong to that
+  record type's own Status Type — a status seeded for a different record
+  type (a different Status Type) is never offered, even if you can read
+  every Status Type in the tenant.
 
 ## What it connects to
 

@@ -1,12 +1,17 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/universaltill/universal-core/internal/kernel/foundation"
+	"github.com/universaltill/universal-core/internal/kernel/purchasing"
+	"github.com/universaltill/universal-core/internal/kernel/sales"
 )
 
 // createVendor is a small helper: POST one Vendor record through the real
@@ -395,5 +400,168 @@ func TestReferenceSearch_RequiresAuth(t *testing.T) {
 	mux.ServeHTTP(rec, req)
 	if rec.Code == http.StatusOK {
 		t.Fatalf("expected an auth failure, got 200: %s", rec.Body.String())
+	}
+}
+
+// TestReferenceSearch_SourceField_StatusIDAutoScopedToOwnStatusType is
+// the HTTP-level proof of ADR-0032's status_id auto-scoping
+// (internal/kernel/crud/target_constraints_test.go's
+// TestEngine_ResolveReferenceFilter_StatusIDScopedToOwnStatusType proves
+// the mechanism itself) — against two REAL modules' real published
+// Definitions (purchasing.PurchaseOrder, sales.SalesOrder), not a
+// throwaway test Definition, so this also confirms the real
+// entity_definitions rows these ship with actually carry StatusTypeCode
+// as the mechanism assumes, and that no source_entity_type/source_field
+// wiring beyond passing sourceDef through (already done for
+// TargetFilter/MustMatchParentField) is needed for a picker to pick this
+// up. Uses two DIFFERENT real StatusTypes specifically so a narrowing
+// bug that returns everything is caught, not just one that narrows to
+// the wrong-but-still-single StatusType.
+func TestReferenceSearch_SourceField_StatusIDAutoScopedToOwnStatusType(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, tenantDB := newTestTenant(t, router)
+	ctx := context.Background()
+	actor := humanActor()
+
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := foundation.PublishForms(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.PublishForms: %v", err)
+	}
+	if err := purchasing.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("purchasing.Publish: %v", err)
+	}
+	if err := purchasing.PublishForms(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("purchasing.PublishForms: %v", err)
+	}
+	if err := purchasing.PublishStatuses(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("purchasing.PublishStatuses: %v", err)
+	}
+	if err := sales.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("sales.Publish: %v", err)
+	}
+	if err := sales.PublishForms(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("sales.PublishForms: %v", err)
+	}
+	if err := sales.PublishStatuses(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("sales.PublishStatuses: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	req := newRequest("GET",
+		"/api/references/Status?source_entity_type=PurchaseOrder&source_field=status_id",
+		tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	opts := decodeRefOptions(t, rec.Body.Bytes())
+	// purchase_order_status seeds exactly 5: Draft, Submitted, Approved,
+	// Received, Cancelled (purchasing/seed.go PublishStatuses).
+	if len(opts) != 5 {
+		t.Fatalf("expected exactly the 5 purchase_order_status statuses, got %d: %+v", len(opts), opts)
+	}
+	wantLabels := map[string]bool{"Draft": true, "Submitted": true, "Approved": true, "Received": true, "Cancelled": true}
+	for _, o := range opts {
+		if !wantLabels[o.Label] {
+			t.Fatalf("unexpected status leaked into PurchaseOrder's own status_id picker: %+v (full list %+v)", o, opts)
+		}
+	}
+	// sales_order_status's own-named statuses (Confirmed, Fulfilled,
+	// Invoiced — NOT shared with purchase_order_status, unlike
+	// Draft/Cancelled) must never appear: the concrete proof this is
+	// narrowed, not just coincidentally short.
+	for _, o := range opts {
+		if o.Label == "Confirmed" || o.Label == "Fulfilled" || o.Label == "Invoiced" {
+			t.Fatalf("sales_order_status's own status leaked into PurchaseOrder's status_id picker: %+v", o)
+		}
+	}
+
+	// The COMPLEMENTARY query — SalesOrder's own status_id picker — must
+	// narrow to the OPPOSITE set (independent review, ADR-0032/
+	// uc-infra#250: the single-sourceDef version of this test couldn't
+	// distinguish "narrowed by sourceDef.StatusTypeCode" from "narrowed
+	// to whichever StatusType happened to seed first"; querying a SECOND
+	// real entity and asserting the sets swap is what actually proves
+	// it's keyed on sourceDef).
+	req2 := newRequest("GET",
+		"/api/references/Status?source_entity_type=SalesOrder&source_field=status_id",
+		tenantID, "farshid", nil)
+	rec2 := httptest.NewRecorder()
+	mux.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec2.Code, rec2.Body.String())
+	}
+	opts2 := decodeRefOptions(t, rec2.Body.Bytes())
+	// sales_order_status seeds exactly 5: Draft, Confirmed, Fulfilled,
+	// Invoiced, Cancelled (sales/seed.go PublishStatuses).
+	if len(opts2) != 5 {
+		t.Fatalf("expected exactly the 5 sales_order_status statuses, got %d: %+v", len(opts2), opts2)
+	}
+	for _, o := range opts2 {
+		if o.Label == "Submitted" || o.Label == "Approved" || o.Label == "Received" {
+			t.Fatalf("purchase_order_status's own status leaked into SalesOrder's status_id picker: %+v", o)
+		}
+	}
+}
+
+// TestReferenceSearch_SourceField_StatusIDUnpublishedStatusTypeIs400Not500
+// is the regression test for the second independent-review finding on
+// this task: an unresolvable StatusTypeCode (purchasing published, but
+// purchasing.PublishStatuses never run — modulebundle.Install's own doc
+// comment documents this exact non-atomic, resumable window as a real,
+// reachable state, not a hypothetical) used to fall through to
+// writeInternalError → 500, even though every OTHER call site
+// classifies the identical crud.ErrInvalidTransition as a 400
+// (handlers.go's create/updateRecord). source_entity_type/source_field
+// are caller-supplied query params, so this was reachable by any
+// authenticated user, not just an edge case an operator might hit.
+func TestReferenceSearch_SourceField_StatusIDUnpublishedStatusTypeIs400Not500(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, tenantDB := newTestTenant(t, router)
+	ctx := context.Background()
+	actor := humanActor()
+
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := foundation.PublishForms(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.PublishForms: %v", err)
+	}
+	if err := purchasing.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("purchasing.Publish: %v", err)
+	}
+	if err := purchasing.PublishForms(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("purchasing.PublishForms: %v", err)
+	}
+	// Deliberately NOT calling purchasing.PublishStatuses — PurchaseOrder
+	// is published with StatusTypeCode "purchase_order_status" set, but
+	// no StatusType row exists yet for this tenant.
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	req := newRequest("GET",
+		"/api/references/Status?source_entity_type=PurchaseOrder&source_field=status_id",
+		tenantID, "farshid", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 (a tenant-provisioning state, not a server fault), got %d: %s", rec.Code, rec.Body.String())
+	}
+	var env struct {
+		Error *string `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("unmarshal error envelope: %v", err)
+	}
+	if env.Error == nil || *env.Error == "" {
+		t.Fatalf("expected a non-empty error message, got %+v", env)
 	}
 }
