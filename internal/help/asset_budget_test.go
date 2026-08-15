@@ -8,19 +8,21 @@ import (
 // Size budget for internal/help/content/assets/ (uc-infra#145: "Help
 // screenshots... with a staleness check and a size budget"). Chosen with
 // real headroom over what TestCaptureHelpScreenshots (internal/e2e)
-// actually measured when this file was written: 8 files, 1280x800
-// viewport JPEGs at helpScreenshotJPEGQuality=82, individually
-// 32,818-42,818 bytes, ~304,927 bytes (~298 KB) total. See this test's
-// own t.Logf output on every run for the current exact per-file sizes.
+// actually measured: 8 files, 1280x800 viewport JPEGs at
+// helpScreenshotJPEGQuality=82, individually 34,730-53,311 bytes (the
+// "help" family's real, populated manual — uc-infra#192 — is the
+// largest of the 8 since uc-infra#147-152 shipped real topic content),
+// ~331,114 bytes (~323 KB) total. See this test's own t.Logf output on
+// every run for the current exact per-file sizes.
 const (
 	// helpAssetPerImageBudgetBytes: the largest real capture measured
-	// ~42.8 KB — 100 KB is a little over 2x that, enough headroom for a
+	// ~53.3 KB — 100 KB is a little under 2x that, enough headroom for a
 	// future page with visibly more content without being so loose it
 	// would wave through a genuinely bloated capture (e.g. a PNG-quality
 	// misconfiguration regenerating these at 10x the size).
 	helpAssetPerImageBudgetBytes = 100 * 1024
 	// helpAssetTotalBudgetBytes: 8 files at the per-image budget would be
-	// 800 KB; the real total measured ~298 KB, so 500 KB leaves
+	// 800 KB; the real total measured ~323 KB, so 500 KB leaves
 	// comparable headroom on the total without permitting every file to
 	// simultaneously max out its own individual budget at the same time.
 	helpAssetTotalBudgetBytes = 500 * 1024
