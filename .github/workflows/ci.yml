@@ -228,6 +228,19 @@ jobs:
         # COVERPKGS silently and `-coverpkg=""` is accepted by `go test`
         # (falls back to plain per-package coverage) rather than erroring
         # — found in independent review, verified by reproducing it.
+        #
+        # `tee "${RUNNER_TEMP}/test-output.log"` (uc-infra#240): the
+        # postgres service container's own stdout gets flushed into this
+        # job's log as one giant burst at container-teardown time, big
+        # enough to exhaust every log-fetch tool's effective return-size
+        # cap before a tail-based fetch can reach back to this step's own
+        # `go test` output — so this step also writes its own output to a
+        # dedicated file the "Publish failing test output" step below can
+        # read directly, independent of the rest of the job log. `tee`
+        # doesn't change `go test`'s exit code reaching this script:
+        # `pipefail` (already set) makes the pipeline's exit status the
+        # last non-zero of `go test`/`tee`, and `tee` itself only fails on
+        # a write error.
         run: |
           set -euo pipefail
           COVERPKGS=$(go list ./... | grep -v '/cmd/' | tr '\n' ',' | sed 's/,$//')
@@ -235,7 +248,73 @@ jobs:
             echo "::error::go list produced no non-cmd packages — refusing to run with an empty -coverpkg (would silently fall back to plain per-package coverage)."
             exit 1
           fi
-          go test ./... -race -count=1 -p 1 -timeout=30m -coverprofile=coverage.out -coverpkg="$COVERPKGS" -covermode=atomic
+          go test ./... -race -count=1 -p 1 -timeout=30m -coverprofile=coverage.out -coverpkg="$COVERPKGS" -covermode=atomic 2>&1 | tee "${RUNNER_TEMP}/test-output.log"
+
+      # uc-infra#240: surfaces the actual `go test` failure detail (which
+      # subtest, its output) through $GITHUB_STEP_SUMMARY — a channel
+      # separate from the job log the postgres service container's own
+      # teardown-time stdout burst dominates, so a cloud pipeline session
+      # (or anyone else) can see *which* test failed without needing a
+      # tail-based fetch of the whole job log to reach it. `if: failure()`
+      # runs this whenever an earlier step failed, not only Test itself —
+      # harmless when `test-output.log` doesn't exist (an earlier step,
+      # e.g. Vet, failed first): reported as such rather than erroring.
+      #
+      # `grep -B 60 -A 30 -- '--- FAIL:'` captures each failing (sub)test's
+      # surrounding output — a heuristic, not a precise per-test extraction
+      # (Go doesn't emit a machine-clean per-test boundary in plain-text
+      # mode; `-json` would, but that would also make this step's own
+      # *human-readable* log output harder to skim, which is the more
+      # common way this is actually read). The wide, asymmetric window is
+      # deliberate, not arbitrary: a `-race` report prints a `WARNING: DATA
+      # RACE` header and two full goroutine stacks (~45-60 lines) *before*
+      # its `--- FAIL:` line, and a panic's own stack trace prints *after*
+      # it — independent review (uc-infra#240) verified empirically that
+      # the previous `-B 20`-only version silently dropped the race header
+      # and the panic stack, i.e. exactly the failure information this step
+      # exists to surface. Still an approximation for a pathologically long
+      # single-goroutine stack; `tail -c 900000` (below) is the backstop.
+      #
+      # A `-timeout=30m` expiry is a *different* failure shape this
+      # extraction alone is blind to: `go test` prints
+      # `panic: test timed out after 30m0s` and the running tests' names,
+      # but never a `--- FAIL:` line, so the grep above matches nothing —
+      # checked explicitly via a separate `grep -c` rather than "is the
+      # extracted text empty", because the trailing `grep '^FAIL'` for the
+      # package summary line still matches even when the `--- FAIL:`
+      # extraction itself found nothing, which silently defeated an
+      # earlier, simpler version of this fallback (independent review,
+      # uc-infra#240 — verified empirically: the combined text was never
+      # actually empty, so that version's fallback never triggered and a
+      # timeout still published a near-empty, test-name-less summary).
+      # Falling back to the full log when no `--- FAIL:` line exists at all
+      # covers a timeout and any other failure shape this heuristic doesn't
+      # anticipate, the same way. `tail -c 900000` bounds either branch to
+      # comfortably under $GITHUB_STEP_SUMMARY's 1MiB-per-step cap even if
+      # many tests fail at once (verified against a 200-failure fixture:
+      # 376KB, every `--- FAIL:` marker retained). The outer fence uses
+      # four backticks so a test's own output containing a plain ``` (e.g.
+      # dumping Markdown content) can't close it early.
+      - name: Publish failing test output to step summary
+        if: failure()
+        run: |
+          LOG="${RUNNER_TEMP}/test-output.log"
+          {
+            echo "## Test step failure detail (uc-infra#240)"
+            if [ ! -f "$LOG" ]; then
+              echo "\`test-output.log\` not found — the Test step likely never ran (an earlier step failed first)."
+            else
+              FAIL_LINES=$(grep -c -- '--- FAIL:' "$LOG" 2>/dev/null || true)
+              if [ "${FAIL_LINES:-0}" -eq 0 ]; then
+                EXTRACT="$(cat "$LOG")"
+              else
+                EXTRACT=$( { grep -B 60 -A 30 -- '--- FAIL:' "$LOG"; echo; grep '^FAIL' "$LOG"; } 2>/dev/null || true )
+              fi
+              echo '````'
+              printf '%s\n' "$EXTRACT" | tail -c 900000
+              echo '````'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Coverage gate
         if: always()
