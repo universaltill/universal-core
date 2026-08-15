@@ -527,7 +527,7 @@ func TestGenerateDepreciationScheduleOnWrite_UpdateAfterPosting_Rejected(t *test
 	// Simulate PostDueDepreciation having posted the first row — via the
 	// raw records repo, matching production's own non-engine posting
 	// path (markSchedulePosted's own doc comment, ledger_test.go).
-	fx.markSchedulePosted(t, rows[0].ID, rows[0].Data["period_end"].(string))
+	fx.markSchedulePosted(t, rec.ID, rows[0].ID, rows[0].Data["period_end"].(string))
 
 	changed := map[string]any{}
 	for k, v := range base {
@@ -663,7 +663,7 @@ func TestGenerateDepreciationScheduleOnWrite_PriorCorrectionThenPosted_Unrelated
 	// stored — the correction itself, not the original Build value) —
 	// via the raw records repo, matching production's own non-engine
 	// posting path.
-	fx.markSchedulePosted(t, rows[0].ID, rows[0].Data["period_end"].(string))
+	fx.markSchedulePosted(t, rec.ID, rows[0].ID, rows[0].Data["period_end"].(string))
 
 	unrelated := map[string]any{}
 	for k, v := range base {
@@ -780,7 +780,7 @@ func TestGenerateDepreciationScheduleOnWrite_GenuineChangeStillRejectedDespiteOv
 	if _, err := fx.engine.Update(ctx, publishedDef(t, fx.tenantDB, "DepreciationSchedule"), rows[0].ID, corrected, nil, humanActor()); err != nil {
 		t.Fatalf("correct DepreciationSchedule row: %v", err)
 	}
-	fx.markSchedulePosted(t, rows[1].ID, rows[1].Data["period_end"].(string))
+	fx.markSchedulePosted(t, rec.ID, rows[1].ID, rows[1].Data["period_end"].(string))
 
 	changed := map[string]any{}
 	for k, v := range base {
@@ -827,7 +827,7 @@ func TestGenerateDepreciationScheduleOnWrite_UpdateAfterPosting_UnrelatedFieldSt
 	if err != nil || len(rows) == 0 {
 		t.Fatalf("list DepreciationSchedule: %v (n=%d)", err, len(rows))
 	}
-	fx.markSchedulePosted(t, rows[0].ID, rows[0].Data["period_end"].(string))
+	fx.markSchedulePosted(t, rec.ID, rows[0].ID, rows[0].Data["period_end"].(string))
 
 	unrelated := map[string]any{}
 	for k, v := range base {
@@ -894,7 +894,7 @@ func TestGenerateDepreciationScheduleOnWrite_AllRowsOverriddenAndPosted_GenuineC
 	// One row also gets posted — bypassing the override hook, matching
 	// production's own posting path (does not disturb the overridden
 	// flag the correction above already set).
-	fx.markSchedulePosted(t, rows[0].ID, rows[0].Data["period_end"].(string))
+	fx.markSchedulePosted(t, rec.ID, rows[0].ID, rows[0].Data["period_end"].(string))
 
 	changed := map[string]any{}
 	for k, v := range base {

@@ -43,6 +43,7 @@ import "github.com/universaltill/universal-core/internal/kernel/entity"
 func FixedAsset() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "FixedAsset",
+		// Version 4 (uc-infra#202): gained posted_period_count below.
 		// Version 3 (uc-infra#80): cost, salvage_value and
 		// useful_life_months gained Min:0 bounds. Version 2 (board #20)
 		// gained the maintenance related list below. The registry is
@@ -50,7 +51,7 @@ func FixedAsset() *entity.Definition {
 		// edit to the last — moduleseed publishes it alongside the old
 		// ones and GetPublished takes the highest, which is the designed
 		// upgrade path for a module that ships again.
-		Version:        3,
+		Version:        4,
 		Module:         "assets",
 		StatusTypeCode: "fixed_asset_status",
 		Fields: []entity.Field{
@@ -81,6 +82,42 @@ func FixedAsset() *entity.Definition {
 			{Name: "depreciation_expense_account_id", Type: entity.FieldReference, Target: "Account"},
 			{Name: "accumulated_depreciation_account_id", Type: entity.FieldReference, Target: "Account"},
 			{Name: "status_id", Type: entity.FieldReference, Required: true, Target: "Status"},
+			// posted_period_count (uc-infra#202, Version 4) is a
+			// denormalized, engine-managed running count of this asset's
+			// own DepreciationSchedule children with a non-empty
+			// posted_at — NOT user-editable (deliberately absent from
+			// FixedAssetForm, forms.go), maintained only by
+			// ledger.go's incrementFixedAssetPostedPeriodCount, in the
+			// SAME transaction as the DepreciationSchedule row's own
+			// posted_at write (postDepreciationRow, markPosted). Exists
+			// so healStuckFullyDepreciatedAssets's completion sweep can
+			// ask "is this asset's schedule quota met" as an O(1)
+			// comparison against useful_life_months (data.
+			// LifeCompleteGroupOptions.ParentCounterField) instead of a
+			// correlated count(*) over every candidate asset's own
+			// posted rows every call — the O(total schedule-row volume)
+			// cost ADR-0026's own Consequences section filed as this
+			// follow-up.
+			//
+			// This IS an invariant a caller must keep, not a value that
+			// self-heals: unlike the count(*) it replaces, this field
+			// can drift from reality if something ever sets
+			// DepreciationSchedule.posted_at without also going through
+			// the two functions above (ledger_test.go's own
+			// markSchedulePosted test helper does both, for exactly this
+			// reason — see its doc comment). A record already written
+			// before Version 4 has no key here at all, which a JSONB
+			// read treats as 0 — correct for a never-posted asset, wrong
+			// for one with real posted history; cmd/backfill-fixedasset-
+			// posted-period-count corrects that once per tenant. Both
+			// gaps fail SAFE, not silently wrong the dangerous way: a
+			// too-low count only ever makes the sweep think an asset
+			// ISN'T finished yet when it actually is (a healing delay,
+			// not an incorrect premature transition) — see that
+			// function's own doc comment for why LifeField's own
+			// `> 0` guard plus this field's regex-guarded cast can never
+			// make a missing/malformed value read as "quota met".
+			{Name: "posted_period_count", Type: entity.FieldNumber, Default: float64(0), Min: entity.Float64Ptr(0)},
 		},
 		Relationships: []entity.Relationship{
 			// Composition, not a related list: a schedule row has no

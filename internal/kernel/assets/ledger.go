@@ -347,37 +347,66 @@ func PostDueDepreciationBatch(ctx context.Context, db *sql.DB, actor audit.Actor
 // records.LifeCompleteGroupIDs answers this as ONE SQL query instead of
 // a Go-side loop, and its RESULT is empty in the ordinary, healthy
 // steady state (nothing stuck). Its own per-call COST is NOT fully
-// proportional to how many assets are actually stuck, though —
-// independent review measured this directly (ADR-0026's own note): the
-// correlated count(*) subquery still has to read every in_service
-// candidate asset's own posted rows to know it ISN'T stuck, which sums
-// to roughly the same order as the tenant's total schedule-row volume
-// for in_service assets, the same asymptotic shape as the bug this
-// whole change exists to fix, just executed in Postgres instead of Go.
-// A real fix (a denormalized per-asset posted-count, or a bounded/
-// rotating candidate batch instead of every in_service asset every
-// call) is real follow-up work, filed as uc-infra#202 rather than
-// designed into this same change — see ADR-0026's Consequences section.
-// What this DOES still fix, unconditionally: ListDueUnposted's own
-// worklist-read cost (the dominant, measured cost in uc-infra#182's own
-// motivating example) is genuinely bounded now; this sweep's residual
-// cost is a smaller, separate, and honestly-documented gap, not a
-// regression from before this change.
+// proportional to how many assets are actually stuck: independent
+// review measured this directly (ADR-0026's own note, ADR-0029) — the
+// underlying NOT EXISTS anti-join this sweep has always used (both
+// before and after uc-infra#202) is not served by any index once the
+// child field name is a bind parameter rather than a literal, so a call
+// where MOST in_service assets are genuinely stuck still costs
+// something close to the tenant's total schedule-row volume, the same
+// asymptotic shape as the bug this whole change exists to fix. What
+// uc-infra#202's ParentCounterField (below) DOES fix unconditionally is
+// the common, steady-state case — nothing stuck, the quota comparison
+// alone excludes every candidate before the anti-join subquery ever
+// runs (independent review measured ~9,500x on ADR-0026's own worked
+// example) — and it is never worse than the plain count(*) path it
+// replaces even in the worst case (still measured faster, since it
+// drops the count(*) subquery's own cost on top of the shared anti-join
+// one). See ADR-0029's Consequences for the measured numbers in both
+// the healthy and fully-stuck cases; don't call this "cheap" or
+// "indexed" in a future edit without re-verifying against EXPLAIN
+// (ANALYZE, BUFFERS) first — independent review found this comment's
+// own prior claim to that effect was simply wrong.
+//
+// LifeCompleteGroupIDs' result here is a CANDIDATE list, not a verified
+// one — uc-infra#202's own posted_period_count counter is maintained by
+// ordinary FixedAsset writes elsewhere in this kernel (the generic
+// entity/form/API surface has no concept of a caller-uneditable field),
+// so nothing stops a candidate from reaching this list with a counter
+// that doesn't match its real DepreciationSchedule rows (spoofed via a
+// direct write, or drifted via a hand-corrected schedule row through
+// DepreciationScheduleForm, which updates posted_at without going
+// through incrementFixedAssetPostedPeriodCount at all — independent
+// review's findings on this decision's first draft). verifyLifeComplete
+// below re-derives the true answer from this ONE candidate's own
+// DepreciationSchedule rows (bounded by that one asset's own schedule
+// length, not the tenant's total row volume) before
+// transitionToFullyDepreciated ever runs — the irreversible write only
+// ever happens on a confirmed answer, never on the counter's word
+// alone. A candidate the counter over-claimed is silently excluded
+// here (not logged as an error — an ordinary, expected outcome of using
+// a fast, sometimes-wrong filter ahead of a slow, always-right check);
+// an asset the counter under-claims (drifted low, or not yet
+// backfilled) never becomes a candidate at all and is simply not
+// healed by this call — the same accepted, self-correcting-by-operator
+// gap ADR-0029 already documents.
+//
 // The returned windowFull (uc-infra#183) reports whether this sweep's
 // own candidate read hit limit — same "the LIMIT was actually the
 // limiting factor" signal PostDueDepreciationBatch's due-rows read uses,
 // and the same narrow imprecision (a stuck count that lands exactly on
 // limit still reads as windowFull after a sweep that actually caught
 // every stuck asset). transitioned counts only the candidates this call
-// ACTUALLY moved to fully_depreciated — not len(stuck), which also
-// includes any candidate transitionToFullyDepreciated failed for (logged
-// below, not returned as an error: one bad asset must not stop the rest
-// from healing). PostDueDepreciationBatch needs this distinction to tell
-// "the window is full of assets this call is genuinely making progress
-// on" apart from "the window is full of assets permanently stuck for a
-// reason this sweep can never resolve" — see its own doc comment.
+// ACTUALLY moved to fully_depreciated — not len(candidates), which also
+// includes any candidate verifyLifeComplete refuted or
+// transitionToFullyDepreciated failed for (logged below, not returned
+// as an error: one bad asset must not stop the rest from healing).
+// PostDueDepreciationBatch needs this distinction to tell "the window
+// is full of assets this call is genuinely making progress on" apart
+// from "the window is full of assets permanently stuck for a reason
+// this sweep can never resolve" — see its own doc comment.
 func healStuckFullyDepreciatedAssets(ctx context.Context, db *sql.DB, records *data.RecordRepo, actor audit.Actor, statusID, today string, limit int) (transitioned int, windowFull bool, err error) {
-	stuck, err := records.LifeCompleteGroupIDs(ctx, data.LifeCompleteGroupOptions{
+	candidates, err := records.LifeCompleteGroupIDs(ctx, data.LifeCompleteGroupOptions{
 		ParentType:       "FixedAsset",
 		ParentMatchField: "status_id",
 		ParentMatchValue: statusID,
@@ -387,18 +416,76 @@ func healStuckFullyDepreciatedAssets(ctx context.Context, db *sql.DB, records *d
 		ChildPostedField: "posted_at",
 		ChildDueField:    "period_end",
 		Cutoff:           today,
+		// uc-infra#202: FixedAsset.posted_period_count (assets.go) turns
+		// this into a cheap pre-filter instead of a per-candidate
+		// count(*) — see this function's own doc comment for why its
+		// result still gets verified, not trusted, before anything
+		// transitions.
+		ParentCounterField: "posted_period_count",
 	}, limit)
 	if err != nil {
-		return 0, false, fmt.Errorf("find stuck fully-depreciated FixedAssets: %w", err)
+		return 0, false, fmt.Errorf("find stuck fully-depreciated FixedAsset candidates: %w", err)
 	}
-	for _, assetID := range stuck {
+	for _, assetID := range candidates {
+		verified, err := verifyLifeComplete(ctx, records, assetID, today)
+		if err != nil {
+			log.Printf("assets: verify stuck FixedAsset %s: %v", assetID, err)
+			continue
+		}
+		if !verified {
+			continue
+		}
 		if err := transitionToFullyDepreciated(ctx, db, records, assetID, actor); err != nil {
 			log.Printf("assets: heal stuck FixedAsset %s: %v", assetID, err)
 			continue
 		}
 		transitioned++
 	}
-	return transitioned, len(stuck) == limit, nil
+	return transitioned, len(candidates) == limit, nil
+}
+
+// verifyLifeComplete re-derives, directly from assetID's own real
+// DepreciationSchedule rows, whether its schedule is GENUINELY
+// exhausted: at least useful_life_months periods posted, AND none due
+// (period_end <= today) and unposted. This is healStuckFullyDepreciatedAssets's
+// safety net against trusting posted_period_count's word alone (see
+// that function's own doc comment) — it recomputes the exact same two
+// conditions LifeCompleteGroupIDs' SQL checks, but scoped to one asset
+// via ordinary reads (RecordRepo.Get/ListByField), so its own cost is
+// bounded by that one asset's own schedule length, not the tenant's
+// total row volume — it does not reintroduce the per-call cost
+// uc-infra#202 exists to avoid, because it only ever runs for the
+// small, LIMIT-bounded candidate set the fast path already narrowed
+// things down to, never for every in_service asset.
+func verifyLifeComplete(ctx context.Context, records *data.RecordRepo, assetID, today string) (bool, error) {
+	asset, err := records.Get(ctx, "FixedAsset", assetID)
+	if err != nil {
+		return false, fmt.Errorf("resolve FixedAsset %s: %w", assetID, err)
+	}
+	life, ok := asset.Data["useful_life_months"].(float64)
+	if !ok || life <= 0 {
+		return false, nil
+	}
+
+	rows, err := records.ListByField(ctx, "DepreciationSchedule", "fixed_asset_id", assetID)
+	if err != nil {
+		return false, fmt.Errorf("list DepreciationSchedule for FixedAsset %s: %w", assetID, err)
+	}
+	var postedCount float64
+	for _, r := range rows {
+		postedAt, _ := r.Data["posted_at"].(string)
+		if postedAt != "" {
+			postedCount++
+			continue
+		}
+		periodEnd, _ := r.Data["period_end"].(string)
+		if periodEnd != "" && periodEnd <= today {
+			// A real due-and-unposted row remains — not life-complete,
+			// regardless of how many other rows are posted.
+			return false, nil
+		}
+	}
+	return postedCount >= life, nil
 }
 
 // depreciationInServiceStatusID resolves the fixed_asset_status
@@ -586,7 +673,7 @@ func postDepreciationRow(ctx context.Context, db *sql.DB, records *data.RecordRe
 		// rather than indistinguishable from an ordinary one.
 		log.Printf("assets: DepreciationSchedule %s has a zero depreciation_amount (period_end %s) — marking posted with no journal entry",
 			row.ID, row.Data["period_end"])
-		if err := markPosted(ctx, db, records, row, actor); err != nil {
+		if err := markPosted(ctx, db, records, asset.ID, row, actor); err != nil {
 			return false, err
 		}
 		return true, nil
@@ -605,6 +692,23 @@ func postDepreciationRow(ctx context.Context, db *sql.DB, records *data.RecordRe
 	}
 	if alreadyPosted {
 		return false, nil
+	}
+
+	// FixedAsset locked/written FIRST, before the DepreciationSchedule
+	// row below — deliberately matching crud.Engine.Update's own lock
+	// order for an ordinary FixedAsset save (records.UpdateTx on the
+	// FixedAsset itself, THEN GenerateDepreciationScheduleOnWrite's
+	// FOR UPDATE on its DepreciationSchedule children). Independent
+	// review of this decision's first draft found the REVERSE order
+	// here (schedule row first, FixedAsset second) forms a real ABBA
+	// lock cycle against that ordinary save path and reproduced the
+	// resulting Postgres deadlock directly — every write in this
+	// transaction must acquire FixedAsset's row lock before
+	// DepreciationSchedule's, full stop; see
+	// incrementFixedAssetPostedPeriodCount's own doc comment for why
+	// the write still has to happen at all.
+	if err := incrementFixedAssetPostedPeriodCount(ctx, tx, records, asset.ID, actor); err != nil {
+		return false, err
 	}
 
 	periodEnd, _ := row.Data["period_end"].(string)
@@ -643,13 +747,25 @@ func postDepreciationRow(ctx context.Context, db *sql.DB, records *data.RecordRe
 // markPosted is postDepreciationRow's zero-amount path: no journal entry
 // to post, but posted_at still needs to advance so this row is never
 // reconsidered "due" again — its own transaction and audit entry, same
-// discipline as every other write in this file.
-func markPosted(ctx context.Context, db *sql.DB, records *data.RecordRepo, row data.Record, actor audit.Actor) error {
+// discipline as every other write in this file. assetID is row's own
+// FixedAsset (postDepreciationRow's own asset.ID — a zero-amount row
+// still completes a period against that asset's quota, so it must bump
+// posted_period_count exactly like the non-zero path does, in the same
+// transaction, or the two paths would silently disagree about what
+// "posted" means for the counter's purposes).
+func markPosted(ctx context.Context, db *sql.DB, records *data.RecordRepo, assetID string, row data.Record, actor audit.Actor) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op after commit
+
+	// FixedAsset first — see postDepreciationRow's own comment on this
+	// same ordering for why (a reproduced deadlock against an ordinary
+	// FixedAsset save, independent review's blocker finding).
+	if err := incrementFixedAssetPostedPeriodCount(ctx, tx, records, assetID, actor); err != nil {
+		return err
+	}
 
 	periodEnd, _ := row.Data["period_end"].(string)
 	newData := mergedRecordData(row.Data, map[string]any{"posted_at": periodEnd})
@@ -665,6 +781,60 @@ func markPosted(ctx context.Context, db *sql.DB, records *data.RecordRepo, row d
 		return fmt.Errorf("write audit entry for DepreciationSchedule %s posted_at: %w", row.ID, err)
 	}
 	return tx.Commit()
+}
+
+// incrementFixedAssetPostedPeriodCount bumps FixedAsset assetID's
+// posted_period_count (assets.go) by 1, within the caller's own tx —
+// called FIRST, before either caller (postDepreciationRow, markPosted)
+// writes its own DepreciationSchedule row, deliberately: this must
+// acquire FixedAsset's row lock before DepreciationSchedule's, matching
+// crud.Engine.Update's own lock order for an ordinary FixedAsset save
+// (FixedAsset write, then GenerateDepreciationScheduleOnWrite's FOR
+// UPDATE on its children) — the reverse order deadlocks against that
+// path under concurrent load (independent review reproduced this
+// directly against a real Postgres on this decision's first draft,
+// which called this LAST). Same transaction as the DepreciationSchedule
+// write either way, so the two can never land as separately-crashable
+// events.
+//
+// This keeps posted_period_count USEFUL as a fast pre-filter (data.
+// LifeCompleteGroupOptions.ParentCounterField) — cheap to maintain,
+// cheap to compare — but it is NOT the sole authority for a real
+// transition: nothing here (or anywhere else the generic entity/API
+// surface reaches) stops an ordinary FixedAsset write from setting this
+// field to whatever a caller submits, and DepreciationScheduleForm can
+// change posted_at on a child row without this function ever running.
+// healStuckFullyDepreciatedAssets's verifyLifeComplete is what
+// re-derives the real answer from the actual child rows before trusting
+// a candidate this counter surfaced — see that function's own doc
+// comment.
+//
+// Re-reads the asset fresh via GetTx (not any earlier snapshot the
+// caller might be holding) for the same reason
+// transitionToFullyDepreciated does: postAssetDepreciation can call this
+// (via postDepreciationRow) more than once for the SAME asset within one
+// call, one row at a time, and each increment must see the previous
+// one's own write, not a stale in-memory count.
+func incrementFixedAssetPostedPeriodCount(ctx context.Context, tx *sql.Tx, records *data.RecordRepo, assetID string, actor audit.Actor) error {
+	asset, err := records.GetTx(ctx, tx, "FixedAsset", assetID)
+	if err != nil {
+		return fmt.Errorf("resolve FixedAsset %s: %w", assetID, err)
+	}
+	count, _ := asset.Data["posted_period_count"].(float64)
+	newCount := count + 1
+	newData := mergedRecordData(asset.Data, map[string]any{"posted_period_count": newCount})
+	expectedVersion := asset.Version
+	if _, err := records.UpdateTx(ctx, tx, "FixedAsset", assetID, newData, &expectedVersion); err != nil {
+		return fmt.Errorf("increment FixedAsset %s posted_period_count: %w", assetID, err)
+	}
+	auditEntry, err := audit.New("FixedAsset", assetID, audit.ActionUpdate, actor, map[string]any{"posted_period_count": newCount})
+	if err != nil {
+		return fmt.Errorf("build audit entry for FixedAsset %s posted_period_count: %w", assetID, err)
+	}
+	if err := data.NewAuditRepo(nil).Insert(ctx, tx, auditEntry); err != nil {
+		return fmt.Errorf("write audit entry for FixedAsset %s posted_period_count: %w", assetID, err)
+	}
+	return nil
 }
 
 // transitionToFullyDepreciated advances a FixedAsset from in_service to
