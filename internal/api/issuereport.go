@@ -246,6 +246,38 @@ func (h *Handler) issueReportTranscribe(w http.ResponseWriter, r *http.Request) 
 	locale := localeFromRequest(w, r)
 	transcript, err := h.speech.Transcribe(r.Context(), file, filename, locale)
 	if err != nil {
+		// uc-infra#239, independent review: a superseded take's client-side
+		// AbortController closes this connection, which cancels r.Context()
+		// and — since Transcribe threads it through to the outbound Whisper
+		// call — surfaces here as a plain request-failed error wrapping
+		// context.Canceled, exactly like any other network failure. That is
+		// now a ROUTINE outcome of a normal fast re-take (the whole point of
+		// #239's own fix), not a real transcription failure: the client that
+		// issued this request is already gone and never sees this response
+		// either way, so writeInternalError's log.Printf would misreport an
+		// ordinary abort as a genuine ASR/network fault indistinguishable
+		// from one in the logs. r.Context().Err() (rather than
+		// errors.Is(err, context.Canceled) against speechassist's wrapped
+		// error) is checked directly: it's the actual, authoritative signal
+		// for "this request's own context ended," independent of exactly how
+		// speechassist/net/http happened to wrap the underlying error.
+		//
+		// Independent review, nitpick: this is a superset of "client
+		// aborted" — it also silences a genuine Whisper-side failure on the
+		// rarer coincidence that the client happened to disconnect first
+		// (e.g. the person closed the tab while a real outage was in
+		// progress), and would (in principle, not reachable through this
+		// deployment's own net/http server + a real browser fetch(), which
+		// always closes the connection on abort) mask a reverse-proxy-level
+		// cancellation unrelated to any client AbortController. Accepted:
+		// either way the original caller is already gone and was never
+		// going to see this response, so the only real cost is a missed
+		// log line in an already-rare coincidence — a smaller cost than
+		// this endpoint's other alternative, misreporting every ordinary
+		// fast re-take as a genuine ASR fault.
+		if r.Context().Err() != nil {
+			return
+		}
 		writeInternalError(w, "transcribe voice note", err)
 		return
 	}
@@ -695,6 +727,42 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
   // stayed unanswered — this was caught by review, not shipped.
   var recordAttemptGeneration = 0;
   var recordingGeneration = 0;
+  // transcribeAbortController identifies "the most recent recordingGeneration-
+  // owning attempt's own request-cancellation handle" — one level down
+  // from recordingGeneration itself (deliberately NOT recordAttemptGeneration
+  // — see below), one level below: aborting it cancels that take's
+  // in-flight /issue-report/transcribe fetch (uc-infra#239, the
+  // AbortController design pass uc-infra#238's own commit deferred here)
+  // instead of only letting the recordingGeneration guard drop its result
+  // silently once it eventually resolves. Dropping the result already
+  // stopped a stale take's response from being *applied*; this stops the
+  // request from being *sent at all* past the point it's genuinely
+  // superseded, cutting real ASR load on a fast re-take sequence.
+  // Reassigned (after aborting whatever it previously pointed to) at the
+  // exact same moment myRecordingGeneration = ++recordingGeneration runs
+  // in the getUserMedia().then() callback below — i.e. once a NEW take
+  // has actually reached a successful mediaRecorder.start(), the same
+  // event that makes recordingGeneration itself advance.
+  //
+  // Deliberately NOT tied to recordAttemptGeneration / the Record click
+  // itself, despite that being the more obvious "supersede now" signal
+  // (and this fix's own first draft did exactly that): independent review
+  // caught that a click alone doesn't mean the PREVIOUS take's data has
+  // actually been superseded — recordAttemptGeneration and
+  // recordingGeneration deliberately disagree while a new attempt's own
+  // getUserMedia/mediaRecorder.start() hasn't yet succeeded (uc-infra#238's
+  // whole point: recordAttemptGeneration owns the status line eagerly,
+  // recordingGeneration owns the transcript/description only once data is
+  // real). Aborting at click time would cancel a still-legitimate EARLIER
+  // take's real, in-flight transcribe call whenever the new attempt's own
+  // start() throws or its getUserMedia rejects (#238's Gap A/Gap B,
+  // respectively) — destroying a transcript recordingGeneration's own
+  // .then guard would otherwise have correctly let land, since nothing
+  // genuinely superseded it in that case. Tying cancellation to
+  // recordingGeneration's own bump instead means "this take's request was
+  // cancelled" and "this take's eventual result would have been dropped
+  // anyway" are now the same condition, not two independently-timed ones.
+  var transcribeAbortController = null;
 
   // Deliberately an if/else, NOT an early "return" out of the whole IIFE
   // (independent review, uc-infra#92: the earlier version DID return
@@ -825,6 +893,26 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
           // transcribe callbacks — which never fire in that case — would
           // otherwise have read.
           var myRecordingGeneration;
+          // uc-infra#239: thisController mirrors myRecordingGeneration
+          // exactly — declared here (undefined), only actually ARMED
+          // (previous attempt's controller aborted, this attempt's own
+          // controller stored) once mediaRecorder.start() below actually
+          // succeeds. Independent review of this fix's own first draft
+          // caught a real bug in aborting any earlier (e.g. at click time,
+          // right alongside recordAttemptGeneration's own bump): cancelling
+          // the PREVIOUS attempt's transcribe request must track
+          // recordingGeneration, not recordAttemptGeneration — the exact
+          // distinction uc-infra#238 drew between which counter owns the
+          // status line (recordAttemptGeneration) versus the transcript/
+          // description (recordingGeneration, deliberately looser — see
+          // that counter's own outer-scope comment). Aborting eagerly
+          // would cancel a still-legitimate EARLIER take's real, in-flight
+          // transcribe call whenever THIS attempt's own start() throws or
+          // its getUserMedia never even resolves (uc-infra#238's Gap A/
+          // Gap B) — silently destroying a transcript that
+          // recordingGeneration's own guard would otherwise have let land
+          // normally, since nothing genuinely superseded it in that case.
+          var thisController;
           mediaRecorder.ondataavailable = function(e) { if (e.data.size > 0) chunks.push(e.data); };
           mediaRecorder.onstop = function() {
             // uc-infra#223: resync recording/the button label here too,
@@ -858,29 +946,39 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
             // newer take had already started — clobbering whatever the
             // newer, currently-visible take had shown, or (for transcript/
             // description) silently overwriting user edits made in the
-            // meantime with a stale take's result. This take's own request
-            // is still sent either way (aborting it would need an
-            // AbortController this take never set up, and the guard's job
-            // is only to stop a stale result from being *applied*, not to
-            // cancel the network request — see uc-infra#238's own separate,
-            // deferred finding on that) — its response is just dropped on
-            // arrival, same "drop the stale take's UI update rather than
-            // apply it" choice onstop's own reset already made for the
-            // button label. Re-checked at every write below (not just once
-            // here), since a newer take can start (or fail to start) at any
-            // point while this fetch is still in flight. Guarded on
-            // recordAttemptGeneration, NOT recorder identity (uc-infra#238:
-            // identity changes the instant a new MediaRecorder is merely
-            // constructed, even one whose own .start() goes on to throw —
-            // recordAttemptGeneration instead tracks the user's actual
-            // Record clicks, see the outer-scope comment for the full
-            // rationale).
+            // meantime with a stale take's result. Since uc-infra#239, this
+            // take's request is also cancelled outright the moment a LATER
+            // take genuinely supersedes it — i.e. the moment that later
+            // take's own recordingGeneration bump fires (see
+            // transcribeAbortController's own outer-scope comment for why
+            // that specific event, not the Record click itself). That is
+            // deliberately the *same* condition the myRecordingGeneration
+            // !== recordingGeneration guard below already checks — not a
+            // separate, independently-timed layer — so cancellation and
+            // "would this result have been dropped anyway" never disagree:
+            // a request only ever gets cancelled when its own result was
+            // already going to be discarded. The status-line write
+            // immediately below stays governed by recordAttemptGeneration
+            // exactly as before (uc-infra#238) — recordAttemptGeneration
+            // and recordingGeneration can and do diverge while a newer
+            // attempt's getUserMedia/start() is still pending, so a stale
+            // take's status write can still be (and needs to still be)
+            // guarded out here well before that take's own request is ever
+            // cancelled. Re-checked at every write below (not just once
+            // here), since a newer take can start (or fail to start) at
+            // any point while this fetch is still in flight. Guarded on
+            // recordAttemptGeneration, NOT recorder identity (uc-infra
+            // #238: identity changes the instant a new MediaRecorder is
+            // merely constructed, even one whose own .start() goes on to
+            // throw — recordAttemptGeneration instead tracks the user's
+            // actual Record clicks, see the outer-scope comment for the
+            // full rationale).
             if (myAttemptGeneration === recordAttemptGeneration) {
               statusEl.textContent = {{.TranscribingLabel}};
             }
             var form = new FormData();
             form.append("audio", blob, "note.webm");
-            fetch({{.TranscribeHref}}, { method: "POST", body: form })
+            fetch({{.TranscribeHref}}, { method: "POST", body: form, signal: thisController.signal })
               .then(function(resp) {
                 if (!resp.ok) { return resp.text().then(function(t) { throw new Error(extractErrorMessage(t)); }); }
                 return resp.text();
@@ -955,6 +1053,26 @@ var issueReportTmpl = template.Must(template.New("issue-report").Parse(`
           // see that declaration's own comment for why this timing is what
           // closes Gap A).
           myRecordingGeneration = ++recordingGeneration;
+          // uc-infra#239: only NOW — once this attempt has genuinely
+          // become the new recordingGeneration-owning take — is the
+          // PREVIOUS attempt's own transcribe request actually cancelled
+          // (see thisController's own declaration above for why any
+          // earlier point would be wrong). Safe to call unconditionally
+          // even if the previous attempt's fetch already settled, was
+          // never sent (its own getUserMedia never resolved, so its
+          // thisController was never armed either), or doesn't exist yet
+          // (the very first successful take): AbortController.abort() on
+          // an already-settled/never-armed/undefined-checked-via-the-if
+          // controller is a spec no-op, and aborting a controller before
+          // fetch() is ever called on it just makes that later fetch()
+          // call reject immediately with AbortError once it does run —
+          // caught by the same recordAttemptGeneration guard every
+          // stale-take status write site below already uses.
+          if (transcribeAbortController) {
+            transcribeAbortController.abort();
+          }
+          thisController = new AbortController();
+          transcribeAbortController = thisController;
           recordBtn.textContent = {{.StopLabel}};
           statusEl.textContent = "";
         } catch (e) {
