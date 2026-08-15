@@ -20,7 +20,10 @@ brand-new lifecycle from scratch on a new Status Type.
 ## Creating a status
 
 1. Go to **Status** and choose **New**.
-2. Choose the Status Type it belongs to, and enter a code and name.
+2. Choose the Status Type it belongs to, and enter a code. The name field
+   has one box per available language — fill in at least the primary
+   language (required); leaving another language blank just means that
+   language falls back to the primary one wherever this status is shown.
 3. A sequence number controls its display order only — it has no other
    effect.
 4. Mark **Initial** if a new record is allowed to start in this status.

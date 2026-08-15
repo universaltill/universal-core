@@ -28,6 +28,14 @@ import (
 )
 
 // Spec is one Status row within a StatusType's graph.
+//
+// Name is a plain Go string, not the i18n_text shape foundation.Status's
+// own "name" field declares (uc-infra#214, ADR-0030) — Seed wraps it as
+// {"en": Name} itself (see Seed's own doc comment), so every one of this
+// package's callers keeps writing an ordinary string literal here. Real
+// per-locale translations are a follow-up: nothing about this Spec shape
+// needs to change for a future call site to seed additional locales —
+// Seed's wrap is the only place that would grow.
 type Spec struct {
 	Code, Name            string
 	Sequence              float64
@@ -88,8 +96,14 @@ func Seed(
 			statusIDs[s.Code] = id
 			continue
 		}
+		// name: wrapped as i18n_text (uc-infra#214, ADR-0030) — Status.name
+		// is FieldI18nText as of foundation.Status's v2, but every caller
+		// of Seed still supplies Spec.Name as a plain Go string (see
+		// Spec's own doc comment). English-only content this phase; real
+		// per-locale translations are a follow-up card, not a further
+		// change to this wrap.
 		rec, err := engine.Create(ctx, statusDef, map[string]any{
-			"status_type_id": statusTypeID, "code": s.Code, "name": s.Name,
+			"status_type_id": statusTypeID, "code": s.Code, "name": map[string]any{"en": s.Name},
 			"sequence": s.Sequence, "is_initial": s.IsInitial, "is_terminal": s.IsTerminal,
 		}, actor)
 		if err != nil {

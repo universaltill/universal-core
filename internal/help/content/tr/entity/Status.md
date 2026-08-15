@@ -22,7 +22,11 @@ döngüsü tanımlarken kendiniz eklersiniz.
 ## Durum oluşturma
 
 1. **Durum**'a gidin ve **Yeni**'yi seçin.
-2. Ait olduğu Durum Türünü seçin, bir kod ve ad girin.
+2. Ait olduğu Durum Türünü seçin ve bir kod girin. Ad alanında
+   kullanılabilir her dil için ayrı bir kutu vardır — en azından birincil
+   dili (zorunlu) doldurun; başka bir dili boş bırakmak yalnızca bu durum
+   gösterildiği her yerde o dilin birincil dile geri düşeceği anlamına
+   gelir.
 3. Bir sıra numarası yalnızca görüntüleme sırasını kontrol eder — başka
    bir etkisi yoktur.
 4. Yeni bir kayda bu durumda başlanmasına izin veriliyorsa **Başlangıç**

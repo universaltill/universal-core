@@ -481,7 +481,7 @@ func TestStatus_ValidatesAgainstItsStatusType(t *testing.T) {
 		t.Fatalf("status type should validate: %v", err)
 	}
 
-	draft := map[string]any{"status_type_id": "st-1", "code": "draft", "name": "Draft", "is_initial": true}
+	draft := map[string]any{"status_type_id": "st-1", "code": "draft", "name": map[string]any{"en": "Draft"}, "is_initial": true}
 	if err := entity.ValidateRecord(statusDef, draft); err != nil {
 		t.Fatalf("draft status should validate: %v", err)
 	}
