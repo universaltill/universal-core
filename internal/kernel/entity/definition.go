@@ -71,6 +71,37 @@ func (t FieldType) valid() bool {
 	return slices.Contains(allFieldTypes, t)
 }
 
+// FieldTypeJSONShape returns the Postgres jsonb_typeof result a
+// validateFieldValue-accepted value of type t is stored as — "string",
+// "number", "boolean", or "object" — and whether t is one this function
+// knows how to answer for. Kept in sync with validateFieldValue's own
+// per-type switch (validate.go) deliberately, not derived from it
+// mechanically: this is the one place outside that switch allowed to
+// know a field type's storage shape, for a caller (cmd/sync-tenant-
+// modules' typeChangeWarnings, via data.RecordRepo.CountFieldTypeMismatch)
+// that needs to compare an OLD stored value's shape against a NEW
+// Definition's declared type without duplicating validateFieldValue's
+// own per-type logic. FieldReference/FieldDate/FieldEnum all validate as
+// a plain string (validateFieldValue's own `case FieldDate, FieldReference`
+// and FieldEnum's `s, ok := v.(string)`), and FieldMoney validates as a
+// JSON number the same as FieldNumber (money.FromAny's whole-number
+// constraint is a value-range check, not a different JSON shape) — so
+// both collapse to the same shape as their nearer cousin here.
+func (t FieldType) FieldTypeJSONShape() (shape string, ok bool) {
+	switch t {
+	case FieldString, FieldDate, FieldReference, FieldEnum:
+		return "string", true
+	case FieldNumber, FieldMoney:
+		return "number", true
+	case FieldBool:
+		return "boolean", true
+	case FieldI18nText:
+		return "object", true
+	default:
+		return "", false
+	}
+}
+
 // RelationshipKind distinguishes the three relationship mechanisms named
 // in ADR-0017 §6 — they must stay distinct, not folded into one concept.
 type RelationshipKind string

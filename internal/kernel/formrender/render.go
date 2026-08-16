@@ -1185,6 +1185,24 @@ func (r *Renderer) buildFields(s form.Section, ent *entity.Definition, record ma
 			// so the API's form decoder can reassemble the object. Ordered
 			// by locale (Available is sorted) for stable rendering.
 			values, _ := record[ff.Name].(map[string]any)
+			if values == nil {
+				// A legacy plain string, from a record written before this
+				// field's own string->i18n_text Version bump and not yet
+				// run through that bump's backfill (uc-infra#214/#245's own
+				// "recordLabel falls through instead of returning the id"
+				// finding, same failure shape here): without this, every
+				// input for this field renders empty while the page's own
+				// heading (recordLabel, handlers.go) still shows the legacy
+				// value, and re-submitting the (all-blank, since no locale
+				// was ever filled in) i18n object fails Required validation
+				// on save — a pre-backfill record becomes uneditable for
+				// EVERY field on the form, not just this one. Seed it into
+				// the fallback locale's box instead, matching how a fresh
+				// record's own first save would have stored it.
+				if s, ok := record[ff.Name].(string); ok && s != "" {
+					values = map[string]any{r.i18n.Fallback(): s}
+				}
+			}
 			for _, loc := range r.i18n.Available() {
 				val, _ := values[loc].(string)
 				fv.I18nInputs = append(fv.I18nInputs, i18nInputView{

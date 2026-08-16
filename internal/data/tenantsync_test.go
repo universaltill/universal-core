@@ -271,6 +271,120 @@ func TestCountMissingField(t *testing.T) {
 	}
 }
 
+// CountFieldTypeMismatch (uc-infra#214/ADR-0031) is CountMissingField's
+// counterpart for a field's declared TYPE changing rather than becoming
+// Required — cmd/sync-tenant-modules' typeChangeWarnings is its only
+// caller. Same "assert each case as its own delta" discipline as
+// TestCountMissingField above, for the same reason: a mixed fixture
+// checked as one total can hide two cancelling mistakes.
+func TestCountFieldTypeMismatch(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	records := data.NewRecordRepo(tenantDB)
+	ctx := context.Background()
+
+	mk := func(fields map[string]any) string {
+		t.Helper()
+		rec, err := records.Create(ctx, "Widget", fields)
+		if err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		return rec.ID
+	}
+	count := func() int {
+		t.Helper()
+		// "object" mirrors the Status.name string->i18n_text bump this
+		// method was built for: the NEW type is i18n_text (an object),
+		// so anything not shaped like an object is a mismatch.
+		n, err := records.CountFieldTypeMismatch(ctx, "Widget", "name", "object")
+		if err != nil {
+			t.Fatalf("CountFieldTypeMismatch: %v", err)
+		}
+		return n
+	}
+
+	if n := count(); n != 0 {
+		t.Fatalf("empty fixture counts %d", n)
+	}
+
+	// A field with NO value at all is not this method's concern —
+	// requiredFieldWarnings' job, not typeChangeWarnings'.
+	mk(map[string]any{"other": "x"})
+	if n := count(); n != 0 {
+		t.Errorf("an absent field must not count as a type mismatch: got %d, want 0", n)
+	}
+
+	// A JSON null is excluded the same way, explicitly (see the method's
+	// own doc comment on why: CountMissingField already claims it).
+	mk(map[string]any{"name": nil})
+	if n := count(); n != 0 {
+		t.Errorf("a JSON null must not count as a type mismatch: got %d, want 0", n)
+	}
+
+	// The actual motivating case: a legacy plain string where the new
+	// Definition now declares i18n_text (an object).
+	mk(map[string]any{"name": "Draft"})
+	if n := count(); n != 1 {
+		t.Errorf("a legacy plain string must count as a type mismatch against \"object\": got %d, want 1", n)
+	}
+
+	// A number and a bool are equally "not an object" — this method
+	// doesn't special-case string, it flags anything jsonb_typeof
+	// disagrees with.
+	mk(map[string]any{"name": float64(5)})
+	if n := count(); n != 2 {
+		t.Errorf("a number must count as a type mismatch against \"object\": got %d, want 2", n)
+	}
+	mk(map[string]any{"name": true})
+	if n := count(); n != 3 {
+		t.Errorf("a bool must count as a type mismatch against \"object\": got %d, want 3", n)
+	}
+
+	// Already the right shape — not a mismatch, backfilled or freshly
+	// created either way.
+	mk(map[string]any{"name": map[string]any{"en": "Draft"}})
+	if n := count(); n != 3 {
+		t.Errorf("an already-object value must not count: got %d, want 3", n)
+	}
+	// An empty object is still an object — no translation is a content
+	// question (a follow-up card's job), not a shape mismatch.
+	mk(map[string]any{"name": map[string]any{}})
+	if n := count(); n != 3 {
+		t.Errorf("an empty object must not count as a type mismatch: got %d, want 3", n)
+	}
+
+	if _, err := records.Create(ctx, "Other", map[string]any{"name": "Draft"}); err != nil {
+		t.Fatalf("create Other: %v", err)
+	}
+	if n := count(); n != 3 {
+		t.Errorf("another entity type must not contribute: got %d, want 3", n)
+	}
+
+	doomed := mk(map[string]any{"name": "Draft"})
+	if err := records.Delete(ctx, "Widget", doomed); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if n := count(); n != 3 {
+		t.Errorf("a soft-deleted row must not contribute: got %d, want 3", n)
+	}
+
+	// The reverse direction (declared type reverts to a plain string —
+	// not the Status.name bump's own direction, but the method is
+	// symmetric, per its own doc comment: it just compares against
+	// whatever expectedJSONType the caller passes): an existing object
+	// value now mismatches "string".
+	n, err := records.CountFieldTypeMismatch(ctx, "Widget", "name", "string")
+	if err != nil {
+		t.Fatalf("CountFieldTypeMismatch: %v", err)
+	}
+	// Live Widget rows with a present, non-null "name" at this point:
+	// the plain string (now a MATCH against "string", not counted), the
+	// number, the bool, and the two object values (non-empty and empty,
+	// both now mismatches against "string") — 4 mismatches.
+	if n != 4 {
+		t.Fatalf("CountFieldTypeMismatch against \"string\" = %d, want 4", n)
+	}
+}
+
 // false and 0 are the cases most likely to be broken by a naive
 // "is it falsy" implementation, and the ones whose failure is loudest:
 // every boolean and every zero quantity in the tenant would be reported

@@ -2719,6 +2719,51 @@ func TestRender_I18nTextRendersOneInputPerLocale(t *testing.T) {
 	}
 }
 
+// TestRender_I18nTextLegacyPlainStringFallsThroughToFallbackLocale is the
+// regression test for uc-infra#214's retry review: a record written before
+// an i18n_text field's own Version bump still holds a plain string until
+// that bump's backfill runs. Before this fix, the form field's `values`
+// lookup (`record[ff.Name].(map[string]any)`) failed on a plain string and
+// silently fell back to nil, so EVERY locale input rendered empty — while
+// the page's own heading (recordLabel, a different code path that already
+// has this same fallback) still showed the legacy value. Re-submitting the
+// all-blank i18n object then fails Required validation, so a pre-backfill
+// record becomes uneditable on ANY field, not just this one. The value
+// must render into the fallback locale's box instead, exactly where a
+// fresh save would have put it.
+func TestRender_I18nTextLegacyPlainStringFallsThroughToFallbackLocale(t *testing.T) {
+	r := testRenderer(t)
+	ent := &entity.Definition{
+		EntityType: "Unit",
+		Fields:     []entity.Field{{Name: "label", Type: entity.FieldI18nText, Required: true}},
+	}
+	def := &form.Definition{
+		EntityType: "Unit",
+		Sections: []form.Section{{
+			Title: "Details", Component: form.ComponentFields,
+			Fields: []form.FormField{{Name: "label", Label: "Label"}},
+		}},
+	}
+	// The legacy shape: a plain string, not yet backfilled to {"en": ...}.
+	data := Data{Record: map[string]any{"label": "Draft"}}
+	var buf strings.Builder
+	if err := r.Render(&buf, def, ent, data, "en"); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	body := buf.String()
+
+	if !strings.Contains(body, `name="label.en" value="Draft"`) {
+		t.Fatalf("expected the legacy plain string to fall through into the fallback (en) input, got:\n%s", body)
+	}
+	// Every other locale still renders empty, not an error and not the
+	// legacy value duplicated across locales.
+	for _, loc := range []string{"ar", "fa", "tr"} {
+		if !strings.Contains(body, `name="label.`+loc+`" value=""`) {
+			t.Fatalf("expected an empty %q input (legacy value only seeds the fallback locale), got:\n%s", loc, body)
+		}
+	}
+}
+
 // TestRender_RelatedListIsServerRenderedNotLazyLoaded is the regression
 // test for board #20's second blocker. The section used to render empty
 // with hx-trigger="load", and the endpoint it fetched ignored the ref

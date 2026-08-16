@@ -140,3 +140,58 @@ func TestSeed_CodeCollisionScoping(t *testing.T) {
 		t.Errorf("expected exactly 2 StatusTransition rows after re-seed, got %d", len(transitions))
 	}
 }
+
+// TestSeed_StatusNameIsWrappedAsI18nText is the unit-level proof for
+// uc-infra#214 (ADR-0030): foundation.Status's "name" field is
+// FieldI18nText, but every Spec still carries a plain Go string — Seed
+// itself must be the thing that wraps it as {"en": Spec.Name}, since no
+// caller (purchasing/sales/hr/projects/crm/assets's own PublishStatuses)
+// changed. A caller-visible regression here (Seed writing the bare
+// string again, or a caller starting to pass an already-wrapped value)
+// would fail every StatusType/Status seed at Create time via
+// entity.ValidateRecord's i18n_text shape check — this test catches the
+// narrower, silent failure mode: Seed writing *some* valid i18n_text
+// shape that just isn't the one callers actually asked for.
+func TestSeed_StatusNameIsWrappedAsI18nText(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "statusgraph-test"}
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	defs := data.NewEntityDefinitionRepo(tenantDB)
+	def := func(entityType string) *entity.Definition {
+		v, err := defs.GetPublished(ctx, entityType)
+		if err != nil {
+			t.Fatalf("GetPublished(%s): %v", entityType, err)
+		}
+		d, err := entity.Unmarshal(v.Definition)
+		if err != nil {
+			t.Fatalf("unmarshal %s: %v", entityType, err)
+		}
+		return d
+	}
+	engine := crud.NewEngine(tenantDB)
+	statusTypeDef, statusDef, transitionDef := def("StatusType"), def("Status"), def("StatusTransition")
+
+	ids, err := Seed(ctx, engine, statusTypeDef, statusDef, transitionDef,
+		"WidgetName", "widget_name_status", "Widget Name Status",
+		[]Spec{{Code: "draft", Name: "Draft", Sequence: 1, IsInitial: true}},
+		nil, actor,
+	)
+	if err != nil {
+		t.Fatalf("Seed: %v", err)
+	}
+
+	rec, err := engine.Get(ctx, statusDef, ids["draft"])
+	if err != nil {
+		t.Fatalf("Get seeded Status: %v", err)
+	}
+	name, ok := rec.Data["name"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected \"name\" stored as an i18n_text object, got %T: %#v", rec.Data["name"], rec.Data["name"])
+	}
+	if len(name) != 1 || name["en"] != "Draft" {
+		t.Fatalf(`expected exactly {"en": "Draft"}, got %#v`, name)
+	}
+}

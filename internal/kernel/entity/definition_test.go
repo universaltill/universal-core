@@ -984,3 +984,53 @@ func TestConditionalUniqueConstraintName(t *testing.T) {
 		t.Fatalf("two different conditions on the same Fields collided: %q", a)
 	}
 }
+
+// TestFieldType_FieldTypeJSONShape pins the storage-shape mapping
+// cmd/sync-tenant-modules' typeChangeWarnings (via
+// data.RecordRepo.CountFieldTypeMismatch) relies on to detect a field
+// whose declared Type changed on an existing field name (uc-infra#214/
+// ADR-0031's Status.name string->i18n_text bump is the first caller).
+// Every entry must match validateFieldValue's own per-type switch
+// (validate.go) — this test is what keeps the two from drifting apart
+// silently if a new FieldType is ever added to one but not the other.
+func TestFieldType_FieldTypeJSONShape(t *testing.T) {
+	cases := []struct {
+		typ       FieldType
+		wantShape string
+		wantOK    bool
+	}{
+		{FieldString, "string", true},
+		{FieldDate, "string", true},
+		{FieldReference, "string", true},
+		{FieldEnum, "string", true},
+		{FieldNumber, "number", true},
+		{FieldMoney, "number", true},
+		{FieldBool, "boolean", true},
+		{FieldI18nText, "object", true},
+		{FieldType("something-not-real"), "", false},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.typ), func(t *testing.T) {
+			shape, ok := tc.typ.FieldTypeJSONShape()
+			if ok != tc.wantOK {
+				t.Fatalf("FieldTypeJSONShape(%q) ok = %v, want %v", tc.typ, ok, tc.wantOK)
+			}
+			if shape != tc.wantShape {
+				t.Fatalf("FieldTypeJSONShape(%q) shape = %q, want %q", tc.typ, shape, tc.wantShape)
+			}
+		})
+	}
+
+	// Exhaustiveness: every FieldType in allFieldTypes must be known here
+	// — a new FieldType constant added to the const block without a
+	// matching case in FieldTypeJSONShape's switch would otherwise fail
+	// silently (open, not closed: typeChangeWarnings just skips a field
+	// it doesn't recognize, rather than erroring), the opposite of how
+	// Definition.Validate's own allFieldTypes check treats an unknown
+	// FieldType on a Definition itself.
+	for _, ft := range allFieldTypes {
+		if _, ok := ft.FieldTypeJSONShape(); !ok {
+			t.Errorf("FieldTypeJSONShape does not know about allFieldTypes entry %q — add a case for it", ft)
+		}
+	}
+}

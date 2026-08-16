@@ -481,7 +481,7 @@ func TestStatus_ValidatesAgainstItsStatusType(t *testing.T) {
 		t.Fatalf("status type should validate: %v", err)
 	}
 
-	draft := map[string]any{"status_type_id": "st-1", "code": "draft", "name": "Draft", "is_initial": true}
+	draft := map[string]any{"status_type_id": "st-1", "code": "draft", "name": map[string]any{"en": "Draft"}, "is_initial": true}
 	if err := entity.ValidateRecord(statusDef, draft); err != nil {
 		t.Fatalf("draft status should validate: %v", err)
 	}
@@ -584,19 +584,19 @@ func TestStatusTransition_RejectsCrossStatusTypeFromAndTo(t *testing.T) {
 	}
 
 	poDraft, err := engine.Create(ctx, Status(), map[string]any{
-		"status_type_id": poType.ID, "code": "draft", "name": "Draft", "is_initial": true,
+		"status_type_id": poType.ID, "code": "draft", "name": map[string]any{"en": "Draft"}, "is_initial": true,
 	}, actor)
 	if err != nil {
 		t.Fatalf("create purchase_order_status draft Status: %v", err)
 	}
 	poSubmitted, err := engine.Create(ctx, Status(), map[string]any{
-		"status_type_id": poType.ID, "code": "submitted", "name": "Submitted",
+		"status_type_id": poType.ID, "code": "submitted", "name": map[string]any{"en": "Submitted"},
 	}, actor)
 	if err != nil {
 		t.Fatalf("create purchase_order_status submitted Status: %v", err)
 	}
 	soDraft, err := engine.Create(ctx, Status(), map[string]any{
-		"status_type_id": soType.ID, "code": "draft", "name": "Draft", "is_initial": true,
+		"status_type_id": soType.ID, "code": "draft", "name": map[string]any{"en": "Draft"}, "is_initial": true,
 	}, actor)
 	if err != nil {
 		t.Fatalf("create sales_order_status draft Status: %v", err)

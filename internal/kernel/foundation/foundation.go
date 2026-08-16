@@ -420,15 +420,52 @@ func StatusType() *entity.Definition {
 // rows already define the actual transition graph and a terminal status
 // with no outgoing StatusTransition rows is already unreachable by
 // construction.
+//
+// Version 1->2 (uc-infra#214, ADR-0030): "name"'s TYPE changed
+// (FieldString -> FieldI18nText), the same class of change PurchaseOrder's
+// v3->v4 bump made for "status" -> "status_id" (see that Definition's own
+// doc comment) — not just a new field added. Before this bump, every
+// status-managed entity's status picker/record view rendered the literal
+// English name seeded at provisioning time in every locale (uc-infra#214's
+// own finding): handlers.Handler.recordLabel only translates a reference's
+// label field when it is declared i18n_text, and plain FieldString never
+// was. A Status row written under v1 still holds a plain string until
+// cmd/backfill-status-name-i18n converts it — reads are unaffected
+// (entity.ValidateRecord only runs on write), so the practical window is
+// between publishing v2 and running that backfill, same "reads still work,
+// writes need the new shape" property every prior Version-bump-replaces-a-
+// field-type migration in this kernel has had.
+//
+// This bump ships the GENERIC mechanism and English-only content only:
+// internal/kernel/statusgraph.Seed now wraps every module's plain-string
+// Spec.Name as {"en": name} when it creates a Status row, so recordLabel's
+// existing i18n_text branch starts resolving it for free — no
+// entity-specific special-casing anywhere. Real per-locale translations
+// for each module's actual status names (the "Onaylandı" side of
+// uc-infra#214's own finding) are deliberately deferred to a follow-up
+// card: getting ~30-50 status names translated correctly across tr/fa/ar
+// is real content work, orthogonal to (and shouldn't block) making the
+// mechanism itself sound — see uc-infra#214's close-out for the follow-up
+// issue number. i18n.Catalog.ResolveLocalized's existing fallback chain
+// (locale -> base language -> catalog fallback -> any translation) means
+// an English-only value renders exactly the same "Draft" in every locale
+// today, so how an already-seeded status's name RENDERS doesn't change —
+// only what a future translation pass can now do without a second schema
+// change. The one real, narrow exception: StatusForm() declares "name"
+// with no override, so an admin hand-authoring a Status record now fills
+// in a per-locale name instead of one plain string (rare — see this
+// Definition's own doc comment on when that path is actually used) — see
+// internal/help/content/*/entity/Status.md and
+// internal/e2e/status_i18n_test.go for that surface.
 func Status() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "Status",
-		Version:    1,
+		Version:    2,
 		Module:     "foundation",
 		Fields: []entity.Field{
 			{Name: "status_type_id", Type: entity.FieldReference, Required: true, Target: "StatusType"},
 			{Name: "code", Type: entity.FieldString, Required: true},
-			{Name: "name", Type: entity.FieldString, Required: true},
+			{Name: "name", Type: entity.FieldI18nText, Required: true},
 			{Name: "sequence", Type: entity.FieldNumber, Default: float64(0)}, // display/ordering hint only
 			{Name: "is_initial", Type: entity.FieldBool, Default: false},
 			{Name: "is_terminal", Type: entity.FieldBool, Default: false},
