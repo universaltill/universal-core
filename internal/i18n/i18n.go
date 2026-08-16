@@ -165,6 +165,34 @@ func (c *Catalog) ResolveLocalized(v any, locale string) (string, bool) {
 // required multilingual field must at least be filled in — see ADR-0009).
 func (c *Catalog) Fallback() string { return c.fallback }
 
+// Keys returns the sorted set of message keys locale's own file
+// carries. Like HasOwn (and unlike T/TOrDefault), this only sees what
+// that locale's own file actually has — no fallback chain. Returns nil
+// only if locale has no locale file at all — a locale whose file exists
+// but is empty ("{}") returns a non-nil, zero-length slice, since that's
+// a real (if degenerate) locale, not an absent one. Available()'s own
+// "has messages" check is a different, stricter test (len(m) > 0) for
+// a different question (which locales are usable at all) — don't read
+// the two as the same definition of "empty."
+//
+// Exists for a caller that needs to enumerate a whole family of
+// data-driven keys (e.g. every "field.{EntityType}.status_id.{code}"
+// entry, uc-infra#256) to check them against another source of truth —
+// T/TOrDefault/HasOwn all require the caller to already know the key,
+// which doesn't help when the question is "what keys exist."
+func (c *Catalog) Keys(locale string) []string {
+	m, ok := c.messages[locale]
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // Available returns the sorted locale codes that have at least one message.
 func (c *Catalog) Available() []string {
 	out := make([]string, 0, len(c.messages))

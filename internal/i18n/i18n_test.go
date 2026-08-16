@@ -109,6 +109,41 @@ func TestLocales_HaveIdenticalKeySets(t *testing.T) {
 	}
 }
 
+func TestKeys_ReturnsSortedKeysForThatLocaleOnly(t *testing.T) {
+	c, err := Load("en")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got := c.Keys("en")
+	if len(got) == 0 {
+		t.Fatal("expected en.json to have at least one key")
+	}
+	for i := 1; i < len(got); i++ {
+		if got[i-1] >= got[i] {
+			t.Fatalf("Keys() not sorted: %q before %q", got[i-1], got[i])
+		}
+	}
+	want := c.messages["en"]
+	if len(got) != len(want) {
+		t.Fatalf("expected %d keys (len of en.json's own map), got %d", len(want), len(got))
+	}
+	for _, k := range got {
+		if _, ok := want[k]; !ok {
+			t.Errorf("Keys() returned %q, not present in en.json's own map", k)
+		}
+	}
+}
+
+func TestKeys_UnknownLocaleReturnsNil(t *testing.T) {
+	c, err := Load("en")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := c.Keys("xx"); got != nil {
+		t.Errorf("expected nil for an unknown locale, got %v", got)
+	}
+}
+
 func TestAvailable_ListsBothLocales(t *testing.T) {
 	c, err := Load("en")
 	if err != nil {
