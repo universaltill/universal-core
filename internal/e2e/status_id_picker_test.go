@@ -41,7 +41,7 @@ func TestReferencePicker_StatusIDOnlyOffersOwnStatusType(t *testing.T) {
 	ctx := context.Background()
 	actor := humanActor()
 
-	testfixtures.PublishStatusPickerFixtures(t, ctx, tenantDB, actor)
+	testfixtures.PublishFoundationPurchasingSalesFixtures(t, ctx, tenantDB, actor)
 
 	bctx := browserCtx(t, tenantID)
 	scope := `.uc-ref[data-field="status_id"]`

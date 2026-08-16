@@ -28,7 +28,7 @@ func setUpStatusTransitionPickerTest(t *testing.T) context.Context {
 	ctx := context.Background()
 	actor := humanActor()
 
-	testfixtures.PublishStatusPickerFixtures(t, ctx, tenantDB, actor)
+	testfixtures.PublishFoundationPurchasingSalesFixtures(t, ctx, tenantDB, actor)
 
 	bctx := browserCtx(t, tenantID)
 	statusTypeScope := `.uc-ref[data-field="status_type_id"]`
