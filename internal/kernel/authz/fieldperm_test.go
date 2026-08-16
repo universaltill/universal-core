@@ -8,6 +8,7 @@ import (
 
 	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/kernel/crud"
+	"github.com/universaltill/universal-core/internal/kernel/entity"
 )
 
 // The field-level half of ADR-0006 (commit 2). Semantics under test:
@@ -477,5 +478,172 @@ func TestGuardedEngine_RejectsHiddenEqualsFilter(t *testing.T) {
 		EqualsFilters: []data.FieldEquals{{Field: "name", Value: "Open"}}, Limit: 10,
 	}); err != nil {
 		t.Fatalf("EqualsFilters on a visible field should work: %v", err)
+	}
+}
+
+// --- ADR-0032/uc-infra#250: status_id auto-scoping through the guarded
+// engine — GuardedEngine.ResolveReferenceFilter's own package had zero
+// coverage with a non-nil sourceDef (every pre-existing call site in
+// authz_test.go passes nil, since those tests only exercise
+// TargetFilter/MustMatchParentField), so a regression that forwarded nil
+// instead of sourceDef would only have been caught transitively, by
+// internal/api's HTTP test (independent review). These two prove the
+// mechanism at the layer that actually owns it: the normal pass-through,
+// and the availability fix for a hidden status_type_id. ---
+
+// statusManagedSourceDef is an ad hoc, UNPUBLISHED Definition — not
+// registered via entityDefs, just a plain Go value passed directly into
+// ResolveReferenceFilter — matching how internal/kernel/crud's own
+// status_test.go fixtures (purchaseOrderDef, etc.) exercise this
+// generic mechanism without needing a real module's Publish/PublishForms
+// to run. Only StatusType/Status (both real, foundation-published
+// entities newFixture already publishes) need real rows.
+func statusManagedSourceDef(statusTypeCode string) *entity.Definition {
+	return &entity.Definition{
+		EntityType:     "PurchaseOrder",
+		Version:        1,
+		StatusTypeCode: statusTypeCode,
+		Fields: []entity.Field{
+			{Name: "status_id", Type: entity.FieldReference, Required: true, Target: "Status"},
+		},
+	}
+}
+
+func TestGuardedEngine_ResolveReferenceFilter_StatusIDAutoScopingPassesThrough(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+
+	st, err := f.engine.Create(ctx, f.def("StatusType"), map[string]any{
+		"entity_type": "PurchaseOrder", "code": "purchase_order_status", "name": "Purchase Order Status",
+	}, f.actor)
+	if err != nil {
+		t.Fatalf("seed StatusType: %v", err)
+	}
+	draft, err := f.engine.Create(ctx, f.def("Status"), map[string]any{
+		"status_type_id": st.ID, "code": "draft", "name": "Draft", "is_initial": true,
+	}, f.actor)
+	if err != nil {
+		t.Fatalf("seed Status: %v", err)
+	}
+	// An unrelated StatusType — proves the guarded wrapper's pass-through
+	// actually narrows, not just that it doesn't error.
+	otherType, err := f.engine.Create(ctx, f.def("StatusType"), map[string]any{
+		"entity_type": "Party", "code": "party_status", "name": "Party Status",
+	}, f.actor)
+	if err != nil {
+		t.Fatalf("seed other StatusType: %v", err)
+	}
+	if _, err := f.engine.Create(ctx, f.def("Status"), map[string]any{
+		"status_type_id": otherType.ID, "code": "active", "name": "Active", "is_initial": true,
+	}, f.actor); err != nil {
+		t.Fatalf("seed other Status: %v", err)
+	}
+
+	sourceDef := statusManagedSourceDef("purchase_order_status")
+	statusField, ok := sourceDef.FieldByName("status_id")
+	if !ok {
+		t.Fatal("status_id field not found")
+	}
+
+	// No Permission/FieldPermission rows configured at all — the RBAC
+	// bootstrap-open case (TestResolver_NoRules_AllowsEverything), same
+	// as any tenant that hasn't opted into field-level RBAC yet.
+	g := guardedFor(f, "user-no-rbac-configured")
+
+	opts, err := g.ResolveReferenceFilter(ctx, sourceDef, statusField, "")
+	if err != nil {
+		t.Fatalf("ResolveReferenceFilter: %v", err)
+	}
+	if len(opts.EqualsFilters) != 1 || opts.EqualsFilters[0].Field != "status_type_id" {
+		t.Fatalf("expected the status_type_id auto-narrowing to pass through the guarded wrapper unchanged, got %+v", opts.EqualsFilters)
+	}
+
+	recs, err := g.ListPageFiltered(ctx, f.def("Status"), data.ListPageOptions{Limit: 10, EqualsFilters: opts.EqualsFilters})
+	if err != nil {
+		t.Fatalf("ListPageFiltered with the guarded engine's resolved opts: %v", err)
+	}
+	if len(recs) != 1 || recs[0].ID != draft.ID {
+		t.Fatalf("expected exactly the purchase_order_status Draft status, got %+v", recs)
+	}
+}
+
+// TestGuardedEngine_ResolveReferenceFilter_DropsStatusIDNarrowingWhenStatusTypeIDHidden
+// is the regression test for the availability bug independent review
+// found in this task's first draft: crud.Engine.ResolveReferenceFilter's
+// auto-added EqualsFilters{Field:"status_type_id"} entry used to reach
+// ListPageFiltered's rejectHiddenSortFilter unfiltered, which denies the
+// ENTIRE request outright when ANY EqualsFilters entry names a field
+// hidden from the caller — unlike a Definition-author-declared
+// TargetFilter (which a module author chose to add, and can choose not
+// to, on a Definition-by-Definition basis), this auto-scoping has no
+// per-Definition opt-out: it applies to every status_id field
+// unconditionally. A tenant merely hiding the technical
+// Status.status_type_id field via FieldPermission — a plausible, benign
+// admin choice — would otherwise 403 every status_id picker across all
+// 16 status-managed entities at once, and since status_id is Required,
+// break saving those forms entirely. Confirms the fix: the narrowing is
+// DROPPED (not denied) when hidden, and the picker still returns a real
+// (unnarrowed) result.
+func TestGuardedEngine_ResolveReferenceFilter_DropsStatusIDNarrowingWhenStatusTypeIDHidden(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+
+	st, err := f.engine.Create(ctx, f.def("StatusType"), map[string]any{
+		"entity_type": "PurchaseOrder", "code": "purchase_order_status", "name": "Purchase Order Status",
+	}, f.actor)
+	if err != nil {
+		t.Fatalf("seed StatusType: %v", err)
+	}
+	if _, err := f.engine.Create(ctx, f.def("Status"), map[string]any{
+		"status_type_id": st.ID, "code": "draft", "name": "Draft", "is_initial": true,
+	}, f.actor); err != nil {
+		t.Fatalf("seed Status: %v", err)
+	}
+
+	sourceDef := statusManagedSourceDef("purchase_order_status")
+	statusField, ok := sourceDef.FieldByName("status_id")
+	if !ok {
+		t.Fatal("status_id field not found")
+	}
+
+	locked := f.role("hides-status-type-id")
+	f.permit(locked.ID, "Status", true, false)
+	f.hide(locked.ID, "Status", "status_type_id")
+	f.grant("user-locked-status", locked.ID)
+	g := guardedFor(f, "user-locked-status")
+
+	opts, err := g.ResolveReferenceFilter(ctx, sourceDef, statusField, "")
+	if err != nil {
+		t.Fatalf("ResolveReferenceFilter: %v", err)
+	}
+	if len(opts.EqualsFilters) != 0 {
+		t.Fatalf("expected the status_type_id narrowing to be DROPPED when Status.status_type_id is hidden, got %+v", opts.EqualsFilters)
+	}
+
+	// Before the fix, this next call would 403 (ErrDenied) — the whole
+	// point of dropping the entry above is that the picker still works,
+	// just unnarrowed, for this caller.
+	recs, err := g.ListPageFiltered(ctx, f.def("Status"), data.ListPageOptions{Limit: 10, EqualsFilters: opts.EqualsFilters})
+	if err != nil {
+		t.Fatalf("ListPageFiltered must still succeed (unnarrowed) rather than deny the whole request: %v", err)
+	}
+	if len(recs) != 1 {
+		t.Fatalf("expected the one seeded Status record (unnarrowed), got %+v", recs)
+	}
+
+	// A role that does NOT have status_type_id hidden still narrows
+	// normally — confirms the drop above is permission-specific, not a
+	// blanket regression of the mechanism (same "one more assertion"
+	// discipline every other test in this file already follows).
+	open := f.role("status-type-id-visible")
+	f.permit(open.ID, "Status", true, false)
+	f.grant("user-open-status", open.ID)
+	gOpen := guardedFor(f, "user-open-status")
+	opts2, err := gOpen.ResolveReferenceFilter(ctx, sourceDef, statusField, "")
+	if err != nil {
+		t.Fatalf("ResolveReferenceFilter (visible): %v", err)
+	}
+	if len(opts2.EqualsFilters) != 1 || opts2.EqualsFilters[0].Field != "status_type_id" {
+		t.Fatalf("expected narrowing to still apply when status_type_id is NOT hidden, got %+v", opts2.EqualsFilters)
 	}
 }

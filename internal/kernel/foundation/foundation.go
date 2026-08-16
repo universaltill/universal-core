@@ -485,15 +485,33 @@ func Status() *entity.Definition {
 // is graph-legal, it does not look at requires_workflow or block on it.
 // Recording the field now rather than adding it later avoids a migration
 // once a workflow trigger consumes it.
+//
+// from_status_id/to_status_id each declare MustMatchParentField:
+// "status_type_id" (uc-infra#252) — without it, nothing on the write
+// path stops either field pointing at a Status belonging to a
+// DIFFERENT StatusType than this row's own status_type_id (e.g.
+// authoring a purchase_order_status transition that actually points at
+// a sales_order_status Status), which produces a structurally invalid
+// graph edge that can never legitimately fire: ValidateStatusTransition
+// only ever looks up transitions by the record's own StatusTypeCode, so
+// a cross-StatusType edge is silently dead, not caught, until someone
+// notices the transition never appears reachable. Same mechanism
+// Task.parent_task_id already uses for its own self-referencing
+// same-project constraint (ADR-0020, uc-infra#78) — status_type_id is
+// StatusTransition's own field to compare each target's status_type_id
+// sibling value against, so this needs no new machinery, just the two
+// declarations below.
 func StatusTransition() *entity.Definition {
 	return &entity.Definition{
 		EntityType: "StatusTransition",
-		Version:    1,
-		Module:     "foundation",
+		// Version 2 (uc-infra#252): from_status_id/to_status_id gained
+		// MustMatchParentField: "status_type_id" — see doc comment above.
+		Version: 2,
+		Module:  "foundation",
 		Fields: []entity.Field{
 			{Name: "status_type_id", Type: entity.FieldReference, Required: true, Target: "StatusType"},
-			{Name: "from_status_id", Type: entity.FieldReference, Required: true, Target: "Status"},
-			{Name: "to_status_id", Type: entity.FieldReference, Required: true, Target: "Status"},
+			{Name: "from_status_id", Type: entity.FieldReference, Required: true, Target: "Status", MustMatchParentField: "status_type_id"},
+			{Name: "to_status_id", Type: entity.FieldReference, Required: true, Target: "Status", MustMatchParentField: "status_type_id"},
 			{Name: "requires_workflow", Type: entity.FieldString}, // optional workflow.Definition Name; not yet consulted, see doc comment above
 		},
 	}

@@ -343,12 +343,16 @@ func CountTargetConstraintViolations(ctx context.Context, db queryable, records 
 // candidate list to only valid targets, given siblingValue — the
 // submitting record's CURRENT value of f.MustMatchParentField (e.g. a
 // Task form's in-progress project_id), empty when unknown or
-// inapplicable. This is the single generic implementation the
-// reference-picker search endpoint (internal/api/reference_search.go)
-// calls to honour Field.TargetFilter/MustMatchParentField (uc-infra#78)
-// — sharing it with checkReferenceTargetConstraints' declaration
-// reading (both walk the same Field data) means the picker's narrowing
-// and Create/Update's enforcement can never quietly diverge.
+// inapplicable. sourceDef is the Definition that DECLARES f (e.g.
+// PurchaseOrder, when f is PurchaseOrder.status_id) — distinct from
+// f.Target (Status), needed for the status_id auto-scoping below, which
+// reads sourceDef.StatusTypeCode, not anything on the target side. This
+// is the single generic implementation the reference-picker search
+// endpoint (internal/api/reference_search.go) calls to honour
+// Field.TargetFilter/MustMatchParentField (uc-infra#78) — sharing it
+// with checkReferenceTargetConstraints' declaration reading (both walk
+// the same Field data) means the picker's narrowing and Create/Update's
+// enforcement can never quietly diverge.
 //
 // An entity-join TargetFilter condition becomes a data.JoinFilter, a
 // correlated-EXISTS narrowing evaluated entirely in SQL — NOT resolved
@@ -365,7 +369,22 @@ func CountTargetConstraintViolations(ctx context.Context, db queryable, records 
 // nothing to compare yet, the same "skip, don't reject" posture
 // checkReferenceTargetConstraints itself takes for a record whose
 // sibling field isn't set.
-func (e *Engine) ResolveReferenceFilter(ctx context.Context, f entity.Field, siblingValue string) (data.ListPageOptions, error) {
+//
+// ADR-0032: a status_id field ALSO auto-narrows to sourceDef's own
+// StatusType, with no Field.TargetFilter declared at all — a
+// tenant-specific status_type_id is resolved at runtime (seed time),
+// never known at Definition-authoring time, so it cannot be written as
+// TargetFilterCondition's literal Value the way every other declared
+// condition is. This mirrors crud.Engine.ValidateStatusTransition's own
+// existing write-path scoping (same statusTypeIDByCode resolution),
+// just applied to the picker's READ path, which that check never
+// touched. Guarded on f.Name/f.Target AND sourceDef.StatusTypeCode
+// together (not just the field shape) — see ADR-0032's Consequences for
+// why the StatusTypeCode check specifically is what gates this, not an
+// inferred-from-field-name-alone rule. An unresolvable StatusTypeCode
+// (tenant not provisioned for it) is a real error, not "nothing to
+// narrow by yet" — returned to the caller rather than silently skipped.
+func (e *Engine) ResolveReferenceFilter(ctx context.Context, sourceDef *entity.Definition, f entity.Field, siblingValue string) (data.ListPageOptions, error) {
 	var opts data.ListPageOptions
 	for _, cond := range f.TargetFilter {
 		if cond.Entity == "" {
@@ -381,6 +400,14 @@ func (e *Engine) ResolveReferenceFilter(ctx context.Context, f entity.Field, sib
 	}
 	if f.MustMatchParentField != "" && siblingValue != "" {
 		opts.EqualsFilters = append(opts.EqualsFilters, data.FieldEquals{Field: f.MustMatchParentField, Value: siblingValue})
+	}
+	if f.Name == entity.StatusIDFieldName && f.Type == entity.FieldReference && f.Target == "Status" &&
+		sourceDef != nil && sourceDef.StatusTypeCode != "" {
+		statusTypeID, err := e.statusTypeIDByCode(ctx, sourceDef.StatusTypeCode)
+		if err != nil {
+			return data.ListPageOptions{}, fmt.Errorf("%s.status_id: resolve status_type_code %q for picker narrowing: %w", sourceDef.EntityType, sourceDef.StatusTypeCode, err)
+		}
+		opts.EqualsFilters = append(opts.EqualsFilters, data.FieldEquals{Field: entity.StatusTypeIDFieldName, Value: statusTypeID})
 	}
 	return opts, nil
 }

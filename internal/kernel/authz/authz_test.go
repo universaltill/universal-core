@@ -626,7 +626,7 @@ func TestGuardedEngine_ResolveReferenceFilter_DropsUnreadableEntityJoinCondition
 	}
 
 	g := Guard(f.engine, humanResolver(f, "user-locked"))
-	opts, err := g.ResolveReferenceFilter(ctx, field, "")
+	opts, err := g.ResolveReferenceFilter(ctx, nil, field, "")
 	if err != nil {
 		t.Fatalf("ResolveReferenceFilter: %v", err)
 	}
@@ -642,7 +642,7 @@ func TestGuardedEngine_ResolveReferenceFilter_DropsUnreadableEntityJoinCondition
 	f.permit(open.ID, "PartyRole", true, false)
 	f.grant("user-open", open.ID)
 	gOpen := Guard(f.engine, humanResolver(f, "user-open"))
-	opts2, err := gOpen.ResolveReferenceFilter(ctx, field, "")
+	opts2, err := gOpen.ResolveReferenceFilter(ctx, nil, field, "")
 	if err != nil {
 		t.Fatalf("ResolveReferenceFilter (open): %v", err)
 	}
@@ -695,7 +695,7 @@ func TestGuardedEngine_ResolveReferenceFilter_DropsEntityJoinConditionOnHiddenJo
 	f.grant("user-hidden-entity-field", hiddenEntityField.ID)
 
 	g := Guard(f.engine, humanResolver(f, "user-hidden-entity-field"))
-	opts, err := g.ResolveReferenceFilter(ctx, field, "")
+	opts, err := g.ResolveReferenceFilter(ctx, nil, field, "")
 	if err != nil {
 		t.Fatalf("ResolveReferenceFilter (hidden EntityField): %v", err)
 	}
@@ -712,7 +712,7 @@ func TestGuardedEngine_ResolveReferenceFilter_DropsEntityJoinConditionOnHiddenJo
 	f.grant("user-hidden-field", hiddenField.ID)
 
 	g2 := Guard(f.engine, humanResolver(f, "user-hidden-field"))
-	opts2, err := g2.ResolveReferenceFilter(ctx, field, "")
+	opts2, err := g2.ResolveReferenceFilter(ctx, nil, field, "")
 	if err != nil {
 		t.Fatalf("ResolveReferenceFilter (hidden Field): %v", err)
 	}
@@ -728,7 +728,7 @@ func TestGuardedEngine_ResolveReferenceFilter_DropsEntityJoinConditionOnHiddenJo
 	f.permit(open.ID, "PartyRole", true, false)
 	f.grant("user-open-fields", open.ID)
 	gOpen := Guard(f.engine, humanResolver(f, "user-open-fields"))
-	opts3, err := gOpen.ResolveReferenceFilter(ctx, field, "")
+	opts3, err := gOpen.ResolveReferenceFilter(ctx, nil, field, "")
 	if err != nil {
 		t.Fatalf("ResolveReferenceFilter (no hidden fields): %v", err)
 	}
@@ -750,7 +750,7 @@ func TestGuardedEngine_ResolveReferenceFilter_DropsEntityJoinConditionOnHiddenJo
 		},
 	}
 	gMulti := Guard(f.engine, humanResolver(f, "user-hidden-entity-field"))
-	opts4, err := gMulti.ResolveReferenceFilter(ctx, multiField, "")
+	opts4, err := gMulti.ResolveReferenceFilter(ctx, nil, multiField, "")
 	if err != nil {
 		t.Fatalf("ResolveReferenceFilter (multi-condition, hidden join field): %v", err)
 	}
