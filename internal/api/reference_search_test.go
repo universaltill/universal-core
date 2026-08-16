@@ -11,7 +11,7 @@ import (
 
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
 	"github.com/universaltill/universal-core/internal/kernel/purchasing"
-	"github.com/universaltill/universal-core/internal/kernel/sales"
+	"github.com/universaltill/universal-core/internal/testfixtures"
 )
 
 // createVendor is a small helper: POST one Vendor record through the real
@@ -424,30 +424,7 @@ func TestReferenceSearch_SourceField_StatusIDAutoScopedToOwnStatusType(t *testin
 	ctx := context.Background()
 	actor := humanActor()
 
-	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
-		t.Fatalf("foundation.Publish: %v", err)
-	}
-	if err := foundation.PublishForms(ctx, tenantDB, actor); err != nil {
-		t.Fatalf("foundation.PublishForms: %v", err)
-	}
-	if err := purchasing.Publish(ctx, tenantDB, actor); err != nil {
-		t.Fatalf("purchasing.Publish: %v", err)
-	}
-	if err := purchasing.PublishForms(ctx, tenantDB, actor); err != nil {
-		t.Fatalf("purchasing.PublishForms: %v", err)
-	}
-	if err := purchasing.PublishStatuses(ctx, tenantDB, actor); err != nil {
-		t.Fatalf("purchasing.PublishStatuses: %v", err)
-	}
-	if err := sales.Publish(ctx, tenantDB, actor); err != nil {
-		t.Fatalf("sales.Publish: %v", err)
-	}
-	if err := sales.PublishForms(ctx, tenantDB, actor); err != nil {
-		t.Fatalf("sales.PublishForms: %v", err)
-	}
-	if err := sales.PublishStatuses(ctx, tenantDB, actor); err != nil {
-		t.Fatalf("sales.PublishStatuses: %v", err)
-	}
+	testfixtures.PublishStatusPickerFixtures(t, ctx, tenantDB, actor)
 
 	mux := http.NewServeMux()
 	testHandler(t, router).Routes(mux)

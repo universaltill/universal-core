@@ -2,52 +2,12 @@ package e2e
 
 import (
 	"context"
-	"database/sql"
 	"testing"
 
 	"github.com/chromedp/chromedp"
 
-	"github.com/universaltill/universal-core/internal/kernel/audit"
-	"github.com/universaltill/universal-core/internal/kernel/foundation"
-	"github.com/universaltill/universal-core/internal/kernel/purchasing"
-	"github.com/universaltill/universal-core/internal/kernel/sales"
+	"github.com/universaltill/universal-core/internal/testfixtures"
 )
-
-// publishStatusPickerFixtures publishes foundation, purchasing (the
-// entity/StatusType under test), and sales (purely to give the tenant a
-// real wrong-StatusType candidate set for a narrowing bug to fail open
-// into — its own status pickers are never visited by either call site)
-// into tenantDB. Shared setup for
-// TestReferencePicker_StatusIDOnlyOffersOwnStatusType below and
-// setUpStatusTransitionPickerTest (status_transition_picker_test.go),
-// which need the identical fixture before driving their own picker.
-func publishStatusPickerFixtures(t *testing.T, ctx context.Context, tenantDB *sql.DB, actor audit.Actor) {
-	t.Helper()
-	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
-		t.Fatalf("foundation.Publish: %v", err)
-	}
-	if err := foundation.PublishForms(ctx, tenantDB, actor); err != nil {
-		t.Fatalf("foundation.PublishForms: %v", err)
-	}
-	if err := purchasing.Publish(ctx, tenantDB, actor); err != nil {
-		t.Fatalf("purchasing.Publish: %v", err)
-	}
-	if err := purchasing.PublishForms(ctx, tenantDB, actor); err != nil {
-		t.Fatalf("purchasing.PublishForms: %v", err)
-	}
-	if err := purchasing.PublishStatuses(ctx, tenantDB, actor); err != nil {
-		t.Fatalf("purchasing.PublishStatuses: %v", err)
-	}
-	if err := sales.Publish(ctx, tenantDB, actor); err != nil {
-		t.Fatalf("sales.Publish: %v", err)
-	}
-	if err := sales.PublishForms(ctx, tenantDB, actor); err != nil {
-		t.Fatalf("sales.PublishForms: %v", err)
-	}
-	if err := sales.PublishStatuses(ctx, tenantDB, actor); err != nil {
-		t.Fatalf("sales.PublishStatuses: %v", err)
-	}
-}
 
 // TestReferencePicker_StatusIDOnlyOffersOwnStatusType is the real-browser
 // proof of ADR-0032's status_id auto-scoping (uc-infra#250) —
@@ -81,7 +41,7 @@ func TestReferencePicker_StatusIDOnlyOffersOwnStatusType(t *testing.T) {
 	ctx := context.Background()
 	actor := humanActor()
 
-	publishStatusPickerFixtures(t, ctx, tenantDB, actor)
+	testfixtures.PublishStatusPickerFixtures(t, ctx, tenantDB, actor)
 
 	bctx := browserCtx(t, tenantID)
 	scope := `.uc-ref[data-field="status_id"]`
