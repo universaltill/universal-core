@@ -39,6 +39,7 @@
 /backfill-inventory-facility
 /backfill-fixedasset-posted-period-count
 /backfill-status-name-i18n
+/backfill-status-name-translations
 
 # A TestCaptureHelpScreenshots run (internal/e2e/help_screenshot_capture_
 # test.go, uc-infra#145) killed mid-write leaves its temp file behind —

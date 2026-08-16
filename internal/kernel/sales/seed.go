@@ -60,6 +60,56 @@ func PublishForms(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 // extraction (purchasing has the twin note).
 type statusSpec = statusgraph.Spec
 
+// salesOrderStatusSpecs/customerInvoiceStatusSpecs are package-level (not
+// inlined into PublishStatuses below) so StatusSpecs can expose the
+// identical literals — Translations included — to cmd/backfill-status-
+// name-translations (uc-infra#244) without a second, driftable copy.
+// Translations content: draft/confirmed/fulfilled/invoiced/issued/paid
+// match this module's own shipped tr/fa/ar help topics
+// (internal/help/content/{tr,fa,ar}/entity/{SalesOrder,
+// CustomerInvoice}.md) — the exact words those topics already use to
+// describe this same status graph. Neither SalesOrder nor
+// CustomerInvoice has its own pre-existing status catalog entry
+// (unlike PurchaseOrder/RequestForQuotation/StockTransfer — see
+// purchasing.purchaseOrderStatusSpecs' own doc comment), so cancelled
+// instead reuses the masculine "ملغى"/"لغوشده"/"İptal Edildi" form
+// already established for every other masculine-noun-owning status
+// type in this kernel (أمر البيع, like أمر الشراء, is masculine) —
+// consistent with, not independently invented against, that precedent.
+var salesOrderStatusSpecs = []statusSpec{
+	{Code: "draft", Name: "Draft", Translations: map[string]string{"ar": "مسودة", "fa": "پیش‌نویس", "tr": "Taslak"}, Sequence: 1, IsInitial: true, IsTerminal: false},
+	{Code: "confirmed", Name: "Confirmed", Translations: map[string]string{"ar": "مؤكَّد", "fa": "تأییدشده", "tr": "Onaylandı"}, Sequence: 2, IsInitial: false, IsTerminal: false},
+	{Code: "fulfilled", Name: "Fulfilled", Translations: map[string]string{"ar": "منفَّذ", "fa": "تکمیل‌شده", "tr": "Tamamlandı"}, Sequence: 3, IsInitial: false, IsTerminal: false},
+	{Code: "invoiced", Name: "Invoiced", Translations: map[string]string{"ar": "مفوتَر", "fa": "فاکتورشده", "tr": "Faturalandı"}, Sequence: 4, IsInitial: false, IsTerminal: true},
+	{Code: "cancelled", Name: "Cancelled", Translations: map[string]string{"ar": "ملغى", "fa": "لغوشده", "tr": "İptal Edildi"}, Sequence: 5, IsInitial: false, IsTerminal: true},
+}
+
+var customerInvoiceStatusSpecs = []statusSpec{
+	{Code: "draft", Name: "Draft", Translations: map[string]string{"ar": "مسودة", "fa": "پیش‌نویس", "tr": "Taslak"}, Sequence: 1, IsInitial: true, IsTerminal: false},
+	{Code: "issued", Name: "Issued", Translations: map[string]string{"ar": "مُصدَرة", "fa": "صادرشده", "tr": "Kesildi"}, Sequence: 2, IsInitial: false, IsTerminal: false},
+	{Code: "paid", Name: "Paid", Translations: map[string]string{"ar": "مدفوعة", "fa": "پرداخت‌شده", "tr": "Ödendi"}, Sequence: 3, IsInitial: false, IsTerminal: true},
+	// void's own word, not "cancelled"'s — see purchasing's
+	// vendorInvoiceStatusSpecs doc comment for the full reasoning
+	// (identical shape here): ar/fa's own CustomerInvoice.md help topics
+	// draw the same distinction (باطلة/باطل‌شده vs. ملغى/لغوشده), but tr's
+	// own help topic uses the bare "İptal" for void — the same lemma
+	// "cancelled" ships as "İptal Edildi" elsewhere — so tr again gets
+	// its own distinct word, "Geçersiz Kılındı", not that ambiguous
+	// prose shorthand.
+	{Code: "void", Name: "Void", Translations: map[string]string{"ar": "باطلة", "fa": "باطل‌شده", "tr": "Geçersiz Kılındı"}, Sequence: 4, IsInitial: false, IsTerminal: true},
+}
+
+// StatusSpecs exposes this module's Status Specs (the identical literals
+// PublishStatuses passes to statusgraph.Seed, including Translations),
+// keyed by StatusTypeCode — see purchasing.StatusSpecs's own doc comment
+// for why (cmd/backfill-status-name-translations, uc-infra#244).
+func StatusSpecs() map[string][]statusgraph.Spec {
+	return map[string][]statusgraph.Spec{
+		"sales_order_status":      statusgraph.CopySpecs(salesOrderStatusSpecs),
+		"customer_invoice_status": statusgraph.CopySpecs(customerInvoiceStatusSpecs),
+	}
+}
+
 // PublishStatuses seeds the actual StatusType/Status/StatusTransition
 // *records* both SalesOrder.StatusTypeCode ("sales_order_status") and
 // CustomerInvoice.StatusTypeCode ("customer_invoice_status") need before
@@ -113,13 +163,7 @@ func PublishStatuses(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 
 	if _, err := statusgraph.Seed(ctx, engine, statusTypeDef, statusDef, transitionDef,
 		"SalesOrder", "sales_order_status", "Sales Order Status",
-		[]statusSpec{
-			{Code: "draft", Name: "Draft", Sequence: 1, IsInitial: true, IsTerminal: false},
-			{Code: "confirmed", Name: "Confirmed", Sequence: 2, IsInitial: false, IsTerminal: false},
-			{Code: "fulfilled", Name: "Fulfilled", Sequence: 3, IsInitial: false, IsTerminal: false},
-			{Code: "invoiced", Name: "Invoiced", Sequence: 4, IsInitial: false, IsTerminal: true},
-			{Code: "cancelled", Name: "Cancelled", Sequence: 5, IsInitial: false, IsTerminal: true},
-		},
+		salesOrderStatusSpecs,
 		[][2]string{
 			{"draft", "confirmed"},
 			{"confirmed", "fulfilled"},
@@ -134,12 +178,7 @@ func PublishStatuses(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 
 	if _, err := statusgraph.Seed(ctx, engine, statusTypeDef, statusDef, transitionDef,
 		"CustomerInvoice", "customer_invoice_status", "Customer Invoice Status",
-		[]statusSpec{
-			{Code: "draft", Name: "Draft", Sequence: 1, IsInitial: true, IsTerminal: false},
-			{Code: "issued", Name: "Issued", Sequence: 2, IsInitial: false, IsTerminal: false},
-			{Code: "paid", Name: "Paid", Sequence: 3, IsInitial: false, IsTerminal: true},
-			{Code: "void", Name: "Void", Sequence: 4, IsInitial: false, IsTerminal: true},
-		},
+		customerInvoiceStatusSpecs,
 		[][2]string{
 			{"draft", "issued"},
 			{"issued", "paid"},

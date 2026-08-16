@@ -652,6 +652,58 @@ func TestInstall_ReinstallKeepsOwnStatusGraph(t *testing.T) {
 	}
 }
 
+// TestInstall_StatusSpecTranslationsPassThrough is the plugin-shaped
+// counterpart to uc-infra#244's built-in-module translations: a bundle
+// (erp_module, ADR-0012) is CLAUDE.md's plugin-first "default new
+// functionality to a plugin" route, so a bundle-defined status graph
+// must be able to carry the same Translations content the six built-in
+// Go modules' StatusSpecs() now do — otherwise a bundle-installed
+// module's Status rows stay English-only forever, with no
+// StatusSpecs()-driven backfill path able to help them either. Proves
+// the JSON "translations" key survives Load -> Install and lands in the
+// real seeded Status row's i18n_text "name", not just that the Go
+// struct field exists.
+func TestInstall_StatusSpecTranslationsPassThrough(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+
+	translated, err := Load(mutate(t, func(m map[string]any) {
+		statuses := m["status_graphs"].([]any)[0].(map[string]any)["statuses"].([]any)
+		draft := statuses[0].(map[string]any)
+		if draft["code"] != "draft" {
+			t.Fatalf("test fixture assumption broken: expected statuses[0].code == \"draft\", got %v", draft["code"])
+		}
+		draft["translations"] = map[string]any{"tr": "Taslak", "ar": "مسودة"}
+	}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if _, err := Install(ctx, tenantDB, translated, actor); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+
+	engine := crud.NewEngine(tenantDB)
+	statusDef := publishedDef(t, tenantDB, "Status")
+	recs, err := engine.ListByField(ctx, statusDef, "code", "draft")
+	if err != nil {
+		t.Fatalf("list Status by code=draft: %v", err)
+	}
+	if len(recs) != 1 {
+		t.Fatalf("expected exactly 1 seeded \"draft\" Status row, got %d", len(recs))
+	}
+	name, ok := recs[0].Data["name"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected \"name\" as an i18n_text object, got %#v", recs[0].Data["name"])
+	}
+	if name["en"] != "Draft" || name["tr"] != "Taslak" || name["ar"] != "مسودة" {
+		t.Fatalf(`expected {"en": "Draft", "tr": "Taslak", "ar": "مسودة"}, got %#v`, name)
+	}
+}
+
 // Divergence conflicts are reported together, not one per attempt —
 // the property ADR-0012 §5 promises.
 func TestInstall_ReportsAllConflictsTogether(t *testing.T) {

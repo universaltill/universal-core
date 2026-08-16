@@ -103,6 +103,16 @@ type StatusSpec struct {
 	Sequence   float64 `json:"sequence"`
 	IsInitial  bool    `json:"is_initial"`
 	IsTerminal bool    `json:"is_terminal"`
+	// Translations optionally supplies additional locales (keyed by
+	// locale code, e.g. "ar"/"fa"/"tr" — never "en", see
+	// statusgraph.Spec's own doc comment on why), passed straight through
+	// to statusgraph.Spec.Translations. Without this, a bundle-defined
+	// module (the plugin-shaped route CLAUDE.md's plugin-first rule
+	// points new functionality at) would stay English-only forever, with
+	// no way for cmd/backfill-status-name-translations to help either —
+	// that tool only knows the six built-in Go modules' StatusSpecs()
+	// (uc-infra#244's own follow-up finding).
+	Translations map[string]string `json:"translations,omitempty"`
 }
 
 type Transition struct {
@@ -437,7 +447,7 @@ func Install(ctx context.Context, db *sql.DB, b *Bundle, actor audit.Actor) ([]B
 		specs := make([]statusgraph.Spec, 0, len(g.Statuses))
 		for _, s := range g.Statuses {
 			specs = append(specs, statusgraph.Spec{
-				Code: s.Code, Name: s.Name, Sequence: s.Sequence,
+				Code: s.Code, Name: s.Name, Translations: s.Translations, Sequence: s.Sequence,
 				IsInitial: s.IsInitial, IsTerminal: s.IsTerminal,
 			})
 		}

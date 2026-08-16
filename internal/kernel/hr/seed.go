@@ -57,6 +57,41 @@ func PublishForms(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 	return moduleseed.PublishAll(ctx, repo, items, actor)
 }
 
+// employeeStatusSpecs/leaveRequestStatusSpecs are package-level (not
+// inlined into PublishStatuses below) so StatusSpecs can expose the
+// identical literals — Translations included — to cmd/backfill-status-
+// name-translations (uc-infra#244) without a second, driftable copy.
+// Translations are the same words already shipped in
+// field.Employee.status_id.* / field.LeaveRequest.status_id.* in
+// internal/i18n/locales/{ar,fa,tr}.json (already reviewed, already
+// matching this module's own help topics) — reused here, not
+// independently re-translated.
+var employeeStatusSpecs = []statusgraph.Spec{
+	{Code: "probation", Name: "Probation", Translations: map[string]string{"ar": "تحت التجربة", "fa": "دوره آزمایشی", "tr": "Deneme Süresi"}, Sequence: 1, IsInitial: true},
+	{Code: "active", Name: "Active", Translations: map[string]string{"ar": "نشط", "fa": "فعال", "tr": "Aktif"}, Sequence: 2},
+	{Code: "on_leave", Name: "On Leave", Translations: map[string]string{"ar": "في إجازة", "fa": "در مرخصی", "tr": "İzinde"}, Sequence: 3},
+	{Code: "terminated", Name: "Terminated", Translations: map[string]string{"ar": "منتهي الخدمة", "fa": "خاتمه‌یافته", "tr": "İşten Ayrıldı"}, Sequence: 4, IsTerminal: true},
+}
+
+var leaveRequestStatusSpecs = []statusgraph.Spec{
+	{Code: "draft", Name: "Draft", Translations: map[string]string{"ar": "مسودة", "fa": "پیش‌نویس", "tr": "Taslak"}, Sequence: 1, IsInitial: true},
+	{Code: "submitted", Name: "Submitted", Translations: map[string]string{"ar": "مُقدَّم", "fa": "ارسال‌شده", "tr": "Gönderildi"}, Sequence: 2},
+	{Code: "approved", Name: "Approved", Translations: map[string]string{"ar": "معتمد", "fa": "تأییدشده", "tr": "Onaylandı"}, Sequence: 3, IsTerminal: true},
+	{Code: "rejected", Name: "Rejected", Translations: map[string]string{"ar": "مرفوض", "fa": "ردشده", "tr": "Reddedildi"}, Sequence: 4, IsTerminal: true},
+	{Code: "cancelled", Name: "Cancelled", Translations: map[string]string{"ar": "ملغى", "fa": "لغوشده", "tr": "İptal Edildi"}, Sequence: 5, IsTerminal: true},
+}
+
+// StatusSpecs exposes this module's Status Specs (the identical literals
+// PublishStatuses passes to statusgraph.Seed, including Translations),
+// keyed by StatusTypeCode — see purchasing.StatusSpecs's own doc comment
+// for why (cmd/backfill-status-name-translations, uc-infra#244).
+func StatusSpecs() map[string][]statusgraph.Spec {
+	return map[string][]statusgraph.Spec{
+		"employee_status":      statusgraph.CopySpecs(employeeStatusSpecs),
+		"leave_request_status": statusgraph.CopySpecs(leaveRequestStatusSpecs),
+	}
+}
+
 // PublishStatuses seeds the StatusType/Status/StatusTransition records
 // Employee's and LeaveRequest's StatusTypeCodes need before the guarded
 // engine will accept a create (the shared seeder is
@@ -110,12 +145,7 @@ func PublishStatuses(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 
 	if _, err := statusgraph.Seed(ctx, engine, statusTypeDef, statusDef, transitionDef,
 		"Employee", "employee_status", "Employee Status",
-		[]statusgraph.Spec{
-			{Code: "probation", Name: "Probation", Sequence: 1, IsInitial: true},
-			{Code: "active", Name: "Active", Sequence: 2},
-			{Code: "on_leave", Name: "On Leave", Sequence: 3},
-			{Code: "terminated", Name: "Terminated", Sequence: 4, IsTerminal: true},
-		},
+		employeeStatusSpecs,
 		[][2]string{
 			{"probation", "active"},
 			{"active", "on_leave"},
@@ -132,13 +162,7 @@ func PublishStatuses(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 
 	if _, err := statusgraph.Seed(ctx, engine, statusTypeDef, statusDef, transitionDef,
 		"LeaveRequest", "leave_request_status", "Leave Request Status",
-		[]statusgraph.Spec{
-			{Code: "draft", Name: "Draft", Sequence: 1, IsInitial: true},
-			{Code: "submitted", Name: "Submitted", Sequence: 2},
-			{Code: "approved", Name: "Approved", Sequence: 3, IsTerminal: true},
-			{Code: "rejected", Name: "Rejected", Sequence: 4, IsTerminal: true},
-			{Code: "cancelled", Name: "Cancelled", Sequence: 5, IsTerminal: true},
-		},
+		leaveRequestStatusSpecs,
 		[][2]string{
 			{"draft", "submitted"},
 			{"submitted", "approved"},

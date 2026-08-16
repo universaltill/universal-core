@@ -9,9 +9,12 @@ import (
 
 	"github.com/universaltill/universal-core/internal/data"
 	"github.com/universaltill/universal-core/internal/kernel/audit"
+	"github.com/universaltill/universal-core/internal/kernel/crm"
 	"github.com/universaltill/universal-core/internal/kernel/crud"
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
+	"github.com/universaltill/universal-core/internal/kernel/purchasing"
+	"github.com/universaltill/universal-core/internal/kernel/sales"
 	"github.com/universaltill/universal-core/internal/kernel/statusgraph"
 )
 
@@ -249,5 +252,166 @@ func TestAPI_StatusName_LegacyPreBackfillRowStillLabelsAndIsFindable(t *testing.
 	opts = decodeRefOptions(t, rec.Body.Bytes())
 	if len(opts) != 1 || opts[0].ID != legacyID || opts[0].Label != "Legacy Draft" {
 		t.Fatalf("expected q=Legacy to find the legacy pre-backfill row by its own plain-string text, got %+v", opts)
+	}
+}
+
+// TestAPI_StatusName_RealModuleTranslationsResolvePerLocale is the
+// phase-2 (uc-infra#244) proof TestAPI_StatusName_ResolvesPerLocale's own
+// doc comment says is still owed: that PROMISE was "the MECHANISM works
+// today, independent of when real translations ship" — this test proves
+// the real translations have now shipped, seeded through the actual
+// production path (purchasing/sales/crm.PublishStatuses ->
+// statusgraph.Seed, not a manual Update standing in for one), and that
+// three different modules' real content resolves correctly, not just
+// purchasing's.
+//
+// source_entity_type/source_field auto-scopes each query to its own
+// StatusType (uc-infra#222) — necessary here because, unlike the
+// single-StatusType widget fixtures above, this test publishes three
+// real modules at once, so an unscoped /api/references/Status would
+// return every module's Status rows mixed together.
+func TestAPI_StatusName_RealModuleTranslationsResolvePerLocale(t *testing.T) {
+	router := newTestRouter(t)
+	withDevAuthEnabled(t)
+	tenantID, db := newTestTenant(t, router)
+
+	ctx := context.Background()
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "test-setup"}
+	if err := foundation.Publish(ctx, db, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	if err := purchasing.Publish(ctx, db, actor); err != nil {
+		t.Fatalf("purchasing.Publish: %v", err)
+	}
+	if err := purchasing.PublishStatuses(ctx, db, actor); err != nil {
+		t.Fatalf("purchasing.PublishStatuses: %v", err)
+	}
+	if err := sales.Publish(ctx, db, actor); err != nil {
+		t.Fatalf("sales.Publish: %v", err)
+	}
+	if err := sales.PublishStatuses(ctx, db, actor); err != nil {
+		t.Fatalf("sales.PublishStatuses: %v", err)
+	}
+	if err := crm.Publish(ctx, db, actor); err != nil {
+		t.Fatalf("crm.Publish: %v", err)
+	}
+	if err := crm.PublishStatuses(ctx, db, actor); err != nil {
+		t.Fatalf("crm.PublishStatuses: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	testHandler(t, router).Routes(mux)
+
+	type refOpt struct{ ID, Label string }
+	get := func(sourceEntityType, sourceField, locale string) []refOpt {
+		t.Helper()
+		req := newRequest("GET",
+			"/api/references/Status?source_entity_type="+sourceEntityType+"&source_field="+sourceField+"&lang="+locale,
+			tenantID, "farshid", nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET references for %s.%s lang=%s: expected 200, got %d: %s", sourceEntityType, sourceField, locale, rec.Code, rec.Body.String())
+		}
+		decoded := decodeRefOptions(t, rec.Body.Bytes())
+		out := make([]refOpt, len(decoded))
+		for i, o := range decoded {
+			out[i] = refOpt{ID: o.ID, Label: o.Label}
+		}
+		return out
+	}
+	findLabel := func(t *testing.T, opts []refOpt, wantIDSet map[string]string, code string) string {
+		t.Helper()
+		id, ok := wantIDSet[code]
+		if !ok {
+			t.Fatalf("test setup error: no id recorded for code %q", code)
+		}
+		for _, o := range opts {
+			if o.ID == id {
+				return o.Label
+			}
+		}
+		t.Fatalf("expected to find option id=%s (code=%s) among %+v", id, code, opts)
+		return ""
+	}
+
+	// Collect ids by code for purchase_order_status via the English
+	// (fallback) listing, which every code resolves against regardless
+	// of locale.
+	poEN := get("PurchaseOrder", "status_id", "en")
+	poIDByLabel := map[string]string{}
+	for _, o := range poEN {
+		poIDByLabel[o.Label] = o.ID
+	}
+	poIDsByCode := map[string]string{
+		"draft":     poIDByLabel["Draft"],
+		"approved":  poIDByLabel["Approved"],
+		"cancelled": poIDByLabel["Cancelled"],
+	}
+	for code, id := range poIDsByCode {
+		if id == "" {
+			t.Fatalf("could not resolve PurchaseOrder status_id id for code %q from en listing: %+v", code, poEN)
+		}
+	}
+
+	poAR := get("PurchaseOrder", "status_id", "ar")
+	if got := findLabel(t, poAR, poIDsByCode, "draft"); got != "مسودة" {
+		t.Errorf("PurchaseOrder draft (ar): expected \"مسودة\", got %q", got)
+	}
+	if got := findLabel(t, poAR, poIDsByCode, "approved"); got != "معتمد" {
+		t.Errorf("PurchaseOrder approved (ar): expected \"معتمد\", got %q", got)
+	}
+
+	poFA := get("PurchaseOrder", "status_id", "fa")
+	if got := findLabel(t, poFA, poIDsByCode, "draft"); got != "پیش‌نویس" {
+		t.Errorf("PurchaseOrder draft (fa): expected \"پیش‌نویس\", got %q", got)
+	}
+	if got := findLabel(t, poFA, poIDsByCode, "cancelled"); got != "لغوشده" {
+		t.Errorf("PurchaseOrder cancelled (fa): expected \"لغوشده\", got %q", got)
+	}
+
+	poTR := get("PurchaseOrder", "status_id", "tr")
+	if got := findLabel(t, poTR, poIDsByCode, "draft"); got != "Taslak" {
+		t.Errorf("PurchaseOrder draft (tr): expected \"Taslak\", got %q", got)
+	}
+	if got := findLabel(t, poTR, poIDsByCode, "approved"); got != "Onaylandı" {
+		t.Errorf("PurchaseOrder approved (tr): expected \"Onaylandı\", got %q", got)
+	}
+
+	// A second module (sales), so this isn't purchasing-only wiring.
+	// CustomerInvoice.status_id (customer_invoice_status), not
+	// SalesOrder.status_id (sales_order_status) — "issued" is the
+	// invoice's own code, a different StatusType from the order's.
+	ciEN := get("CustomerInvoice", "status_id", "en")
+	ciIDByLabel := map[string]string{}
+	for _, o := range ciEN {
+		ciIDByLabel[o.Label] = o.ID
+	}
+	ciIDsByCode := map[string]string{"issued": ciIDByLabel["Issued"]}
+	if ciIDsByCode["issued"] == "" {
+		t.Fatalf("could not resolve CustomerInvoice status_id id for code \"issued\" from en listing: %+v", ciEN)
+	}
+	ciAR := get("CustomerInvoice", "status_id", "ar")
+	if got := findLabel(t, ciAR, ciIDsByCode, "issued"); got != "مُصدَرة" {
+		t.Errorf("CustomerInvoice issued (ar): expected \"مُصدَرة\", got %q", got)
+	}
+
+	// A third module (crm), whose translations were pulled from the
+	// pre-existing field.Case.status_id.* catalog rather than help-topic
+	// prose — proving that source produced correct StatusSpecs content
+	// too, not just the modules whose translations were newly authored
+	// for this card.
+	caseEN := get("Case", "status_id", "en")
+	caseIDByLabel := map[string]string{}
+	for _, o := range caseEN {
+		caseIDByLabel[o.Label] = o.ID
+	}
+	caseIDsByCode := map[string]string{"resolved": caseIDByLabel["Resolved"]}
+	if caseIDsByCode["resolved"] == "" {
+		t.Fatalf("could not resolve Case status_id id for code \"resolved\" from en listing: %+v", caseEN)
+	}
+	caseFA := get("Case", "status_id", "fa")
+	if got := findLabel(t, caseFA, caseIDsByCode, "resolved"); got != "حل‌شده" {
+		t.Errorf("Case resolved (fa): expected \"حل‌شده\", got %q", got)
 	}
 }

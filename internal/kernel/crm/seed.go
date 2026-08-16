@@ -57,6 +57,59 @@ func PublishForms(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 	return moduleseed.PublishAll(ctx, repo, items, actor)
 }
 
+// caseStatusSpecs/leadStatusSpecs/opportunityStatusSpecs/campaignStatusSpecs
+// are package-level (not inlined into PublishStatuses below) so
+// StatusSpecs can expose the identical literals — Translations included
+// — to cmd/backfill-status-name-translations (uc-infra#244) without a
+// second, driftable copy. Translations are the same words already
+// shipped in field.{Case,Lead,Opportunity,Campaign}.status_id.* in
+// internal/i18n/locales/{ar,fa,tr}.json.
+var caseStatusSpecs = []statusgraph.Spec{
+	{Code: "new", Name: "New", Translations: map[string]string{"ar": "جديدة", "fa": "جدید", "tr": "Yeni"}, Sequence: 1, IsInitial: true},
+	{Code: "in_progress", Name: "In Progress", Translations: map[string]string{"ar": "قيد المعالجة", "fa": "در حال بررسی", "tr": "İşlemde"}, Sequence: 2},
+	{Code: "waiting_customer", Name: "Waiting on Customer", Translations: map[string]string{"ar": "بانتظار العميل", "fa": "در انتظار مشتری", "tr": "Müşteri Bekleniyor"}, Sequence: 3},
+	{Code: "resolved", Name: "Resolved", Translations: map[string]string{"ar": "تم الحل", "fa": "حل‌شده", "tr": "Çözüldü"}, Sequence: 4},
+	{Code: "closed", Name: "Closed", Translations: map[string]string{"ar": "مغلقة", "fa": "بسته‌شده", "tr": "Kapatıldı"}, Sequence: 5, IsTerminal: true},
+	{Code: "cancelled", Name: "Cancelled", Translations: map[string]string{"ar": "ملغاة", "fa": "لغوشده", "tr": "İptal Edildi"}, Sequence: 6, IsTerminal: true},
+}
+
+var leadStatusSpecs = []statusgraph.Spec{
+	{Code: "new", Name: "New", Translations: map[string]string{"ar": "جديد", "fa": "جدید", "tr": "Yeni"}, Sequence: 1, IsInitial: true},
+	{Code: "contacted", Name: "Contacted", Translations: map[string]string{"ar": "تم الاتصال", "fa": "تماس گرفته‌شده", "tr": "İletişim Kuruldu"}, Sequence: 2},
+	{Code: "qualified", Name: "Qualified", Translations: map[string]string{"ar": "مؤهل", "fa": "واجد شرایط", "tr": "Nitelikli"}, Sequence: 3},
+	{Code: "converted", Name: "Converted", Translations: map[string]string{"ar": "تم التحويل", "fa": "تبدیل‌شده", "tr": "Dönüştürüldü"}, Sequence: 4, IsTerminal: true},
+	{Code: "disqualified", Name: "Disqualified", Translations: map[string]string{"ar": "غير مؤهل", "fa": "رد‌شده", "tr": "Elendi"}, Sequence: 5, IsTerminal: true},
+}
+
+var opportunityStatusSpecs = []statusgraph.Spec{
+	{Code: "prospecting", Name: "Prospecting", Translations: map[string]string{"ar": "استكشاف", "fa": "جست‌وجو", "tr": "Araştırma"}, Sequence: 1, IsInitial: true},
+	{Code: "qualification", Name: "Qualification", Translations: map[string]string{"ar": "تأهيل", "fa": "ارزیابی", "tr": "Değerlendirme"}, Sequence: 2},
+	{Code: "proposal", Name: "Proposal", Translations: map[string]string{"ar": "عرض", "fa": "پیشنهاد", "tr": "Teklif"}, Sequence: 3},
+	{Code: "negotiation", Name: "Negotiation", Translations: map[string]string{"ar": "تفاوض", "fa": "مذاکره", "tr": "Müzakere"}, Sequence: 4},
+	{Code: "won", Name: "Won", Translations: map[string]string{"ar": "تم الفوز", "fa": "برنده‌شده", "tr": "Kazanıldı"}, Sequence: 5, IsTerminal: true},
+	{Code: "lost", Name: "Lost", Translations: map[string]string{"ar": "خسارة", "fa": "ازدست‌رفته", "tr": "Kaybedildi"}, Sequence: 6, IsTerminal: true},
+}
+
+var campaignStatusSpecs = []statusgraph.Spec{
+	{Code: "planned", Name: "Planned", Translations: map[string]string{"ar": "مخطط لها", "fa": "برنامه‌ریزی‌شده", "tr": "Planlandı"}, Sequence: 1, IsInitial: true},
+	{Code: "active", Name: "Active", Translations: map[string]string{"ar": "نشطة", "fa": "فعال", "tr": "Aktif"}, Sequence: 2},
+	{Code: "completed", Name: "Completed", Translations: map[string]string{"ar": "مكتملة", "fa": "تکمیل‌شده", "tr": "Tamamlandı"}, Sequence: 3, IsTerminal: true},
+	{Code: "cancelled", Name: "Cancelled", Translations: map[string]string{"ar": "ملغاة", "fa": "لغوشده", "tr": "İptal Edildi"}, Sequence: 4, IsTerminal: true},
+}
+
+// StatusSpecs exposes this module's Status Specs (the identical literals
+// PublishStatuses passes to statusgraph.Seed, including Translations),
+// keyed by StatusTypeCode — see purchasing.StatusSpecs's own doc comment
+// for why (cmd/backfill-status-name-translations, uc-infra#244).
+func StatusSpecs() map[string][]statusgraph.Spec {
+	return map[string][]statusgraph.Spec{
+		"case_status":       statusgraph.CopySpecs(caseStatusSpecs),
+		"lead_status":       statusgraph.CopySpecs(leadStatusSpecs),
+		"opportunity_stage": statusgraph.CopySpecs(opportunityStatusSpecs),
+		"campaign_status":   statusgraph.CopySpecs(campaignStatusSpecs),
+	}
+}
+
 // PublishStatuses seeds the StatusType/Status/StatusTransition records
 // this module's four StatusTypeCodes need before the guarded engine
 // will accept a create (the shared seeder is internal/kernel/
@@ -115,14 +168,7 @@ func PublishStatuses(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 
 	if _, err := statusgraph.Seed(ctx, engine, statusTypeDef, statusDef, transitionDef,
 		"Case", "case_status", "Case Status",
-		[]statusgraph.Spec{
-			{Code: "new", Name: "New", Sequence: 1, IsInitial: true},
-			{Code: "in_progress", Name: "In Progress", Sequence: 2},
-			{Code: "waiting_customer", Name: "Waiting on Customer", Sequence: 3},
-			{Code: "resolved", Name: "Resolved", Sequence: 4},
-			{Code: "closed", Name: "Closed", Sequence: 5, IsTerminal: true},
-			{Code: "cancelled", Name: "Cancelled", Sequence: 6, IsTerminal: true},
-		},
+		caseStatusSpecs,
 		[][2]string{
 			{"new", "in_progress"},
 			{"in_progress", "waiting_customer"},
@@ -169,13 +215,7 @@ func PublishStatuses(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 	// then has to reason about.
 	if _, err := statusgraph.Seed(ctx, engine, statusTypeDef, statusDef, transitionDef,
 		"Lead", "lead_status", "Lead Status",
-		[]statusgraph.Spec{
-			{Code: "new", Name: "New", Sequence: 1, IsInitial: true},
-			{Code: "contacted", Name: "Contacted", Sequence: 2},
-			{Code: "qualified", Name: "Qualified", Sequence: 3},
-			{Code: "converted", Name: "Converted", Sequence: 4, IsTerminal: true},
-			{Code: "disqualified", Name: "Disqualified", Sequence: 5, IsTerminal: true},
-		},
+		leadStatusSpecs,
 		[][2]string{
 			{"new", "contacted"},
 			{"contacted", "qualified"},
@@ -209,14 +249,7 @@ func PublishStatuses(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 	// including prospecting.
 	if _, err := statusgraph.Seed(ctx, engine, statusTypeDef, statusDef, transitionDef,
 		"Opportunity", "opportunity_stage", "Opportunity Stage",
-		[]statusgraph.Spec{
-			{Code: "prospecting", Name: "Prospecting", Sequence: 1, IsInitial: true},
-			{Code: "qualification", Name: "Qualification", Sequence: 2},
-			{Code: "proposal", Name: "Proposal", Sequence: 3},
-			{Code: "negotiation", Name: "Negotiation", Sequence: 4},
-			{Code: "won", Name: "Won", Sequence: 5, IsTerminal: true},
-			{Code: "lost", Name: "Lost", Sequence: 6, IsTerminal: true},
-		},
+		opportunityStatusSpecs,
 		[][2]string{
 			{"prospecting", "qualification"},
 			{"qualification", "proposal"},
@@ -245,12 +278,7 @@ func PublishStatuses(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 	// enum-to-graph migration once (PurchaseOrder).
 	if _, err := statusgraph.Seed(ctx, engine, statusTypeDef, statusDef, transitionDef,
 		"Campaign", "campaign_status", "Campaign Status",
-		[]statusgraph.Spec{
-			{Code: "planned", Name: "Planned", Sequence: 1, IsInitial: true},
-			{Code: "active", Name: "Active", Sequence: 2},
-			{Code: "completed", Name: "Completed", Sequence: 3, IsTerminal: true},
-			{Code: "cancelled", Name: "Cancelled", Sequence: 4, IsTerminal: true},
-		},
+		campaignStatusSpecs,
 		[][2]string{
 			{"planned", "active"},
 			{"active", "completed"},
