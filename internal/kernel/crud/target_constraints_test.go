@@ -132,6 +132,91 @@ func groupedItemOptionalGroupDef() *entity.Definition {
 	return def
 }
 
+// storageBinDef and inventoryItemDef are the StatusTransition/Status
+// shape (uc-infra#252, independent review finding #2): TWO DIFFERENT
+// Definitions sharing a same-named field ("zone_id") that
+// MustMatchParentField compares across. Every other MustMatchParentField
+// user in this file (groupedItemDef above) and in production
+// (projects.Task.parent_task_id) is a SELF-reference — the declaring
+// Definition and Target are the same type. StatusTransition.
+// from_status_id/to_status_id (foundation.go) is the first CROSS-entity
+// user (StatusTransition -> Status, two distinct Definitions), and
+// nothing here proved the generic mechanism (target_constraints.go's
+// valueMatches/EqualsFilters comparison, which only ever looks at field
+// *names*, never Definition identity) actually holds up across that
+// shape until now.
+func storageBinDef() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "StorageBin",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "code", Type: entity.FieldString, Required: true},
+			{Name: "zone_id", Type: entity.FieldString, Required: true},
+		},
+	}
+}
+
+func inventoryItemDef() *entity.Definition {
+	return &entity.Definition{
+		EntityType: "InventoryItem",
+		Version:    1,
+		Fields: []entity.Field{
+			{Name: "sku", Type: entity.FieldString, Required: true},
+			{Name: "zone_id", Type: entity.FieldString, Required: true},
+			{Name: "bin_id", Type: entity.FieldReference, Target: "StorageBin", MustMatchParentField: "zone_id"},
+		},
+	}
+}
+
+// TestEngine_Create_MustMatchParentField_CrossEntityRejectsMismatchedZone
+// is storageBinDef/inventoryItemDef's counterpart to
+// TestEngine_Update_MustMatchParentField_RejectsCrossGroupParent above,
+// proving the SAME rejection holds when source and target are different
+// Definitions, not just a self-reference.
+func TestEngine_Create_MustMatchParentField_CrossEntityRejectsMismatchedZone(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	binInZoneA, err := engine.Create(ctx, storageBinDef(), map[string]any{"code": "A-1", "zone_id": "zone-a"}, actor)
+	if err != nil {
+		t.Fatalf("create bin in zone-a: %v", err)
+	}
+
+	_, err = engine.Create(ctx, inventoryItemDef(), map[string]any{
+		"sku": "WIDGET-1", "zone_id": "zone-b", "bin_id": binInZoneA.ID,
+	}, actor)
+	if !errors.Is(err, ErrTargetConstraintViolation) {
+		t.Fatalf("expected ErrTargetConstraintViolation for an item in zone-b pointing at a zone-a bin, got %v", err)
+	}
+}
+
+// TestEngine_Create_MustMatchParentField_CrossEntityAllowsMatchedZone is
+// the positive-case twin: a matching zone_id, across two different
+// Definitions, must still succeed.
+func TestEngine_Create_MustMatchParentField_CrossEntityAllowsMatchedZone(t *testing.T) {
+	db := freshTenantDB(t)
+	ctx := context.Background()
+	engine := NewEngine(db)
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "farshid"}
+
+	binInZoneA, err := engine.Create(ctx, storageBinDef(), map[string]any{"code": "A-1", "zone_id": "zone-a"}, actor)
+	if err != nil {
+		t.Fatalf("create bin in zone-a: %v", err)
+	}
+
+	item, err := engine.Create(ctx, inventoryItemDef(), map[string]any{
+		"sku": "WIDGET-1", "zone_id": "zone-a", "bin_id": binInZoneA.ID,
+	}, actor)
+	if err != nil {
+		t.Fatalf("expected a same-zone bin to be allowed, got %v", err)
+	}
+	if item.Data["bin_id"] != binInZoneA.ID {
+		t.Fatalf("expected bin_id %s, got %v", binInZoneA.ID, item.Data["bin_id"])
+	}
+}
+
 func TestEngine_Create_TargetFilterEntityJoin_RejectsWhenTargetLacksRole(t *testing.T) {
 	db := freshTenantDB(t)
 	ctx := context.Background()

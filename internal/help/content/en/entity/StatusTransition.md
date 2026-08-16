@@ -31,6 +31,9 @@ building a brand-new lifecycle on a new Status Type.
 - Direction matters: a row from Draft to Approved does not also allow
   Approved back to Draft — add a second row if the reverse move should be
   legal too.
+- **From** and **To** must each belong to the Status Type chosen on this
+  row — you cannot point either one at a status from a different Status
+  Type's lifecycle.
 - A confirmed example from Purchase Order Status: Draft → Submitted,
   Submitted → Approved, and Approved → Received form the normal path.
   Draft → Cancelled, Submitted → Cancelled, and Approved → Cancelled are

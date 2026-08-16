@@ -223,7 +223,7 @@ var wantHashes = map[string]string{
 	"entity:ExchangeRate@v3":                 "78516fa2b76628e40b05b92ac2bf4c25b674fd68b139605a7ac0e58a774beea7",
 	"entity:StatusType@v1":                   "633c522a100ada70a2fb5aa281ba24577730a5aead9bcac43d91da4b70f1a054",
 	"entity:Status@v1":                       "53b8108a33de9c1104fbf088c8a2aa7dcd81127a4a1f0a305e095e9f3d3acdb3",
-	"entity:StatusTransition@v1":             "00f369446a59120ff712e191e65b8ab3fea4084a8fafad3a8dd437ec75921248",
+	"entity:StatusTransition@v2":             "2d06dd168bfdeac2009fd52d615446ea6fff18d8dd25e5c96ab5af484466131f",
 	"entity:IssueReport@v3":                  "cffb12600181dd86859a7edfd432e0505a96d3f6f3b0f45749824bd99c924764",
 	"entity:AIProviderConnection@v2":         "40b88384ca109e19a124a29d1731c97e18cd9966e11c123e5dcd8bc276b297f1",
 	"entity:ExternalSQLSource@v1":            "837549058fc96b76c07441fa4e809e926d09e42fc21307688379df88cb21d1dd",
