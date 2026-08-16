@@ -57,6 +57,39 @@ func PublishForms(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 	return moduleseed.PublishAll(ctx, repo, items, actor)
 }
 
+// fixedAssetStatusSpecs/maintenanceOrderStatusSpecs are package-level
+// (not inlined into PublishStatuses below) so StatusSpecs can expose the
+// identical literals — Translations included — to cmd/backfill-status-
+// name-translations (uc-infra#244) without a second, driftable copy.
+// Translations are the same words already shipped in
+// field.FixedAsset.status_id.* / field.MaintenanceOrder.status_id.* in
+// internal/i18n/locales/{ar,fa,tr}.json.
+var fixedAssetStatusSpecs = []statusgraph.Spec{
+	{Code: "draft", Name: "Draft", Translations: map[string]string{"ar": "مسودة", "fa": "پیش‌نویس", "tr": "Taslak"}, Sequence: 1, IsInitial: true},
+	{Code: "in_service", Name: "In Service", Translations: map[string]string{"ar": "قيد الاستخدام", "fa": "در حال استفاده", "tr": "Kullanımda"}, Sequence: 2},
+	{Code: "fully_depreciated", Name: "Fully Depreciated", Translations: map[string]string{"ar": "مستهلك بالكامل", "fa": "مستهلک‌شده", "tr": "Tamamen Amortismana Tabi"}, Sequence: 3},
+	{Code: "disposed", Name: "Disposed", Translations: map[string]string{"ar": "مستبعد", "fa": "واگذارشده", "tr": "Elden Çıkarıldı"}, Sequence: 4, IsTerminal: true},
+	{Code: "written_off", Name: "Written Off", Translations: map[string]string{"ar": "مشطوب", "fa": "حذف‌شده", "tr": "Kayıttan Düşüldü"}, Sequence: 5, IsTerminal: true},
+}
+
+var maintenanceOrderStatusSpecs = []statusgraph.Spec{
+	{Code: "scheduled", Name: "Scheduled", Translations: map[string]string{"ar": "مجدول", "fa": "برنامه‌ریزی‌شده", "tr": "Planlandı"}, Sequence: 1, IsInitial: true},
+	{Code: "in_progress", Name: "In Progress", Translations: map[string]string{"ar": "قيد التنفيذ", "fa": "در حال انجام", "tr": "Devam Ediyor"}, Sequence: 2},
+	{Code: "completed", Name: "Completed", Translations: map[string]string{"ar": "مكتمل", "fa": "تکمیل‌شده", "tr": "Tamamlandı"}, Sequence: 3, IsTerminal: true},
+	{Code: "cancelled", Name: "Cancelled", Translations: map[string]string{"ar": "ملغى", "fa": "لغوشده", "tr": "İptal Edildi"}, Sequence: 4, IsTerminal: true},
+}
+
+// StatusSpecs exposes this module's Status Specs (the identical literals
+// PublishStatuses passes to statusgraph.Seed, including Translations),
+// keyed by StatusTypeCode — see purchasing.StatusSpecs's own doc comment
+// for why (cmd/backfill-status-name-translations, uc-infra#244).
+func StatusSpecs() map[string][]statusgraph.Spec {
+	return map[string][]statusgraph.Spec{
+		"fixed_asset_status":       statusgraph.CopySpecs(fixedAssetStatusSpecs),
+		"maintenance_order_status": statusgraph.CopySpecs(maintenanceOrderStatusSpecs),
+	}
+}
+
 // PublishStatuses seeds the StatusType/Status/StatusTransition records
 // FixedAsset's StatusTypeCode needs before the guarded engine will
 // accept a create (same requirement and same shape as purchasing's and
@@ -104,13 +137,7 @@ func PublishStatuses(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 
 	if _, err := statusgraph.Seed(ctx, engine, statusTypeDef, statusDef, transitionDef,
 		"FixedAsset", "fixed_asset_status", "Fixed Asset Status",
-		[]statusgraph.Spec{
-			{Code: "draft", Name: "Draft", Sequence: 1, IsInitial: true},
-			{Code: "in_service", Name: "In Service", Sequence: 2},
-			{Code: "fully_depreciated", Name: "Fully Depreciated", Sequence: 3},
-			{Code: "disposed", Name: "Disposed", Sequence: 4, IsTerminal: true},
-			{Code: "written_off", Name: "Written Off", Sequence: 5, IsTerminal: true},
-		},
+		fixedAssetStatusSpecs,
 		[][2]string{
 			{"draft", "in_service"},
 			{"in_service", "fully_depreciated"},
@@ -135,12 +162,7 @@ func PublishStatuses(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 	// the same reasoning sales.PublishStatuses gives for a paid invoice.
 	if _, err := statusgraph.Seed(ctx, engine, statusTypeDef, statusDef, transitionDef,
 		"MaintenanceOrder", "maintenance_order_status", "Maintenance Order Status",
-		[]statusgraph.Spec{
-			{Code: "scheduled", Name: "Scheduled", Sequence: 1, IsInitial: true},
-			{Code: "in_progress", Name: "In Progress", Sequence: 2},
-			{Code: "completed", Name: "Completed", Sequence: 3, IsTerminal: true},
-			{Code: "cancelled", Name: "Cancelled", Sequence: 4, IsTerminal: true},
-		},
+		maintenanceOrderStatusSpecs,
 		[][2]string{
 			{"scheduled", "in_progress"},
 			{"in_progress", "completed"},

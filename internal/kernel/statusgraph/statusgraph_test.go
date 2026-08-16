@@ -141,6 +141,36 @@ func TestSeed_CodeCollisionScoping(t *testing.T) {
 	}
 }
 
+// TestCopySpecs_MutatingResultDoesNotAffectOriginal is the proof behind
+// every module's StatusSpecs() doc comment claim ("a fresh copy every
+// call, safe for a caller to mutate"): a caller that mutates a returned
+// Spec's Translations map — the exact hazard a bare "read-only" comment
+// doesn't actually prevent — must not corrupt the original slice/map the
+// package's own PublishStatuses seeds from.
+func TestCopySpecs_MutatingResultDoesNotAffectOriginal(t *testing.T) {
+	original := []Spec{
+		{Code: "draft", Name: "Draft", Translations: map[string]string{"ar": "مسودة"}},
+	}
+	got := CopySpecs(original)
+
+	got[0].Translations["ar"] = "CORRUPTED"
+	got[0].Translations["tr"] = "ADDED"
+	if original[0].Translations["ar"] != "مسودة" {
+		t.Errorf("mutating the copy's Translations map corrupted the original: %#v", original[0].Translations)
+	}
+	if _, ok := original[0].Translations["tr"]; ok {
+		t.Errorf("adding a key to the copy's Translations map leaked into the original: %#v", original[0].Translations)
+	}
+
+	// A nil Translations map must not panic and must round-trip as nil,
+	// not an empty-but-non-nil map that would then compare unequal to a
+	// Spec built with a literal omitting Translations entirely.
+	nilCase := CopySpecs([]Spec{{Code: "done", Name: "Done"}})
+	if nilCase[0].Translations != nil {
+		t.Errorf("expected nil Translations to copy as nil, got %#v", nilCase[0].Translations)
+	}
+}
+
 // TestSeed_StatusNameIsWrappedAsI18nText is the unit-level proof for
 // uc-infra#214 (ADR-0030): foundation.Status's "name" field is
 // FieldI18nText, but every Spec still carries a plain Go string — Seed
@@ -193,5 +223,105 @@ func TestSeed_StatusNameIsWrappedAsI18nText(t *testing.T) {
 	}
 	if len(name) != 1 || name["en"] != "Draft" {
 		t.Fatalf(`expected exactly {"en": "Draft"}, got %#v`, name)
+	}
+}
+
+// TestBuildI18nName is the unit-level proof for uc-infra#244's merge
+// contract: Translations' locales are merged in alongside Name's "en",
+// and a Translations "en" entry (a caller mistake) is silently
+// overwritten by Name rather than left to win — see BuildI18nName's own
+// doc comment on why that's the deliberate choice, not an oversight.
+func TestBuildI18nName(t *testing.T) {
+	got := BuildI18nName("Draft", map[string]string{"ar": "مسودة", "tr": "Taslak"})
+	want := map[string]any{"en": "Draft", "ar": "مسودة", "tr": "Taslak"}
+	if len(got) != len(want) {
+		t.Fatalf("expected %d keys, got %d: %#v", len(want), len(got), got)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("key %q: expected %q, got %#v", k, v, got[k])
+		}
+	}
+
+	// nil Translations: behaves exactly like the pre-uc-infra#244 shape.
+	if got := BuildI18nName("Draft", nil); len(got) != 1 || got["en"] != "Draft" {
+		t.Fatalf(`expected {"en": "Draft"} for nil Translations, got %#v`, got)
+	}
+
+	// A Translations "en" entry must not win over Name.
+	if got := BuildI18nName("Draft", map[string]string{"en": "WRONG"}); got["en"] != "Draft" {
+		t.Fatalf(`expected Name to override a Translations["en"] entry, got %#v`, got)
+	}
+}
+
+// TestSeed_TranslationsAreMergedIntoI18nName is the integration-level
+// proof that Seed actually wires Spec.Translations through
+// BuildI18nName end to end, against a real Postgres row — not just that
+// the pure helper is correct in isolation.
+func TestSeed_TranslationsAreMergedIntoI18nName(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := audit.Actor{Type: audit.ActorHuman, ID: "statusgraph-test"}
+	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
+		t.Fatalf("foundation.Publish: %v", err)
+	}
+	defs := data.NewEntityDefinitionRepo(tenantDB)
+	def := func(entityType string) *entity.Definition {
+		v, err := defs.GetPublished(ctx, entityType)
+		if err != nil {
+			t.Fatalf("GetPublished(%s): %v", entityType, err)
+		}
+		d, err := entity.Unmarshal(v.Definition)
+		if err != nil {
+			t.Fatalf("unmarshal %s: %v", entityType, err)
+		}
+		return d
+	}
+	engine := crud.NewEngine(tenantDB)
+	statusTypeDef, statusDef, transitionDef := def("StatusType"), def("Status"), def("StatusTransition")
+
+	ids, err := Seed(ctx, engine, statusTypeDef, statusDef, transitionDef,
+		"WidgetTranslated", "widget_translated_status", "Widget Translated Status",
+		[]Spec{
+			{Code: "draft", Name: "Draft", Translations: map[string]string{"ar": "مسودة", "fa": "پیش‌نویس", "tr": "Taslak"}, Sequence: 1, IsInitial: true},
+			// No Translations at all: must behave exactly like the
+			// pre-uc-infra#244 English-only shape, proving this is
+			// additive/optional per-Spec, not a new requirement.
+			{Code: "done", Name: "Done", Sequence: 2, IsTerminal: true},
+		},
+		nil, actor,
+	)
+	if err != nil {
+		t.Fatalf("Seed: %v", err)
+	}
+
+	draftRec, err := engine.Get(ctx, statusDef, ids["draft"])
+	if err != nil {
+		t.Fatalf("Get draft Status: %v", err)
+	}
+	draftName, ok := draftRec.Data["name"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected draft \"name\" as an i18n_text object, got %#v", draftRec.Data["name"])
+	}
+	want := map[string]any{"en": "Draft", "ar": "مسودة", "fa": "پیش‌نویس", "tr": "Taslak"}
+	if len(draftName) != len(want) {
+		t.Fatalf("expected %d locales, got %d: %#v", len(want), len(draftName), draftName)
+	}
+	for k, v := range want {
+		if draftName[k] != v {
+			t.Errorf("locale %q: expected %q, got %#v", k, v, draftName[k])
+		}
+	}
+
+	doneRec, err := engine.Get(ctx, statusDef, ids["done"])
+	if err != nil {
+		t.Fatalf("Get done Status: %v", err)
+	}
+	doneName, ok := doneRec.Data["name"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected done \"name\" as an i18n_text object, got %#v", doneRec.Data["name"])
+	}
+	if len(doneName) != 1 || doneName["en"] != "Done" {
+		t.Fatalf(`expected a Spec with no Translations to still produce exactly {"en": "Done"}, got %#v`, doneName)
 	}
 }

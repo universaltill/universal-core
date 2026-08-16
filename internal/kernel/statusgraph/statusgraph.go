@@ -29,17 +29,62 @@ import (
 
 // Spec is one Status row within a StatusType's graph.
 //
-// Name is a plain Go string, not the i18n_text shape foundation.Status's
-// own "name" field declares (uc-infra#214, ADR-0030) — Seed wraps it as
-// {"en": Name} itself (see Seed's own doc comment), so every one of this
-// package's callers keeps writing an ordinary string literal here. Real
-// per-locale translations are a follow-up: nothing about this Spec shape
-// needs to change for a future call site to seed additional locales —
-// Seed's wrap is the only place that would grow.
+// Name is the required English/fallback value. Translations optionally
+// supplies additional locales (keyed by locale code, e.g. "ar"/"fa"/"tr" —
+// never "en", see BuildI18nName's own doc comment on why) — this is the follow-up
+// uc-infra#244 promised when Name was still the only content Seed had to
+// wrap (uc-infra#214, ADR-0030/0031): a caller that only sets Name keeps
+// behaving exactly as before (nil Translations is fine, Seed treats it the
+// same as an empty map), and one that also sets Translations gets those
+// locales merged into the same i18n_text object.
 type Spec struct {
 	Code, Name            string
+	Translations          map[string]string
 	Sequence              float64
 	IsInitial, IsTerminal bool
+}
+
+// CopySpecs returns a deep copy of specs — specifically, each Spec's own
+// Translations map is a fresh copy, never the caller's original. Every
+// module's exported StatusSpecs() (purchasing.StatusSpecs and its five
+// siblings) returns this rather than its package-level var directly: the
+// package-level vars are shared, process-lifetime state that Seed itself
+// only ever reads, but a StatusSpecs() caller mutating a returned Spec's
+// Translations map in place (e.g. `specs[0].Translations["ar"] = x`)
+// would otherwise corrupt every future seed of that module for the rest
+// of the process — the exact hazard a plain "read-only, don't mutate"
+// comment doesn't actually prevent.
+func CopySpecs(specs []Spec) []Spec {
+	out := make([]Spec, len(specs))
+	for i, s := range specs {
+		out[i] = s
+		if s.Translations != nil {
+			out[i].Translations = make(map[string]string, len(s.Translations))
+			for k, v := range s.Translations {
+				out[i].Translations[k] = v
+			}
+		}
+	}
+	return out
+}
+
+// BuildI18nName builds the i18n_text object (ADR-0009) a Status.name
+// field stores from a Spec's plain-string Name plus its optional
+// Translations map — the one place that wrap happens, so Seed and a
+// backfill tool updating an already-seeded tenant's existing rows
+// (uc-infra#244) apply the identical merge rather than two independent
+// copies that could drift. "en" always comes from Name: a "en" key
+// inside Translations is overwritten by this, deliberately, since Name
+// is documented as the required fallback and letting Translations
+// silently win would make the two ways of setting English-language
+// content disagree about which one applies.
+func BuildI18nName(name string, translations map[string]string) map[string]any {
+	obj := make(map[string]any, len(translations)+1)
+	for locale, text := range translations {
+		obj[locale] = text
+	}
+	obj["en"] = name
+	return obj
 }
 
 // Seed seeds one StatusType, its Status rows, and its StatusTransition
@@ -96,14 +141,15 @@ func Seed(
 			statusIDs[s.Code] = id
 			continue
 		}
-		// name: wrapped as i18n_text (uc-infra#214, ADR-0030) — Status.name
-		// is FieldI18nText as of foundation.Status's v2, but every caller
-		// of Seed still supplies Spec.Name as a plain Go string (see
-		// Spec's own doc comment). English-only content this phase; real
-		// per-locale translations are a follow-up card, not a further
-		// change to this wrap.
+		// name: wrapped as i18n_text (uc-infra#214, ADR-0030). "en" is
+		// always Name, the required fallback; any additional locale in
+		// Translations is merged in alongside it (uc-infra#244) — a
+		// caller-supplied "en" key in Translations would be silently
+		// overwritten by Name's own assignment below, so BuildI18nName
+		// (the single place this merge happens) documents Name as the
+		// only source of "en" rather than accepting two.
 		rec, err := engine.Create(ctx, statusDef, map[string]any{
-			"status_type_id": statusTypeID, "code": s.Code, "name": map[string]any{"en": s.Name},
+			"status_type_id": statusTypeID, "code": s.Code, "name": BuildI18nName(s.Name, s.Translations),
 			"sequence": s.Sequence, "is_initial": s.IsInitial, "is_terminal": s.IsTerminal,
 		}, actor)
 		if err != nil {

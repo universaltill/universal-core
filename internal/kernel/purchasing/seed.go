@@ -72,6 +72,94 @@ func PublishForms(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 // the original duplication note ruled out.
 type statusSpec = statusgraph.Spec
 
+// purchaseOrderStatusSpecs, vendorInvoiceStatusSpecs, stockTransferStatusSpecs,
+// and rfqStatusSpecs are package-level (rather than inlined into
+// PublishStatuses below) so StatusSpecs can expose the identical literals
+// — Translations included — to cmd/backfill-status-name-translations
+// (uc-infra#244) without a second, driftable copy.
+//
+// Translations content: draft/submitted/approved/received match this
+// module's own shipped tr/fa/ar help topics (internal/help/content/
+// {tr,fa,ar}/entity/{PurchaseOrder,VendorInvoice,StockTransfer,
+// RequestForQuotation}.md) — the exact words those topics already use to
+// describe this same status graph. cancelled instead reuses the
+// pre-existing field.PurchaseOrder.status.cancelled / field.
+// RequestForQuotation.status.cancelled / field.StockTransfer.status.
+// cancelled catalog entries (internal/i18n/locales/{ar,fa,tr}.json,
+// already shipped and used by internal/api/reporting.go and
+// rfq_report.go) — those help topics only use the verbal-noun form
+// ("الإلغاء"/"لغو کردن"/"İptal", as in "cancelling is possible from...")
+// in prose, not the status-label form itself. Either way, not
+// independently invented wording.
+var purchaseOrderStatusSpecs = []statusSpec{
+	{Code: "draft", Name: "Draft", Translations: map[string]string{"ar": "مسودة", "fa": "پیش‌نویس", "tr": "Taslak"}, Sequence: 1, IsInitial: true, IsTerminal: false},
+	{Code: "submitted", Name: "Submitted", Translations: map[string]string{"ar": "مُقدَّم", "fa": "ارسال‌شده", "tr": "Gönderildi"}, Sequence: 2, IsInitial: false, IsTerminal: false},
+	{Code: "approved", Name: "Approved", Translations: map[string]string{"ar": "معتمد", "fa": "تأییدشده", "tr": "Onaylandı"}, Sequence: 3, IsInitial: false, IsTerminal: false},
+	{Code: "received", Name: "Received", Translations: map[string]string{"ar": "مستلم", "fa": "دریافت‌شده", "tr": "Teslim Alındı"}, Sequence: 4, IsInitial: false, IsTerminal: true},
+	{Code: "cancelled", Name: "Cancelled", Translations: map[string]string{"ar": "ملغى", "fa": "لغوشده", "tr": "İptal Edildi"}, Sequence: 5, IsInitial: false, IsTerminal: true},
+}
+
+var vendorInvoiceStatusSpecs = []statusSpec{
+	{Code: "draft", Name: "Draft", Translations: map[string]string{"ar": "مسودة", "fa": "پیش‌نویس", "tr": "Taslak"}, Sequence: 1, IsInitial: true, IsTerminal: false},
+	{Code: "matched", Name: "Matched", Translations: map[string]string{"ar": "مطابقة", "fa": "تطبیق‌شده", "tr": "Eşleştirildi"}, Sequence: 2, IsInitial: false, IsTerminal: false},
+	// Sequence 3, ahead of paid/void: display-order only (this
+	// kernel has no other meaning for Sequence), placed here
+	// because an exception is a "still in flight" state like
+	// draft/matched, not a resolved one.
+	{Code: "match_exception", Name: "Match Exception", Translations: map[string]string{"ar": "استثناء المطابقة", "fa": "استثنای تطبیق", "tr": "Eşleşme İstisnası"}, Sequence: 3, IsInitial: false, IsTerminal: false},
+	{Code: "paid", Name: "Paid", Translations: map[string]string{"ar": "مدفوعة", "fa": "پرداخت‌شده", "tr": "Ödendi"}, Sequence: 4, IsInitial: false, IsTerminal: true},
+	// void's own word, not "cancelled"'s (ar ملغى/fa لغوشده/tr İptal
+	// Edildi) — Void vs. Cancelled are different words in this kernel's
+	// English (see VendorInvoice's own doc comment on why), and ar/fa's
+	// own VendorInvoice.md help topics draw the identical distinction
+	// (باطلة vs. ملغى; باطل‌شده vs. لغوشده). tr's own help topic does NOT
+	// — it uses the bare word "İptal" for void, the same lemma
+	// "cancelled" ships as "İptal Edildi" (tr/entity/VendorInvoice.md
+	// alongside tr/entity/{PurchaseOrder,StockTransfer,
+	// RequestForQuotation,SalesOrder}.md's identical prose shorthand for
+	// their own "cancelled" codes) — reusing that word here would make
+	// void and cancelled indistinguishable to a Turkish reader, the
+	// opposite of what ar/fa's own distinct words accomplish. tr's void
+	// gets its own distinct word instead, "Geçersiz Kılındı" ("rendered
+	// void/invalid" — the ordinary Turkish term for a voided invoice,
+	// matching this status set's own past-participle style, e.g.
+	// "Onaylandı"/"Ödendi"), not sourced from the help topic's own
+	// (ambiguous, on this one point) prose.
+	{Code: "void", Name: "Void", Translations: map[string]string{"ar": "باطلة", "fa": "باطل‌شده", "tr": "Geçersiz Kılındı"}, Sequence: 5, IsInitial: false, IsTerminal: true},
+}
+
+var stockTransferStatusSpecs = []statusSpec{
+	{Code: "draft", Name: "Draft", Translations: map[string]string{"ar": "مسودة", "fa": "پیش‌نویس", "tr": "Taslak"}, Sequence: 1, IsInitial: true, IsTerminal: false},
+	{Code: "in_transit", Name: "In Transit", Translations: map[string]string{"ar": "قيد النقل", "fa": "در حال انتقال", "tr": "Yolda"}, Sequence: 2, IsInitial: false, IsTerminal: false},
+	{Code: "received", Name: "Received", Translations: map[string]string{"ar": "مستلم", "fa": "دریافت‌شده", "tr": "Teslim Alındı"}, Sequence: 3, IsInitial: false, IsTerminal: true},
+	{Code: "cancelled", Name: "Cancelled", Translations: map[string]string{"ar": "ملغى", "fa": "لغوشده", "tr": "İptal Edildi"}, Sequence: 4, IsInitial: false, IsTerminal: true},
+}
+
+var rfqStatusSpecs = []statusSpec{
+	{Code: "draft", Name: "Draft", Translations: map[string]string{"ar": "مسودة", "fa": "پیش‌نویس", "tr": "Taslak"}, Sequence: 1, IsInitial: true, IsTerminal: false},
+	{Code: "sent", Name: "Sent", Translations: map[string]string{"ar": "مُرسَل", "fa": "ارسال‌شده", "tr": "Gönderildi"}, Sequence: 2, IsInitial: false, IsTerminal: false},
+	{Code: "quotes_received", Name: "Quotes Received", Translations: map[string]string{"ar": "تم استلام العروض", "fa": "قیمت‌های دریافت‌شده", "tr": "Teklifler Alındı"}, Sequence: 3, IsInitial: false, IsTerminal: false},
+	{Code: "closed", Name: "Closed", Translations: map[string]string{"ar": "مغلق", "fa": "بسته‌شده", "tr": "Kapatıldı"}, Sequence: 4, IsInitial: false, IsTerminal: true},
+	{Code: "cancelled", Name: "Cancelled", Translations: map[string]string{"ar": "ملغى", "fa": "لغوشده", "tr": "İptal Edildi"}, Sequence: 5, IsInitial: false, IsTerminal: true},
+}
+
+// StatusSpecs exposes this module's Status Specs (the identical content
+// PublishStatuses passes to statusgraph.Seed, including Translations),
+// keyed by StatusTypeCode — a fresh statusgraph.CopySpecs copy every
+// call, safe for a caller to mutate without corrupting this package's
+// own seed data. cmd/backfill-status-name-translations (uc-infra#244)
+// uses this to look up (status_type_code, code) -> Translations for an
+// already-provisioned tenant's existing Status rows without re-running
+// Publish/PublishForms/PublishStatuses.
+func StatusSpecs() map[string][]statusgraph.Spec {
+	return map[string][]statusgraph.Spec{
+		"purchase_order_status": statusgraph.CopySpecs(purchaseOrderStatusSpecs),
+		"vendor_invoice_status": statusgraph.CopySpecs(vendorInvoiceStatusSpecs),
+		"stock_transfer_status": statusgraph.CopySpecs(stockTransferStatusSpecs),
+		"rfq_status":            statusgraph.CopySpecs(rfqStatusSpecs),
+	}
+}
+
 // PublishStatuses seeds the actual StatusType/Status/StatusTransition
 // *records* PurchaseOrder's StatusTypeCode ("purchase_order_status") and
 // VendorInvoice's StatusTypeCode ("vendor_invoice_status") need to
@@ -216,13 +304,7 @@ func PublishStatuses(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 
 	if _, err := statusgraph.Seed(ctx, engine, statusTypeDef, statusDef, transitionDef,
 		"PurchaseOrder", "purchase_order_status", "Purchase Order Status",
-		[]statusSpec{
-			{Code: "draft", Name: "Draft", Sequence: 1, IsInitial: true, IsTerminal: false},
-			{Code: "submitted", Name: "Submitted", Sequence: 2, IsInitial: false, IsTerminal: false},
-			{Code: "approved", Name: "Approved", Sequence: 3, IsInitial: false, IsTerminal: false},
-			{Code: "received", Name: "Received", Sequence: 4, IsInitial: false, IsTerminal: true},
-			{Code: "cancelled", Name: "Cancelled", Sequence: 5, IsInitial: false, IsTerminal: true},
-		},
+		purchaseOrderStatusSpecs,
 		[][2]string{
 			{"draft", "submitted"},
 			{"submitted", "approved"},
@@ -238,17 +320,7 @@ func PublishStatuses(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 
 	if _, err := statusgraph.Seed(ctx, engine, statusTypeDef, statusDef, transitionDef,
 		"VendorInvoice", "vendor_invoice_status", "Vendor Invoice Status",
-		[]statusSpec{
-			{Code: "draft", Name: "Draft", Sequence: 1, IsInitial: true, IsTerminal: false},
-			{Code: "matched", Name: "Matched", Sequence: 2, IsInitial: false, IsTerminal: false},
-			// Sequence 3, ahead of paid/void: display-order only (this
-			// kernel has no other meaning for Sequence), placed here
-			// because an exception is a "still in flight" state like
-			// draft/matched, not a resolved one.
-			{Code: "match_exception", Name: "Match Exception", Sequence: 3, IsInitial: false, IsTerminal: false},
-			{Code: "paid", Name: "Paid", Sequence: 4, IsInitial: false, IsTerminal: true},
-			{Code: "void", Name: "Void", Sequence: 5, IsInitial: false, IsTerminal: true},
-		},
+		vendorInvoiceStatusSpecs,
 		[][2]string{
 			{"draft", "matched"},
 			{"matched", "paid"},
@@ -289,12 +361,7 @@ func PublishStatuses(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 
 	if _, err := statusgraph.Seed(ctx, engine, statusTypeDef, statusDef, transitionDef,
 		"StockTransfer", "stock_transfer_status", "Stock Transfer Status",
-		[]statusSpec{
-			{Code: "draft", Name: "Draft", Sequence: 1, IsInitial: true, IsTerminal: false},
-			{Code: "in_transit", Name: "In Transit", Sequence: 2, IsInitial: false, IsTerminal: false},
-			{Code: "received", Name: "Received", Sequence: 3, IsInitial: false, IsTerminal: true},
-			{Code: "cancelled", Name: "Cancelled", Sequence: 4, IsInitial: false, IsTerminal: true},
-		},
+		stockTransferStatusSpecs,
 		[][2]string{
 			{"draft", "in_transit"},
 			{"in_transit", "received"},
@@ -308,13 +375,7 @@ func PublishStatuses(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 
 	if _, err := statusgraph.Seed(ctx, engine, statusTypeDef, statusDef, transitionDef,
 		"RequestForQuotation", "rfq_status", "RFQ Status",
-		[]statusSpec{
-			{Code: "draft", Name: "Draft", Sequence: 1, IsInitial: true, IsTerminal: false},
-			{Code: "sent", Name: "Sent", Sequence: 2, IsInitial: false, IsTerminal: false},
-			{Code: "quotes_received", Name: "Quotes Received", Sequence: 3, IsInitial: false, IsTerminal: false},
-			{Code: "closed", Name: "Closed", Sequence: 4, IsInitial: false, IsTerminal: true},
-			{Code: "cancelled", Name: "Cancelled", Sequence: 5, IsInitial: false, IsTerminal: true},
-		},
+		rfqStatusSpecs,
 		[][2]string{
 			{"draft", "sent"},
 			{"sent", "quotes_received"},

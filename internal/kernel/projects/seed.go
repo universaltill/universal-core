@@ -57,6 +57,44 @@ func PublishForms(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 	return moduleseed.PublishAll(ctx, repo, items, actor)
 }
 
+// projectStatusSpecs/taskStatusSpecs are package-level (not inlined into
+// PublishStatuses below) so StatusSpecs can expose the identical
+// literals — Translations included — to cmd/backfill-status-name-
+// translations (uc-infra#244) without a second, driftable copy.
+// Translations are the same words already shipped in
+// field.Project.status_id.* / field.Task.status_id.* in
+// internal/i18n/locales/{ar,fa,tr}.json.
+var projectStatusSpecs = []statusgraph.Spec{
+	{Code: "planned", Name: "Planned", Translations: map[string]string{"ar": "مخطط", "fa": "برنامه‌ریزی‌شده", "tr": "Planlandı"}, Sequence: 1, IsInitial: true},
+	{Code: "active", Name: "Active", Translations: map[string]string{"ar": "نشط", "fa": "فعال", "tr": "Aktif"}, Sequence: 2},
+	{Code: "on_hold", Name: "On Hold", Translations: map[string]string{"ar": "معلق", "fa": "متوقف", "tr": "Beklemede"}, Sequence: 3},
+	{Code: "completed", Name: "Completed", Translations: map[string]string{"ar": "مكتمل", "fa": "تکمیل‌شده", "tr": "Tamamlandı"}, Sequence: 4, IsTerminal: true},
+	{Code: "cancelled", Name: "Cancelled", Translations: map[string]string{"ar": "ملغى", "fa": "لغوشده", "tr": "İptal Edildi"}, Sequence: 5, IsTerminal: true},
+}
+
+var taskStatusSpecs = []statusgraph.Spec{
+	{Code: "todo", Name: "To Do", Translations: map[string]string{"ar": "قيد الانتظار", "fa": "انجام‌نشده", "tr": "Yapılacak"}, Sequence: 1, IsInitial: true},
+	{Code: "in_progress", Name: "In Progress", Translations: map[string]string{"ar": "قيد التنفيذ", "fa": "در حال انجام", "tr": "Devam Ediyor"}, Sequence: 2},
+	{Code: "blocked", Name: "Blocked", Translations: map[string]string{"ar": "محجوب", "fa": "مسدود", "tr": "Engellendi"}, Sequence: 3},
+	// Terminal is descriptive, not enforcing (nothing in
+	// ValidateStatusTransition reads it), so flagging done does not
+	// conflict with the reopening edge below — it is what lets a
+	// filter or report tell a finished task from a live one.
+	{Code: "done", Name: "Done", Translations: map[string]string{"ar": "منجز", "fa": "انجام‌شده", "tr": "Tamamlandı"}, Sequence: 4, IsTerminal: true},
+	{Code: "cancelled", Name: "Cancelled", Translations: map[string]string{"ar": "ملغى", "fa": "لغوشده", "tr": "İptal Edildi"}, Sequence: 5, IsTerminal: true},
+}
+
+// StatusSpecs exposes this module's Status Specs (the identical literals
+// PublishStatuses passes to statusgraph.Seed, including Translations),
+// keyed by StatusTypeCode — see purchasing.StatusSpecs's own doc comment
+// for why (cmd/backfill-status-name-translations, uc-infra#244).
+func StatusSpecs() map[string][]statusgraph.Spec {
+	return map[string][]statusgraph.Spec{
+		"project_status": statusgraph.CopySpecs(projectStatusSpecs),
+		"task_status":    statusgraph.CopySpecs(taskStatusSpecs),
+	}
+}
+
 // PublishStatuses seeds the StatusType/Status/StatusTransition records
 // Project's and Task's StatusTypeCodes need before the guarded engine
 // will accept a create (same requirement and shape as every other
@@ -107,13 +145,7 @@ func PublishStatuses(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 
 	if _, err := statusgraph.Seed(ctx, engine, statusTypeDef, statusDef, transitionDef,
 		"Project", "project_status", "Project Status",
-		[]statusgraph.Spec{
-			{Code: "planned", Name: "Planned", Sequence: 1, IsInitial: true},
-			{Code: "active", Name: "Active", Sequence: 2},
-			{Code: "on_hold", Name: "On Hold", Sequence: 3},
-			{Code: "completed", Name: "Completed", Sequence: 4, IsTerminal: true},
-			{Code: "cancelled", Name: "Cancelled", Sequence: 5, IsTerminal: true},
-		},
+		projectStatusSpecs,
 		[][2]string{
 			{"planned", "active"},
 			{"active", "on_hold"},
@@ -130,17 +162,7 @@ func PublishStatuses(ctx context.Context, db *sql.DB, actor audit.Actor) error {
 
 	if _, err := statusgraph.Seed(ctx, engine, statusTypeDef, statusDef, transitionDef,
 		"Task", "task_status", "Task Status",
-		[]statusgraph.Spec{
-			{Code: "todo", Name: "To Do", Sequence: 1, IsInitial: true},
-			{Code: "in_progress", Name: "In Progress", Sequence: 2},
-			{Code: "blocked", Name: "Blocked", Sequence: 3},
-			// Terminal is descriptive, not enforcing (nothing in
-			// ValidateStatusTransition reads it), so flagging done does not
-			// conflict with the reopening edge below — it is what lets a
-			// filter or report tell a finished task from a live one.
-			{Code: "done", Name: "Done", Sequence: 4, IsTerminal: true},
-			{Code: "cancelled", Name: "Cancelled", Sequence: 5, IsTerminal: true},
-		},
+		taskStatusSpecs,
 		[][2]string{
 			{"todo", "in_progress"},
 			// Blocked is reachable from todo, not only from in_progress:
