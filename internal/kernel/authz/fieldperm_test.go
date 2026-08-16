@@ -520,7 +520,7 @@ func TestGuardedEngine_ResolveReferenceFilter_StatusIDAutoScopingPassesThrough(t
 		t.Fatalf("seed StatusType: %v", err)
 	}
 	draft, err := f.engine.Create(ctx, f.def("Status"), map[string]any{
-		"status_type_id": st.ID, "code": "draft", "name": "Draft", "is_initial": true,
+		"status_type_id": st.ID, "code": "draft", "name": map[string]any{"en": "Draft"}, "is_initial": true,
 	}, f.actor)
 	if err != nil {
 		t.Fatalf("seed Status: %v", err)
@@ -534,7 +534,7 @@ func TestGuardedEngine_ResolveReferenceFilter_StatusIDAutoScopingPassesThrough(t
 		t.Fatalf("seed other StatusType: %v", err)
 	}
 	if _, err := f.engine.Create(ctx, f.def("Status"), map[string]any{
-		"status_type_id": otherType.ID, "code": "active", "name": "Active", "is_initial": true,
+		"status_type_id": otherType.ID, "code": "active", "name": map[string]any{"en": "Active"}, "is_initial": true,
 	}, f.actor); err != nil {
 		t.Fatalf("seed other Status: %v", err)
 	}
@@ -595,7 +595,7 @@ func TestGuardedEngine_ResolveReferenceFilter_DropsStatusIDNarrowingWhenStatusTy
 		t.Fatalf("seed StatusType: %v", err)
 	}
 	if _, err := f.engine.Create(ctx, f.def("Status"), map[string]any{
-		"status_type_id": st.ID, "code": "draft", "name": "Draft", "is_initial": true,
+		"status_type_id": st.ID, "code": "draft", "name": map[string]any{"en": "Draft"}, "is_initial": true,
 	}, f.actor); err != nil {
 		t.Fatalf("seed Status: %v", err)
 	}
