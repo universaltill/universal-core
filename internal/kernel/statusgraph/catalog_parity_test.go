@@ -38,28 +38,62 @@ import (
 	"testing"
 
 	"github.com/universaltill/universal-core/internal/i18n"
+	"github.com/universaltill/universal-core/internal/kernel/assets"
+	"github.com/universaltill/universal-core/internal/kernel/crm"
+	"github.com/universaltill/universal-core/internal/kernel/entity"
+	"github.com/universaltill/universal-core/internal/kernel/hr"
+	"github.com/universaltill/universal-core/internal/kernel/projects"
 	"github.com/universaltill/universal-core/internal/kernel/statusgraph"
 )
 
-// entityTypeToStatusTypeCode maps each of the 10 entity types that carry
-// a field.{EntityType}.status_id.{code} catalog entry to the module
-// StatusTypeCode whose StatusSpecs() is that content's real, consumed
-// source today. Six of allModuleStatusSpecs()'s 16 StatusTypeCode groups
-// (purchasing's 4, sales' 2) are deliberately absent — those entities
-// have no field.*.status_id.* catalog keys at all (confirmed by grep
-// while filing uc-infra#256), so there is nothing for this test to check
-// them against.
-var entityTypeToStatusTypeCode = map[string]string{
-	"Employee":         "employee_status",
-	"LeaveRequest":     "leave_request_status",
-	"Project":          "project_status",
-	"Task":             "task_status",
-	"Campaign":         "campaign_status",
-	"Case":             "case_status",
-	"Lead":             "lead_status",
-	"Opportunity":      "opportunity_stage",
-	"FixedAsset":       "fixed_asset_status",
-	"MaintenanceOrder": "maintenance_order_status",
+// deriveEntityTypeToStatusTypeCode builds the EntityType -> StatusTypeCode
+// map this test checks the catalog against by reading it directly off each
+// hr/crm/assets/projects Definition (entity.Definition.StatusTypeCode is
+// itself the field statusgraph.Seed's callers pass — see each module's
+// seed.go), rather than hand-maintaining a second, independent copy of the
+// same 10 pairs (uc-infra#258: this map used to be a hardcoded literal that
+// was itself a third copy of content the catalog-vs-StatusSpecs() drift
+// check above already exists to catch a second copy of).
+//
+// Definitions with no lifecycle (StatusTypeCode == "", e.g.
+// hr.AttendanceRecord()) are skipped. purchasing/sales are deliberately
+// not iterated here — their 4+2 StatusTypeCode groups have no
+// field.*.status_id.* catalog keys at all (confirmed by grep while filing
+// uc-infra#256), so there is nothing for this test to check them against.
+//
+// Unlike the hardcoded literal this replaces, this map's scope is now
+// dynamic, not pinned: a lifecycle newly added to any hr/crm/assets/
+// projects entity is picked up automatically (no opt-in edit here needed
+// any more), and TestFieldStatusIDCatalogKeysMatchStatusSpecs's reverse
+// check then requires that entity to carry a matching field.*.status_id.*
+// catalog key in every locale, or the test fails — same "fails loudly on
+// drift" behavior as before, just triggered by a Definition change now
+// instead of a forgotten map edit. The wantEntityTypeCount check below is
+// what still pins the *count* at exactly 10, the same role the literal's
+// line count used to serve, matching allModuleStatusSpecs()'s own count
+// check in i18n_coverage_test.go for the same "hand-maintained module
+// list, guarded by a count assertion" shape.
+func deriveEntityTypeToStatusTypeCode(t *testing.T) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	for _, defs := range [][]*entity.Definition{
+		hr.All(), crm.All(), assets.All(), projects.All(),
+	} {
+		for _, d := range defs {
+			if d.StatusTypeCode == "" {
+				continue
+			}
+			if existing, dup := out[d.EntityType]; dup && existing != d.StatusTypeCode {
+				t.Fatalf("EntityType %q is registered with two different StatusTypeCodes (%q and %q) across hr/crm/assets/projects — module Definitions must keep EntityType globally unique", d.EntityType, existing, d.StatusTypeCode)
+			}
+			out[d.EntityType] = d.StatusTypeCode
+		}
+	}
+	const wantEntityTypeCount = 10
+	if len(out) != wantEntityTypeCount {
+		t.Fatalf("expected %d entity types with a StatusTypeCode across hr/crm/assets/projects, got %d — a Definition's StatusTypeCode was added, removed, or emptied without updating this test's own understanding of scope (or this comment's count)", wantEntityTypeCount, len(out))
+	}
+	return out
 }
 
 // fieldStatusIDKeyPattern matches exactly the dead-for-rendering key
@@ -82,12 +116,13 @@ func TestFieldStatusIDCatalogKeysMatchStatusSpecs(t *testing.T) {
 		t.Fatalf("load i18n catalog: %v", err)
 	}
 	allSpecs := allModuleStatusSpecs()
+	entityTypeToStatusTypeCode := deriveEntityTypeToStatusTypeCode(t)
 
 	specsByEntity := make(map[string]map[string]statusgraph.Spec, len(entityTypeToStatusTypeCode))
 	for entityType, statusTypeCode := range entityTypeToStatusTypeCode {
 		specs, ok := allSpecs[statusTypeCode]
 		if !ok {
-			t.Fatalf("%s: no StatusSpecs() group for StatusTypeCode %q — entityTypeToStatusTypeCode is stale", entityType, statusTypeCode)
+			t.Fatalf("%s: no StatusSpecs() group for StatusTypeCode %q — either this Definition's StatusTypeCode is a typo, or allModuleStatusSpecs() (i18n_coverage_test.go) is missing this module", entityType, statusTypeCode)
 		}
 		byCode := make(map[string]statusgraph.Spec, len(specs))
 		for _, s := range specs {
@@ -116,7 +151,7 @@ func TestFieldStatusIDCatalogKeysMatchStatusSpecs(t *testing.T) {
 
 		byCode, tracked := specsByEntity[entityType]
 		if !tracked {
-			t.Errorf("catalog has %s but %q isn't in entityTypeToStatusTypeCode — a new entity type grew field.*.status_id.* keys; add it here or confirm the key is a mistake", key, entityType)
+			t.Errorf("catalog has %s but %q has no StatusTypeCode in hr/crm/assets/projects — set entity.Definition.StatusTypeCode on that entity, recognize it as a purchasing/sales entity this test deliberately doesn't track, or confirm the catalog key is a mistake", key, entityType)
 			continue
 		}
 		spec, ok := byCode[code]
