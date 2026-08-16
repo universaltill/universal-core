@@ -5,10 +5,6 @@ import (
 	"testing"
 
 	"github.com/chromedp/chromedp"
-
-	"github.com/universaltill/universal-core/internal/kernel/foundation"
-	"github.com/universaltill/universal-core/internal/kernel/purchasing"
-	"github.com/universaltill/universal-core/internal/kernel/sales"
 )
 
 // setUpStatusTransitionPickerTest is the shared setup for the
@@ -30,33 +26,7 @@ func setUpStatusTransitionPickerTest(t *testing.T) context.Context {
 	ctx := context.Background()
 	actor := humanActor()
 
-	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
-		t.Fatalf("foundation.Publish: %v", err)
-	}
-	if err := foundation.PublishForms(ctx, tenantDB, actor); err != nil {
-		t.Fatalf("foundation.PublishForms: %v", err)
-	}
-	if err := purchasing.Publish(ctx, tenantDB, actor); err != nil {
-		t.Fatalf("purchasing.Publish: %v", err)
-	}
-	if err := purchasing.PublishForms(ctx, tenantDB, actor); err != nil {
-		t.Fatalf("purchasing.PublishForms: %v", err)
-	}
-	if err := purchasing.PublishStatuses(ctx, tenantDB, actor); err != nil {
-		t.Fatalf("purchasing.PublishStatuses: %v", err)
-	}
-	// sales published too, purely to give a real wrong-StatusType
-	// candidate set for the narrowing to fail open into — its own
-	// StatusTransition picker is never visited.
-	if err := sales.Publish(ctx, tenantDB, actor); err != nil {
-		t.Fatalf("sales.Publish: %v", err)
-	}
-	if err := sales.PublishForms(ctx, tenantDB, actor); err != nil {
-		t.Fatalf("sales.PublishForms: %v", err)
-	}
-	if err := sales.PublishStatuses(ctx, tenantDB, actor); err != nil {
-		t.Fatalf("sales.PublishStatuses: %v", err)
-	}
+	publishStatusPickerFixtures(t, ctx, tenantDB, actor)
 
 	bctx := browserCtx(t, tenantID)
 	statusTypeScope := `.uc-ref[data-field="status_type_id"]`
