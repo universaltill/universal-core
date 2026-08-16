@@ -21,8 +21,8 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/entity"
 	"github.com/universaltill/universal-core/internal/kernel/foundation"
 	"github.com/universaltill/universal-core/internal/kernel/purchasing"
-	"github.com/universaltill/universal-core/internal/kernel/sales"
 	"github.com/universaltill/universal-core/internal/tenantdb"
+	"github.com/universaltill/universal-core/internal/testfixtures"
 )
 
 // ublFixture is everything the UBL export tests create: a tenant with
@@ -52,30 +52,7 @@ func setupUBLTenant(t *testing.T) *ublFixture {
 	ctx := context.Background()
 	actor := humanActor()
 
-	if err := foundation.Publish(ctx, db, actor); err != nil {
-		t.Fatalf("foundation.Publish: %v", err)
-	}
-	if err := foundation.PublishForms(ctx, db, actor); err != nil {
-		t.Fatalf("foundation.PublishForms: %v", err)
-	}
-	if err := purchasing.Publish(ctx, db, actor); err != nil {
-		t.Fatalf("purchasing.Publish: %v", err)
-	}
-	if err := purchasing.PublishForms(ctx, db, actor); err != nil {
-		t.Fatalf("purchasing.PublishForms: %v", err)
-	}
-	if err := purchasing.PublishStatuses(ctx, db, actor); err != nil {
-		t.Fatalf("purchasing.PublishStatuses: %v", err)
-	}
-	if err := sales.Publish(ctx, db, actor); err != nil {
-		t.Fatalf("sales.Publish: %v", err)
-	}
-	if err := sales.PublishForms(ctx, db, actor); err != nil {
-		t.Fatalf("sales.PublishForms: %v", err)
-	}
-	if err := sales.PublishStatuses(ctx, db, actor); err != nil {
-		t.Fatalf("sales.PublishStatuses: %v", err)
-	}
+	testfixtures.PublishFoundationPurchasingSalesFixtures(t, ctx, db, actor)
 
 	engine := crud.NewEngine(db)
 	defs := entityDefLookup(t, db)

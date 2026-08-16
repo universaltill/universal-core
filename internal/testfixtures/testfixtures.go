@@ -18,19 +18,25 @@ import (
 	"github.com/universaltill/universal-core/internal/kernel/sales"
 )
 
-// PublishStatusPickerFixtures publishes foundation, purchasing (the
-// entity/StatusType under test in the two internal/e2e call sites), and
-// sales (a real wrong-StatusType candidate set for a
-// status_id/from_status_id/to_status_id narrowing bug to fail open into,
-// in the internal/e2e call sites — and, in the internal/api call site,
-// the complementary SalesOrder picker whose own narrowed result set is
-// asserted directly) into tenantDB. Shared by internal/e2e (status_id_picker_test.go,
-// status_transition_picker_test.go) and internal/api
-// (reference_search_test.go's
-// TestReferenceSearch_SourceField_StatusIDAutoScopedToOwnStatusType) —
-// three call sites across two packages that otherwise can't share a
-// package-internal helper.
-func PublishStatusPickerFixtures(t *testing.T, ctx context.Context, tenantDB *sql.DB, actor audit.Actor) {
+// PublishFoundationPurchasingSalesFixtures publishes foundation,
+// purchasing, and sales (Publish, PublishForms, and — for purchasing and
+// sales — PublishStatuses) into tenantDB. Shared by four call sites
+// across two packages that otherwise can't share a package-internal
+// helper:
+//   - internal/e2e/status_id_picker_test.go and
+//     status_transition_picker_test.go use purchasing (the entity/
+//     StatusType under test) and sales (a real wrong-StatusType candidate
+//     set for a status_id/from_status_id/to_status_id narrowing bug to
+//     fail open into).
+//   - internal/api/reference_search_test.go's
+//     TestReferenceSearch_SourceField_StatusIDAutoScopedToOwnStatusType
+//     asserts the complementary SalesOrder picker's own narrowed result
+//     set directly.
+//   - internal/api/ublexport_test.go's setupUBLTenant needs all three
+//     modules published as the base tenant fixture for its UBL export
+//     tests (Party/Currency/Item/PurchaseOrder/SalesOrder/CustomerInvoice
+//     records), unrelated to status pickers.
+func PublishFoundationPurchasingSalesFixtures(t *testing.T, ctx context.Context, tenantDB *sql.DB, actor audit.Actor) {
 	t.Helper()
 	if err := foundation.Publish(ctx, tenantDB, actor); err != nil {
 		t.Fatalf("foundation.Publish: %v", err)

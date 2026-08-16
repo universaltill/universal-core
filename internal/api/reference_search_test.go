@@ -424,7 +424,7 @@ func TestReferenceSearch_SourceField_StatusIDAutoScopedToOwnStatusType(t *testin
 	ctx := context.Background()
 	actor := humanActor()
 
-	testfixtures.PublishStatusPickerFixtures(t, ctx, tenantDB, actor)
+	testfixtures.PublishFoundationPurchasingSalesFixtures(t, ctx, tenantDB, actor)
 
 	mux := http.NewServeMux()
 	testHandler(t, router).Routes(mux)
