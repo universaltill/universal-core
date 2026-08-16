@@ -33,6 +33,9 @@ kurarken kendiniz eklersiniz.
 - Yön önemlidir: Taslak'tan Onaylandı'ya bir satır, Onaylandı'dan geri
   Taslak'a da izin vermez — ters hareketin de yasal olması gerekiyorsa
   ikinci bir satır ekleyin.
+- **Kaynak** ve **Hedef**, bu satırda seçilen Durum Türüne ait olmalıdır
+  — ikisinden birini farklı bir Durum Türünün yaşam döngüsündeki bir
+  duruma işaret edemezsiniz.
 - Satın Alma Siparişi Durumundan doğrulanmış bir örnek: Taslak →
   Gönderildi, Gönderildi → Onaylandı ve Onaylandı → Alındı normal yolu
   oluşturur. Taslak → İptal Edildi, Gönderildi → İptal Edildi ve Onaylandı

@@ -511,6 +511,119 @@ func TestStatusTransition_MissingToStatus(t *testing.T) {
 	}
 }
 
+// TestStatusTransition_FromStatusMustShareStatusType and its to_status_id
+// twin below (uc-infra#252) mirror
+// projects.TestTask_ParentTaskMustShareProject's own shape-level proof
+// for the same mechanism: from_status_id/to_status_id declare
+// MustMatchParentField: "status_type_id" — crud.Engine (proven generically
+// against throwaway Definitions by
+// internal/kernel/crud/target_constraints_test.go) is what actually
+// enforces it at write time; this only proves StatusTransition's own
+// Definition wires the constraint on, closing the gap uc-infra#252
+// itself reported: a transition could point at a Status belonging to an
+// entirely different StatusType with no error, since nothing before this
+// declared the constraint (StatusTransition's own doc comment never
+// claimed otherwise — it only ever called out requires_workflow as
+// unenforced).
+func TestStatusTransition_FromStatusMustShareStatusType(t *testing.T) {
+	f, ok := StatusTransition().FieldByName("from_status_id")
+	if !ok {
+		t.Fatal("expected a from_status_id field")
+	}
+	if f.Type != entity.FieldReference || f.Target != "Status" {
+		t.Fatalf("expected from_status_id to be a FieldReference targeting Status, got type=%s target=%s", f.Type, f.Target)
+	}
+	if f.MustMatchParentField != "status_type_id" {
+		t.Fatalf("expected must_match_parent_field %q, got %q", "status_type_id", f.MustMatchParentField)
+	}
+}
+
+func TestStatusTransition_ToStatusMustShareStatusType(t *testing.T) {
+	f, ok := StatusTransition().FieldByName("to_status_id")
+	if !ok {
+		t.Fatal("expected a to_status_id field")
+	}
+	if f.Type != entity.FieldReference || f.Target != "Status" {
+		t.Fatalf("expected to_status_id to be a FieldReference targeting Status, got type=%s target=%s", f.Type, f.Target)
+	}
+	if f.MustMatchParentField != "status_type_id" {
+		t.Fatalf("expected must_match_parent_field %q, got %q", "status_type_id", f.MustMatchParentField)
+	}
+}
+
+// TestStatusTransition_RejectsCrossStatusTypeFromAndTo (uc-infra#252) is
+// the real-Postgres end-to-end proof that the two shape tests above
+// actually do something at write time: crud.Engine.Create must reject a
+// StatusTransition whose from_status_id or to_status_id names a Status
+// belonging to a DIFFERENT StatusType than the transition row's own
+// status_type_id, and must still accept the legitimate same-StatusType
+// case. The generic MustMatchParentField mechanism itself is already
+// proven against throwaway Definitions
+// (internal/kernel/crud/target_constraints_test.go); this exercises the
+// real StatusTransition Definition specifically, the same "prove the real
+// Definition wires the generic mechanism correctly" layer
+// TestSystemOfRecord_DuplicateEntityTypeAndSourceRejected above
+// establishes for a different constraint.
+func TestStatusTransition_RejectsCrossStatusTypeFromAndTo(t *testing.T) {
+	tenantDB := freshTenantDB(t)
+	ctx := context.Background()
+	actor := humanActor()
+	engine := crud.NewEngine(tenantDB)
+
+	poType, err := engine.Create(ctx, StatusType(), map[string]any{
+		"entity_type": "PurchaseOrder", "code": "purchase_order_status", "name": "Purchase Order Status",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create purchase_order_status StatusType: %v", err)
+	}
+	soType, err := engine.Create(ctx, StatusType(), map[string]any{
+		"entity_type": "SalesOrder", "code": "sales_order_status", "name": "Sales Order Status",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create sales_order_status StatusType: %v", err)
+	}
+
+	poDraft, err := engine.Create(ctx, Status(), map[string]any{
+		"status_type_id": poType.ID, "code": "draft", "name": "Draft", "is_initial": true,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create purchase_order_status draft Status: %v", err)
+	}
+	poSubmitted, err := engine.Create(ctx, Status(), map[string]any{
+		"status_type_id": poType.ID, "code": "submitted", "name": "Submitted",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create purchase_order_status submitted Status: %v", err)
+	}
+	soDraft, err := engine.Create(ctx, Status(), map[string]any{
+		"status_type_id": soType.ID, "code": "draft", "name": "Draft", "is_initial": true,
+	}, actor)
+	if err != nil {
+		t.Fatalf("create sales_order_status draft Status: %v", err)
+	}
+
+	// Legitimate same-StatusType transition still succeeds.
+	if _, err := engine.Create(ctx, StatusTransition(), map[string]any{
+		"status_type_id": poType.ID, "from_status_id": poDraft.ID, "to_status_id": poSubmitted.ID,
+	}, actor); err != nil {
+		t.Fatalf("expected a same-StatusType transition to succeed: %v", err)
+	}
+
+	// from_status_id pointing at the WRONG StatusType is rejected.
+	if _, err := engine.Create(ctx, StatusTransition(), map[string]any{
+		"status_type_id": poType.ID, "from_status_id": soDraft.ID, "to_status_id": poSubmitted.ID,
+	}, actor); !errors.Is(err, crud.ErrTargetConstraintViolation) {
+		t.Fatalf("expected ErrTargetConstraintViolation for a cross-StatusType from_status_id, got %v", err)
+	}
+
+	// to_status_id pointing at the WRONG StatusType is rejected.
+	if _, err := engine.Create(ctx, StatusTransition(), map[string]any{
+		"status_type_id": poType.ID, "from_status_id": poDraft.ID, "to_status_id": soDraft.ID,
+	}, actor); !errors.Is(err, crud.ErrTargetConstraintViolation) {
+		t.Fatalf("expected ErrTargetConstraintViolation for a cross-StatusType to_status_id, got %v", err)
+	}
+}
+
 func TestIssueReport_DefaultsToNewStatus(t *testing.T) {
 	def := IssueReport()
 	f, ok := def.FieldByName("status")
