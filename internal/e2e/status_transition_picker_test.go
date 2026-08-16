@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/chromedp/chromedp"
+
+	"github.com/universaltill/universal-core/internal/testfixtures"
 )
 
 // setUpStatusTransitionPickerTest is the shared setup for the
@@ -26,7 +28,7 @@ func setUpStatusTransitionPickerTest(t *testing.T) context.Context {
 	ctx := context.Background()
 	actor := humanActor()
 
-	publishStatusPickerFixtures(t, ctx, tenantDB, actor)
+	testfixtures.PublishStatusPickerFixtures(t, ctx, tenantDB, actor)
 
 	bctx := browserCtx(t, tenantID)
 	statusTypeScope := `.uc-ref[data-field="status_type_id"]`
