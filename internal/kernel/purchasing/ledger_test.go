@@ -3257,11 +3257,20 @@ func TestMatchVendorInvoiceOnUpdate_SecondConsecutiveFailure_UpdatesReason(t *te
 		t.Fatalf("get VendorInvoice: %v", err)
 	}
 	firstReason, _ := first.Data["match_exception_reason"].(string)
-	// "999", not "999.00" — %v formatting, not a fixed 2dp format
-	// (independent review, uc-infra#193, see the MismatchedTotal test
-	// above for why).
-	if !strings.Contains(firstReason, "999") {
-		t.Fatalf("expected the first reason to mention 999, got %q", firstReason)
+	// Exact match, same idiom as TestMatchVendorInvoiceOnUpdate_
+	// MismatchedTotal_RedirectsToMatchException above — every figure here
+	// is deterministic (fx's received value is 125.00, fx.poID is in
+	// hand), so pinning the whole string is both flake-proof (uc-infra#257:
+	// a bare strings.Contains(reason, "999") could spuriously match
+	// fx.poID's own hex digits instead of the total, reproduced failing
+	// once in CI on a UUID like "...b37d6f57999d") and drift-proof (a
+	// substring match wouldn't catch vendorInvoiceMatchDetail's own format
+	// string changing under it). "999", not "999.00" — %v formatting, not
+	// a fixed 2dp format (independent review, uc-infra#193, see the
+	// MismatchedTotal test above for why).
+	wantFirst := fmt.Sprintf("total 999 (99900 minor units) does not match received value 125 (12500 minor units) for PurchaseOrder %s", fx.poID)
+	if firstReason != wantFirst {
+		t.Fatalf("expected match_exception_reason %q, got %q", wantFirst, firstReason)
 	}
 
 	// Retry with a DIFFERENT wrong total — still disagrees, but not the
@@ -3280,11 +3289,14 @@ func TestMatchVendorInvoiceOnUpdate_SecondConsecutiveFailure_UpdatesReason(t *te
 		t.Fatalf("get VendorInvoice: %v", err)
 	}
 	secondReason, _ := second.Data["match_exception_reason"].(string)
-	if !strings.Contains(secondReason, "777") {
-		t.Fatalf("expected the second reason to mention the new total 777, got %q", secondReason)
-	}
-	if strings.Contains(secondReason, "999") {
-		t.Fatalf("expected the reason to be replaced, not accumulated — still mentions the old 999: %q", secondReason)
+	// Same exact-match idiom as firstReason above (uc-infra#257) — and
+	// exact equality on the whole string also proves the reason was
+	// REPLACED, not appended to, subsuming what a separate
+	// strings.Contains(secondReason, "999")-style absence check would
+	// have tried (and, pre-fix, failed to reliably) verify.
+	wantSecond := fmt.Sprintf("total 777 (77700 minor units) does not match received value 125 (12500 minor units) for PurchaseOrder %s", fx.poID)
+	if secondReason != wantSecond {
+		t.Fatalf("expected the reason to be replaced with %q, got %q", wantSecond, secondReason)
 	}
 }
 
